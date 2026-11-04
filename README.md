@@ -1,5 +1,19 @@
 # Secure Linux netboot
 
+## One manual step
+
+GitHub only lets apps with extra permission create workflow files directly, so the automated publish
+could not create `.github/workflows/build-flipper-fap.yml`. The same workflow is included here as
+`flipper/build-flipper-fap.yml`. To enable the Flipper app build:
+
+1. Open this repository on GitHub and choose **Add file → Create new file**.
+2. Name the file `.github/workflows/build-flipper-fap.yml`.
+3. Paste the contents of `flipper/build-flipper-fap.yml`, then choose **Commit changes**.
+4. Open **Actions**, select **Build the Boot2Flipper app (Flipper Zero)** (`build-flipper-fap`), then
+   choose **Run workflow**.
+
+After this one-time setup, the workflow also runs monthly.
+
 Install **The Complete Secure Linux Package** on a PC **without a USB stick**: the computer downloads
 everything itself. Works two ways:
 
@@ -62,9 +76,9 @@ turned into a one-way hash in memory and never sent anywhere. The test suite
 
 ## The Flipper app (Boot2Flipper)
 
-Boot2Flipper has no prebuilt releases, so a GitHub Action in this repository
-(`.github/workflows/build-flipper-fap.yml`) builds it from source with the RogueMaster firmware
-toolchain, monthly and on demand, and attaches `boot2flipper.fap` to this repository's
+Boot2Flipper has no prebuilt releases. After the one manual step above, a GitHub Action in this
+repository (`.github/workflows/build-flipper-fap.yml`) builds it from source with the RogueMaster
+firmware toolchain, monthly and on demand, and attaches `boot2flipper.fap` to this repository's
 **"flipper-fap" release**. Download that file, put it on the Flipper's SD card under `apps/USB/`,
 copy the `flipper/` folder's contents to the SD card root, add the two iPXE files from
 <https://boot.ipxe.org>, and follow `flipper/README-FLIPPER.txt`.

@@ -1,0 +1,66 @@
+# Builds the Boot2Flipper app (Flipper Zero / RogueMaster firmware) from its source and publishes it.
+#
+# Boot2Flipper (https://github.com/Stella-IT/boot2flipper) has no prebuilt releases, so this workflow
+# builds the .fap the way RogueMaster apps are built: the app source is dropped into the RogueMaster
+# firmware tree (flipperzero-firmware-wPlugins) and built with that tree's own ./fbt. Run it by hand
+# (Actions > "Build the Boot2Flipper app" > Run workflow) or wait for the monthly run. The result is
+# uploaded as a workflow artifact AND attached to the "flipper-fap" release of this repository, which
+# is the file README-FLIPPER.txt tells people to download.
+name: Build the Boot2Flipper app (Flipper Zero)
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '23 7 1 * *'   # monthly, on the 1st, at an off-peak minute (07:23 UTC)
+
+permissions:
+  contents: write   # to create/update the "flipper-fap" release
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Get the RogueMaster firmware tree (the app's build system)
+        run: |
+          git clone --depth 1 --recurse-submodules --shallow-submodules \
+            https://github.com/RogueMaster/flipperzero-firmware-wPlugins firmware
+
+      - name: Get the Boot2Flipper source
+        run: |
+          git clone --depth 1 https://github.com/Stella-IT/boot2flipper firmware/applications_user/boot2flipper
+
+      - name: Build the app with the firmware's own build tool
+        run: |
+          cd firmware
+          python3 -m pip install --upgrade pip
+          if [ -f scripts/requirements.txt ]; then pip3 install -r scripts/requirements.txt; fi
+          # fbt downloads the matching toolchain by itself on the first run
+          ./fbt fap_boot2flipper
+
+      - name: Collect the built app
+        run: |
+          mkdir -p dist
+          FAP=$(find firmware/build -name 'boot2flipper.fap' | head -n 1)
+          if [ -z "$FAP" ]; then
+            echo "::error::boot2flipper.fap was not produced"; find firmware/build -name '*.fap' | head; exit 1
+          fi
+          cp "$FAP" dist/boot2flipper.fap
+          ls -la dist/
+
+      - name: Upload the app as a workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: boot2flipper-fap
+          path: dist/boot2flipper.fap
+
+      - name: Publish the app in the "flipper-fap" release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if ! gh release view flipper-fap >/dev/null 2>&1; then
+            gh release create flipper-fap \
+              --title "Boot2Flipper app for the Flipper Zero" \
+              --notes "boot2flipper.fap, built automatically from https://github.com/Stella-IT/boot2flipper with the RogueMaster firmware toolchain. Put it on the Flipper's SD card under apps/USB/ - see flipper/README-FLIPPER.txt."
+          fi
+          gh release upload flipper-fap dist/boot2flipper.fap --clobber

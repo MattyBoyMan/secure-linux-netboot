@@ -1,0 +1,53 @@
+# parts.map (owner: hardware) - which software each kind of hardware needs. Read by secure-linux-parts.
+#
+# id | rule | packages on every profile | extra packages on FULL (KDE) | extra packages on LITE (Xfce) | units to enable | title | why (plain English)
+#
+# Rules are made of atoms.  ";" means OR, "+" means AND (AND is checked across all devices, not one device).
+#   always                    every computer
+#   sys:GLOB                  a path under /sys exists (e.g. sys:block/sr*)
+#   dev:GLOB                  a path under /dev exists
+#   pci:CLASS[/VENDOR[/DEVICE]]   a PCI device (class = hex prefix, vendor/device = 4 hex digits); e.g. pci:03/10de = any NVIDIA display chip
+#   usbif:CC                  a USB device with an interface of class CC (06 imaging, 07 printer, 0b smart card, 0e video, e0 wireless)
+#   usbdev:CC                 a USB device whose device class is CC
+#   usbid:VVVV[:PPPP]         a USB device with this vendor (and product) id
+#   usbname:w1,w2             a USB device whose product/maker name contains any of the words (any case)
+#   input:w1,w2               an input device whose name contains any of the words
+#   dmi:FIELD=w1,w2           a DMI field (sys_vendor, product_name, chassis_vendor ...) contains any of the words
+# Packages are Fedora (and RPM Fusion) package names; ones that do not exist on a release are skipped quietly.
+# "@drivers" means: handled by secure-linux-drivers (graphics, Wi-Fi, Macs), which needs a restart and maybe a Secure Boot key.
+# "-" means nothing. Only packages from the normal Fedora / RPM Fusion repositories are ever listed here: nothing is
+# downloaded from anywhere else, ever. VERIFY on Fedora 44: every package name below (see docs/notes/health-parts-verify.md).
+#
+health-tools|always|smartmontools nvme-cli lm_sensors usbutils pciutils dmidecode ethtool iw libinput-utils alsa-utils v4l-utils edid-decode fwupd|stress-ng memtester vulkan-tools mesa-demos libva-utils pipewire-utils|pipewire-utils|-|Hardware health tools|These let Secure Linux test your drives, memory, processor, sound, screen and more (secure-linux-health).
+repair-tools|always|ddrescue testdisk ntfs-3g ntfsprogs exfatprogs dosfstools f2fs-tools gdisk efibootmgr cryptsetup|chntpw|-|-|Repair and data-rescue tools|Used by secure-linux-repair to fix disks, boot problems and to copy files off a failing drive.
+audio|sys:class/sound/card*|alsa-utils pipewire-alsa wireplumber|-|-|-|Sound (speakers, headphones, microphone)|Plays and records sound through the modern sound system (PipeWire).
+audio-sof|pci:0401/8086;pci:0403/8086|alsa-sof-firmware alsa-ucm-conf|-|-|-|Intel sound firmware|Newer Intel laptops need this firmware file or the speakers and microphone stay silent.
+optical|sys:block/sr*|xorriso wodim eject cdparanoia|k3b|xfburn|-|CD / DVD / Blu-ray drive|Lets you read, copy and burn discs (K3b on KDE, Xfburn on Xfce).
+scanner|usbif:06;usbname:scanner,scanjet,canoscan,lide|sane-backends sane-backends-drivers-scanners sane-backends-drivers-cameras sane-airscan|skanlite|simple-scan|-|Scanner|Scanning drivers (SANE) plus a simple scanning program.
+printer|usbif:07;sys:class/usb/lp*;dev:usb/lp*|cups cups-filters gutenprint-cups cups-browsed|plasma-print-manager print-manager|system-config-printer|cups.socket|Printer|The printing system (CUPS) with drivers for most printers; Settings > Printers adds yours.
+printer-hp|usbif:07+usbid:03f0|hplip|hplip-gui|-|-|HP printer or scanner|HP's own driver (HPLIP) gives full printing, scanning and ink levels.
+printer-epson|usbif:07+usbid:04b8|epson-inkjet-printer-escpr|-|-|-|Epson printer|Epson's driver for inkjet printers (ESC/P-R).
+printer-brother|usbif:07+usbid:04f9|brlaser|-|-|-|Brother printer|Driver for Brother laser printers.
+touchpad|input:touchpad,trackpad,synaptics,etps,clickpad|libinput-utils xorg-x11-drv-libinput|-|touchegg|-|Touchpad gestures|Two-finger scroll and tap work already; this adds the tools to tune them (KDE has gestures built in).
+fingerprint|usbname:fingerprint,fprint,validity,authentec,egis,upek;usbid:138a;usbid:27c6;usbid:1c7a;usbid:08ff;usbid:147e|fprintd fprintd-pam|-|-|-|Fingerprint reader|Register a finger in Settings > Users. We do NOT switch your login to fingerprints on our own.
+bluetooth|sys:class/bluetooth/hci*;usbdev:e0|bluez bluez-obexd|bluedevil pipewire-codec-aptx|blueman|bluetooth.service|Bluetooth|Connects headphones, mice, keyboards and phones; the codec package gives better headphone sound.
+wacom|usbid:056a;usbid:256c;usbid:28bd;usbid:5543|libwacom libwacom-data xorg-x11-drv-wacom|-|-|-|Drawing tablet|Pressure-sensitive pens and tablet buttons (Wacom, Huion, XP-Pen).
+gamepad|input:xbox,gamepad,controller,dualshock,dualsense,joystick,wireless controller;sys:class/input/js*|game-devices-udev|-|-|-|Game controller|Lets games see your controller. Xbox pads over Bluetooth can use the optional xpadneo driver (not in Fedora; only install it yourself if you need it).
+webcam|sys:class/video4linux/video*;usbif:0e|v4l-utils|kamoso|cheese|-|Webcam|Tools to test and adjust the camera plus a simple camera app.
+gpu-nvidia|pci:03/10de|@drivers|-|-|-|NVIDIA graphics card|NVIDIA's own driver is much faster than the open one; it comes from RPM Fusion and needs a restart (secure-linux-drivers).
+gpu-amd|pci:03/1002|@drivers|-|-|-|AMD graphics|Firmware and hardware video decoding for AMD graphics (secure-linux-drivers).
+gpu-intel|pci:03/8086|@drivers|-|-|-|Intel graphics|Firmware and hardware video decoding for Intel graphics (secure-linux-drivers).
+wifi-chip|pci:0280|@drivers|-|-|-|Wi-Fi chip|The right firmware for your Wi-Fi chip (secure-linux-drivers).
+apple-mac|dmi:sys_vendor=apple|@drivers|-|-|-|Apple Mac hardware|Keyboard keys, fans and (T2 Macs) the special kernel (secure-linux-drivers).
+sdcard|sys:class/mmc_host/mmc*|-|-|-|-|SD / memory-card reader|Built into Linux: put a card in and it appears in the file manager. Nothing to install.
+smartcard|usbif:0b;usbname:smart card,smartcard,cac reader,gemalto,acs acr|pcsc-lite pcsc-lite-ccid pcsc-tools opensc|-|-|pcscd.socket|Smart-card / NFC reader|Lets Linux read ID cards, bank cards and NFC tags.
+security-key|usbid:1050;usbname:fido,security key,solokey,titan key|libfido2 yubikey-manager|-|-|-|Security key (YubiKey, FIDO)|Tools to manage your hardware security key.
+mouse3d|usbid:046d:c62b;usbid:046d:c626;usbid:256f|spacenavd|-|-|-|3D mouse|Driver for 3Dconnexion space mice.
+logitech|usbid:046d:c52b;usbid:046d:c534;usbid:046d:c548;usbid:046d:c547|solaar|-|-|-|Logitech wireless receiver|Solaar pairs and configures Logitech Unifying/Bolt mice and keyboards.
+phone-android|usbname:android,pixel,galaxy,oneplus,xiaomi,huawei,mtp|libmtp gvfs-mtp gvfs-gphoto2|-|-|-|Android phone or camera|Copy photos and files from a phone or camera in the file manager.
+phone-iphone|usbname:iphone,ipad|libimobiledevice usbmuxd ifuse|-|-|-|iPhone / iPad|Copy photos from an iPhone or iPad.
+modem|usbname:modem,wwan,quectel,sierra wireless,huawei mobile,lte;sys:class/net/wwan*|ModemManager mobile-broadband-provider-info usb_modeswitch|-|-|ModemManager.service|Mobile-broadband modem (SIM card)|Lets the network menu use a SIM-card modem.
+sensors-iio|sys:bus/iio/devices/iio:device*|iio-sensor-proxy|-|-|-|Screen-rotation and light sensors|Rotates the screen when you turn a convertible and dims it in the dark.
+thunderbolt|sys:bus/thunderbolt/devices/*;pci:0c0340|bolt|plasma-thunderbolt|-|-|Thunderbolt / USB4|Asks before a new Thunderbolt device is allowed to talk to the computer.
+tpm|sys:class/tpm/tpm0|tpm2-tools tpm2-tss|-|-|-|TPM security chip|Tools for unlocking the disk with the TPM.
+ups|usbid:051d;usbid:0764|nut|-|-|-|Battery backup (UPS)|Monitors a UPS and shuts down safely when the power fails.

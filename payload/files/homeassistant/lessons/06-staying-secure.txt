@@ -1,0 +1,15 @@
+Staying secure: the short version
+
+ 1. Never port-forward Home Assistant on your router. Never.
+ 2. Reach it from away with NordVPN Meshnet (best for you), or Cloudflare Tunnel with a login rule, or Nabu Casa.
+ 3. Two-step login on every account. Long unique passwords.
+ 4. You use a non-admin account every day; the admin account is for changing settings.
+ 5. Backups: automatic, encrypted, one copy outside the house, and a restore test twice a year.
+ 6. Update monthly: back up first, read the release notes, update one thing at a time.
+ 7. Put smart gadgets on their own Wi-Fi/VLAN and block internet for the ones that work locally.
+ 8. Secrets in secrets.yaml, never inside other files, never in Git.
+ 9. Delete tokens, add-ons and integrations you are not using.
+10. Watch the login alerts. A phone alert for a failed login is your smoke alarm.
+
+secure-linux-ha-secure --check gives you a grade A to F with plain-English fixes.
+secure-linux-ha-secure --apply fixes the safe ones for you (it shows you first and asks).

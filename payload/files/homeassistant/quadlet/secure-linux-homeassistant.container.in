@@ -1,0 +1,20 @@
+# Home Assistant "try it on this laptop" copy. Written by Secure Linux (secure-linux-ha local enable).
+# Rootless Podman Quadlet: runs as YOU, not as root, and only this laptop can reach it (127.0.0.1).
+# It is OFF until you start it: secure-linux-ha local start    Stop: secure-linux-ha local stop
+# It is NOT an automatic-update container: updates are a decision you make (secure-linux-ha local update).
+[Unit]
+Description=Home Assistant (try-it copy, this laptop only)
+
+[Container]
+Image=ghcr.io/home-assistant/home-assistant:stable
+ContainerName=secure-linux-homeassistant
+# 127.0.0.1 = this laptop only. Nothing else on the network can reach it.
+PublishPort=127.0.0.1:8123:8123
+# Your test config lives in a normal folder you can look at and back up. :Z = SELinux label for this container only.
+Volume=@CONFIG@:/config:Z
+Environment=TZ=@TZ@
+
+[Service]
+# The first start downloads the image (about 1.5 GB), so allow plenty of time.
+TimeoutStartSec=1800
+Restart=no

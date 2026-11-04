@@ -1,0 +1,61 @@
+# =====================================================================================================
+# Blueprint: Vacation simulation (looks like someone is home)
+# =====================================================================================================
+# Create it from: Settings > Automations & scenes > Blueprints > "Vacation simulation" > Create automation.
+#
+# WHAT IT DOES   While the "Vacation mode" switch is ON, at dusk (a random few minutes after sunset so it never looks
+#                the same) it turns on ONE of your chosen lights, leaves it a random 1 to 3 hours, then turns
+#                it off. Different light most nights. Burglars watch for houses that stay dark.
+# TO USE         Create the automation once, then just flip "Vacation mode" on when you leave and off when
+#                you're back. Tell nobody on social media you are away.
+blueprint:
+  name: "Vacation simulation"
+  author: Secure Linux
+  description: >
+    While Vacation mode is on, turns a random light on at dusk and off a few hours later so the house looks lived in.
+  domain: automation
+  min_version: 2024.10.0
+  input:
+    vacation_switch:
+      name: Vacation mode switch
+      default: input_boolean.sl_vacation_mode
+      selector:
+        entity:
+          domain: input_boolean
+    lights:
+      name: Lights to use
+      description: Lights that can be seen from outside (lounge, hallway, bedroom).
+      selector:
+        entity:
+          domain: light
+          multiple: true
+
+mode: single
+
+variables:
+  lights: !input lights
+
+triggers:
+  - trigger: sun
+    event: sunset
+
+conditions:
+  - condition: state
+    entity_id: !input vacation_switch
+    state: "on"
+  - condition: template
+    value_template: "{{ lights | count > 0 }}"
+
+actions:
+  - delay:
+      minutes: "{{ range(0, 31) | random }}"
+  - variables:
+      chosen: "{{ lights | random }}"
+  - action: light.turn_on
+    target:
+      entity_id: "{{ chosen }}"
+  - delay:
+      minutes: "{{ range(60, 181) | random }}"
+  - action: light.turn_off
+    target:
+      entity_id: "{{ chosen }}"

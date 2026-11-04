@@ -1,0 +1,31 @@
+# =====================================================================================================
+# sl_door_left_open.yaml  -  "the garage / front door has been open for 10 minutes"
+# =====================================================================================================
+# WHAT IT DOES   If any door, window or garage-door sensor stays open for 10 minutes, you get a message
+#                naming it.
+# WHY            Doors left open waste heating, let bugs in, and are a security risk.
+# CHANGE THE TIME  Change "00:10:00" (hours:minutes:seconds). Try "00:05:00" for 5 minutes.
+# NOTE           It speaks up once per open period. To be told again, close everything and reopen.
+# NEEDS          sl_helpers.yaml (for script.sl_notify)
+
+automation:
+  - alias: "Doors: left open for 10 minutes"
+    id: sl_door_open
+    description: "Tells you when a door, window or garage door has been open for 10 minutes."
+    mode: single
+    triggers:
+      - trigger: template
+        value_template: >
+          {{ states.binary_sensor | selectattr('attributes.device_class', 'defined')
+             | selectattr('attributes.device_class', 'in', ['door', 'window', 'garage_door', 'opening'])
+             | selectattr('state', 'eq', 'on') | list | count > 0 }}
+        for: "00:10:00"
+    actions:
+      - action: script.sl_notify
+        data:
+          title: "Still open"
+          message: >
+            {{ states.binary_sensor | selectattr('attributes.device_class', 'defined')
+               | selectattr('attributes.device_class', 'in', ['door', 'window', 'garage_door', 'opening'])
+               | selectattr('state', 'eq', 'on') | map(attribute='name') | join(', ') }}
+            open for 10 minutes or more.

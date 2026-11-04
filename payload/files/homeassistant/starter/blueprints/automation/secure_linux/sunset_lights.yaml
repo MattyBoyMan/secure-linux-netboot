@@ -1,0 +1,62 @@
+# =====================================================================================================
+# Blueprint: Lights on at sunset, off at bedtime
+# =====================================================================================================
+# Create it from: Settings > Automations & scenes > Blueprints > "Lights on at sunset, off at bedtime" > Create automation.
+#
+# WHAT IT DOES   Lights come on a little before the sun sets (so the house is never dark), and go off at your
+#                chosen bedtime. Home Assistant knows when the sun sets at YOUR address (set in Settings >
+#                System > General), so it follows the seasons by itself.
+# THE "BEFORE SUNSET" BOX  Type it as hours:minutes:seconds with a minus sign, for example -00:30:00 means
+#                30 minutes BEFORE sunset. 00:15:00 (no minus) means 15 minutes after.
+blueprint:
+  name: "Lights on at sunset, off at bedtime"
+  author: Secure Linux
+  description: >
+    Switches your chosen lights on around sunset and off at a set time every night.
+  domain: automation
+  min_version: 2024.10.0
+  input:
+    lights:
+      name: Lights
+      selector:
+        target:
+          entity:
+            domain: light
+    sunset_offset:
+      name: Sunset offset
+      description: "-00:30:00 = half an hour before sunset. 00:00:00 = exactly at sunset."
+      default: "-00:30:00"
+      selector:
+        text:
+    bedtime:
+      name: Off at
+      description: Time the lights go off.
+      default: "23:00:00"
+      selector:
+        time:
+
+mode: single
+
+triggers:
+  - trigger: sun
+    event: sunset
+    offset: !input sunset_offset
+    id: "on"
+  - trigger: time
+    at: !input bedtime
+    id: "off"
+
+actions:
+  - choose:
+      - conditions:
+          - condition: trigger
+            id: "on"
+        sequence:
+          - action: light.turn_on
+            target: !input lights
+      - conditions:
+          - condition: trigger
+            id: "off"
+        sequence:
+          - action: light.turn_off
+            target: !input lights

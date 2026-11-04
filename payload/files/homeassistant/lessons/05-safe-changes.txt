@@ -1,0 +1,14 @@
+Changing things without breaking anything
+
+Rule 1: take a restore point before you change files.
+    secure-linux-ha snapshot       (saves your config with Git; your passwords are left out on purpose)
+Rule 2: check before you restart.
+    secure-linux-ha validate       (finds YAML mistakes, duplicate keys, missing files)
+Rule 3: if it goes wrong, go back.
+    secure-linux-ha rollback       (shows your restore points, you pick one, it asks first)
+Rule 4: try risky ideas in a copy.
+    secure-linux-ha local start    (a private test Home Assistant on this laptop only)
+
+What never goes in your config files: passwords, API keys, tokens. They go in secrets.yaml and you write
+    password: !secret name
+Home Assistant's own backups are the second safety net: Settings > System > Backups.

@@ -1,0 +1,127 @@
+# =====================================================================================================
+# Blueprint: Goodnight routine
+# =====================================================================================================
+# Create it from: Settings > Automations & scenes > Blueprints > "Goodnight routine" > Create automation.
+#
+# HOW YOU START IT   Turn on the "Goodnight" switch (it appears on your dashboard and works with voice:
+#                "turn on goodnight"). Or pick a time and it runs by itself each night.
+# WHAT IT DOES   Lights off, doors locked, optional heating setback, then tells you if a door or window is
+#                still open. The switch turns itself off again, ready for tomorrow.
+blueprint:
+  name: "Goodnight routine"
+  author: Secure Linux
+  description: >
+    One switch (or a bedtime) that turns off lights, locks doors, and warns you about anything left open.
+  domain: automation
+  min_version: 2024.10.0
+  input:
+    trigger_switch:
+      name: Goodnight switch
+      default: input_boolean.sl_goodnight
+      selector:
+        entity:
+          domain: input_boolean
+    use_bedtime:
+      name: Also run automatically at bedtime
+      default: false
+      selector:
+        boolean:
+    bedtime:
+      name: Bedtime
+      default: "22:30:00"
+      selector:
+        time:
+    lights:
+      name: Lights to switch off
+      default: []
+      selector:
+        entity:
+          domain: light
+          multiple: true
+    locks:
+      name: Locks to lock
+      default: []
+      selector:
+        entity:
+          domain: lock
+          multiple: true
+    heating:
+      name: Heating or cooling to turn down (optional)
+      default: []
+      selector:
+        entity:
+          domain: climate
+          multiple: true
+    night_temperature:
+      name: Night temperature
+      default: 17
+      selector:
+        number:
+          min: 10
+          max: 26
+          unit_of_measurement: "°C"
+
+mode: single
+
+variables:
+  lights: !input lights
+  locks: !input locks
+  heating: !input heating
+  use_bedtime: !input use_bedtime
+
+triggers:
+  - trigger: state
+    entity_id: !input trigger_switch
+    to: "on"
+  - trigger: time
+    at: !input bedtime
+
+conditions:
+  - condition: or
+    conditions:
+      - condition: template
+        value_template: "{{ trigger.platform == 'state' }}"
+      - condition: template
+        value_template: "{{ use_bedtime }}"
+
+actions:
+  - if:
+      - condition: template
+        value_template: "{{ lights | count > 0 }}"
+    then:
+      - action: light.turn_off
+        target:
+          entity_id: !input lights
+  - if:
+      - condition: template
+        value_template: "{{ locks | count > 0 }}"
+    then:
+      - action: lock.lock
+        target:
+          entity_id: !input locks
+  - if:
+      - condition: template
+        value_template: "{{ heating | count > 0 }}"
+    then:
+      - action: climate.set_temperature
+        target:
+          entity_id: !input heating
+        data:
+          temperature: !input night_temperature
+  - if:
+      - condition: template
+        value_template: >
+          {{ states.binary_sensor | selectattr('attributes.device_class', 'defined')
+             | selectattr('attributes.device_class', 'in', ['door', 'window', 'garage_door', 'opening'])
+             | selectattr('state', 'eq', 'on') | list | count > 0 }}
+    then:
+      - action: script.sl_notify
+        data:
+          title: "Goodnight: still open"
+          message: >
+            {{ states.binary_sensor | selectattr('attributes.device_class', 'defined')
+               | selectattr('attributes.device_class', 'in', ['door', 'window', 'garage_door', 'opening'])
+               | selectattr('state', 'eq', 'on') | map(attribute='name') | join(', ') }}
+  - action: input_boolean.turn_off
+    target:
+      entity_id: !input trigger_switch

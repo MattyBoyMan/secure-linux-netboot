@@ -1,0 +1,38 @@
+# =====================================================================================================
+# sl_cert_expiry.yaml  -  "your HTTPS certificate expires soon"
+# =====================================================================================================
+# WHAT IT DOES   Each morning checks every "Certificate Expiry" sensor and warns when one has under 14 days left.
+# WHY            An expired certificate stops your phone app and browsers connecting, usually at a bad time.
+#                (Caddy renews its own certificates, so this is your early warning if renewal quietly breaks.)
+# ONE-TIME SETUP Settings > Devices & services > Add integration > "Certificate Expiry". Enter your
+#                Home Assistant address (for example ha.home) and port 443. Add one per certificate.
+#                Nothing is checked until you do that: no sensors, no alerts.
+# NEEDS          sl_helpers.yaml (for script.sl_notify)
+
+automation:
+  - alias: "Certificates: expiring within 14 days"
+    id: sl_cert_expiry
+    description: "Warns when a Certificate Expiry sensor has fewer than 14 days left."
+    mode: single
+    triggers:
+      - trigger: time
+        at: "09:05:00"
+    variables:
+      soon: >
+        {% set ns = namespace(items=[]) %}
+        {% for s in states.sensor | selectattr('attributes.device_class', 'defined') | selectattr('attributes.device_class', 'eq', 'timestamp') | selectattr('entity_id', 'search', 'cert_expiry') %}
+          {% set left = ((as_timestamp(s.state, 0) - now().timestamp()) / 86400) | int %}
+          {% if s.state not in ['unknown', 'unavailable'] and left < 14 %}
+            {% set ns.items = ns.items + [s.name ~ ' (' ~ left ~ ' days)'] %}
+          {% endif %}
+        {% endfor %}
+        {{ ns.items }}
+    conditions:
+      - condition: template
+        value_template: "{{ soon | count > 0 }}"
+    actions:
+      - action: script.sl_notify
+        data:
+          title: "Certificate expiring"
+          message: "{{ soon | join(', ') }}"
+          urgent: true

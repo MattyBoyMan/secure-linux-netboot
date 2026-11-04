@@ -1,0 +1,9 @@
+# Secure Linux (hardware): when a NEW kind of device is plugged in, start the helper that installs the software to use it
+# (printer driver, scanner, burning program ...). The helper (secure-linux-parts --hotplug) waits a few seconds, compares
+# with the devices it has already seen, tells the user "New device found: X. Installing software to use it", and installs
+# ONLY packages from Fedora's own repositories. Installed to /etc/udev/rules.d/ by steps/15-drivers.sh.
+# SYSTEMD_WANTS only starts a service; it does nothing itself, so a busy bus cannot slow the hot-plug down.
+ACTION=="add", SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", TAG+="systemd", ENV{SYSTEMD_WANTS}+="secure-linux-parts-hotplug.service"
+ACTION=="add", SUBSYSTEM=="bluetooth", ENV{DEVTYPE}=="host", TAG+="systemd", ENV{SYSTEMD_WANTS}+="secure-linux-parts-hotplug.service"
+ACTION=="add", SUBSYSTEM=="block", ENV{ID_CDROM}=="1", TAG+="systemd", ENV{SYSTEMD_WANTS}+="secure-linux-parts-hotplug.service"
+ACTION=="add", SUBSYSTEM=="thunderbolt", TAG+="systemd", ENV{SYSTEMD_WANTS}+="secure-linux-parts-hotplug.service"

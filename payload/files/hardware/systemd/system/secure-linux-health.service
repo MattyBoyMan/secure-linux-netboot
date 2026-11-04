@@ -1,0 +1,10 @@
+[Unit]
+Description=Secure Linux hardware health check (quick, read-only)
+ConditionPathExists=/usr/local/bin/secure-linux-health
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/secure-linux-health --quick --no-interactive
+Nice=19
+IOSchedulingClass=idle
+TimeoutStartSec=15min

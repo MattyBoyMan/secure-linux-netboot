@@ -1,0 +1,24 @@
+[Desktop Entry]
+Type=Application
+Name=Home Assistant
+GenericName=Smart home
+Comment=Open your Home Assistant smart-home dashboard in its own window
+Exec=/usr/local/bin/secure-linux-ha open
+Icon=user-home
+Terminal=false
+Categories=Network;Utility;
+Keywords=smart home;home automation;lights;iot;home assistant;hass;
+StartupNotify=true
+Actions=Security;Learn;Status;
+
+[Desktop Action Security]
+Name=Security check (grade A to F)
+Exec=/usr/local/bin/secure-linux-terminal /usr/local/bin/secure-linux-ha-secure --guided
+
+[Desktop Action Learn]
+Name=Learn Home Assistant (beginner lessons)
+Exec=/usr/local/bin/secure-linux-terminal /usr/local/bin/secure-linux-ha-learn
+
+[Desktop Action Status]
+Name=Is it working? (status)
+Exec=/usr/local/bin/secure-linux-terminal --hold /usr/local/bin/secure-linux-ha status

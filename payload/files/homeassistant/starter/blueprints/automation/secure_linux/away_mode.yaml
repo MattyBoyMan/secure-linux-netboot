@@ -1,0 +1,114 @@
+# =====================================================================================================
+# Blueprint: Away mode (everyone out: switch off and lock up; someone home: switch back)
+# =====================================================================================================
+# Create it from: Settings > Automations & scenes > Blueprints > "Away mode" > Create automation.
+#
+# HOW IT KNOWS NOBODY IS HOME  The built-in "Home" zone counts how many People are there. For this you
+#                need the Home Assistant app on each phone with location turned on (see the guide chapter
+#                "Presence by phone"). When the count stays at 0 for 5 minutes, everyone is out.
+# WHAT IT DOES   Everyone out: turns on the "Away mode" switch (from sl_helpers.yaml, or pick your own), turns off the
+#                lights you choose and locks the locks you choose. Someone comes home: Away mode goes off.
+#                Optional: arm an alarm panel if you have one.
+# SAFETY         Locks are only LOCKED, never unlocked, by this blueprint.
+blueprint:
+  name: "Away mode"
+  author: Secure Linux
+  description: >
+    When the last person leaves, switch off lights and lock the doors. When someone comes home, go back to normal.
+  domain: automation
+  min_version: 2024.10.0
+  input:
+    away_switch:
+      name: Away mode switch
+      description: The on/off helper that other automations can look at.
+      default: input_boolean.sl_away_mode
+      selector:
+        entity:
+          domain: input_boolean
+    wait_minutes:
+      name: Wait before deciding nobody is home
+      description: Stops false alarms when a phone's location jumps for a moment.
+      default: 5
+      selector:
+        number:
+          min: 1
+          max: 60
+          unit_of_measurement: minutes
+    lights:
+      name: Lights to switch off
+      default: []
+      selector:
+        entity:
+          domain: light
+          multiple: true
+    locks:
+      name: Locks to lock
+      default: []
+      selector:
+        entity:
+          domain: lock
+          multiple: true
+    alarm:
+      name: Alarm panel to arm (optional)
+      default: []
+      selector:
+        entity:
+          domain: alarm_control_panel
+          multiple: true
+
+mode: single
+
+variables:
+  lights: !input lights
+  locks: !input locks
+  alarm: !input alarm
+
+triggers:
+  - trigger: numeric_state
+    entity_id: zone.home
+    below: 1
+    for:
+      minutes: !input wait_minutes
+    id: left
+  - trigger: numeric_state
+    entity_id: zone.home
+    above: 0
+    id: arrived
+
+actions:
+  - choose:
+      - conditions:
+          - condition: trigger
+            id: left
+        sequence:
+          - action: input_boolean.turn_on
+            target:
+              entity_id: !input away_switch
+          - if:
+              - condition: template
+                value_template: "{{ lights | count > 0 }}"
+            then:
+              - action: light.turn_off
+                target:
+                  entity_id: !input lights
+          - if:
+              - condition: template
+                value_template: "{{ locks | count > 0 }}"
+            then:
+              - action: lock.lock
+                target:
+                  entity_id: !input locks
+          - if:
+              - condition: template
+                value_template: "{{ alarm | count > 0 }}"
+            then:
+              - action: alarm_control_panel.alarm_arm_away
+                target:
+                  entity_id: !input alarm
+      - conditions:
+          - condition: trigger
+            id: arrived
+        sequence:
+          - action: input_boolean.turn_off
+            target:
+              entity_id: !input away_switch

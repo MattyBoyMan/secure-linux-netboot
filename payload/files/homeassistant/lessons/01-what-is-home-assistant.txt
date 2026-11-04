@@ -1,0 +1,18 @@
+What is Home Assistant?
+
+Home Assistant is free, open-source software that lives on a small computer in your house (a "home server") and
+becomes the brain of your smart home. Lights, plugs, heaters, door sensors, cameras and speakers from many
+different brands all show up in ONE place, and you can make them work together.
+
+Why people love it
+  - It works inside your house, so it still works when the internet is down.
+  - Your data stays with you: no company sees when you come and go.
+  - It talks to thousands of gadgets, so you are not locked in to one brand.
+
+Where does it run?
+  - A dedicated mini computer (Home Assistant OS on a Raspberry Pi or a small PC). This is the recommended way.
+  - Or as a "container" on a server you already have (like your Immich server).
+  - Or, to try it out, right here on this laptop (secure-linux-ha local start).
+
+Important: Home Assistant is the server. This laptop has a window ("Home Assistant" in the app menu) that opens its
+web page, and your phone has the Home Assistant app.

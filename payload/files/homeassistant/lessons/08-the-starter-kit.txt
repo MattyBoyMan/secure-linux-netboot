@@ -1,0 +1,16 @@
+The starter kit: ready-made automations
+
+Always-on "packages" (zero setup). Put them in your config 'packages' folder with: secure-linux-ha starter install
+  1. Low batteries      sl_battery_alerts.yaml     a daily list of every battery under 20%
+  2. Leak and smoke     sl_leak_smoke.yaml         urgent alert; covers every leak/smoke/gas sensor you ever add
+  3. Door left open     sl_door_left_open.yaml     "still open after 10 minutes"
+  4. Offline watchdog   sl_offline_watchdog.yaml   something unavailable for 30 minutes
+  5. Backup alert       sl_backup_alert.yaml       failed, or too old
+  6. Certificate expiry sl_cert_expiry.yaml        warns 14 days before an HTTPS certificate runs out
+  7. Update digest      sl_update_digest.yaml      Sundays: what is waiting to be updated
+  8. Login alert        sl_security_watch.yaml     a failed login goes straight to your phone
+Blueprints (you pick the sensors and lights from lists, no typing):
+  9. Motion lights and Sunset lights
+ 10. Away mode, Goodnight routine, Vacation simulation
+
+Hear any of them explained out loud in plain English:   secure-linux-ha-learn explain sl_battery_alerts.yaml

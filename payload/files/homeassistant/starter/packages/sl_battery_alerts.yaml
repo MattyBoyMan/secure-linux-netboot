@@ -1,0 +1,63 @@
+# =====================================================================================================
+# sl_battery_alerts.yaml  -  tells you about EVERY low battery in the house (nothing to set up)
+# =====================================================================================================
+# WHAT IT DOES   Warns you about every low battery in the house. Every morning at 9 it looks at all battery sensors (door sensors, motion sensors, remotes,
+#                phones, temperature gadgets...) and sends you one message listing any under 20%.
+#                Also warns straight away if any drops under 10%.
+# WHY            Flat batteries are the number one reason a smart home "stops working". This finds them first.
+# HOW IT FINDS THEM  Home Assistant labels battery sensors with device_class "battery". We ask for all
+#                of those, so new gadgets are covered automatically.
+# CHANGE THE LIMITS  Edit the two numbers: 20 (daily digest) and 10 (urgent). Save, then run
+#                secure-linux-ha validate before restarting.
+# NEEDS          sl_helpers.yaml (for script.sl_notify)
+
+automation:
+  - alias: "Batteries: daily low-battery list"
+    id: sl_battery_daily
+    description: "At 9am, lists every battery under 20% in one message."
+    mode: single
+    triggers:
+      - trigger: time
+        at: "09:00:00"
+    variables:
+      # Build a list like "Front door (12%)" from every battery sensor under 20.
+      low: >
+        {% set ns = namespace(items=[]) %}
+        {% for s in states.sensor | selectattr('attributes.device_class', 'defined') | selectattr('attributes.device_class', 'eq', 'battery') %}
+          {% if s.state | float(100) < 20 %}
+            {% set ns.items = ns.items + [s.name ~ ' (' ~ (s.state | float | round(0) | int) ~ '%)'] %}
+          {% endif %}
+        {% endfor %}
+        {% for s in states.binary_sensor | selectattr('attributes.device_class', 'defined') | selectattr('attributes.device_class', 'eq', 'battery') | selectattr('state', 'eq', 'on') %}
+          {% set ns.items = ns.items + [s.name ~ ' (low)'] %}
+        {% endfor %}
+        {{ ns.items }}
+    conditions:
+      - condition: template
+        value_template: "{{ low | count > 0 }}"
+    actions:
+      - action: script.sl_notify
+        data:
+          title: "Low batteries"
+          message: "{{ low | join(', ') }}"
+
+  - alias: "Batteries: urgent when one gets very low"
+    id: sl_battery_urgent
+    description: "Warns straight away when any battery drops under 10%."
+    mode: single
+    triggers:
+      - trigger: template
+        value_template: >
+          {{ states.sensor | selectattr('attributes.device_class', 'defined') | selectattr('attributes.device_class', 'eq', 'battery')
+             | selectattr('state', 'search', '^[0-9.]+$') | map(attribute='state') | map('float') | select('lt', 10) | list | count > 0 }}
+    actions:
+      - action: script.sl_notify
+        data:
+          title: "Battery almost flat"
+          message: >
+            {% set ns = namespace(items=[]) %}
+            {% for s in states.sensor | selectattr('attributes.device_class', 'defined') | selectattr('attributes.device_class', 'eq', 'battery') %}
+              {% if s.state | float(100) < 10 %}{% set ns.items = ns.items + [s.name ~ ' (' ~ (s.state | float | round(0) | int) ~ '%)'] %}{% endif %}
+            {% endfor %}
+            {{ ns.items | join(', ') }}
+          urgent: false

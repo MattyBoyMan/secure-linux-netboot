@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Home Assistant: Learn the Basics
+GenericName=Smart home lessons
+Comment=Short plain-English lessons, and hear the ready-made automations explained
+Exec=/usr/local/bin/secure-linux-terminal /usr/local/bin/secure-linux-ha-learn
+Icon=help-contents
+Terminal=false
+Categories=Education;Utility;
+Keywords=smart home;home assistant;lessons;tutorial;

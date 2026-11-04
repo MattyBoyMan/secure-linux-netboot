@@ -1,0 +1,32 @@
+# =====================================================================================================
+# sl_offline_watchdog.yaml  -  "something has dropped off the network"
+# =====================================================================================================
+# WHAT IT DOES   If any device has been "unavailable" for 30 minutes, you get a message listing up to 10.
+# WHY            Smart gadgets quietly go offline (Wi-Fi hiccup, flat battery, unplugged). You would otherwise
+#                find out when the light does not come on. A device that stays offline for days can also mean
+#                a problem on your network.
+# TIPS           A device you switch off on purpose (a TV) will show up here. If it nags you, disable that
+#                entity: Settings > Devices & services > Entities > the entity > Settings > Disable.
+# CHANGE THE TIME  Edit "00:30:00".
+# NEEDS          sl_helpers.yaml (for script.sl_notify)
+
+automation:
+  - alias: "Watchdog: devices offline for 30 minutes"
+    id: sl_offline
+    description: "Messages you when something has been unavailable for 30 minutes."
+    mode: single
+    triggers:
+      - trigger: template
+        value_template: >
+          {{ states | selectattr('state', 'eq', 'unavailable')
+             | rejectattr('domain', 'in', ['automation', 'script', 'scene', 'update', 'event', 'button', 'input_button'])
+             | list | count > 0 }}
+        for: "00:30:00"
+    actions:
+      - action: script.sl_notify
+        data:
+          title: "Offline devices"
+          message: >
+            {% set bad = states | selectattr('state', 'eq', 'unavailable')
+               | rejectattr('domain', 'in', ['automation', 'script', 'scene', 'update', 'event', 'button', 'input_button']) | list %}
+            {{ bad[:10] | map(attribute='name') | join(', ') }}{{ ' and ' ~ (bad | count - 10) ~ ' more' if bad | count > 10 else '' }}

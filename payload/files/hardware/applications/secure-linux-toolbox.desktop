@@ -1,0 +1,23 @@
+[Desktop Entry]
+Type=Application
+Name=Secure Linux Toolbox
+GenericName=Look after, fix and rescue your computer
+Comment=One friendly place: it checks your computer, then fixes what is safe to fix. Also rescues your files and checks the hardware
+Exec=/usr/local/bin/secure-linux-toolbox
+Icon=applications-system
+Terminal=false
+Categories=System;Settings;
+Keywords=toolbox;fix;repair;rescue;health;check;backup;update;clean;help;problem;slow;
+Actions=autopilot;rescue;hardware;
+
+[Desktop Action autopilot]
+Name=Look after my computer
+Exec=/usr/local/bin/secure-linux-toolbox --autopilot
+
+[Desktop Action rescue]
+Name=Rescue my files
+Exec=/usr/local/bin/secure-linux-toolbox --screen rescue
+
+[Desktop Action hardware]
+Name=Check my hardware
+Exec=/usr/local/bin/secure-linux-toolbox --screen health

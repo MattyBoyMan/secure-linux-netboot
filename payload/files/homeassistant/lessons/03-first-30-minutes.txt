@@ -1,0 +1,18 @@
+Your first 30 minutes
+
+1. Open it.          Home Assistant (app menu), or the address in your browser. First time: make the owner
+                     account. Use a long unique password from your password manager. This is the admin.
+2. Make a second     Settings > People > Add person. Give yourself a normal (non-admin) account for daily use.
+   account.
+3. Turn on 2-step    Profile (bottom-left) > Security > Multi-factor Authentication > Enable. Use an
+   login.            authenticator app. Do it for every account.
+4. Set your home.    Settings > System > General: location, time zone (Australia/Melbourne), units, currency AUD.
+5. Look at what      Settings > Devices & services. Home Assistant often discovers lights and speakers by itself.
+   it found.         Click Configure on what you recognise.
+6. Add your phone.   Install the Home Assistant app (Android) and sign in. It gives you notifications and presence.
+7. Switch on         Settings > System > Backups > Set up automatic backups. Keep encryption on. Save the key in
+   backups.          your password manager.
+8. Run the           secure-linux-ha-secure --check . Fix anything marked NEEDS FIXING.
+   security check.
+
+Stop there. Everything else can wait for another day.

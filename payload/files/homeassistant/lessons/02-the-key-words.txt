@@ -1,0 +1,18 @@
+The key words you need
+
+Entity       One thing Home Assistant can see or control: a light, a temperature reading, a door sensor.
+             Names look like light.lounge or sensor.hall_temperature. (domain.name)
+Device       The physical gadget. One device can have several entities (a motion sensor also reports battery).
+Integration  The "driver" that lets Home Assistant talk to a brand or a standard (Zigbee, Hue, Matter, ESPHome).
+Area         A room: Kitchen, Bedroom. Put devices in areas and you can say "turn off the kitchen".
+Automation   "When this happens, do that." A trigger, optional conditions, and actions.
+Script       A saved list of actions you run on demand. Like a macro.
+Scene        A saved look: "Movie night" sets these lights to these levels.
+
+Three more you will meet soon
+Helper       A little switch, number or text box you create yourself. Great for modes ("Away mode").
+Blueprint    A ready-made automation recipe where you only choose the sensor and lights from lists.
+Dashboard    The pages you look at. Yours to arrange.
+Add-on       Extra software that runs next to Home Assistant (only on Home Assistant OS).
+
+Look up any word: secure-linux-ha-learn glossary WORD

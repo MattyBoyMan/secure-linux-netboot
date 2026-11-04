@@ -1,0 +1,48 @@
+# =====================================================================================================
+# sl_backup_alert.yaml  -  "your backup failed" or "your backup is too old"
+# =====================================================================================================
+# WHAT IT DOES   1. Alerts you when an automatic backup fails.
+#                2. Every morning checks the last good backup is less than 36 hours old; alerts if not.
+# WHY            Backups fail silently. The day you need one is the wrong day to find out.
+# BEFORE USING   Switch on automatic backups: Settings > System > Backups > Set up automatic backups.
+# VERIFY         The entity names below (event.backup_automatic_backup and
+#                sensor.backup_last_successful_automatic_backup) are Home Assistant's built-in backup
+#                entities in recent versions. If yours differ, check Settings > Devices & services >
+#                Entities, search "backup", and change the names here.
+# NEEDS          sl_helpers.yaml (for script.sl_notify)
+
+automation:
+  - alias: "Backup: failed"
+    id: sl_backup_failed
+    description: "Tells you when Home Assistant's automatic backup fails."
+    mode: single
+    triggers:
+      - trigger: state
+        entity_id: event.backup_automatic_backup
+    conditions:
+      - condition: template
+        value_template: "{{ trigger.to_state is not none and trigger.to_state.attributes.get('event_type') == 'failed' }}"
+    actions:
+      - action: script.sl_notify
+        data:
+          title: "Backup FAILED"
+          message: "Home Assistant's automatic backup failed. Open Settings > System > Backups to see why."
+          urgent: true
+
+  - alias: "Backup: too old"
+    id: sl_backup_old
+    description: "Every morning, alerts if the last good backup is older than 36 hours."
+    mode: single
+    triggers:
+      - trigger: time
+        at: "08:30:00"
+    conditions:
+      - condition: template
+        value_template: >
+          {% set last = states('sensor.backup_last_successful_automatic_backup') %}
+          {{ last in ['unknown', 'unavailable', 'none', ''] or (now().timestamp() - as_timestamp(last, 0)) > 36 * 3600 }}
+    actions:
+      - action: script.sl_notify
+        data:
+          title: "Backup is out of date"
+          message: "No successful automatic backup in the last 36 hours. Settings > System > Backups."

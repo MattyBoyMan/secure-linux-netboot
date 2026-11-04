@@ -1,0 +1,44 @@
+Entity	One thing Home Assistant can see or control, like a light or a temperature reading. Named domain.name, for example light.lounge.
+Device	The physical gadget. A device can have several entities.
+Integration	The driver that connects Home Assistant to a brand or standard (Zigbee, Matter, Hue, MQTT).
+Area	A room or zone of the house, used to group devices and to give voice commands like "turn off the kitchen".
+Automation	A rule: when something happens (trigger), and optionally only if something is true (condition), do something (action).
+Trigger	The "when" part of an automation.
+Condition	An optional gate: the automation only continues if it is true.
+Action	The "do" part of an automation.
+Script	A saved list of actions you can run on demand.
+Scene	A saved look for lights and devices, like "Movie night".
+Helper	A small switch, number, text box or timer you create yourself, used to hold modes and settings.
+Blueprint	A shareable automation recipe where you only choose the sensor and lights from lists.
+Dashboard	A page of cards that shows and controls your home.
+Add-on	Extra software that runs beside Home Assistant on Home Assistant OS (for example Mosquitto or ESPHome).
+Home Assistant OS	A small operating system that runs only Home Assistant. The recommended way on dedicated hardware.
+Container	Home Assistant running inside a Docker or Podman container on a server you already have. No add-ons; you manage the extras yourself.
+Supervisor	The part of Home Assistant OS that manages add-ons, backups and updates.
+YAML	The text format Home Assistant settings are written in. Indentation (spaces, never tabs) matters.
+secrets.yaml	A private file for passwords and keys, referenced as !secret name from other files.
+Package	A YAML file that bundles related settings (helpers, scripts, automations) in one place.
+MQTT	A light messaging system many gadgets use to talk. Needs a broker such as Mosquitto.
+Mosquitto	A popular free MQTT broker.
+Zigbee	A low-power wireless standard for sensors and bulbs. Needs a USB dongle (coordinator).
+ZHA	Home Assistant's built-in Zigbee integration.
+Zigbee2MQTT	An alternative Zigbee system that publishes devices over MQTT and supports a very wide range of devices.
+Z-Wave	Another low-power wireless standard, common for locks.
+Matter	A newer smart-home standard that works locally across brands. Home Assistant has a Matter server.
+Thread	A low-power mesh network used by Matter devices.
+ESPHome	Free firmware and tools for making your own sensors and switches with cheap ESP32 boards.
+Node-RED	A drag-and-drop automation editor, optional. Home Assistant's own automations are enough to start.
+Assist	Home Assistant's built-in voice assistant. It can run fully on your own server.
+Whisper	A free speech-to-text engine used by Assist; runs locally.
+Piper	A free text-to-speech engine used by Assist; runs locally.
+Presence detection	Knowing who is home, usually from the phone app's location.
+Long-lived access token	A password-like key that never expires, used by scripts and tools. Treat it like a password and delete unused ones.
+MFA	Multi-factor authentication: a second proof at login, like a 6-digit code from an authenticator app.
+Reverse proxy	A front-door program (Caddy) that adds HTTPS in front of Home Assistant.
+trusted_proxies	The list of reverse proxy addresses Home Assistant is allowed to believe about visitors' real addresses.
+VLAN	A separate virtual network on your router. Put smart gadgets on one so a hacked gadget cannot see your computers.
+Meshnet	NordVPN's feature that links your own devices privately, used to reach Home Assistant from away.
+Cloudflare Tunnel	A way to publish a service through Cloudflare without opening a router port. Pair it with Zero Trust Access.
+Nabu Casa	The paid Home Assistant Cloud subscription. Easy remote access that funds the project.
+Restore point	A saved copy of your settings (made with Git) that you can go back to.
+Rollback	Going back to a restore point.

@@ -1,0 +1,30 @@
+# =====================================================================================================
+# sl_leak_smoke.yaml  -  water, smoke, gas and carbon monoxide alarms: loud phone alert, nothing to set up
+# =====================================================================================================
+# WHAT IT DOES   If ANY sensor of type moisture (leak), smoke, gas or carbon monoxide turns "on", you get an
+#                urgent message on your phone and in Home Assistant, naming the sensor.
+# WHY            These are the alerts you never want to miss. Doing it by sensor TYPE means a new leak sensor
+#                is protected the moment you add it.
+# IMPORTANT      This is an EXTRA alert. Smoke and CO safety must still come from proper, certified alarms.
+# NEEDS          sl_helpers.yaml (for script.sl_notify)
+
+automation:
+  - alias: "Safety: leak, smoke or gas alarm"
+    id: sl_leak_smoke
+    description: "Urgent phone alert when any leak, smoke, gas or carbon monoxide sensor goes on."
+    mode: queued
+    triggers:
+      - trigger: template
+        value_template: >
+          {{ states.binary_sensor | selectattr('attributes.device_class', 'defined')
+             | selectattr('attributes.device_class', 'in', ['moisture', 'smoke', 'gas', 'carbon_monoxide'])
+             | selectattr('state', 'eq', 'on') | list | count > 0 }}
+    actions:
+      - action: script.sl_notify
+        data:
+          title: "ALARM: leak, smoke or gas"
+          message: >
+            {{ states.binary_sensor | selectattr('attributes.device_class', 'defined')
+               | selectattr('attributes.device_class', 'in', ['moisture', 'smoke', 'gas', 'carbon_monoxide'])
+               | selectattr('state', 'eq', 'on') | map(attribute='name') | join(', ') }} - go and check now.
+          urgent: true

@@ -1,0 +1,13 @@
+[Unit]
+Description=Secure Linux: fix the safe things automatically (only if you chose it)
+ConditionPathExists=/usr/local/bin/secure-linux-diagnose
+After=network-online.target
+
+[Service]
+Type=oneshot
+# Does nothing unless:  secure-linux-choice set auto_fix_safe yes   (default is no).
+# Never runs on battery below 30%, during an update, or on a failing drive. Writes "I fixed X for you" notices.
+ExecStart=/usr/local/bin/secure-linux-diagnose --auto-fix-safe
+Nice=19
+IOSchedulingClass=idle
+TimeoutStartSec=45min

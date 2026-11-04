@@ -1,0 +1,83 @@
+# =====================================================================================================
+# Blueprint: Lights on when there is motion
+# =====================================================================================================
+# A blueprint is a RECIPE. You don't edit this file. In Home Assistant go to
+#   Settings > Automations & scenes > Blueprints > "Lights on when there is motion" > Create automation
+# and pick your motion sensor and lights from the drop-down lists. Done: no YAML typing.
+#
+# WHAT IT DOES   Motion seen -> lights on. No motion for the wait time -> lights off.
+# OPTION         "Only when it's dark" stops daytime switching (uses the sun).
+blueprint:
+  name: "Lights on when there is motion"
+  author: Secure Linux
+  description: >
+    Turns lights on when a motion sensor sees movement and off again after nobody has moved for a while.
+    Tick "only when dark" so it does nothing in daylight.
+  domain: automation
+  min_version: 2024.10.0
+  input:
+    motion_sensor:
+      name: Motion sensor
+      description: The sensor that sees movement.
+      selector:
+        entity:
+          filter:
+            - domain: binary_sensor
+              device_class: motion
+    lights:
+      name: Lights
+      description: Which lights to switch (pick lights, a room or a floor).
+      selector:
+        target:
+          entity:
+            domain: light
+    wait_seconds:
+      name: Switch off after
+      description: How long with no movement before the lights go off.
+      default: 120
+      selector:
+        number:
+          min: 10
+          max: 3600
+          step: 10
+          unit_of_measurement: seconds
+    only_dark:
+      name: Only when it's dark
+      description: When on, nothing happens while the sun is up.
+      default: true
+      selector:
+        boolean:
+
+mode: restart
+max_exceeded: silent
+
+variables:
+  only_dark: !input only_dark
+
+triggers:
+  - trigger: state
+    entity_id: !input motion_sensor
+    from: "off"
+    to: "on"
+
+conditions:
+  - condition: or
+    conditions:
+      - condition: template
+        value_template: "{{ not only_dark }}"
+      - condition: state
+        entity_id: sun.sun
+        state: below_horizon
+
+actions:
+  - action: light.turn_on
+    target: !input lights
+  - wait_for_trigger:
+      - trigger: state
+        entity_id: !input motion_sensor
+        from: "on"
+        to: "off"
+        for:
+          seconds: !input wait_seconds
+  - action: light.turn_off
+    target: !input lights

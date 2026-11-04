@@ -1,0 +1,13 @@
+Reaching Home Assistant from away (safely)
+
+Your ranking, best first:
+ 1. NordVPN Meshnet (you already pay for it). Your phone and the server join a private network. Nothing is opened on
+    your router. Cost: nothing extra. Needs: Meshnet working on the server and the phone.
+ 2. Cloudflare Tunnel plus Zero Trust Access. The server makes an outbound connection to Cloudflare; visitors must pass
+    a login rule (your email plus a one-time code) BEFORE they even see Home Assistant. Cost: free for a few users.
+    Needs: a domain on Cloudflare.
+ 3. Nabu Casa (Home Assistant Cloud). Paid, very simple, works with Alexa and Google, and it funds Home Assistant's
+    developers. Trade-off: your connection passes through their servers (encrypted); it is a monthly cost.
+NEVER: forwarding port 8123 or 443 on your router. Bots find these within hours.
+
+Tell the checker which one you use: secure-linux-ha-secure --checklist

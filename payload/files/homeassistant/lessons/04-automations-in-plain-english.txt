@@ -1,0 +1,16 @@
+Automations in plain English
+
+An automation has three parts:
+  TRIGGER     what starts it ("the motion sensor sees movement", "the sun sets", "it is 7:00 am")
+  CONDITION   optional gate ("only if it is dark", "only if someone is home")
+  ACTION      what it does ("turn on the hallway light", "send me a notification")
+
+Three ways to make one, easiest first:
+  1. Blueprint.  Settings > Automations & scenes > Blueprints. Pick the recipe, choose your sensor and lights from the
+                 lists, save. No typing. We ship several (motion lights, sunset lights, away mode, goodnight, vacation).
+  2. The editor. Settings > Automations & scenes > Create. Pick the pieces from menus.
+  3. YAML.       Text files. Most powerful, easy to break; use secure-linux-ha validate before restarting.
+
+Tip: secure-linux-ha-learn explain <file> reads any of our files aloud in plain English, so you can learn by
+looking at working examples.
+Tip: change one thing at a time and test it before moving on.

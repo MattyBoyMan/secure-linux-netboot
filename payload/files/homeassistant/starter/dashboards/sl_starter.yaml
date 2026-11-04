@@ -1,0 +1,73 @@
+# =====================================================================================================
+# sl_starter.yaml  -  a starter dashboard that needs NO editing to be useful
+# =====================================================================================================
+# WHAT IT IS     A page called "Home (starter)" in the sidebar with: your switches, what needs attention
+#                (low batteries, offline devices, open doors, waiting updates) and a few history graphs.
+#                The "what needs attention" cards work out the answers themselves, so you add no entity names.
+# HOW TO TURN IT ON  The secure-defaults configuration already registers it. Or add this to configuration.yaml:
+#                    lovelace:
+#                      dashboards:
+#                        sl-starter:
+#                          mode: yaml
+#                          title: Home (starter)
+#                          icon: mdi:home-heart
+#                          show_in_sidebar: true
+#                          filename: dashboards/sl_starter.yaml
+#                Then run secure-linux-ha validate, and restart Home Assistant.
+# NO SECRETS     Never put logins or keys in a dashboard: dashboards are easy to screenshot and share.
+
+title: Home (starter)
+views:
+  - title: Home
+    path: home
+    icon: mdi:home
+    cards:
+      - type: markdown
+        title: Welcome
+        content: >
+          This page is yours to change. Click the pencil (top right) to edit.
+          The cards below work out what needs your attention by themselves.
+
+      - type: entities
+        title: Quick switches
+        show_header_toggle: false
+        entities:
+          - entity: input_boolean.sl_away_mode
+          - entity: input_boolean.sl_vacation_mode
+          - entity: input_boolean.sl_goodnight
+          - entity: input_text.sl_notify_service
+
+      - type: markdown
+        title: Batteries under 30%
+        content: >
+          {% set ns = namespace(items=[]) %}
+          {% for s in states.sensor | selectattr('attributes.device_class', 'defined') | selectattr('attributes.device_class', 'eq', 'battery') %}
+            {% if s.state | float(100) < 30 %}{% set ns.items = ns.items + [s.name ~ ': ' ~ (s.state | float | round(0) | int) ~ '%'] %}{% endif %}
+          {% endfor %}
+          {{ ns.items | join('\n\n') if ns.items else 'All good.' }}
+
+      - type: markdown
+        title: Offline devices
+        content: >
+          {% set bad = states | selectattr('state', 'eq', 'unavailable') | rejectattr('domain', 'in', ['automation', 'script', 'scene', 'update', 'event', 'button', 'input_button']) | list %}
+          {{ (bad[:15] | map(attribute='name') | join('\n\n')) if bad else 'Everything is reachable.' }}
+
+      - type: markdown
+        title: Doors and windows open
+        content: >
+          {% set o = states.binary_sensor | selectattr('attributes.device_class', 'defined') | selectattr('attributes.device_class', 'in', ['door', 'window', 'garage_door', 'opening']) | selectattr('state', 'eq', 'on') | list %}
+          {{ (o | map(attribute='name') | join('\n\n')) if o else 'All closed.' }}
+
+      - type: markdown
+        title: Updates waiting
+        content: >
+          {% set u = states.update | selectattr('state', 'eq', 'on') | list %}
+          {{ (u | map(attribute='name') | join('\n\n')) if u else 'Everything is up to date.' }}
+          Back up first, read the release notes, then update.
+
+      - type: history-graph
+        title: Last 24 hours
+        hours_to_show: 24
+        entities:
+          - sun.sun
+          - zone.home

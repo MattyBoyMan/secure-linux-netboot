@@ -1,0 +1,7 @@
+[Unit]
+Description=Secure Linux: check that your backups are running
+
+[Service]
+Type=oneshot
+Nice=10
+ExecStart=/usr/local/bin/secure-linux-backup-check

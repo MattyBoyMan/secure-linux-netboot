@@ -1,0 +1,15 @@
+[Unit]
+Description=Secure Linux: keep the battery charge limit you chose
+# Only on laptops whose firmware lets us set a limit (asus-wmi on the Zenbook)
+ConditionPathExistsGlob=/sys/class/power_supply/BAT*/charge_control_end_threshold
+After=local-fs.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/secure-linux-battery apply
+# At shutdown: if the limit was changed in KDE's Power settings, remember that choice
+ExecStop=/usr/local/bin/secure-linux-battery save-current
+
+[Install]
+WantedBy=multi-user.target

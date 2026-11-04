@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=Charge to 100% for a Trip
+Comment=Charge the battery fully once; it goes back to your usual limit when you unplug
+Exec=/usr/local/bin/secure-linux-terminal /usr/local/bin/secure-linux-battery travel
+Icon=battery-full-charging
+Categories=System;

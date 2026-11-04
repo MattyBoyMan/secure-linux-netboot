@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Hardware Test (full, 5 minutes)
+GenericName=Test everything, including speakers, microphone, camera and screen
+Comment=The thorough check: stress test, memory test, drive self-tests, and tests where you listen and look
+Exec=/usr/local/bin/secure-linux-health --gui --full
+Icon=preferences-desktop-peripherals
+Terminal=false
+Categories=System;Settings;HardwareSettings;
+Keywords=hardware;test;stress;speaker;microphone;camera;dead pixel;

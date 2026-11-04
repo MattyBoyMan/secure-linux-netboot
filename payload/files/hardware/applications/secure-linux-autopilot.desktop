@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Look After My Computer
+GenericName=One tap: check, fix, update and tidy up
+Comment=Looks for problems, fixes the safe ones, installs updates and tidies up. You say yes once
+Exec=/usr/local/bin/secure-linux-toolbox --autopilot
+Icon=security-high
+Terminal=false
+Categories=System;Settings;
+Keywords=autopilot;maintenance;fix;update;clean;slow;problem;care;

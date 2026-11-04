@@ -1,0 +1,7 @@
+[Unit]
+Description=Secure Linux: today's tip (first two weeks)
+ConditionPathExists=/usr/local/bin/secure-linux-tips
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/secure-linux-tips --today

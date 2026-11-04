@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<!-- Secure Linux (experience helpers): ask for the password once, then remember it for a few minutes -->
+<policyconfig>
+  <vendor>The Complete Secure Linux Package</vendor>
+  <action id="org.securelinux.welcome">
+    <description>Save your welcome-wizard choices or add a family member</description>
+    <message>Save your welcome-wizard choices or add a family member: your password is needed</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/bin/secure-linux-welcome</annotate>
+  </action>
+  <action id="org.securelinux.battery">
+    <description>Change the battery charge limit</description>
+    <message>Change the battery charge limit: your password is needed</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/bin/secure-linux-battery</annotate>
+  </action>
+  <action id="org.securelinux.ai">
+    <description>Set up the local AI engine (models, graphics acceleration)</description>
+    <message>Set up the local AI engine (models, graphics acceleration): your password is needed</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/bin/secure-linux-ai</annotate>
+  </action>
+  <action id="org.securelinux.choice">
+    <description>Save a setup choice</description>
+    <message>Save a setup choice: your password is needed</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/bin/secure-linux-choice</annotate>
+  </action>
+  <action id="org.securelinux.choice-kit">
+    <description>Save a setup choice</description>
+    <message>Save a setup choice: your password is needed</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/lib/secure-linux/bin/secure-linux-choice</annotate>
+  </action>
+</policyconfig>

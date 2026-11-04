@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Welcome & Setup Choices
+GenericName=Secure Linux welcome
+Comment=Go through the welcome questions again: VPN, home Wi-Fi, battery, backups, browser and more
+Exec=/usr/local/bin/secure-linux-welcome --again
+Icon=preferences-system
+Categories=System;Settings;

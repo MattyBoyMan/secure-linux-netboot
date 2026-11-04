@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Secure Linux welcome
+Comment=First-login welcome and setup choices
+Exec=/usr/local/bin/secure-linux-welcome --autostart
+Icon=security-high
+NoDisplay=true
+X-KDE-autostart-phase=2
+X-GNOME-Autostart-Delay=10

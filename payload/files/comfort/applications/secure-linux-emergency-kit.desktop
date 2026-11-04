@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Emergency Kit
+GenericName=Printable recovery sheet and 2FA checklist
+Comment=Make a printable page of where your recovery keys live, plus a two-step-login checklist
+Exec=/usr/local/bin/secure-linux-emergency-kit
+Icon=document-print
+Terminal=false
+Categories=Utility;Security;
+Keywords=recovery;password;2fa;backup;codes;emergency;print;

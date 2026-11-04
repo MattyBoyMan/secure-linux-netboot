@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Family Safety
+GenericName=Kids' accounts, family filter and guest account
+Comment=Set up a safe computer for children and visitors
+Exec=/usr/local/bin/secure-linux-family
+Icon=preferences-desktop-user
+Terminal=false
+Categories=System;Settings;
+Keywords=children;kids;parental;guest;family;filter;

@@ -1,0 +1,4 @@
+# Flipper Zero: let the logged-in user use it without admin rights (same as qFlipper's own rules).
+# Only installed when qFlipper comes from Flathub (the Fedora qflipper RPM ships these rules itself).
+SUBSYSTEMS=="usb", ATTRS{idVendor}=="0483", ATTRS{idProduct}=="5740", ATTRS{manufacturer}=="Flipper Devices Inc.", TAG+="uaccess"
+SUBSYSTEMS=="usb", ATTRS{idVendor}=="0483", ATTRS{idProduct}=="df11", TAG+="uaccess"

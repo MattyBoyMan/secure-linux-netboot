@@ -1,0 +1,11 @@
+[Unit]
+Description=Secure Linux: fresh, empty home folder for the Guest account
+Before=display-manager.service systemd-user-sessions.service
+After=local-fs.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash /usr/local/lib/secure-linux/files/comfort/guest-reset.sh boot
+
+[Install]
+WantedBy=multi-user.target

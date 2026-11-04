@@ -1,0 +1,3 @@
+# Secure Linux: when the charger is plugged in or out: end "travel mode" (100% once) on unplug, and
+# switch power profile (battery -> power-saver, charger -> balanced) where tuned-ppd doesn't already.
+SUBSYSTEM=="power_supply", ATTR{type}=="Mains", RUN+="/usr/local/bin/secure-linux-battery ac-changed"

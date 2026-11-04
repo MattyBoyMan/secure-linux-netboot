@@ -1,0 +1,2 @@
+# comfort: user units enabled for everyone (systemctl --global enable)
+secure-linux-tips.timer

@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=Hardware Check
+Comment=Check sound, microphone, camera, keys, Wi-Fi and sleep in two minutes
+Exec=/usr/local/bin/secure-linux-hwtest
+Icon=preferences-desktop-peripherals
+Categories=System;

@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=Add a Family Member
+Comment=Create a separate account for someone else who uses this computer
+Exec=/usr/local/bin/secure-linux-welcome --add-family-member
+Icon=list-add-user
+Categories=System;Settings;

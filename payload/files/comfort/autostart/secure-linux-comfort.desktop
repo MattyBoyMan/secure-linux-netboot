@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Secure Linux comfort settings
+Comment=Screen size, touchpad, Australian formats and the searchable guide (once per person)
+Exec=/bin/bash /usr/local/lib/secure-linux/files/comfort/first-login.sh
+Icon=preferences-desktop
+NoDisplay=true
+X-GNOME-Autostart-enabled=true
+X-KDE-autostart-phase=2

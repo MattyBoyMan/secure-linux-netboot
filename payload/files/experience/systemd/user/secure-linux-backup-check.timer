@@ -1,0 +1,11 @@
+[Unit]
+Description=Secure Linux: daily backup check
+
+[Timer]
+OnStartupSec=20min
+OnCalendar=daily
+Persistent=true
+RandomizedDelaySec=30min
+
+[Install]
+WantedBy=timers.target

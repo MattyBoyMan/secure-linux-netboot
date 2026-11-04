@@ -1,0 +1,15 @@
+# One-shot after a Fedora version upgrade (enabled by secure-linux-upgrade, disables itself when done):
+# re-enables repositories that were paused for the upgrade and runs `setup.sh --repair`.
+[Unit]
+Description=Secure Linux: finish a Fedora version upgrade
+Wants=network-online.target
+After=network-online.target
+ConditionPathExists=/var/lib/secure-linux/upgrade-pending
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/secure-linux-upgrade --post
+TimeoutStartSec=2h
+
+[Install]
+WantedBy=multi-user.target

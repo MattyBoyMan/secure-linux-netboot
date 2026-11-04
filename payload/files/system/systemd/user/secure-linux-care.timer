@@ -1,0 +1,10 @@
+[Unit]
+Description=Secure Linux care calendar (daily)
+
+[Timer]
+OnStartupSec=10min
+OnCalendar=daily
+Persistent=true
+
+[Install]
+WantedBy=timers.target

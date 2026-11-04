@@ -1,0 +1,10 @@
+[Unit]
+Description=Secure Linux monthly wear log (battery, SSD)
+
+[Timer]
+OnCalendar=monthly
+Persistent=true
+RandomizedDelaySec=2h
+
+[Install]
+WantedBy=timers.target

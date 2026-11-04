@@ -1,0 +1,10 @@
+[Unit]
+Description=Secure Linux weekly home server watchdog
+
+[Timer]
+OnCalendar=weekly
+Persistent=true
+RandomizedDelaySec=3h
+
+[Install]
+WantedBy=timers.target

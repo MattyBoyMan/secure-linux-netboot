@@ -1,0 +1,6 @@
+[Unit]
+Description=Secure Linux care calendar reminders
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/secure-linux-care --notify

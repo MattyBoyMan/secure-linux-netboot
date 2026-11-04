@@ -1,0 +1,10 @@
+# Weekly: home server (Immich) version vs latest release, HTTPS certificate expiry, server backup health.
+# Uses build.conf IMMICH_URL (or choice immich_url) and choice server_health_url. Does nothing when neither is set.
+[Unit]
+Description=Secure Linux home server watchdog
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/secure-linux-check --server

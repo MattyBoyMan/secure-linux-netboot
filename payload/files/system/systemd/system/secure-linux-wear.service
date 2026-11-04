@@ -1,0 +1,7 @@
+# Monthly: log battery and SSD wear to /var/lib/secure-linux/wear.csv; alert when worn (see secure-linux-check --wear).
+[Unit]
+Description=Secure Linux monthly wear log (battery, SSD)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/secure-linux-check --wear

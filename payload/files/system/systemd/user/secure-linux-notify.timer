@@ -1,0 +1,9 @@
+[Unit]
+Description=Secure Linux desktop notifications every 15 minutes
+
+[Timer]
+OnStartupSec=5min
+OnUnitActiveSec=15min
+
+[Install]
+WantedBy=timers.target

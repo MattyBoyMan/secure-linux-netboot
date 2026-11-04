@@ -1,0 +1,10 @@
+# Weekly: compares apps installed from outside Fedora (OpenSnitch, ArtCraft launcher, immich-go) with their
+# latest GitHub release; raises alert outside-apps-update with a one-click update.
+[Unit]
+Description=Secure Linux check for updates to apps from outside Fedora
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/secure-linux-outside-apps --check

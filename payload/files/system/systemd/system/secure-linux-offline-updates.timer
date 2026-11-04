@@ -1,0 +1,11 @@
+[Unit]
+Description=Secure Linux: prepare updates daily (installed at the next restart)
+
+[Timer]
+OnBootSec=30min
+OnCalendar=daily
+Persistent=true
+RandomizedDelaySec=1h
+
+[Install]
+WantedBy=timers.target

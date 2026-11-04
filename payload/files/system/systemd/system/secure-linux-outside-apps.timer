@@ -1,0 +1,10 @@
+[Unit]
+Description=Secure Linux weekly check for updates to apps from outside Fedora
+
+[Timer]
+OnCalendar=weekly
+Persistent=true
+RandomizedDelaySec=3h
+
+[Install]
+WantedBy=timers.target

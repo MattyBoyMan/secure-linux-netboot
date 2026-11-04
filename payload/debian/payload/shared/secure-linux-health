@@ -1,0 +1,286 @@
+#!/bin/bash
+# secure-linux-health: checks the health of EVERY part of this computer and says, in plain English, what is wrong and what to do.
+#
+#   secure-linux-health                 standard check (about a minute, changes nothing)
+#   secure-linux-health --quick         fast check (no speed tests, no 3D/video probes, no firmware lookup)
+#   secure-linux-health --full          everything: stress test, memory test on free memory, drive self-tests,
+#                                       and the "does it work for you" tests (speaker, microphone, camera, screen, keys, pointer)
+#   secure-linux-health --part NAME     only one part, e.g. storage, storage:sda, cpu, ram, optical, audio, graphics, wifi, battery
+#                                       (several: --part cpu,ram). See --list for all names.
+#   secure-linux-health --json          print the machine-readable result (JSON) instead of the text report
+#   secure-linux-health --gui           show the result in a window (kdialog / zenity; text if there is no desktop)
+#   secure-linux-health --summary       one line: how many OK / WARN / FAIL (exit code 0 / 1 / 2)
+#   secure-linux-health --list          list the part names
+#   secure-linux-health --elevate       ask for administrator rights (more detail: SMART, memory sticks, kernel log)
+#   secure-linux-health --no-interactive / --interactive   never / always ask you to listen, look or type
+#   secure-linux-health --no-save       do not write report files or alerts
+#   secure-linux-health --out DIR       write the report files to DIR
+#
+# Works on the installed system and from SystemRescue / any Linux live shell; with or without administrator rights or
+# network. Read-only: it never writes to a disk, never installs anything. Hardware that is not there is "NOT-PRESENT",
+# not a failure. Missing tools are listed at the end ("limited"), with the package that adds them.
+# Report: /var/lib/secure-linux/health/latest.txt and latest.json (an alert per WARN/FAIL in alerts.d when run as root).
+# Exit code: 0 = nothing wrong, 1 = warnings, 2 = at least one failure.
+set -u   # no pipefail: "cmd | grep -q" must not fail when grep stops reading early
+export LC_ALL=C
+
+SELF=$(readlink -f "$0" 2>/dev/null || echo "$0")
+HERE=$(dirname "$SELF")
+SL_ROOT=${SL_ROOT:-/usr/local/lib/secure-linux}
+HLIB=""
+for c in "$SL_ROOT/hw/health" "$HERE/../hw/health" "$HERE/../linux/hw/health"; do [ -r "$c/lib.sh" ] && { HLIB=$c; break; }; done
+[ -n "$HLIB" ] || { echo "secure-linux-health: cannot find its library (hw/health/lib.sh) next to $0." >&2; exit 3; }
+[ -d "$SL_ROOT/hw" ] || SL_ROOT=$(cd "$HLIB/../.." && pwd)
+SLH_TITLE="Hardware health"
+# shellcheck source=../hw/health/lib.sh
+. "$HLIB/lib.sh"
+. "$HLIB/checks-core.sh"; . "$HLIB/checks-io.sh"; . "$HLIB/checks-sys.sh"
+
+ALL_PARTS="cpu ram storage filesystem optical usb keyboard pointer audio bluetooth camera display graphics wifi ethernet battery ac thermal tpm sdcard fingerprint sensors printers thunderbolt fwupd bios kernel unknown"
+usage() { sed -n '2,/^# Exit code/p' "$SELF" | sed 's/^# \{0,1\}//'; }
+
+ORIG_ARGS=("$@")      # kept for --elevate: the loop below shifts everything away
+SYNC=0
+MODE=standard; INTERACTIVE=0; FORCE_INT=""; OUT_FMT=text; GUI=0; SAVE=1; OUT_DIR=""; PARTS=""; SUMMARY=0; ELEV=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    --quick) MODE=quick ;;
+    --full) MODE=full ;;
+    --standard) MODE=standard ;;
+    --json) OUT_FMT=json ;;
+    --gui) GUI=1 ;;
+    --summary) SUMMARY=1 ;;
+    --list) printf '%s\n' $ALL_PARTS; exit 0 ;;
+    --elevate) ELEV=1 ;;
+    --interactive) FORCE_INT=1 ;;
+    --no-interactive) FORCE_INT=0 ;;
+    --no-save) SAVE=0 ;;
+    --sync-system) SYNC=1 ;;     # (used by --gui) with --out: ALSO refresh the real saved report in the system folder
+    --out) shift; OUT_DIR=${1:-}; SL_HEALTH_DIR=$OUT_DIR ;;
+    --part) shift; PARTS="$PARTS ${1:-}" ;;
+    --part=*) PARTS="$PARTS ${1#--part=}" ;;
+    *) echo "Unknown option: $1  (try --help)" >&2; exit 3 ;;
+  esac
+  shift
+done
+
+# --elevate: run again with administrator rights (polkit asks for the password)
+if [ "$ELEV" = 1 ] && ! slh_is_root; then
+  args=(); for a in "${ORIG_ARGS[@]}"; do [ "$a" = --elevate ] || args+=("$a"); done
+  have pkexec && exec pkexec "$SELF" "${args[@]}"
+  have sudo && exec sudo "$SELF" "${args[@]}"
+  echo "No pkexec or sudo here: run this as the administrator (root)." >&2
+fi
+if [ -n "$FORCE_INT" ]; then INTERACTIVE=$FORCE_INT
+elif [ "$MODE" = full ]; then INTERACTIVE=1; fi
+[ "$OUT_FMT" = json ] && [ -z "$FORCE_INT" ] && INTERACTIVE=0
+[ "$SUMMARY" = 1 ] && [ -z "$FORCE_INT" ] && INTERACTIVE=0
+
+# --gui from a desktop menu: do the measuring as administrator (drive health, memory sticks, kernel log) through pkexec,
+# show the result in a window as the normal user, then run the "listen and look" tests as the user (they need the desktop).
+if [ "$GUI" = 1 ] && ! slh_is_root && have pkexec && [ -z "${SL_HEALTH_NO_PKEXEC:-}" ] && ! slh_scripted && slh_gui_ok; then
+  GOUT=$(mktemp -d); chmod 755 "$GOUT"
+  gargs=("--$MODE" --no-interactive --out "$GOUT" --sync-system); [ -n "${PARTS// /}" ] && gargs+=(--part "${PARTS# }")
+  pkexec "$SELF" "${gargs[@]}" >/dev/null 2>&1; prc=$?
+  gf="$GOUT/latest.txt"; [ -s "$gf" ] || gf="$GOUT/part-latest.txt"
+  if [ "$prc" -le 2 ] && [ -s "$gf" ]; then
+    slh_show_file "Secure Linux hardware health" "$gf"
+    if [ "$INTERACTIVE" = 1 ]; then SL_HEALTH_NO_PKEXEC=1 "$SELF" --gui --no-save --interactive --part keyboard,pointer,audio,camera,display --"$MODE"; fi
+    rm -rf "$GOUT"; exit "$prc"
+  fi
+  rm -rf "$GOUT"       # the password prompt was cancelled: carry on without administrator rights
+fi
+
+# --part aliases -> canonical check names
+expand_parts() {   # sets RUN_PARTS (and SLH_ITEM_FILTER); runs in this shell so "exit 3" really exits
+  local p out="" item=""
+  for p in ${*//,/ }; do
+    item=""; case "$p" in *:*) item=${p#*:}; p=${p%%:*} ;; esac
+    case "${p,,}" in
+      cpu|processor) p=cpu ;; ram|memory|mem) p=ram ;;
+      storage|disk|disks|ssd|hdd|nvme|drive|drives|usbdrive|sd|smart) p=storage ;;
+      filesystem|fs|filesystems|raid) p=filesystem ;;
+      optical|cd|dvd|bluray|blu-ray|cdrom|disc) p=optical ;;
+      usb|usbports|ports|hub) p=usb ;; keyboard|keys) p=keyboard ;;
+      pointer|mouse|touchpad|trackpad|trackpoint|touchscreen|tablet) p=pointer ;;
+      audio|sound|speakers|speaker|headphones|mic|microphone) p=audio ;;
+      bluetooth|bt) p=bluetooth ;; camera|webcam) p=camera ;;
+      display|screen|monitor|backlight) p=display ;; graphics|gpu|video) p=graphics ;;
+      wifi|wireless|wlan) p=wifi ;; ethernet|lan) p=ethernet ;; network|net) out="$out wifi ethernet"; continue ;;
+      battery) p=battery ;; ac|charger|power|adapter) p=ac ;;
+      thermal|fans|fan|temperature|temps|sensors-temp) p=thermal ;; tpm) p=tpm ;;
+      sdcard|cardreader|sd-reader) p=sdcard ;; fingerprint) p=fingerprint ;; sensors|accelerometer|light) p=sensors ;;
+      printers|printer|scanner|scanners) p=printers ;; thunderbolt|usb4) p=thunderbolt ;;
+      fwupd|firmware|updates) p=fwupd ;; bios|uefi) p=bios ;; kernel|journal|taint) p=kernel ;; unknown|drivers) p=unknown ;;
+      *) echo "Unknown part '$p'. Names: $ALL_PARTS" >&2; exit 3 ;;
+    esac
+    out="$out $p"
+    [ -n "$item" ] && SLH_ITEM_FILTER="$p:$item"
+  done
+  RUN_PARTS=$out
+}
+if [ -n "${PARTS// /}" ]; then expand_parts "$PARTS"; else RUN_PARTS=$ALL_PARTS; [ "$MODE" = quick ] && RUN_PARTS=${RUN_PARTS/ fwupd/}; fi
+
+TMPD=$(mktemp -d 2>/dev/null || echo "/tmp/slh.$$"); mkdir -p "$TMPD"
+trap 'rm -rf "$TMPD"; [ -n "${SLH_KLOG:-}" ] && rm -f "$SLH_KLOG"' EXIT
+[ "$OUT_FMT" = text ] && [ "$SUMMARY" = 0 ] && [ -t 2 ] && echo "Checking your computer's hardware ($MODE check)..." >&2
+
+declare -A RAN=()
+slh_klog_load      # read the kernel log once, here (not inside a $( ) where the result would be lost)
+for p in $RUN_PARTS; do
+  RAN[$p]=1
+  if declare -F "chk_$p" >/dev/null; then "chk_$p" 2>"$TMPD/err.$p" || true
+  else res "$p" SKIPPED "No check named $p." "" ""; fi
+done
+# if a check hit a script error, say so instead of hiding it
+for p in $RUN_PARTS; do
+  if [ -s "$TMPD/err.$p" ] && grep -qiE 'unbound variable|syntax error|bad substitution' "$TMPD/err.$p"; then
+    res "$p:internal" WARN "The $p check hit an internal problem and may be incomplete." "Please send the output of secure-linux-diag to the Secure Linux helpers." "$(head -n 1 "$TMPD/err.$p")"
+  fi
+done
+
+# ---------------------------------------------------------------- tally
+nOK=0; nWARN=0; nFAIL=0; nNP=0; nSK=0
+for ((i = 0; i < SLH_N; i++)); do
+  case "${R_STATUS[i]}" in OK) nOK=$((nOK + 1)) ;; WARN) nWARN=$((nWARN + 1)) ;; FAIL) nFAIL=$((nFAIL + 1)) ;; NOT-PRESENT) nNP=$((nNP + 1)) ;; SKIPPED) nSK=$((nSK + 1)) ;; esac
+done
+EXITC=0; [ "$nWARN" -gt 0 ] && EXITC=1; [ "$nFAIL" -gt 0 ] && EXITC=2
+if [ "$SUMMARY" = 1 ]; then
+  echo "Hardware health: $nOK OK, $nWARN WARN, $nFAIL FAIL ($nNP not present, $nSK skipped)"
+  exit $EXITC
+fi
+
+# ---------------------------------------------------------------- reports
+printf -v NOW '%(%Y-%m-%d %H:%M)T' -1; printf -v STAMP '%(%Y%m%d-%H%M%S)T' -1
+slh_rdv _v1 "$SLH_SYS/class/dmi/id/sys_vendor"; slh_rdv _v2 "$SLH_SYS/class/dmi/id/product_name"; COMP="$_v1 $_v2"; COMP=${COMP#" "}; COMP=${COMP%" "}; [ -n "$COMP" ] || COMP="unknown computer"
+slh_rdv KERN "$SLH_PROC/sys/kernel/osrelease"; [ -n "$KERN" ] || KERN=$(uname -r 2>/dev/null)
+WHO="normal user"; slh_is_root && WHO="administrator"
+label_of() { printf '%s' "$1"; }
+id_of() { local i=$1; if [ -n "${R_ITEM[i]}" ]; then printf '%s:%s' "${R_PART[i]}" "${R_ITEM[i]}"; else printf '%s' "${R_PART[i]}"; fi; }
+COL=0; [ -t 1 ] && [ -z "${NO_COLOR:-}" ] && [ "$OUT_FMT" = text ] && COL=1
+paint() { if [ "$COL" = 1 ]; then case "$1" in OK) printf '\033[32m%s\033[0m' "$2" ;; WARN) printf '\033[33m%s\033[0m' "$2" ;; FAIL) printf '\033[31;1m%s\033[0m' "$2" ;; *) printf '\033[90m%s\033[0m' "$2" ;; esac; else printf '%s' "$2"; fi; }
+
+make_text() {
+  echo "Secure Linux hardware health - $NOW ($MODE check)"
+  echo "Computer: $COMP    Kernel: $KERN    Run as: $WHO"
+  echo
+  local i st
+  for ((i = 0; i < SLH_N; i++)); do
+    st=${R_STATUS[i]}
+    printf '%-14s %-22s %s\n' "[$st]" "$(id_of "$i")" "${R_MEANING[i]}"
+    if [ -n "${R_TODO[i]}" ] && [ "$st" != OK ] && [ "$st" != NOT-PRESENT ]; then printf '%-14s %-22s What to do: %s\n' "" "" "${R_TODO[i]}"
+    elif [ -n "${R_TODO[i]}" ] && [ "$st" = OK ]; then printf '%-14s %-22s Tip: %s\n' "" "" "${R_TODO[i]}"; fi
+  done
+  echo
+  echo "Summary: $nOK OK, $nWARN need a look (WARN), $nFAIL failing (FAIL), $nNP not present, $nSK could not be checked."
+  if [ $((nWARN + nFAIL)) -gt 0 ]; then
+    echo; echo "NEEDS ATTENTION"
+    for st in FAIL WARN; do
+      for ((i = 0; i < SLH_N; i++)); do
+        [ "${R_STATUS[i]}" = "$st" ] || continue
+        printf ' * [%s] %s: %s\n     -> %s\n' "$st" "$(id_of "$i")" "${R_MEANING[i]}" "${R_TODO[i]:-See the line above.}"
+      done
+    done
+  else echo; echo "Everything that is present looks healthy."; fi
+  if [ ${#SLH_MISSING[@]} -gt 0 ] || [ ${#SLH_LIMITED[@]} -gt 0 ]; then
+    echo; echo "SOME CHECKS WERE LIMITED"
+    local t
+    for t in "${!SLH_MISSING[@]}"; do printf ' * %s is not installed: no %s. Package: %s  (install everything with: sudo secure-linux-parts --install)\n' "$t" "${SLH_MISSING[$t]%%|*}" "${SLH_MISSING[$t]##*|}"; done | sort
+    for t in "${SLH_LIMITED[@]:-}"; do [ -n "$t" ] && printf ' * %s\n' "$t"; done
+  fi
+  echo
+  echo "For a complete memory test restart and choose Memtest86+ from the Secure Linux USB stick's menu."
+}
+make_json() {
+  local i first=1 t
+  printf '{\n  "tool": "secure-linux-health",\n  "generated": "%s",\n  "mode": "%s",\n  "computer": "%s",\n  "kernel": "%s",\n  "run_as": "%s",\n' \
+    "$NOW" "$MODE" "$(slh_esc "$COMP")" "$(slh_esc "$KERN")" "$WHO"
+  printf '  "summary": {"ok": %d, "warn": %d, "fail": %d, "not_present": %d, "skipped": %d, "exit_code": %d},\n' "$nOK" "$nWARN" "$nFAIL" "$nNP" "$nSK" "$EXITC"
+  printf '  "results": [\n'
+  for ((i = 0; i < SLH_N; i++)); do
+    [ $first = 1 ] || printf ',\n'; first=0
+    printf '    {"part": "%s", "item": "%s", "status": "%s", "meaning": "%s", "what_to_do": "%s", "detail": "%s"}' \
+      "$(slh_esc "${R_PART[i]}")" "$(slh_esc "${R_ITEM[i]}")" "${R_STATUS[i]}" "$(slh_esc "${R_MEANING[i]}")" "$(slh_esc "${R_TODO[i]}")" "$(slh_esc "${R_DETAIL[i]}")"
+  done
+  printf '\n  ],\n  "missing_tools": ['
+  first=1
+  for t in "${!SLH_MISSING[@]}"; do
+    [ $first = 1 ] || printf ', '; first=0
+    printf '{"tool": "%s", "needed_for": "%s", "package": "%s"}' "$(slh_esc "$t")" "$(slh_esc "${SLH_MISSING[$t]%%|*}")" "$(slh_esc "${SLH_MISSING[$t]##*|}")"
+  done
+  printf '],\n  "limited": ['
+  first=1
+  for t in "${SLH_LIMITED[@]:-}"; do [ -n "$t" ] || continue; [ $first = 1 ] || printf ', '; first=0; printf '"%s"' "$(slh_esc "$t")"; done
+  printf ']\n}\n'
+}
+make_text > "$TMPD/report.txt"
+make_json > "$TMPD/report.json"
+
+# ---------------------------------------------------------------- save + alerts
+SAVED=""
+if [ "$SAVE" = 1 ]; then
+  D=$(slh_state_dir)
+  if [ -n "$D" ] && [ -w "$D" ]; then
+    if [ -z "${PARTS// /}" ]; then
+      cp "$TMPD/report.txt" "$D/latest.txt" 2>/dev/null; cp "$TMPD/report.json" "$D/latest.json" 2>/dev/null
+      cp "$TMPD/report.txt" "$D/health-$STAMP.txt" 2>/dev/null; cp "$TMPD/report.json" "$D/health-$STAMP.json" 2>/dev/null
+      # keep the last 12 of each
+      for ext in txt json; do ls -1t "$D"/health-*."$ext" 2>/dev/null | tail -n +13 | while read -r old; do rm -f "$old"; done; done
+    else
+      cp "$TMPD/report.txt" "$D/part-latest.txt" 2>/dev/null; cp "$TMPD/report.json" "$D/part-latest.json" 2>/dev/null
+    fi
+    # --gui as a normal user: the measuring pass (root) wrote into a temporary --out folder for the window; also refresh the
+    # real saved report, so Status, secure-linux-diag and the alerts see this run too
+    if [ "$SYNC" = 1 ] && [ -n "$OUT_DIR" ]; then
+      SD=$SL_STATE/health; mkdir -p "$SD" 2>/dev/null
+      if [ -w "$SD" ] && [ "$SD" != "$D" ]; then
+        if [ -z "${PARTS// /}" ]; then
+          cp "$TMPD/report.txt" "$SD/latest.txt" 2>/dev/null; cp "$TMPD/report.json" "$SD/latest.json" 2>/dev/null
+          cp "$TMPD/report.txt" "$SD/health-$STAMP.txt" 2>/dev/null; cp "$TMPD/report.json" "$SD/health-$STAMP.json" 2>/dev/null
+        else cp "$TMPD/report.txt" "$SD/part-latest.txt" 2>/dev/null; cp "$TMPD/report.json" "$SD/part-latest.json" 2>/dev/null; fi
+        chmod 644 "$SD"/*latest.* 2>/dev/null
+      fi
+    fi
+    SAVED=$D
+    # alerts: one per WARN/FAIL result; remove the ones that are fixed (only for the parts that were checked now)
+    if slh_is_root || [ -w "$SL_STATE/alerts.d" ] 2>/dev/null; then
+      newids="$TMPD/newids"; : > "$newids"
+      for ((i = 0; i < SLH_N; i++)); do
+        case "${R_STATUS[i]}" in WARN|FAIL) ;; *) continue ;; esac
+        aid="health-$(printf '%s' "$(id_of "$i")" | tr -c 'A-Za-z0-9\n' '-' | sed 's/--*/-/g; s/-$//')"
+        title="Hardware: $(id_of "$i") $( [ "${R_STATUS[i]}" = FAIL ] && echo 'is failing' || echo 'needs a look')"
+        if slh_alert "$aid" "$title" "${R_MEANING[i]}" "${R_TODO[i]:-Run: secure-linux-health}"; then echo "$aid|${R_PART[i]}" >> "$newids"; fi
+      done
+      prev="$D/alert-ids"
+      if [ -f "$prev" ]; then
+        while IFS='|' read -r pid ppart; do
+          [ -n "$pid" ] && [ -n "${RAN[$ppart]:-}" ] && ! grep -q "^$pid|" "$newids" && slh_alert_clear "$pid"
+        done < "$prev"
+        while IFS='|' read -r pid ppart; do [ -n "$pid" ] && [ -z "${RAN[$ppart]:-}" ] && echo "$pid|$ppart" >> "$newids"; done < "$prev"
+      fi
+      sort -u "$newids" > "$prev" 2>/dev/null
+    fi
+  fi
+fi
+
+# ---------------------------------------------------------------- show
+if [ "$GUI" = 1 ]; then
+  tool=$(slh_ui_tool)
+  if [ "$tool" = none ] || [ "$tool" = tty ]; then cat "$TMPD/report.txt"
+  else
+    slh_show_file "Secure Linux hardware health: $nOK OK, $nWARN WARN, $nFAIL FAIL" "$TMPD/report.txt"
+    if [ "$nFAIL" -gt 0 ] && have secure-linux-repair && [ "$(slh_ask health_repair "Something is failing. Open the guided repair tool?" "Open repair" "Not now")" = yes ]; then
+      if have secure-linux-terminal; then secure-linux-terminal secure-linux-repair --auto-diagnose; else secure-linux-repair --auto-diagnose; fi
+    fi
+  fi
+elif [ "$OUT_FMT" = json ]; then cat "$TMPD/report.json"
+else
+  if [ "$COL" = 1 ]; then
+    while IFS= read -r line; do
+      case "$line" in "[OK]"*) paint OK "${line:0:14}"; printf '%s\n' "${line:14}" ;; "[WARN]"*) paint WARN "${line:0:14}"; printf '%s\n' "${line:14}" ;; "[FAIL]"*) paint FAIL "${line:0:14}"; printf '%s\n' "${line:14}" ;; "[NOT-PRESENT]"*|"[SKIPPED]"*) paint NP "${line:0:14}"; printf '%s\n' "${line:14}" ;; *) printf '%s\n' "$line" ;; esac
+    done < "$TMPD/report.txt"
+  else cat "$TMPD/report.txt"; fi
+  [ -n "$SAVED" ] && echo "Saved: $SAVED/latest.txt and latest.json"
+fi
+exit $EXITC

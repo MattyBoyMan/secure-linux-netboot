@@ -1,0 +1,46 @@
+#winner	suppressed (comma separated)	note
+gpu-nvidia-unsigned	gpu-nvidia-module-missing,gpu-black-screen-after-update,sb-key-not-enrolled,gpu-software-rendering,gpu-errors,boot-nomodeset-left	One cause: Secure Boot blocks the NVIDIA driver
+sb-key-not-enrolled	gpu-software-rendering	Secure Boot has not approved the driver key
+disk-smart-failing	disk-io-errors,fs-ext4-errors,fs-btrfs-errors,fs-xfs-errors,fs-readonly,fs-needs-check,disk-pending-sectors,disk-selftest-failed,disk-cable-errors,boot-emergency-mode	The drive itself is failing
+disk-nvme-critical	disk-io-errors,fs-ext4-errors,fs-btrfs-errors,fs-xfs-errors,fs-readonly,disk-ssd-wear,disk-nvme-link	The fast drive reports a critical warning
+disk-pending-sectors	disk-io-errors,fs-ext4-errors,fs-btrfs-errors,fs-readonly,disk-selftest-failed	Damaged spots cause the file errors
+disk-io-errors	fs-ext4-errors,fs-btrfs-errors,fs-xfs-errors,fs-readonly	Read errors cause the file errors
+fs-readonly	fs-ext4-errors,fs-btrfs-errors,fs-xfs-errors	The disk went read-only after errors
+boot-fstab-bad-uuid	boot-emergency-mode	The missing drive causes emergency mode
+boot-no-kernel	boot-initramfs-missing,boot-panic-after-update	No system core files
+net-service-stopped	net-offline,net-dns-broken,net-connected-no-internet,net-radio-switched-off	The network service is not running
+net-vpn-lockout	net-offline,net-connected-no-internet,net-dns-broken	The VPN switch is blocking everything
+net-radio-hard-blocked	net-offline,net-wifi-no-driver	A physical switch
+net-radio-switched-off	net-offline	Radios are off
+net-wifi-no-driver	net-offline,net-wifi-firmware-missing	No Wi-Fi driver
+net-wifi-firmware-missing	net-offline	No Wi-Fi firmware
+net-dns-broken	net-connected-no-internet	Name lookups fail
+audio-no-device	audio-dummy-output,audio-muted,audio-volume-zero,audio-wrong-output,audio-speaker-test	No sound device
+audio-firmware-missing	audio-dummy-output,audio-speaker-test	No sound firmware
+audio-service-stopped	audio-dummy-output,audio-muted,audio-volume-zero,audio-mic-muted	The sound service is stopped
+audio-dummy-output	audio-speaker-test	No real output
+audio-muted	audio-speaker-test	Muted
+audio-volume-zero	audio-speaker-test	Volume at zero
+gpu-nvidia-module-missing	gpu-software-rendering,gpu-vulkan-missing,gpu-video-decode-missing	The NVIDIA driver is not built
+gpu-software-rendering	gpu-vulkan-missing,gpu-video-decode-missing	The graphics card is not used
+cpu-overheat	cpu-throttling,cpu-dust	It is too hot
+fan-not-spinning	cpu-overheat,cpu-throttling,cpu-dust,thermal-critical	A fan has stopped
+thermal-critical	cpu-dust	Something is dangerously hot
+ac-adapter-weak	battery-not-charging	The charger is too weak
+mem-pressure	swap-full,mem-hog,load-high	Memory is full
+swap-full	mem-hog,load-high	Memory is full
+disk-full	home-full,cache-bloat,log-bloat,maint-cache-clean,maint-journal-trim	The main disk is full
+cache-bloat	maint-cache-clean	Downloads are large
+log-bloat	maint-journal-trim	Logs are large
+system-out-of-date	maint-updates-due,cpu-security	Updates are overdue
+boot-partition-full	boot-too-many-kernels,maint-old-kernels	The start-up partition is full
+boot-too-many-kernels	maint-old-kernels	Many old versions
+time-sync-off	maint-time-sync	The clock
+firmware-updates-pending	maint-firmware-due	Firmware
+snapshot-space	maint-snapshots-trim	Snapshots
+btrfs-scrub-old	maint-scrub-due	Scrub overdue
+orphaned-packages	maint-autoremove	Unused packages
+trim-off	maint-trim-run	TRIM
+pkg-db-broken	pkg-broken-deps,pkg-duplicates,system-out-of-date,maint-updates-due,repos-failing	The software list is damaged
+boot-grub-cfg-missing	boot-grub-rescue	The boot menu file
+windows-bitlocker	windows-hibernated	BitLocker volumes cannot be hibernated

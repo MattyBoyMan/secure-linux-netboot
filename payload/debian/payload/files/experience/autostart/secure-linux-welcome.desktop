@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Secure Linux welcome
+Comment=Finishes the first-login questions (only while some are not done)
+Exec=/usr/local/bin/secure-linux-welcome --autostart
+Terminal=false
+NoDisplay=true
+X-GNOME-Autostart-enabled=true

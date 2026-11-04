@@ -1,0 +1,64 @@
+#!/bin/bash
+# secure-linux-wifi-import (Debian): add the Wi-Fi networks that were saved from this computer's Windows.
+#   secure-linux-wifi-import        asks for the PIN (if you set one), then which networks to add
+# The installer could not open PIN-protected networks, so they wait here. Nothing is added unless you say so.
+set -u   # no pipefail: "cmd | grep -q" must not fail when grep stops reading early
+SL_ROOT=${SL_ROOT:-/usr/local/lib/secure-linux}
+. "$SL_ROOT/lib/common.sh"
+case "${1:-}" in -h|--help) sed -n '2,4p' "$0"; exit 0 ;; esac
+self=$(readlink -f "$0" 2>/dev/null || echo "$0")
+[ "$(id -u)" -eq 0 ] || [ -n "$SL_SYSROOT" ] || exec pkexec "$self" "$@"
+PY=$SL_ROOT/sl-wifi.py
+REC=$SL_STATE/wifi-record
+STAGED=$SL_STATE/wifi-staged
+DEST=$R/etc/NetworkManager/system-connections
+[ -s "$REC" ] || [ -s "$STAGED" ] || { echo "No saved Windows Wi-Fi networks are waiting. Nothing to do."; sl_clear wifi-import; exit 0; }
+command -v python3 >/dev/null 2>&1 && [ -f "$PY" ] || { echo "The Wi-Fi import tool isn't available on this computer (python3 or sl-wifi.py missing)."; exit 1; }
+tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
+chmod 700 "$tmp"
+
+if [ -s "$REC" ]; then
+  kind=$(cut -d'|' -f1 "$REC" | head -1)
+  opened=""
+  if [ "$kind" = enc1 ]; then
+    echo "These networks were saved with a PIN / password (chosen when they were saved in Windows)."
+    for _try in 1 2 3; do
+      read -rsp "PIN / password (Enter with nothing = skip for now): " SL_WIFI_PIN; echo
+      [ -n "$SL_WIFI_PIN" ] || { echo "OK, nothing added. Run this again whenever you like."; exit 0; }
+      if SL_WIFI_PIN=$SL_WIFI_PIN python3 "$PY" open "$REC" "$tmp/bundle" > "$tmp/count" 2>/dev/null; then opened=1; break; fi
+      echo "That's not it."
+    done
+    SL_WIFI_PIN=""
+  elif python3 "$PY" open "$REC" "$tmp/bundle" > "$tmp/count" 2>/dev/null; then opened=1
+  fi
+  [ -n "$opened" ] || { echo "The saved networks can't be opened. You can connect with the Wi-Fi icon instead."; exit 1; }
+  echo "$(cat "$tmp/count") Wi-Fi network(s) were saved from this computer's Windows:"
+  python3 "$PY" list "$tmp/bundle" | while IFS='|' read -r i name sec; do printf '  %2s)  %-32.32s %s\n' "$i" "$name" "$sec"; done
+  : > "$tmp/selected"
+  while true; do
+    read -rp "Add them? A = all, C = choose one by one, N = none: " a || exit 0
+    case "$a" in
+      [Aa]) cp "$tmp/bundle" "$tmp/selected"; break ;;
+      [Nn]) break ;;
+      [Cc]) python3 "$PY" list "$tmp/bundle" > "$tmp/names"
+            while IFS='|' read -r i name sec <&3; do
+              while true; do
+                read -rp "Add '$name' ($sec)? Y or N: " y || exit 0
+                case "$y" in [Yy]) sed -n "${i}p" "$tmp/bundle" >> "$tmp/selected"; break ;; [Nn]) break ;; esac
+              done
+            done 3< "$tmp/names"
+            break ;;
+    esac
+  done
+  if [ -s "$tmp/selected" ]; then
+    python3 "$PY" keyfiles "$tmp/selected" "$DEST" && echo "Added." || echo "FAILED: could not add the networks" | tee -a "$SL_FAILS"
+    command -v nmcli >/dev/null 2>&1 && nmcli connection reload >/dev/null 2>&1
+  fi
+  rm -f "$REC"
+fi
+if [ -s "$STAGED" ]; then
+  python3 "$PY" keyfiles "$STAGED" "$DEST" && rm -f "$STAGED"
+  command -v nmcli >/dev/null 2>&1 && nmcli connection reload >/dev/null 2>&1
+fi
+sl_clear wifi-import
+exit 0

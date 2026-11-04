@@ -1,0 +1,251 @@
+#!/bin/bash
+# secure-linux-status (Debian): plain-English status of this computer, with one-click fixes.
+# Same interface as the Fedora setup's secure-linux-status, so secure-linux-status-gui and the notifier work unchanged.
+#   secure-linux-status                terminal view: green/red list and numbered fixes
+#   secure-linux-status --terminal     force the interactive text view (never opens a window)
+#   secure-linux-status --text         print the status list once, as plain text, and stop (no menus)
+#   secure-linux-status --json         check results + active alerts as JSON
+#   secure-linux-status --rows         one line per row, worst first: status|label|detail|fix key|fix label
+#   secure-linux-status --refresh      run the health check again now (no password needed)
+#   secure-linux-status --fix KEY      run one fix; --list-fixes shows every key and whether it's available
+#   secure-linux-status --av-findings  print the latest antivirus findings
+# The results come from secure-linux-check (/var/lib/secure-linux/checks); alerts from every area are included.
+set -u   # no pipefail: "cmd | grep -q" must not fail when grep stops reading early
+SL_ROOT=${SL_ROOT:-/usr/local/lib/secure-linux}
+# shellcheck source=../lib/common.sh
+. "$SL_ROOT/lib/common.sh"
+CHECKS=$SL_STATE/checks
+UALERTS=$SL_STATE/user-alerts/${USER:-$(id -un)}
+have() { command -v "$1" >/dev/null 2>&1; }
+guide_file() { local f; for f in /usr/share/secure-linux/START-HERE.html /usr/local/share/secure-linux/START-HERE.html; do [ -f "$f" ] && { echo "$f"; return 0; }; done; return 1; }
+
+# ---------------------------------------------------------------- fixes
+ALL_FIXES="updates restart repair check diag disk guide hotspot wifi vpn welcome hwhealth parts recovery-key av-findings av-ack snapshots snapshots-clean"
+AV_DIR=$SL_LOGDIR/clamscan
+fix_label() {
+  case "$1" in
+    restart) echo "Restart the computer" ;;          updates) echo "Install updates now" ;;
+    repair) echo "Repair setup" ;;                    check) echo "Check again" ;;
+    disk) echo "See what's using disk space" ;;       guide) echo "Open the START-HERE guide" ;;
+    hotspot) echo "Hotel / cafe Wi-Fi login" ;;       wifi) echo "Add my saved Wi-Fi networks" ;;
+    diag) echo "Create a diagnostics file" ;;         vpn) echo "Set up VPN" ;;
+    welcome) echo "Welcome & setup choices" ;;        hwhealth) echo "Run hardware check" ;;
+    parts) echo "Install software for my hardware" ;;  recovery-key) echo "Make a disk recovery key" ;;
+    av-findings) echo "Show antivirus findings" ;;     av-ack) echo "Mark antivirus findings as dealt with" ;;
+    snapshots) echo "Go back to an earlier snapshot" ;; snapshots-clean) echo "Free space from old snapshots" ;;
+    *) echo "$1" ;;
+  esac
+}
+fix_helper() {   # the helper(s) a fix needs, best first (empty = built in)
+  case "$1" in
+    hotspot) echo secure-linux-dns ;; wifi) echo secure-linux-wifi-import ;;
+    diag) echo secure-linux-diag ;; vpn) echo "secure-linux-welcome secure-linux-vpn" ;; welcome) echo secure-linux-welcome ;;
+    hwhealth) echo secure-linux-health ;; parts) echo secure-linux-parts ;;
+    recovery-key) echo "secure-linux-welcome secure-linux-recovery-key" ;;
+    av-findings|av-ack) echo secure-linux-scan ;; snapshots) echo secure-linux-repair ;; snapshots-clean) echo secure-linux-snapshot ;;
+  esac
+}
+fix_available() {
+  local h hs ok=""; hs=$(fix_helper "$1")
+  if [ -n "$hs" ]; then
+    for h in $hs; do have "$h" && ok=1; done
+    [ -n "$ok" ] || return 1
+  fi
+  case "$1" in
+    guide) [ -n "$(guide_file)" ] ;;
+    av-findings|av-ack) ls "$AV_DIR"/*.log >/dev/null 2>&1 ;;
+    snapshots|snapshots-clean) have lvs && ! secure-linux-snapshot status 2>/dev/null | grep -qE '^(unavailable|off)' ;;
+    vpn) [ "$(sl_arch)" = amd64 ] && have nordvpn ;;
+    *) return 0 ;;
+  esac
+}
+fix_for_alert() {   # alerts written by other areas: pick a fix from the alert id
+  case "$1" in
+    wifi*) echo wifi ;; dns-blocked*|hotspot*|captive*) echo hotspot ;; debian-eol*) echo guide ;;
+    health-*|health) echo hwhealth ;; parts-pending*) echo parts ;; *recovery*) echo recovery-key ;;
+    antivirus*) echo av-findings ;; snapshot*) echo snapshots ;; vpn*|nord*|warp*) echo vpn ;; welcome*) echo welcome ;;
+    restart*|reboot*|updates-waiting*) echo restart ;; updates*) echo updates ;; disk-full*) echo disk ;;
+    *) echo repair ;;
+  esac
+}
+in_terminal() { [ -t 0 ] && [ -t 1 ]; }
+run_term() {   # run a command that talks to the user; open a terminal window if we aren't in one
+  if in_terminal; then "$@"; else secure-linux-terminal --hold "$@"; fi
+}
+wizard_or() {   # wizard_or PAGE CMD...   the welcome wizard's page for this choice, else CMD in a terminal
+  local page=$1; shift
+  if have secure-linux-welcome; then secure-linux-welcome --page "$page"
+  elif have "$1"; then run_term "$@"
+  else echo "This option isn't installed on this computer."; return 1; fi
+}
+av_findings() {
+  local latest; latest=$(ls -1 "$AV_DIR"/*.log 2>/dev/null | sort | tail -1)
+  if [ -z "$latest" ]; then echo "No virus scan has run yet."; return 0; fi
+  echo "Latest weekly scan: $(basename "$latest" .log)"
+  if grep -q 'FOUND$' "$latest"; then
+    echo "Suspicious files (nothing was deleted):"; echo
+    grep 'FOUND$' "$latest" | sed 's/^/  /'
+    echo
+    echo "What to do: if you don't know a file, delete it (or ask someone you trust)."
+    echo "Then choose 'Mark antivirus findings as dealt with'."
+  else
+    echo "Nothing suspicious was found."
+  fi
+}
+refresh() {
+  echo "Checking everything (this can take a minute)..."
+  systemctl start secure-linux-check.service 2>/dev/null || pkexec /usr/local/bin/secure-linux-check
+}
+do_fix() {
+  local key=$1
+  case "$key" in
+    restart) systemctl reboot ;;
+    updates) run_term pkexec sh -c 'apt-get update && apt-get -y full-upgrade && apt-get -y autoremove; command -v flatpak >/dev/null && flatpak update --system -y --noninteractive' ;;
+    repair) run_term pkexec "$SL_ROOT/setup.sh" --repair; refresh ;;
+    check) refresh ;;
+    disk) if have baobab; then setsid -f baobab >/dev/null 2>&1; else xdg-open "$HOME" >/dev/null 2>&1; fi ;;
+    hotspot) run_term secure-linux-dns open ;;
+    wifi) run_term secure-linux-wifi-import ;;
+    diag) run_term secure-linux-diag ;;
+    vpn) wizard_or vpn secure-linux-vpn setup ;;
+    welcome) secure-linux-welcome --again ;;
+    hwhealth) secure-linux-health --gui ;;
+    parts) run_term secure-linux-parts --install ;;
+    recovery-key) wizard_or recovery secure-linux-recovery-key create ;;
+    av-findings) av_findings ;;
+    av-ack) pkexec /usr/local/bin/secure-linux-scan ack ;;
+    snapshots) run_term secure-linux-repair --action snapshot ;;
+    snapshots-clean) run_term pkexec /usr/local/bin/secure-linux-snapshot prune ;;
+    guide) xdg-open "$(guide_file)" >/dev/null 2>&1 ;;
+    *) echo "Unknown fix: $key" >&2; return 2 ;;
+  esac
+}
+
+# ---------------------------------------------------------------- data
+rank() { case "$1" in bad) echo 0 ;; warn) echo 1 ;; *) echo 2 ;; esac; }
+nobar() { printf '%s' "${1//|//}"; }
+rows() {   # status|label|detail|fix|fixlabel, worst first; includes alerts from other areas
+  local f id title msg fix st label detail
+  {
+    if [ -f "$CHECKS" ]; then
+      while IFS='|' read -r id st label detail fix; do
+        [ -n "$id" ] || continue
+        [ -n "$fix" ] && ! fix_available "$fix" && fix=""
+        printf '%s|%s|%s|%s|%s|%s\n' "$(rank "$st")" "$st" "$label" "$detail" "$fix" "${fix:+$(fix_label "$fix")}"
+      done < "$CHECKS"
+    fi
+    for f in "$SL_STATE"/alerts.d/* "$UALERTS"/*; do
+      [ -f "$f" ] || continue; id=${f##*/}
+      [ -f "$CHECKS" ] && grep -q "^$id|" "$CHECKS" && continue
+      title=$(sed -n 1p "$f"); msg=$(sed -n 2p "$f")
+      fix=$(fix_for_alert "$id"); fix_available "$fix" || fix=""
+      printf '0|bad|%s|%s|%s|%s\n' "$(nobar "$title")" "$(nobar "$msg")" "$fix" "${fix:+$(fix_label "$fix")}"
+    done
+  } | sort -t '|' -k1,1n -s | cut -d'|' -f2-
+}
+json_str() {
+  local s=$1
+  s=${s//\\/\\\\}; s=${s//\"/\\\"}; s=${s//$'\t'/\\t}; s=${s//$'\n'/\\n}; s=${s//$'\r'/}
+  printf '"%s"' "$s"
+}
+to_json() {
+  local first=1 id st label detail fix f title msg hint
+  printf '{\n  "updated": %s,\n  "profile": %s,\n  "checks": [' "$(json_str "$(cat "$SL_STATE/checks.time" 2>/dev/null)")" "$(json_str "$(sl_profile)")"
+  if [ -f "$CHECKS" ]; then
+    while IFS='|' read -r id st label detail fix; do
+      [ -n "$id" ] || continue
+      [ -n "$fix" ] && ! fix_available "$fix" && fix=""
+      [ $first = 1 ] && first=0 || printf ','
+      printf '\n    {"id": %s, "status": %s, "label": %s, "detail": %s, "fix": %s, "fix_label": %s}' \
+        "$(json_str "$id")" "$(json_str "$st")" "$(json_str "$label")" "$(json_str "$detail")" \
+        "$(json_str "$fix")" "$(json_str "${fix:+$(fix_label "$fix")}")"
+    done < "$CHECKS"
+  fi
+  printf '\n  ],\n  "alerts": ['
+  first=1
+  for f in "$SL_STATE"/alerts.d/* "$UALERTS"/*; do
+    [ -f "$f" ] || continue; id=${f##*/}
+    title=$(sed -n 1p "$f"); msg=$(sed -n 2p "$f"); hint=$(sed -n 3p "$f")
+    fix=$(grep "^$id|" "$CHECKS" 2>/dev/null | head -1 | cut -d'|' -f5)
+    [ -n "$fix" ] || fix=$(fix_for_alert "$id")
+    fix_available "$fix" || fix=""
+    [ $first = 1 ] && first=0 || printf ','
+    printf '\n    {"id": %s, "title": %s, "message": %s, "hint": %s, "fix": %s}' \
+      "$(json_str "$id")" "$(json_str "$title")" "$(json_str "$msg")" "$(json_str "$hint")" "$(json_str "$fix")"
+  done
+  printf '\n  ]\n}\n'
+}
+
+# ---------------------------------------------------------------- terminal view
+terminal_view() {
+  local c st label detail fix fl n i keys=() k
+  while true; do
+    clear 2>/dev/null
+    printf '\n  SECURE LINUX STATUS   (checked: %s)\n\n' "$(cat "$SL_STATE/checks.time" 2>/dev/null || echo never)"
+    keys=()
+    while IFS='|' read -r st label detail fix fl; do
+      case "$st" in
+        bad)  printf '   \033[31m[ !! ]\033[0m %s' "$label" ;;
+        warn) printf '   \033[33m[ -- ]\033[0m %s' "$label" ;;
+        *)    printf '   \033[32m[ OK ]\033[0m %s' "$label" ;;
+      esac
+      [ -n "$detail" ] && printf '  \033[2m(%s)\033[0m' "$detail"
+      printf '\n'
+      if [ -n "$fix" ] && [ "$st" != ok ]; then
+        case " ${keys[*]:-} " in *" $fix "*) ;; *) keys+=("$fix") ;; esac
+      fi
+    done < <(rows)
+    for k in updates restart repair hwhealth diag hotspot guide; do
+      fix_available "$k" || continue
+      case " ${keys[*]:-} " in *" $k "*) ;; *) keys+=("$k") ;; esac
+    done
+    keys+=(check)
+    printf '\n  What would you like to do?\n'
+    n=0; for k in "${keys[@]}"; do n=$((n + 1)); printf '   %2d  %s\n' "$n" "$(fix_label "$k")"; done
+    printf '    q  Quit\n\n'
+    read -rp "  Choose: " c || exit 0
+    case "$c" in
+      q|Q) exit 0 ;;
+      *[!0-9]*|'') continue ;;
+    esac
+    [ "$c" -ge 1 ] && [ "$c" -le "$n" ] || continue
+    k=${keys[$((c - 1))]}
+    echo
+    case "$k" in
+      restart) read -rp "  Save your work first. Restart now? [y/N] " i; [ "$i" = y ] || [ "$i" = Y ] || continue ;;
+    esac
+    do_fix "$k"
+    read -rp "  Press Enter to go back to the status list. " _
+  done
+}
+
+# ---------------------------------------------------------------- one-pass text view
+text_view() {   # --text: the status list printed once, no menus, no colour; for scripts and the Toolbox tile
+  local st label detail fix fl
+  printf 'Secure Linux Status (checked: %s)\n\n' "$(cat "$SL_STATE/checks.time" 2>/dev/null || echo never)"
+  while IFS='|' read -r st label detail fix fl; do
+    case "$st" in
+      bad)  printf '[ !! ] %s' "$label" ;;
+      warn) printf '[ -- ] %s' "$label" ;;
+      info) printf '[ i  ] %s' "$label" ;;
+      *)    printf '[ OK ] %s' "$label" ;;
+    esac
+    [ -n "$detail" ] && printf '  (%s)' "$detail"
+    printf '\n'
+    [ -n "$fix" ] && [ "$st" != ok ] && printf '       Fix: %s\n' "${fl:-$fix}"
+  done < <(rows)
+}
+
+case "${1:-}" in
+  -h|--help) sed -n '2,11p' "$0" ;;
+  --json) to_json ;;
+  --rows) rows ;;
+  --text) text_view ;;
+  --terminal) terminal_view ;;
+  --refresh) refresh ;;
+  --av-findings) av_findings ;;
+  --list-fixes) for k in $ALL_FIXES; do fix_available "$k" && a=yes || a=no; printf '%s|%s|%s\n' "$k" "$a" "$(fix_label "$k")"; done ;;
+  --fix) [ -n "${2:-}" ] || { echo "Usage: $0 --fix KEY" >&2; exit 2; }; do_fix "$2" ;;
+  "") if in_terminal || [ -n "${SL_STATUS_TERMINAL:-}" ]; then terminal_view; else exec secure-linux-terminal --no-hold "$0" --terminal; fi ;;
+  *) echo "Unknown option: $1 (see --help)" >&2; exit 2 ;;
+esac

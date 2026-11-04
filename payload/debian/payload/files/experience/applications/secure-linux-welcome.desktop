@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Welcome & Setup Choices
+GenericName=First-run wizard
+Comment=Wi-Fi, updates, browser, backups, disk recovery key and hardware check - one page at a time
+Exec=/usr/local/bin/secure-linux-welcome --again
+Icon=preferences-system
+Terminal=false
+Categories=System;Settings;
+Keywords=welcome;wizard;setup;choices;browser;recovery;

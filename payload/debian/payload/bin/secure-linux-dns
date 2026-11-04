@@ -1,0 +1,134 @@
+#!/bin/bash
+# secure-linux-dns (Debian): encrypted DNS (the internet's "phone book") on/off.
+#
+#   secure-linux-dns status [--short]   show what is answering name lookups (short: encrypted|family|paused|off)
+#   secure-linux-dns open [MINUTES]     pause encrypted DNS so a hotel/cafe Wi-Fi login page can load;
+#                                       switches back on by itself after MINUTES (default 15)
+#   secure-linux-dns secure             switch encrypted DNS back on now
+#   secure-linux-dns sync               (automatic) let a connected VPN's DNS win, or go back to encrypted DNS
+#   secure-linux-dns family on|off|status
+#                                       family filter: Cloudflare for Families (1.1.1.3) also blocks adult sites
+#
+# How it works (same files as the Fedora setup):
+#   /etc/systemd/resolved.conf.d/10-secure-linux-dns.conf   Cloudflare 1.1.1.2 + Quad9 over TLS, Domains=~.
+#   /etc/systemd/resolved.conf.d/15-secure-linux-family.conf family filter: replaces the servers with 1.1.1.3
+#   /run/systemd/resolved.conf.d/99-secure-linux-open.conf   pause for login pages (gone after a restart)
+set -u   # no pipefail: "cmd | grep -q" must not fail when grep stops reading early
+SL_ROOT=${SL_ROOT:-/usr/local/lib/secure-linux}
+. "$SL_ROOT/lib/common.sh"
+DNS_CONF=$R/etc/systemd/resolved.conf.d/10-secure-linux-dns.conf
+DNS_FAMILY=$R/etc/systemd/resolved.conf.d/15-secure-linux-family.conf
+DNS_OPEN=$R/run/systemd/resolved.conf.d/99-secure-linux-open.conf
+self=$(readlink -f "$0" 2>/dev/null || echo "$0")
+usage() { sed -n '2,13p' "$self" | sed 's/^# \{0,1\}//'; }
+need_root() { [ "$(id -u)" -eq 0 ] && return 0; exec pkexec "$self" "$@"; }
+dns_reload() {
+  if [ "$(systemctl show -p CanReload --value systemd-resolved 2>/dev/null)" = yes ]; then systemctl reload systemd-resolved
+  else systemctl restart systemd-resolved; fi
+}
+dns_mode() {
+  if [ ! -f "$DNS_CONF" ]; then echo off
+  elif [ -f "$DNS_OPEN" ]; then echo paused
+  elif [ -f "$DNS_FAMILY" ]; then echo family
+  else echo encrypted; fi
+}
+# ---------------------------------------------------------------- VPN and DNS (same behaviour as the Fedora setup)
+DNS_VPN=$R/run/systemd/resolved.conf.d/50-secure-linux-vpn.conf     # exists while a VPN supplies DNS
+VPN_IFACES='^(nordlynx|nordtun|CloudflareWARP|tun[0-9]+|wg[0-9]+|proton[0-9]*|tailscale[0-9]+)$'
+family_on() { [ -f "$DNS_FAMILY" ]; }
+vpn_links_default() {   # names of VPN network interfaces that are up
+  local n
+  for n in $(ls "$R/sys/class/net" 2>/dev/null); do
+    printf '%s' "$n" | grep -Eq "$VPN_IFACES" || continue
+    [ "$(cat "$R/sys/class/net/$n/operstate" 2>/dev/null)" = down ] && continue
+    printf '%s\n' "$n"
+  done
+}
+cmd_sync() {   # decide who answers lookups: a VPN that claims all names (~.), or our encrypted servers
+  need_root sync "$@"
+  local vpns l changed=0
+  [ -f "$DNS_OPEN" ] && return 0          # paused for a login page: leave alone
+  vpns=$(vpn_links_default)
+  if family_on; then
+    # Family filter: the VPN must not answer lookups (its DNS has no adult-site filter); lookups go through the tunnel to Cloudflare for Families
+    for l in $vpns; do resolvectl domain "$l" "" 2>/dev/null; resolvectl default-route "$l" false 2>/dev/null; done
+    [ -f "$DNS_VPN" ] && { rm -f "$DNS_VPN"; changed=1; }
+  elif [ -n "$vpns" ]; then
+    for l in $vpns; do resolvectl dnsovertls "$l" no 2>/dev/null; resolvectl dnssec "$l" no 2>/dev/null; done   # VPN DNS servers don't speak DNS-over-TLS
+    if [ ! -f "$DNS_VPN" ]; then
+      mkdir -p "$(dirname "$DNS_VPN")"
+      printf '%s\n' "# Written by secure-linux-dns sync while a VPN supplies DNS ($(echo $vpns))." "[Resolve]" "Domains=" > "$DNS_VPN"
+      changed=1
+    fi
+  elif [ -f "$DNS_VPN" ]; then rm -f "$DNS_VPN"; changed=1; fi
+  if [ "$changed" = 1 ] && [ "${1:-}" != quiet ]; then dns_reload; fi
+  return 0
+}
+cmd_status() {
+  local m; m=$(dns_mode)
+  [ "${1:-}" = --short ] && { echo "$m"; return 0; }
+  case "$m" in
+    family)    echo "Family filter is ON: lookups go privately to Cloudflare for Families (blocks malware and adult sites)." ;;
+    encrypted) echo "Encrypted DNS is ON: lookups go privately to Cloudflare (blocks known malware sites), with Quad9 as backup." ;;
+    paused)    echo "Encrypted DNS is PAUSED for a Wi-Fi login page. It switches back on by itself, or run: secure-linux-dns secure" ;;
+    off)       echo "Encrypted DNS is not set up. Open 'Secure Linux Status' and choose Repair." ;;
+  esac
+}
+cmd_open() {
+  need_root open "$@"
+  local min=${1:-15}
+  case "$min" in ''|*[!0-9]*) min=15 ;; esac
+  mkdir -p "$(dirname "$DNS_OPEN")"
+  cat > "$DNS_OPEN" <<'EOT'
+# Written by secure-linux-dns open: plain DNS from the Wi-Fi network so its login page can load.
+# Removed by "secure-linux-dns secure", by the automatic timer, or by restarting the computer.
+[Resolve]
+DNS=
+Domains=
+DNSOverTLS=no
+DNSSEC=no
+EOT
+  dns_reload
+  systemctl stop secure-linux-dns-restore.timer secure-linux-dns-restore.service >/dev/null 2>&1
+  systemctl reset-failed secure-linux-dns-restore.service >/dev/null 2>&1
+  systemd-run --quiet --on-active="${min}min" --unit=secure-linux-dns-restore /usr/local/bin/secure-linux-dns secure
+  echo "Encrypted DNS is paused for $min minutes so the Wi-Fi login page can load."
+}
+cmd_secure() {
+  need_root secure "$@"
+  rm -f "$DNS_OPEN"
+  systemctl stop secure-linux-dns-restore.timer >/dev/null 2>&1
+  cmd_sync quiet
+  dns_reload
+  echo "Encrypted DNS is on."
+}
+cmd_family() {
+  case "${1:-status}" in
+    status) [ -f "$DNS_FAMILY" ] && echo "Family filter: on" || echo "Family filter: off"; return 0 ;;
+    on|off) ;;
+    *) echo "Use: secure-linux-dns family on|off|status" >&2; return 2 ;;
+  esac
+  need_root family "$@"
+  local f=$SL_ROOT/files/security/resolved/15-secure-linux-family.conf
+  if [ "$1" = on ]; then
+    mkdir -p "$(dirname "$DNS_FAMILY")"
+    cmp -s "$f" "$DNS_FAMILY" || install -m 0644 "$f" "$DNS_FAMILY"
+    sl_choice_set family_dns yes
+  else
+    rm -f "$DNS_FAMILY"
+    sl_choice_set family_dns no
+  fi
+  cmd_sync quiet
+  dns_reload
+  if [ "$1" = on ]; then echo "Family filter is on: adult and dangerous sites are blocked for everyone on this computer."
+  else echo "Family filter is off."; fi
+}
+case "${1:-}" in
+  -h|--help|help|"") usage ;;
+  family) shift; cmd_family "$@" ;;
+  status) shift; cmd_status "$@" ;;
+  open)   shift; cmd_open "$@" ;;
+  secure) shift; cmd_secure "$@" ;;
+  sync)   shift; cmd_sync "$@" ;;
+  *) echo "Unknown command '$1'." >&2; usage; exit 2 ;;
+esac

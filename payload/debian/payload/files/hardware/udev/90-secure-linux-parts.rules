@@ -1,0 +1,7 @@
+# Secure Linux (Debian): when a NEW kind of device is plugged in, start the helper that installs the software to use it
+# (printer driver, scanner, burning program ...). Same rules as the Fedora version; it installs ONLY packages from Debian's own
+# archive. Installed to /etc/udev/rules.d/ by steps/45-hardware.sh.
+ACTION=="add", SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", TAG+="systemd", ENV{SYSTEMD_WANTS}+="secure-linux-parts-hotplug.service"
+ACTION=="add", SUBSYSTEM=="bluetooth", ENV{DEVTYPE}=="host", TAG+="systemd", ENV{SYSTEMD_WANTS}+="secure-linux-parts-hotplug.service"
+ACTION=="add", SUBSYSTEM=="block", ENV{ID_CDROM}=="1", TAG+="systemd", ENV{SYSTEMD_WANTS}+="secure-linux-parts-hotplug.service"
+ACTION=="add", SUBSYSTEM=="thunderbolt", TAG+="systemd", ENV{SYSTEMD_WANTS}+="secure-linux-parts-hotplug.service"

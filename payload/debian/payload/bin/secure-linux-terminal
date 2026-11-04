@@ -1,0 +1,20 @@
+#!/bin/bash
+# secure-linux-terminal: open a command in whichever terminal this desktop has
+# (Konsole on KDE, Xfce Terminal on lite, Ptyxis / GNOME Terminal / xterm otherwise).
+#   secure-linux-terminal [--hold|--no-hold] COMMAND [ARGS...]
+# The window stays open at the end ("Press Enter to close") so the result can be read; --no-hold closes it
+# as soon as the command ends. (--hold is accepted for compatibility; it is the default.)
+case "${1:-}" in -h|--help|"") sed -n '2,6p' "$0"; exit 0 ;; esac
+hold=1
+case "$1" in --hold) shift ;; --no-hold) hold=""; shift ;; esac
+[ $# -gt 0 ] || exit 0
+if [ -n "$hold" ]; then
+  set -- bash -c '"$@"; rc=$?; echo; read -rp "Finished. Press Enter to close this window. " _; exit $rc' secure-linux-terminal "$@"
+fi
+if command -v konsole >/dev/null 2>&1; then exec konsole --hide-menubar -e "$@"
+elif command -v xfce4-terminal >/dev/null 2>&1; then exec xfce4-terminal -x "$@"
+elif command -v ptyxis >/dev/null 2>&1; then exec ptyxis --new-window -- "$@"
+elif command -v gnome-terminal >/dev/null 2>&1; then exec gnome-terminal --wait -- "$@"
+elif command -v xterm >/dev/null 2>&1; then exec xterm -e "$@"
+else exec "$@"
+fi

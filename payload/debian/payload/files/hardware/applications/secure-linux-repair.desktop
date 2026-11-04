@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Repair This Computer
+GenericName=Guided repair (boot, disks, packages, network, passwords)
+Comment=Step-by-step repairs. Every change shows what it will do first and waits for your yes
+Exec=/usr/local/bin/secure-linux-terminal --hold /usr/local/bin/secure-linux-repair
+Icon=system-run
+Terminal=false
+Categories=System;
+Keywords=repair;fix;boot;grub;disk;fsck;recovery;rescue;password;

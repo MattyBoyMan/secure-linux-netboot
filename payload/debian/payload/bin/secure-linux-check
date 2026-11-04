@@ -1,0 +1,214 @@
+#!/bin/bash
+# secure-linux-check (Debian): the health check (needs root; runs 10 min after start and every 6 h).
+# Turns problems into plain-English alerts (/var/lib/secure-linux/alerts.d/<id>, removed again when fixed)
+# and writes the results table shown by "Secure Linux Status & Fixes" (/var/lib/secure-linux/checks).
+# Same files and formats as the Fedora setup's secure-linux-check, so the notifier and the status window work unchanged.
+#   secure-linux-check            run every check
+set -u   # no pipefail: "cmd | grep -q" must not fail when grep stops reading early
+export LC_ALL=C
+SL_ROOT=${SL_ROOT:-/usr/local/lib/secure-linux}
+# shellcheck source=../lib/common.sh
+. "$SL_ROOT/lib/common.sh"
+
+case "${1:-}" in
+  -h|--help) sed -n '2,7p' "$0"; exit 0 ;;
+esac
+[ "$(id -u)" -eq 0 ] || [ -n "$SL_SYSROOT" ] || exec pkexec "$0" "$@"
+
+mkdir -p "$SL_STATE/alerts.d" "$SL_STATE/events.d"
+CHECKS=$SL_STATE/checks
+NOW=$(date +%s)
+RES=$(mktemp); trap 'rm -f "$RES"' EXIT
+have() { command -v "$1" >/dev/null 2>&1; }
+
+# results line: id|status|label|detail|fix     status: ok, warn, bad      fix: a key understood by secure-linux-status --fix
+row() { printf '%s|%s|%s|%s|%s\n' "$1" "$2" "$3" "${4:-}" "${5:-}" | tr -d '\r' >> "$RES"; }
+fix_label() {
+  case "$1" in
+    restart) echo "Restart the computer" ;;      updates) echo "Install updates now" ;;
+    repair) echo "Repair setup" ;;                disk) echo "See what's using disk space" ;;
+    hotspot) echo "Hotel / cafe Wi-Fi login" ;;  wifi) echo "Add my saved Wi-Fi networks" ;;
+    guide) echo "Open the START-HERE guide" ;;    recovery-key) echo "Make a disk recovery key" ;;
+    hwhealth) echo "Run hardware check" ;;        av-findings) echo "Show antivirus findings" ;;    *) echo "$1" ;;
+  esac
+}
+hint() { [ -n "${1:-}" ] && printf "Open 'Secure Linux Status & Fixes' and choose '%s'." "$(fix_label "$1")"; }
+good() { row "$1" ok "$2" "${3:-}" ""; sl_clear "$1"; }                       # good ID LABEL [DETAIL]
+note() { row "$1" "$2" "$3" "${4:-}" "${5:-}"; sl_clear "$1"; }              # note ID STATUS LABEL DETAIL [FIX]  (row only)
+problem() {   # problem ID bad|warn LABEL DETAIL FIX "Alert title" "Alert message"   (row + desktop alert)
+  row "$1" "$2" "$3" "$4" "$5"
+  sl_alert "$1" "$6" "$7" "$(hint "$5")"
+}
+age_days() { local m; m=$(stat -c %Y "$1" 2>/dev/null) || { echo 0; return; }; echo $(( (NOW - m) / 86400 )); }
+unit_ok() { systemctl is-enabled -q "$1" 2>/dev/null; }
+
+# ---------------------------------------------------------------- setup still running?
+if [ -f "$SL_STATE/progress" ] && ! grep -q '^done' "$SL_STATE/progress"; then
+  IFS='|' read -r pn pt ptext < "$SL_STATE/progress"
+  note setup-running warn "Setup is still running" "Step $pn of $pt: $ptext"
+fi
+if [ -s "$SL_FAILS" ] && grep -q '^done' "$SL_STATE/progress" 2>/dev/null; then
+  problem setup-failures warn "Some setup items didn't finish" "$(grep -c . "$SL_FAILS") item(s); usually a brief internet problem" repair \
+    "A few things didn't install" "Often just an internet hiccup. Running Repair tries them again."
+else
+  good setup-failures "Setup finished without problems"
+fi
+
+# ---------------------------------------------------------------- updates
+if unit_ok apt-daily-upgrade.timer && [ -f "$R/etc/apt/apt.conf.d/52secure-linux-unattended" ]; then
+  good updates-auto "Automatic updates are on" "every day"
+else
+  problem updates-auto bad "Automatic updates are off" "unattended-upgrades isn't set up" repair \
+    "Automatic updates are off" "Your computer isn't installing security updates by itself."
+fi
+stamp=$R/var/lib/apt/periodic/update-success-stamp
+if [ -f "$stamp" ] && [ "$(age_days "$stamp")" -gt 7 ]; then
+  problem updates-stale warn "Updates haven't been checked for $(age_days "$stamp") days" "no successful update check" updates \
+    "Updates haven't been checked lately" "The computer hasn't been able to check for updates for over a week. Check the internet connection."
+else
+  good updates-stale "Update checks are recent"
+fi
+if [ -f "$R/run/reboot-required" ] || [ -f "$R/var/run/reboot-required" ]; then
+  rr=$R/run/reboot-required; [ -f "$rr" ] || rr=$R/var/run/reboot-required
+  d=$(age_days "$rr")
+  if [ "$d" -ge 7 ]; then
+    problem updates-waiting bad "A restart has been waiting for $d days" "updates are installed but not active yet" restart \
+      "Please restart your computer" "Security updates are only active after a restart. It has been waiting $d days."
+  else
+    problem updates-waiting warn "A restart is waiting" "updates are installed but not active yet" restart \
+      "A restart will finish your updates" "Restart when it suits you. It takes a minute."
+  fi
+else
+  good updates-waiting "No restart is waiting"
+fi
+
+# ---------------------------------------------------------------- firewall and DNS
+if have ufw && ufw status 2>/dev/null | grep -q '^Status: active'; then
+  good firewall "Firewall is on" "blocks connections from outside"
+else
+  problem firewall bad "Firewall is off" "ufw isn't active" repair "Firewall is off" "Your computer isn't blocking connections from outside."
+fi
+if [ -f "$R/etc/systemd/resolved.conf.d/10-secure-linux-dns.conf" ] && systemctl is-active -q systemd-resolved 2>/dev/null; then
+  if have getent && ! getent hosts deb.debian.org >/dev/null 2>&1 && have ping && ping -c1 -W3 1.1.1.1 >/dev/null 2>&1; then
+    problem dns-blocked warn "Encrypted DNS seems blocked on this network" "pages can't be found but the internet works" hotspot \
+      "This Wi-Fi blocks encrypted DNS" "Hotel and cafe Wi-Fi often does. Use 'Hotel / cafe Wi-Fi login' to pause it for a few minutes."
+  else
+    good dns "Encrypted DNS is on"
+  fi
+else
+  problem dns warn "Encrypted DNS isn't running" "systemd-resolved or its settings are missing" repair \
+    "Encrypted DNS is off" "Website lookups aren't private. Running Repair switches it back on."
+fi
+
+# ---------------------------------------------------------------- disk
+use=$(df --output=pcent "${SL_SYSROOT:-/}" 2>/dev/null | tail -1 | tr -dc 0-9)
+if [ -n "$use" ] && [ "$use" -ge 95 ]; then
+  problem disk-full bad "Disk is $use% full" "almost no room left" disk "Your disk is almost full" "Only $((100 - use))% is left. Delete files you don't need."
+elif [ -n "$use" ] && [ "$use" -ge 90 ]; then
+  problem disk-full warn "Disk is $use% full" "getting full" disk "Your disk is getting full" "Only $((100 - use))% is left."
+else
+  good disk-full "Disk space is fine" "${use:-?}% used"
+fi
+if have smartctl; then
+  badd=""
+  for dev in $(smartctl --scan 2>/dev/null | awk '{print $1}'); do
+    smartctl -H "$dev" 2>/dev/null | grep -qiE 'FAILED|failing' && badd="$badd $dev"
+  done
+  if [ -n "$badd" ]; then
+    problem disk-health bad "A drive reports it is failing" "$badd" "" "Your drive may be failing" "Back up your files now and plan to replace the drive:$badd"
+  else
+    good disk-health "Drive health is fine"
+  fi
+fi
+if have lsblk && lsblk -rno TYPE 2>/dev/null | grep -q '^crypt$'; then
+  good encryption "Disk is encrypted"
+elif have lsblk && [ -z "$SL_SYSROOT" ]; then
+  note encryption warn "This disk is not encrypted" "if the computer is lost, files can be read"
+fi
+
+# ---------------------------------------------------------------- services, time, memory
+nf=$(systemctl --failed --no-legend 2>/dev/null | grep -c .)
+if [ "${nf:-0}" -gt 0 ]; then note services warn "$nf service(s) failed to start" "$(systemctl --failed --no-legend 2>/dev/null | awk '{print $2}' | head -3 | tr '\n' ' ')" repair
+else good services "All services are running"; fi
+if have timedatectl && [ "$(timedatectl show -p NTPSynchronized --value 2>/dev/null)" = no ]; then
+  note clock warn "The clock isn't synchronised" "check the internet connection"
+else good clock "Clock is right"; fi
+if have swapon && [ -n "$(swapon --show --noheadings 2>/dev/null)" ]; then good memory "Swap (memory overflow) is on" "$(sl_ram_mb) MB of memory"
+else note memory warn "No swap space" "$(sl_ram_mb) MB of memory; a small PC can run out" repair; fi
+
+# ---------------------------------------------------------------- Wi-Fi networks from Windows, still waiting
+if [ -s "$SL_STATE/wifi-record" ] || [ -s "$SL_STATE/wifi-staged" ]; then
+  problem wifi-import warn "Your saved Windows Wi-Fi networks are waiting" "they need your PIN" wifi \
+    "Add your saved Wi-Fi networks" "Wi-Fi networks from your old Windows are ready to add."
+else
+  sl_clear wifi-import
+fi
+
+# ---------------------------------------------------------------- disk recovery key (alert stays until a key is made and saved)
+if [ -x "$SL_ROOT/bin/secure-linux-recovery-key" ]; then
+  rk=$("$SL_ROOT/bin/secure-linux-recovery-key" status --alert 2>/dev/null)
+  case "$rk" in
+    "A recovery key exists"*) good luks-recovery-key "Disk recovery key exists" "a spare way in if the disk password is forgotten" ;;
+    "No recovery key"*) row luks-recovery-key warn "Make a spare key for your disk" "if the disk password is forgotten, everything is lost" recovery-key ;;
+  esac
+fi
+
+# ---------------------------------------------------------------- system snapshots (LVM, taken before updates)
+if [ -x "$SL_ROOT/bin/secure-linux-snapshot" ]; then
+  IFS='|' read -r sn_state sn_a sn_b <<< "$("$SL_ROOT/bin/secure-linux-snapshot" status 2>/dev/null)"
+  case "${sn_state:-}" in
+    ok) good snapshots "System snapshots are on" "${sn_a} kept; newest ${sn_b} day(s) old (Repair This Computer > Go back to an earlier snapshot)" ;;
+    none) good snapshots "System snapshots are on" "the first one is taken before the next software update" ;;
+    pending) note snapshots warn "Going back to an earlier system state is waiting for a restart" "$sn_a" restart ;;
+    full) note snapshots warn "A system snapshot is nearly full" "it stops working when full; it is removed automatically" ;;
+    off) note snapshots ok "System snapshots are switched off" "your choice" ;;
+    unavailable) note snapshots warn "System snapshots are not available" "${sn_a}" ;;
+  esac
+fi
+
+# ---------------------------------------------------------------- virus scanner (weekly scan; the scan itself raises the alert)
+if have clamscan; then
+  if [ -f "$SL_STATE/av-last" ]; then
+    IFS='|' read -r av_when av_n < "$SL_STATE/av-last"
+    if [ "${av_n:-0}" -gt 0 ] && [ -f "$SL_STATE/alerts.d/antivirus-found" ]; then
+      row antivirus-found bad "The virus scanner found something" "$av_n suspicious file(s); nothing was deleted" av-findings
+    else good antivirus "Virus scan: nothing suspicious" "last scan $av_when"; fi
+  else good antivirus "Virus scanner is on" "the first weekly scan has not run yet"; fi
+elif [ -f "$SL_STATE/av-skipped" ]; then
+  note antivirus warn "No virus scanner on this computer" "$(cat "$SL_STATE/av-skipped")"
+fi
+
+# ---------------------------------------------------------------- hardware health (weekly quick check by secure-linux-health)
+hh=$SL_STATE/health/latest.txt
+if [ -f "$hh" ]; then
+  hh_age=$(age_days "$hh")
+  hh_sum=$(sed -n 's/^Summary: //p' "$hh" | head -n1)
+  hh_w=$(printf '%s' "$hh_sum" | sed -n 's/.*, \([0-9]*\) need a look.*/\1/p'); hh_f=$(printf '%s' "$hh_sum" | sed -n 's/.*, \([0-9]*\) failing.*/\1/p')
+  if [ "${hh_f:-0}" -gt 0 ]; then note hardware bad "A part of the computer is failing" "$hh_sum" hwhealth
+  elif [ "${hh_w:-0}" -gt 0 ]; then note hardware warn "Some parts of the computer need a look" "$hh_sum" hwhealth
+  elif [ "$hh_age" -gt 30 ]; then note hardware warn "The hardware check hasn't run for $hh_age days" "it normally runs every week" hwhealth
+  else good hardware "Hardware looks healthy" "checked $hh_age day(s) ago"; fi
+fi
+
+# ---------------------------------------------------------------- how long this Debian is supported (honest end of life)
+end=$(sl_support_end)
+if [ -n "$end" ]; then
+  left=$(( ( $(date -d "$end" +%s 2>/dev/null || echo 0) - NOW ) / 86400 ))
+  if [ "$left" -le 0 ]; then
+    problem debian-eol bad "This version of Debian is no longer supported" "support ended $end" guide \
+      "This computer needs a newer system" "Security updates for this version of Debian have ended. Open the guide for what to do next."
+  elif [ "$left" -le 180 ]; then
+    problem debian-eol warn "Security updates for this Debian end on $end" "$left days left" guide \
+      "Updates for this system are ending soon" "Security updates stop on $end. Open the guide to plan the next step."
+  else
+    good debian-eol "Security updates until $end"
+  fi
+fi
+if sl_is_i386; then
+  # A permanent heads-up row, not a daily alert: the facts do not change from day to day.
+  note browser-eol warn "Web browser on a 32-bit computer" "browsers are dropping 32-bit; updates may stop before $end" guide
+fi
+
+mv -f "$RES" "$CHECKS.new" && mv -f "$CHECKS.new" "$CHECKS"; chmod 644 "$CHECKS"
+date '+%Y-%m-%d %H:%M' > "$SL_STATE/checks.time"; chmod 644 "$SL_STATE/checks.time"
+exit 0

@@ -1,0 +1,25 @@
+# health-packages.map (Debian): the shared hardware check (secure-linux-health) names the Fedora package for every tool it is
+# missing ("Package: mesa-demos"). The Debian wrapper (bin/secure-linux-health) swaps those names for the Debian ones from this
+# file, so the advice a person reads is right for this computer. Format: fedora-name=debian-name (one per line).
+# Names checked on packages.debian.org for bookworm and trixie on 2026-11-03.
+alsa-utils=alsa-utils
+bluez=bluez
+dmidecode=dmidecode
+fwupd=fwupd
+memtester=memtester
+smartmontools=smartmontools
+stress-ng=stress-ng
+vulkan-tools=vulkan-tools
+xorriso=xorriso
+mesa-demos=mesa-utils
+libva-utils=vainfo
+pipewire-utils=wireplumber
+cups=cups-client
+nvme-cli=nvme-cli
+lm_sensors=lm-sensors
+libinput-utils=libinput-tools
+ddrescue=gddrescue
+ntfsprogs=ntfs-3g
+iw=iw
+pciutils=pciutils
+usbutils=usbutils

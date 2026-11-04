@@ -1,0 +1,108 @@
+#!/bin/bash
+# secure-linux-repair (Debian): a guided repair menu for a computer that will not start, has a damaged disk, broken software,
+# no network, a black screen, a forgotten password - and for rescuing your files first. Plain English, one step at a time.
+#
+#   secure-linux-repair                     the menu (works on the installed system and from a rescue system)
+#   secure-linux-repair --auto-diagnose     only LOOK: finds the likely cause and says which menu item fixes it
+#   secure-linux-repair --action NAME       go straight to one menu item (see --list)
+#   secure-linux-repair --dry-run           show everything that WOULD be done, change nothing (combine with any action)
+#   secure-linux-repair --target DIR        the broken Debian is already mounted at DIR (e.g. /target in the installer's rescue mode)
+#   secure-linux-repair --list              list the action names
+#
+# Every step that changes something shows what it will do and waits for an explicit yes (typed words for the dangerous
+# ones). A safety copy of the boot files is made first. A drive that says it is failing (SMART) gets a loud warning before
+# anything writes to it: rescue your files first. Nothing here ever wipes a drive without you typing its name.
+# This is the Debian version of the shared tool (linux/bin/secure-linux-repair): the menu, the helpers and the actions that
+# do not depend on the distribution are the shared ones (hw/health/*.sh); lib/repair-debian.sh replaces the actions that do
+# (boot loader: update-grub / grub-install; start-up images: initramfs-tools; software: apt and dpkg; disk: LUKS + LVM +
+# ext4 as the installer lays it out; snapshots: LVM).
+set -u
+export LC_ALL=C
+SELF=$(readlink -f "$0" 2>/dev/null || echo "$0"); HERE=$(dirname "$SELF")
+SL_ROOT=${SL_ROOT:-/usr/local/lib/secure-linux}
+# shellcheck source=../lib/common.sh
+. "$SL_ROOT/lib/common.sh"
+export SL_STATE SL_ETC
+HLIB=""
+for c in "${SL_HLIB:-}" "$SL_ROOT/hw/health" "$HERE/../hw/health" "${SL_SHARED:-/nonexistent}/../hw/health" "$SL_ROOT/linux/hw/health"; do
+  [ -n "$c" ] && [ -r "$c/lib.sh" ] && { HLIB=$c; break; }
+done
+[ -n "$HLIB" ] || { echo "secure-linux-repair: the repair library (hw/health/lib.sh) is missing. Run 'Repair setup' from Secure Linux Status, or copy the linux-setup folder from the USB stick." >&2; exit 3; }
+SLH_TITLE="Repair this computer"
+# shellcheck source=/dev/null
+. "$HLIB/lib.sh"; . "$HLIB/repair-lib.sh"; . "$HLIB/repair-boot.sh"; . "$HLIB/repair-disk.sh"; . "$HLIB/repair-misc.sh"
+# the Debian versions of the actions (replace the Fedora ones of the same name)
+DEBLIB=""
+for c in "$SL_ROOT/lib/repair-debian.sh" "$HERE/../lib/repair-debian.sh"; do [ -r "$c" ] && { DEBLIB=$c; break; }; done
+[ -n "$DEBLIB" ] || { echo "secure-linux-repair: lib/repair-debian.sh is missing. Run 'Repair setup' from Secure Linux Status." >&2; exit 3; }
+# shellcheck source=../lib/repair-debian.sh
+. "$DEBLIB"
+RP_BIN_DIR=$HERE
+ORIG_ARGS=("$@")
+usage() { sed -n '2,/^# ext4 as the installer/p' "$SELF" | sed 's/^# \{0,1\}//'; }
+ACTIONS="diagnose health data boot fs snapshot kernel gpu packages network windows password malware clone factory wipe"
+
+ACTION=""; AUTO=0; LIST=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    --dry-run|-n) RP_DRY=1 ;;
+    --auto-diagnose) AUTO=1 ;;
+    --action) shift; ACTION=${1:-} ;;
+    --action=*) ACTION=${1#--action=} ;;
+    --target) shift; RP_WANT_TARGET=${1:-} ;;
+    --list) LIST=1 ;;
+    *) echo "Unknown option: $1  (try --help)" >&2; exit 3 ;;
+  esac
+  shift
+done
+if [ "$LIST" = 1 ]; then for a in $ACTIONS; do printf '%-10s %s\n' "$a" "$(rp_action_label "$a")"; done; exit 0; fi
+if [ -n "$ACTION" ] && ! printf ' %s ' "$ACTIONS" | grep -q " $ACTION "; then echo "Unknown action '$ACTION'. Actions: $ACTIONS" >&2; exit 3; fi
+
+# real changes need administrator rights; a dry run and a look around do not
+if [ "$RP_DRY" != 1 ] && ! slh_is_root; then
+  if have sudo && [ -t 0 ]; then exec sudo "$SELF" "${ORIG_ARGS[@]}"; fi
+  if have pkexec; then exec pkexec "$SELF" "${ORIG_ARGS[@]}"; fi
+  echo "This needs administrator rights: run it with sudo." >&2; exit 1
+fi
+trap rp_cleanup EXIT
+trap 'echo; echo "Stopped. Unmounting everything that was opened..."; exit 130' INT
+
+banner() {
+  echo
+  echo "=================================================================="
+  echo "  Repair this computer  (Secure Linux, Debian)"
+  echo "  Running from: $(rp_env_name "$(rp_env)")"
+  [ "$RP_DRY" = 1 ] && echo "  DRY RUN: nothing will be changed. You only see what would happen."
+  echo "  Every change is explained first and waits for your yes."
+  echo "=================================================================="
+}
+run_action() {
+  case "$1" in
+    diagnose) act_diagnose ;; health) act_health ;; data) act_data ;; boot) act_boot ;; fs) act_fs ;; snapshot) act_snapshot ;;
+    kernel) act_kernel ;; gpu) act_gpu ;; packages) act_packages ;; network) act_network ;; windows) act_windows ;;
+    password) act_password ;; malware) act_malware ;; clone) act_clone ;; factory) act_factory ;; wipe) act_wipe ;;
+  esac
+}
+menu() {
+  local entries=() a choice args=()
+  for a in $ACTIONS; do entries+=("$a|$(rp_action_label "$a")"); done
+  if [ -t 0 ] && [ -t 1 ] && [ -z "${SL_REPAIR_PLAIN:-}" ] && have whiptail; then
+    for a in $ACTIONS; do args+=("$a" "$(rp_action_label "$a")"); done
+    choice=$(whiptail --title "Repair this computer" --menu "Pick what is wrong. If unsure, choose 'Find out what is wrong'." 22 78 15 "${args[@]}" 3>&1 1>&2 2>&3) || choice=""
+  else
+    choice=$(slh_menu "What is wrong? (if unsure, choose 1)" "${entries[@]}")
+  fi
+  printf '%s' "$choice"
+}
+
+banner
+if [ "$AUTO" = 1 ]; then act_diagnose; exit 0; fi
+if [ -n "$ACTION" ]; then run_action "$ACTION"; exit 0; fi
+while true; do
+  c=$(menu)
+  [ -n "$c" ] || { echo "Goodbye. Nothing else was changed."; break; }
+  run_action "$c"
+  rp_pause
+done
+exit 0

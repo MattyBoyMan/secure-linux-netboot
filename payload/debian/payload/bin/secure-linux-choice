@@ -1,0 +1,34 @@
+#!/bin/bash
+# secure-linux-choice: read or save one of your setup choices (/etc/secure-linux/choices).
+#   secure-linux-choice get KEY [DEFAULT]   print the saved value (or DEFAULT)
+#   secure-linux-choice set KEY VALUE       save it (needs your password once; runs as root)
+#   secure-linux-choice list                all saved choices
+# KEY: lowercase letters, digits and _ only. VALUE: one line, no control characters, at most 200 chars.
+# Settings take effect at the next "Repair setup" (Secure Linux Status), or right away where a helper applies them.
+# Choices you can set on this Debian setup: default_browser (librewolf|firefox), lite_auto_reboot (yes|no),
+# family_dns (yes|no), home_ssid (name of your home Wi-Fi), desktop (xfce|lxqt|icewm), ssh_server (yes|no),
+# nordvpn (yes|no), nordvpn_i386 (yes), warp (yes), antivirus (auto|yes|no), snapshots (yes|no), snapshot_keep (1-4),
+# snapshot_days, nvidia_driver (nvidia|nouveau), parts_autoinstall (yes|no).
+set -u   # no pipefail: "cmd | grep -q" must not fail when grep stops reading early
+SL_ROOT=${SL_ROOT:-/usr/local/lib/secure-linux}
+. "$SL_ROOT/lib/common.sh"
+valid_key() { printf '%s' "${1:-}" | grep -qE '^[a-z0-9_]{1,64}$' || { echo "Invalid choice name '${1:-}' (use a-z, 0-9, _)." >&2; exit 2; }; }
+elevate() {
+  [ "$(id -u)" -eq 0 ] && return 0
+  local self; self=$(readlink -f "$0" 2>/dev/null || echo "$0")
+  if [ -n "${DISPLAY:-}" ] && command -v pkexec >/dev/null 2>&1; then exec pkexec "$self" "$@"; fi
+  exec sudo "$self" "$@"
+}
+case "${1:-}" in
+  get) valid_key "${2:-}"; sl_choice_get "$2" "${3:-}"; echo ;;
+  set)
+    valid_key "${2:-}"; [ $# -ge 3 ] || { echo "Use: secure-linux-choice set KEY VALUE" >&2; exit 2; }
+    v=$3
+    case "$v" in *[[:cntrl:]]*) echo "Invalid value (control characters)." >&2; exit 2 ;; esac
+    [ ${#v} -le 200 ] || { echo "Value too long." >&2; exit 2; }
+    [ -n "${SL_SYSROOT:-}" ] || elevate "$@"
+    sl_choice_set "$2" "$v" ;;
+  list) cat "$SL_ETC/choices" 2>/dev/null ;;
+  -h|--help|help|"") sed -n '2,13p' "$0" ;;
+  *) sed -n '2,13p' "$0"; exit 2 ;;
+esac

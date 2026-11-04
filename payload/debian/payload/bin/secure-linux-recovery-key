@@ -1,0 +1,231 @@
+#!/bin/bash
+# secure-linux-recovery-key (Debian): a spare key for your encrypted disk, in case you forget your disk password.
+#
+#   secure-linux-recovery-key [create]        make a recovery key (if there isn't one yet), show it once, offer to print it
+#   secure-linux-recovery-key status          is there a recovery key already?   (--alert: also raise or clear the reminder)
+#   secure-linux-recovery-key replace         the old key is lost: remove it and make a new one
+#   secure-linux-recovery-key header-backup DIR
+#                                             save a copy of the disk's encryption header to DIR on a USB drive
+#                                             (rescues the disk if its first few megabytes ever get damaged)
+# How it works: the recovery key is one more password for the same encrypted disk (LUKS key slot), made with cryptsetup
+# luksAddKey. It is checked to really unlock the disk before it is shown. Until you have saved it, a reminder stays in
+# Secure Linux Status ("Make a spare key for your disk").
+set -u   # no pipefail: "cmd | grep -q" must not fail when grep stops reading early
+SL_ROOT=${SL_ROOT:-/usr/local/lib/secure-linux}
+# shellcheck source=../lib/common.sh
+. "$SL_ROOT/lib/common.sh"
+# shellcheck source=../files/security/lib-security.sh
+. "$SL_ROOT/files/security/lib-security.sh"
+
+usage() { sed -n '2,12p' "$(sec_self)" | sed 's/^# \{0,1\}//'; }
+
+find_dev() {
+  DEV=$(sec_luks_dev) || { echo "This computer's disk isn't encrypted (no LUKS disk found), so there's nothing to do."; return 1; }
+  UUID_=$(cryptsetup luksUUID "$DEV" 2>/dev/null)
+}
+luks_slots() {   # luks_slots DEV -> the numbers of the key slots in use (LUKS1 and LUKS2)
+  cryptsetup luksDump "$1" 2>/dev/null | awk '
+    /^Key Slot [0-9]+: ENABLED/ { print $3 + 0; next }
+    /^Keyslots:/ { f = 1; next }
+    /^[A-Za-z]/ { f = 0 }
+    f && /^[ \t]+[0-9]+: / { sub(/:.*/, "", $1); print $1 + 0 }' | sort -n
+}
+have_recovery() {   # a recovery key that WE made for this very disk, and the disk still has a second key slot
+  [ "$(sl_choice_get recovery_key_done no)" = yes ] || return 1
+  [ -n "$UUID_" ] && [ "$(sl_choice_get recovery_key_uuid)" = "$UUID_" ] || return 1
+  local slot; slot=$(sl_choice_get recovery_key_slot)
+  [ -n "$slot" ] && luks_slots "$DEV" | grep -qx "$slot"
+}
+set_alert() {
+  sl_alert luks-recovery-key "Make a spare key for your disk" \
+    "If you ever forget your disk password, everything on this computer is lost. A recovery key prevents that and takes 2 minutes." \
+    "Run: secure-linux-recovery-key   (or choose 'Make a disk recovery key' in Secure Linux Status)"
+}
+
+cmd_status() {
+  local alert=0 quiet=0 a
+  for a in "$@"; do case "$a" in --alert) alert=1 ;; --quiet) quiet=1 ;; esac; done
+  if ! find_dev >/dev/null 2>&1; then
+    [ "$quiet" = 1 ] || echo "This computer's disk isn't encrypted (no LUKS disk found), so there's nothing to do."
+    [ "$alert" = 1 ] && sl_clear luks-recovery-key
+    return 0
+  fi
+  if have_recovery; then
+    [ "$quiet" = 1 ] || echo "A recovery key exists for $DEV."
+    [ "$alert" = 1 ] && sl_clear luks-recovery-key
+    return 0
+  fi
+  [ "$quiet" = 1 ] || echo "No recovery key yet for $DEV. Run: secure-linux-recovery-key"
+  [ "$alert" = 1 ] && set_alert
+  return 1
+}
+
+make_key() {   # 6 groups of 6 letters/digits (no confusing ones: 0 o 1 l i): about 178 bits, easy to copy by hand
+  local raw
+  raw=$(LC_ALL=C tr -dc 'abcdefghjkmnpqrstuvwxyz23456789' < "${SL_RK_RANDOM:-/dev/urandom}" | head -c 36)
+  [ ${#raw} -eq 36 ] || return 1
+  printf '%s-%s-%s-%s-%s-%s' "${raw:0:6}" "${raw:6:6}" "${raw:12:6}" "${raw:18:6}" "${raw:24:6}" "${raw:30:6}"
+}
+
+print_page() {   # print_page KEY   one page for the printer (text); returns 1 if it could not be printed
+  local key=$1 page
+  command -v lp >/dev/null 2>&1 || return 1
+  lpstat -p 2>/dev/null | grep -q . || return 1
+  page=$(cat <<EOF
+DISK RECOVERY KEY
+=================
+Computer: $(hostname -s 2>/dev/null || echo this computer)      Made: $(date '+%d %B %Y')
+Disk: $DEV  ($UUID_)
+
+    $key
+
+Type this key INSTEAD of your disk password in the box that appears when the computer starts.
+Keep this page at home, in a safe place. NOT in the laptop bag.
+Anyone who holds this page and the computer can read everything on it.
+EOF
+)
+  printf '%s\n' "$page" | lp -t "Disk recovery key" >/dev/null 2>&1
+}
+
+cmd_create() {
+  sec_need_terminal create
+  sec_need_root create
+  find_dev || { sec_pause; return 0; }
+  if have_recovery; then
+    echo "Your disk already has a recovery key. (For safety it can't be shown again.)"
+    echo "If you lost it, a new one can be made: secure-linux-recovery-key replace"
+    sl_choice_set recovery_key_done yes; sl_clear luks-recovery-key
+    sec_pause "Press Enter to close. "; return 0
+  fi
+  cat <<'EOF'
+
+  DISK RECOVERY KEY
+  -----------------
+  This makes a long spare key that unlocks your disk if you ever forget your disk password.
+  You'll be asked for your CURRENT disk password first (the one you type when the computer starts).
+
+  Then the recovery key is shown ONCE. Save it in TWO places:
+    1. Bitwarden: make a new Secure Note called "Laptop disk recovery key" and paste it in.
+    2. Paper: write it down (or print it here) and keep it at home, NOT in the laptop bag.
+  Never keep it with the laptop: anyone holding both can read everything on it.
+
+EOF
+  sec_pause "Press Enter to continue (or close this window to stop). "
+  # kf, slot and saved are global on purpose: the EXIT trap below runs after this function has returned
+  local key before after
+  kf=""; slot=""; saved=0
+  key=$(make_key) || { echo "Couldn't make a random key. Nothing was changed."; sec_pause; return 1; }
+  kf=$(mktemp "${SL_RK_TMP:-/dev/shm}/slrk.XXXXXX" 2>/dev/null) || kf=$(mktemp)
+  chmod 600 "$kf"; printf '%s' "$key" > "$kf"
+  # if this window is closed before the key is saved, the new key slot is removed again (a key nobody has seen is useless)
+  cleanup() {
+    if [ -n "$slot" ] && [ "$saved" != 1 ] && [ -s "$kf" ]; then cryptsetup luksRemoveKey "$DEV" "$kf" >/dev/null 2>&1; fi
+    if command -v shred >/dev/null 2>&1; then shred -u "$kf" 2>/dev/null; fi; rm -f "$kf"
+  }
+  trap cleanup EXIT; trap 'exit 130' INT HUP TERM
+  before=$(luks_slots "$DEV" | tr '\n' ' ')
+  # cryptsetup asks for the current password on this terminal
+  if ! cryptsetup luksAddKey "$DEV" "$kf"; then
+    echo; echo "That didn't work (wrong password?). Nothing was changed. Try again any time."
+    sec_pause "Press Enter to close. "; return 1
+  fi
+  after=$(luks_slots "$DEV" | tr '\n' ' ')
+  slot=$(printf '%s\n' $after | grep -vxF -f <(printf '%s\n' $before) | head -n1)
+  if [ -z "$slot" ]; then
+    echo "The key was added but its place on the disk couldn't be worked out, so it can't be checked. Nothing is recorded."
+    sec_pause; return 1
+  fi
+  if ! cryptsetup open --test-passphrase --key-file "$kf" "$DEV" >/dev/null 2>&1; then
+    echo "The new key did not unlock the disk when tested, so it is being removed again. Nothing was changed."
+    sec_pause; return 1       # the exit trap removes the slot
+  fi
+  clear 2>/dev/null
+  echo
+  echo "  YOUR DISK RECOVERY KEY (shown only this once):"
+  echo
+  echo "      $key"
+  echo
+  if command -v qrencode >/dev/null 2>&1; then
+    echo "  The same key as a QR code (scan it with the Bitwarden app on your phone, then save as a note):"
+    qrencode -t ANSIUTF8 "$key"
+  fi
+  echo "  1. Save it in Bitwarden (Secure Note)."
+  echo "  2. Write it on paper; keep it at home, never with the laptop."
+  echo "  To use it: at the start-up password box, type this key instead of your password."
+  echo "  (It was tested just now: it does unlock this disk.)"
+  echo
+  local p=""
+  if command -v lp >/dev/null 2>&1 && lpstat -p 2>/dev/null | grep -q .; then
+    read -rp "  A printer is set up. Print this key on paper now? [y/N] " p || p=""
+    case "$p" in
+      [Yy]*) if print_page "$key"; then echo "  Sent to the printer. Collect the page and keep it safe. (The printing system holds the page only until it has printed.)"
+             else echo "  The printer didn't accept it. Write the key down by hand instead."; fi ;;
+    esac
+  fi
+  local a=""
+  while [ "$a" != saved ]; do read -rp "  Type  saved  and press Enter once you've stored it in both places: " a || break; done
+  if [ "$a" = saved ]; then
+    saved=1
+    sl_choice_set recovery_key_done yes; sl_choice_set recovery_key_uuid "$UUID_"; sl_choice_set recovery_key_slot "$slot"
+    sl_clear luks-recovery-key
+    clear 2>/dev/null
+    echo "Thank you. The key is no longer on screen. The reminder in Secure Linux Status is gone."
+  else
+    clear 2>/dev/null
+    echo "The window was closed before you confirmed, so the new key was removed again. Run secure-linux-recovery-key to start over."
+  fi
+}
+
+cmd_replace() {   # lost the old key: remove it and make a new one
+  sec_need_terminal replace
+  sec_need_root replace
+  find_dev || return 0
+  if have_recovery; then
+    sec_ask "Remove the old recovery key and make a new one? (Only do this if the old one is lost.)" no || return 0
+    local slot; slot=$(sl_choice_get recovery_key_slot)
+    echo "Removing the old recovery key (you are asked for your current disk password)..."
+    cryptsetup luksKillSlot "$DEV" "$slot" || { echo "Couldn't remove the old key."; sec_pause; return 1; }
+    sl_choice_set recovery_key_done no
+  fi
+  cmd_create
+}
+
+cmd_header_backup() {
+  local dir=${1:-}
+  [ -n "$dir" ] || { echo "Usage: secure-linux-recovery-key header-backup /media/$USER/YOUR-USB-DRIVE"; return 2; }
+  sec_need_root header-backup "$dir"
+  [ -d "$dir" ] || { echo "Folder '$dir' doesn't exist. Plug in the USB drive and choose a folder on it."; return 1; }
+  find_dev || return 0
+  local src_disk dst_dev
+  src_disk=$(lsblk -no PKNAME "$DEV" 2>/dev/null | head -1)
+  dst_dev=$(findmnt -no SOURCE --target "$dir" 2>/dev/null)
+  if [ -n "$src_disk" ] && [ -n "$dst_dev" ] && lsblk -sno NAME "$dst_dev" 2>/dev/null | grep -qx "$src_disk"; then
+    echo "That folder is on this computer's own disk. Please choose a folder on a USB drive instead."; return 1
+  fi
+  cat <<'EOF'
+
+  IMPORTANT: this backup still accepts every disk password and recovery key that works TODAY,
+  even if you change or remove them later. Keep the USB drive somewhere safe at home, and
+  delete this file if you ever change your disk password because someone may have seen it.
+
+EOF
+  local f
+  f="$dir/disk-header-$(hostname -s 2>/dev/null || echo laptop)-$(date +%Y%m%d).img"
+  [ -e "$f" ] && { echo "A backup from today is already there: $f"; return 0; }
+  if cryptsetup luksHeaderBackup "$DEV" --header-backup-file "$f"; then
+    chmod 600 "$f"; local u; u=$(sl_user); [ -n "$u" ] && chown "$u": "$f" 2>/dev/null
+    echo "Saved: $f"
+    echo "To restore it one day (from the rescue USB): cryptsetup luksHeaderRestore <disk> --header-backup-file $(basename "$f")"
+  else
+    echo "The backup didn't work. Is the USB drive full or read-only?"; return 1
+  fi
+}
+
+case "${1:-create}" in
+  -h|--help|help) usage ;;
+  create) cmd_create ;;
+  replace) cmd_replace ;;
+  status) shift; cmd_status "$@" ;;
+  header-backup) shift; cmd_header_backup "$@" ;;
+  *) echo "Unknown command '$1'." >&2; usage; exit 2 ;;
+esac

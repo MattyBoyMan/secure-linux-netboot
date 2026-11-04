@@ -1,0 +1,13 @@
+[Unit]
+Description=Secure Linux: software for a newly plugged-in device
+# Several devices plugged in together are one run (a oneshot unit that is already running is not started twice).
+StartLimitIntervalSec=300
+StartLimitBurst=6
+ConditionPathExists=/usr/local/bin/secure-linux-parts
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/secure-linux-parts --hotplug --quiet
+Nice=10
+IOSchedulingClass=idle
+TimeoutStartSec=30min

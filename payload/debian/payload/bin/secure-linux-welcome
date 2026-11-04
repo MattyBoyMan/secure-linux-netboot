@@ -1,0 +1,284 @@
+#!/bin/bash
+# secure-linux-welcome (Debian): the first-login wizard, made for people who do not want to decide things. It looks at this
+# computer, decides everything it safely can by itself, and asks AT MOST 3 simple questions in one go. Every question has an
+# answer already chosen: press Enter to accept it. Your answers are remembered and never asked again.
+#   secure-linux-welcome                  run the wizard (only what is still open)
+#   secure-linux-welcome --again          go through everything again ("Welcome & setup choices")
+#   secure-linux-welcome --page NAME      one page on its own: wifi updates browser backup recovery health vpn snapshots
+#   secure-linux-welcome --list           the pages and whether they are done
+#   secure-linux-welcome --status         one line: what is done
+# What it decides for you (no question): firmware, microcode, updates, firewall, encrypted DNS, the default browser, the weekly
+# hardware check, the weekly virus scan (computers with 1.5 GB of memory or more), system snapshots before updates.
+# What it may ask (only when detection says it matters, most important first, never more than 3 per run, the rest at the next login):
+#   1. your Windows Wi-Fi networks (only if you saved them on the old computer; needs the PIN you chose)
+#   2. the Broadcom Wi-Fi driver (only if your Wi-Fi chip needs it; recommended: yes)
+#   3. a spare key for your encrypted disk (only if there is none; recommended: yes)
+#   4. NVIDIA's own graphics driver (only if the card is supported; recommended: yes without Secure Boot, no with it)
+#   5. which browser opens links (only if both Firefox and LibreWolf are installed; recommended: your saved choice)
+# Windows: zenity dialogs when there is a desktop; whiptail or dialog (or plain questions) in a terminal. Nothing times out;
+# closing a window means "use the recommended answer" for the browser and "not now" for anything that installs or changes something.
+# Extra pages from other areas plug in from $SL_ROOT/wizard.d/NN-name.sh, run after ours only while fewer than 3 questions were asked.
+# A page file defines two functions and nothing else: page_title (prints a short title) and page_run (shows the page with the
+# helpers below, returns 0). Helpers (same names as the Fedora wizard): wz_info "text", wz_yesno "question" [yes|no = the
+# answer Enter gives; default no] (0 = yes), wz_choice "question" opt1 opt2 ... (prints the chosen option; Enter = the first),
+# wz_input "question" [default], wz_open URL_or_file, wz_root CMD..., wz_term CMD..., wz_done KEY / wz_is_done KEY.
+# Tests: SL_WIZARD_ANSWERS="page=answer,..." answers without showing anything (yes|no, or an option; a missing answer = Enter).
+set -u   # no pipefail: "cmd | grep -q" must not fail when grep stops reading early
+SL_ROOT=${SL_ROOT:-/usr/local/lib/secure-linux}
+# shellcheck source=../lib/common.sh
+. "$SL_ROOT/lib/common.sh"
+have() { command -v "$1" >/dev/null 2>&1; }
+SELF=$(readlink -f "$0" 2>/dev/null || echo "$0")
+TITLE="Welcome to Secure Linux"
+USTATE=${SL_WELCOME_STATE:-${XDG_STATE_HOME:-${HOME:-/tmp}/.local/state}/secure-linux/welcome}
+mkdir -p "$USTATE" 2>/dev/null
+DONE=$USTATE/wz-done; touch "$DONE" 2>/dev/null
+ANS=$USTATE/answers; touch "$ANS" 2>/dev/null
+PAGES="wifi updates browser backup recovery health vpn snapshots"
+MAXQ=3
+CUR=""
+
+# ---------------------------------------------------------------- windows
+ui_tool() {
+  [ -n "${SL_WIZARD_ANSWERS:-}" ] && { echo script; return; }
+  if [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ] && have zenity; then echo zenity; return; fi
+  if [ -t 0 ] && [ -t 1 ]; then
+    have whiptail && { echo whiptail; return; }
+    have dialog && { echo dialog; return; }
+    echo tty; return
+  fi
+  echo none
+}
+scripted() { printf ',%s,' "$SL_WIZARD_ANSWERS" | sed -n "s/.*,$CUR=\([^,]*\),.*/\1/p" | head -n1; }
+wz_info() {
+  case "$(ui_tool)" in
+    script) printf 'INFO[%s]: %s\n' "$CUR" "$1" ;;
+    zenity) zenity --info --no-markup --title="$TITLE" --width=560 --text="$1" 2>/dev/null ;;
+    whiptail) whiptail --title "$TITLE" --msgbox "$1" 22 76 ;;
+    dialog) dialog --title "$TITLE" --msgbox "$1" 22 76; clear ;;
+    tty) printf '\n%s\n' "$1"; read -rp "Press Enter to continue. " _ ;;
+    *) return 0 ;;
+  esac
+}
+wz_yesno() {   # wz_yesno "question" [yes|no]  -> 0 = yes. Enter takes the second argument (default no).
+  local a def=${2:-no} q=$1
+  case "$(ui_tool)" in
+    script) a=$(scripted); a=${a:-$def}; printf 'ASK[%s]: %s -> %s\n' "$CUR" "$q" "$a"; [ "$a" = yes ] ;;
+    zenity) zenity --question --no-markup --title="$TITLE" --width=560 --ok-label="Yes$([ "$def" = yes ] && echo ' (recommended)')" --cancel-label="No$([ "$def" = no ] && echo ' (recommended)')" --text="$q" 2>/dev/null ;;
+    whiptail) whiptail --title "$TITLE" $([ "$def" = no ] && echo --defaultno) --yesno "$q" 22 76 ;;
+    dialog) dialog --title "$TITLE" $([ "$def" = no ] && echo --defaultno) --yesno "$q" 22 76; a=$?; clear; return $a ;;
+    tty) if [ "$def" = yes ]; then read -rp "$q [Y/n] " a || return 1; case "$a" in [Nn]*) return 1 ;; *) return 0 ;; esac
+         else read -rp "$q [y/N] " a || return 1; case "$a" in [Yy]*) return 0 ;; *) return 1 ;; esac; fi ;;
+    *) [ "$def" = yes ] && return 0; return 1 ;;
+  esac
+}
+wz_choice() {   # wz_choice "question" opt... -> prints the option; Enter / closing the window = the FIRST option
+  local q=$1 o i=0 args=() a; shift
+  case "$(ui_tool)" in
+    script) a=$(scripted); for o in "$@"; do case "$o" in "$a"*) [ -n "$a" ] && { printf '%s' "$o"; return 0; } ;; esac; done; printf '%s' "$1"; return 0 ;;
+    zenity) a=$(for o in "$@"; do [ $i = 0 ] && echo TRUE || echo FALSE; echo "$o"; i=$((i + 1)); done | zenity --list --radiolist --title="$TITLE" --width=560 --height=360 --text="$q" --column="" --column=Choice 2>/dev/null | head -n1)
+            printf '%s' "${a:-$1}" ;;
+    whiptail|dialog) for o in "$@"; do i=$((i + 1)); args+=("$i" "$o"); done
+      a=$("$(ui_tool)" --title "$TITLE" --default-item 1 --menu "$q" 22 76 10 "${args[@]}" 3>&1 1>&2 2>&3) || a=1
+      [ "$(ui_tool)" = dialog ] && clear >&2
+      [[ "$a" =~ ^[0-9]+$ ]] && eval "printf '%s' \"\${$((a))}\"" 2>/dev/null ;;
+    tty) printf '\n%s\n' "$q" >&2; for o in "$@"; do i=$((i + 1)); printf '  %d) %s%s\n' "$i" "$o" "$([ $i = 1 ] && echo '   <- recommended (Enter)')" >&2; done
+      read -rp "Number (Enter = 1): " a || a=""
+      if [[ "$a" =~ ^[0-9]+$ ]] && [ "$a" -ge 1 ] && [ "$a" -le "$i" ]; then eval "printf '%s' \"\${$((a))}\""; else printf '%s' "$1"; fi ;;
+    *) printf '%s' "$1" ;;
+  esac
+}
+wz_input() {
+  local a
+  case "$(ui_tool)" in
+    script) a=$(scripted); printf '%s' "${a:-${2:-}}" ;;
+    zenity) zenity --entry --title="$TITLE" --width=560 --text="$1" --entry-text="${2:-}" 2>/dev/null ;;
+    whiptail) whiptail --title "$TITLE" --inputbox "$1" 12 76 "${2:-}" 3>&1 1>&2 2>&3 ;;
+    dialog) dialog --title "$TITLE" --inputbox "$1" 12 76 "${2:-}" 3>&1 1>&2 2>&3; clear >&2 ;;
+    tty) read -rp "$1 [${2:-}] " a || return 0; printf '%s' "${a:-${2:-}}" ;;
+    *) printf '%s' "${2:-}" ;;
+  esac
+}
+wz_open() { [ "$(ui_tool)" = script ] && { echo "OPEN: $1"; return 0; }; have xdg-open && { xdg-open "$1" >/dev/null 2>&1 & }; return 0; }
+wz_root() { if [ "$(ui_tool)" = script ]; then echo "ROOT: $*"; return 0; fi; if [ "$(id -u)" -eq 0 ]; then "$@"; else pkexec "$@"; fi; }
+wz_term() {
+  if [ "$(ui_tool)" = script ]; then echo "RUN: $*"; return 0; fi
+  if [ -t 0 ] && [ -t 1 ]; then "$@"; elif have secure-linux-terminal; then secure-linux-terminal --hold "$@"; else "$@"; fi
+}
+wz_done() { grep -qx "$1" "$DONE" 2>/dev/null || echo "$1" >> "$DONE"; }
+wz_is_done() { grep -qx "$1" "$DONE" 2>/dev/null; }
+remember() { sed -i "/^$1=/d" "$ANS" 2>/dev/null; printf '%s=%s\n' "$1" "$2" >> "$ANS"; }   # remember KEY VALUE (your answers, per person)
+
+# ---------------------------------------------------------------- detection (decides what is worth asking)
+connected() { [ "$(nmcli -t -f STATE general 2>/dev/null)" = connected ]; }
+sb_on() { have mokutil && mokutil --sb-state 2>/dev/null | grep -qi 'SecureBoot enabled'; }
+drivers_offer() { have secure-linux-drivers && secure-linux-drivers check 2>/dev/null | grep -q "OFFER.*$1"; }
+needs_recovery() {
+  have secure-linux-recovery-key || return 1
+  lsblk -rno FSTYPE 2>/dev/null | grep -q crypto_LUKS || return 1
+  ! secure-linux-recovery-key status --quiet >/dev/null 2>&1
+}
+both_browsers() { sl_pkg_installed firefox-esr && sl_pkg_installed librewolf; }
+
+# ---------------------------------------------------------------- the questions: q_NAME returns 0 if it asked something (and remembers the answer)
+q_wifi() {
+  { [ -s "$SL_STATE/wifi-record" ] || [ -s "$SL_STATE/wifi-staged" ]; } || return 1
+  CUR=wifi
+  if wz_yesno "You saved your Wi-Fi networks from Windows. Add them to this computer now? (You will type the PIN you chose when you saved them.)" yes; then
+    wz_term secure-linux-wifi-import; remember wifi yes
+  else remember wifi later; fi
+  wz_done q-wifi; return 0
+}
+q_broadcom() {
+  drivers_offer Broadcom || return 1
+  CUR=broadcom
+  if wz_yesno "Your Wi-Fi chip (Broadcom) needs an extra driver to work. Install it now? It comes from Debian's own archive and needs a cable or phone USB tethering for the download. Recommended: yes." yes; then
+    wz_term secure-linux-drivers broadcom --yes; remember broadcom yes
+  else remember broadcom no; fi
+  wz_done q-broadcom; return 0
+}
+q_recovery() {
+  needs_recovery || return 1
+  CUR=recovery
+  if wz_yesno "Make a spare key for your encrypted disk? If you ever forget the disk password, everything on this computer is lost. The spare key prevents that: it takes 2 minutes and you save it in Bitwarden and on paper. Recommended: yes." yes; then
+    wz_term secure-linux-recovery-key create; remember recovery yes
+  else remember recovery later; fi
+  wz_done q-recovery; return 0
+}
+q_nvidia() {
+  drivers_offer NVIDIA || return 1
+  CUR=nvidia
+  local def=yes note="Recommended: yes."
+  if sb_on; then def=no; note="Secure Boot is on, so it needs a key you approve on a blue screen at the next restart. Recommended: no, unless you play 3D games or do video editing."; fi
+  if wz_yesno "Your NVIDIA graphics card works now with the open driver (fine for everyday use). NVIDIA's own driver is faster for 3D, but it is not open source and needs a restart. Install it? $note" "$def"; then
+    wz_term secure-linux-drivers nvidia --yes; remember nvidia yes
+  else remember nvidia no; wz_root /usr/local/bin/secure-linux-choice set nvidia_driver nouveau; fi
+  wz_done q-nvidia; return 0
+}
+q_browser() {
+  both_browsers || return 1
+  CUR=browser
+  local want c
+  want=$(sl_choice_get default_browser librewolf)
+  if [ "$want" = firefox ]; then c=$(wz_choice "Which web browser should open links? (Enter keeps the recommended one.)" "Firefox ESR (most compatible)" "LibreWolf (more private)")
+  else c=$(wz_choice "Which web browser should open links? (Enter keeps the recommended one.)" "LibreWolf (more private)" "Firefox ESR (most compatible)"); fi
+  case "$c" in LibreWolf*) secure-linux-browser set librewolf >/dev/null; remember browser librewolf ;; Firefox*) secure-linux-browser set firefox >/dev/null; remember browser firefox ;; esac
+  wz_done q-browser; return 0
+}
+
+applies() {   # applies NAME -> 0 if the question could be asked on this computer
+  case "$1" in
+    wifi) [ -s "$SL_STATE/wifi-record" ] || [ -s "$SL_STATE/wifi-staged" ] ;;
+    broadcom) drivers_offer Broadcom ;; nvidia) drivers_offer NVIDIA ;; recovery) needs_recovery ;; browser) both_browsers ;;
+  esac
+}
+anything_open() {   # 0 if the summary has not been shown or a question still waits
+  local q
+  wz_is_done summary || return 0
+  for q in wifi broadcom recovery nvidia browser; do wz_is_done "q-$q" && continue; applies "$q" && return 0; done
+  return 1
+}
+
+# ---------------------------------------------------------------- the one summary: what is already taken care of
+summary_text() {
+  local t="Everything below is already taken care of. You do not need to do anything.
+"
+  if connected; then t="$t
+ - Internet: connected."; else t="$t
+ - Internet: not connected yet. Click the network icon at the top right and pick your Wi-Fi (or plug in a cable); setup carries on by itself."; fi
+  t="$t
+ - Updates: checked every day; security updates install by themselves. A notice tells you when a restart helps$([ "$(sl_choice_get lite_auto_reboot no)" = yes ] && echo ' (restarts at 4 am by itself, your choice)')."
+  t="$t
+ - Firmware and drivers: chosen for your hardware. Hardware health check: every week."
+  if have clamscan; then t="$t
+ - Virus scan: every week, quietly. You only hear about it if something is found."
+  else t="$t
+ - Virus scan: not installed (this computer is too small for it)."; fi
+  case "$(secure-linux-snapshot status 2>/dev/null | cut -d'|' -f1)" in
+    ok|none|pending|full) t="$t
+ - System snapshot before updates: on. If an update breaks something: Repair This Computer > Go back to an earlier snapshot." ;;
+    *) t="$t
+ - System snapshots: not available on this computer (not enough spare disk room)." ;;
+  esac
+  if [ "$(sl_arch)" = amd64 ] && have nordvpn; then t="$t
+ - VPN: NordVPN is installed. Sign in any time: Applications > VPN Setup."; fi
+  t="$t
+ - Backups: this computer does not copy your files elsewhere by itself. Copy Documents and Pictures to an external drive regularly; the START-HERE guide has a short chapter on it."
+  if sl_is_i386; then t="$t
+ - 32-bit computer: web browsers are dropping 32-bit support. Debian still updates Firefox ESR today; the START-HERE guide says what to do when that stops."; fi
+  printf '%s' "$t"
+}
+
+# ---------------------------------------------------------------- single pages (--page NAME, used by Status "Fix it" buttons)
+page_title_of() {
+  case "$1" in
+    wifi) echo "Connect to the internet" ;; updates) echo "Updates" ;; browser) echo "Your web browser" ;;
+    backup) echo "Keeping your files safe" ;; recovery) echo "A spare key for your disk" ;; health) echo "Is the computer healthy?" ;;
+    vpn) echo "VPN (private internet)" ;; snapshots) echo "Undoing a bad update" ;; *) echo "$1" ;;
+  esac
+}
+run_page() {
+  CUR=$1
+  case "$1" in
+    wifi)
+      if connected; then wz_info "This computer is connected to the internet."; else
+        wz_info "This computer is not connected to the internet yet. Click the network icon at the top right of the screen, choose your Wi-Fi name and type its password. A cable also works."; fi
+      if { [ -s "$SL_STATE/wifi-record" ] || [ -s "$SL_STATE/wifi-staged" ]; } && wz_yesno "Add the Wi-Fi networks you saved from Windows now?" yes; then wz_term secure-linux-wifi-import; fi ;;
+    updates)
+      wz_info "Updates: this computer checks every day and installs security updates by itself. When an update needs a restart, a notice tells you."
+      if wz_yesno "Restart by itself at 4 am when an update needs it? (Open work would be closed. 'No' is the safer answer for most people.)" no; then
+        wz_root /usr/local/bin/secure-linux-choice set lite_auto_reboot yes; else wz_root /usr/local/bin/secure-linux-choice set lite_auto_reboot no; fi
+      wz_yesno "Install the updates that are waiting right now?" yes && wz_term secure-linux-status --fix updates ;;
+    browser) q_browser || wz_info "There is only one web browser installed, so links open in it." ;;
+    backup) wz_info "Your files are not backed up by this computer on its own. Copy Documents and Pictures to an external drive or a cloud service regularly, and keep one copy away from this computer. The START-HERE guide has a short chapter on backups."
+      if wz_yesno "Open the guide now?" yes; then if have secure-linux-guide; then secure-linux-guide >/dev/null 2>&1 & fi; fi ;;
+    recovery) if needs_recovery; then q_recovery; else wz_info "The disk recovery key is taken care of (or this disk is not encrypted)."; fi ;;
+    health) wz_info "This checks every part of the computer and tells you in plain English what needs a look. About a minute; it changes nothing."
+      wz_yesno "Run the hardware check now?" yes && secure-linux-health --gui ;;
+    vpn) if [ "$(sl_arch)" != amd64 ]; then wz_info "NordVPN and Cloudflare WARP are not available for a 32-bit computer. WireGuard works: see 'secure-linux-vpn available'."
+         elif have nordvpn; then wz_info "NordVPN is installed. You need your own NordVPN account to sign in."; wz_yesno "Sign in to NordVPN now?" no && wz_term secure-linux-vpn setup
+         else wz_info "The VPN app is still being installed. Try again after setup has finished."; fi ;;
+    snapshots) wz_info "Before updates, this computer keeps a snapshot of its system part (not your files). If an update breaks something, open 'Repair This Computer' and choose 'Go back to an earlier snapshot'. Status: $(secure-linux-snapshot status 2>/dev/null)" ;;
+  esac
+  return 0
+}
+
+page_ids() { local f; for f in "$SL_ROOT"/wizard.d/*.sh; do [ -f "$f" ] && echo "$f"; done; }
+run_plugin() {   # a page from another area; one that fails never stops the wizard
+  local f=$1 key; key=$(basename "$f" .sh)
+  CUR=${key#[0-9][0-9]-}
+  ( # shellcheck disable=SC1090
+    . "$f" 2>/dev/null && declare -F page_run >/dev/null && page_run ) || true
+}
+
+wizard() {   # wizard [again]
+  local again=${1:-} asked=0 q p
+  [ "$(ui_tool)" = none ] && { echo "No screen or terminal to ask on; the welcome wizard will run at your next login."; return 0; }
+  for q in wifi broadcom recovery nvidia browser; do
+    [ "$asked" -ge "$MAXQ" ] && break
+    if [ "$again" != again ] && wz_is_done "q-$q"; then continue; fi
+    if "q_$q"; then asked=$((asked + 1)); fi
+  done
+  # pages from other areas only while there is room for more questions
+  if [ "$asked" -lt "$MAXQ" ]; then for p in $(page_ids); do CUR=$(basename "$p" .sh); run_plugin "$p"; done; fi
+  # one summary, once (or whenever asked for again)
+  if [ "$again" = again ] || ! wz_is_done summary; then CUR=summary; wz_info "$(summary_text)"; wz_done summary; fi
+  return 0
+}
+
+case "${1:-}" in
+  -h|--help) sed -n '2,/^# Tests:/p' "$0" | sed 's/^# \{0,1\}//' ;;
+  --list) for p in $PAGES; do printf '%-10s %-34s %s\n' "$p" "$(page_title_of "$p")" "$(wz_is_done "q-$p" && echo done || echo 'not asked / nothing to ask')"; done ;;
+  --status) echo "$(grep -c '^q-' "$DONE") question(s) answered; summary $(wz_is_done summary && echo shown || echo 'not shown yet')" ;;
+  --again) : > "$DONE"; wizard again ;;
+  --page) [ -n "${2:-}" ] || { echo "Which page? $PAGES"; exit 2; }
+          case " $PAGES " in *" $2 "*) run_page "$2" ;; *) echo "Unknown page: $2 (pages: $PAGES)"; exit 1 ;; esac ;;
+  --autostart)
+    # at login: only if something is still open; give the desktop a moment to settle first
+    anything_open || exit 0
+    [ -n "${SL_WIZARD_ANSWERS:-}" ] || sleep "${SL_WELCOME_DELAY:-20}"
+    wizard ;;
+  "") wizard ;;
+  *) echo "Unknown option: $1" >&2; exit 2 ;;
+esac
+exit 0

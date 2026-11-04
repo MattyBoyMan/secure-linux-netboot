@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Scan for Viruses Now
+GenericName=Virus scan (ClamAV)
+Comment=Scans your files for viruses now (the same scan also runs by itself every week). Nothing is deleted.
+Exec=/usr/local/bin/secure-linux-terminal --hold /usr/local/bin/secure-linux-scan now
+Icon=security-medium
+Terminal=false
+Categories=System;Security;
+Keywords=virus;scan;clamav;malware;

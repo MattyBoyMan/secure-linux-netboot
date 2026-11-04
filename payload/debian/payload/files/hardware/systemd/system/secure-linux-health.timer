@@ -1,0 +1,11 @@
+[Unit]
+Description=Secure Linux hardware health check (20 minutes after start, then every week)
+
+[Timer]
+OnBootSec=20min
+OnUnitActiveSec=7d
+RandomizedDelaySec=1h
+Persistent=true
+
+[Install]
+WantedBy=timers.target

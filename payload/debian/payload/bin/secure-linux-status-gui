@@ -1,0 +1,131 @@
+#!/bin/bash
+# secure-linux-status-gui: the "Secure Linux Status & Fixes" window (C2).
+# A list with a green / orange / red dot for every check; pick a red or orange row and press "Fix it".
+# Uses kdialog on KDE and zenity elsewhere; with neither, opens the terminal view instead.
+#   secure-linux-status-gui [--zenity|--kdialog]   force one toolkit
+set -u   # no pipefail: "cmd | grep -q" must not fail when grep stops reading early
+case "${1:-}" in -h|--help) sed -n '2,5p' "$0"; exit 0 ;; esac
+have() { command -v "$1" >/dev/null 2>&1; }
+TITLE="Secure Linux Status & Fixes"
+NL=$'\n'
+SL_ROOT=${SL_ROOT:-/usr/local/lib/secure-linux}
+SL_STATE=${SL_STATE:-/var/lib/secure-linux}   # (the test suite points this at a scratch folder)
+# shellcheck source=../lib/common.sh
+. "$SL_ROOT/lib/common.sh" 2>/dev/null
+
+UI=""
+case "${1:-}" in
+  --zenity) UI=zenity ;; --kdialog) UI=kdialog ;;
+  *) # only when a desktop session is actually running (over ssh or from a text console, a window
+     # program would fail silently - the terminal view is the friendly answer there)
+     if [ -z "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]; then UI=""
+     elif [[ "${XDG_CURRENT_DESKTOP:-}" == *KDE* ]] && have kdialog; then UI=kdialog
+     elif have zenity; then UI=zenity
+     elif have kdialog; then UI=kdialog; fi ;;
+esac
+# No window toolkit: fall back to the text view. --terminal stops secure-linux-status from bouncing
+# straight back into this script (its no-argument form would open the window again).
+[ -n "$UI" ] || exec secure-linux-terminal --no-hold secure-linux-status --terminal
+
+info() { if [ "$UI" = kdialog ]; then kdialog --title "$TITLE" --msgbox "$1"; else zenity --info --no-markup --title="$TITLE" --width=460 --text="$1"; fi; }
+ask()  { if [ "$UI" = kdialog ]; then kdialog --title "$TITLE" --yesno "$1"; else zenity --question --no-markup --title="$TITLE" --width=460 --text="$1"; fi; }
+busy() {   # busy "message" cmd...   run cmd while showing a "please wait" note
+  local msg=$1; shift
+  if [ "$UI" = kdialog ]; then
+    kdialog --title "$TITLE" --passivepopup "$msg" 20 2>/dev/null &
+    "$@" >/dev/null 2>&1
+  else
+    "$@" 2>&1 | zenity --progress --pulsate --auto-close --no-cancel --title="$TITLE" --text="$msg" 2>/dev/null
+  fi
+}
+
+# First open: check again if the results are missing or older than 6 hours
+if [ ! -f "$SL_STATE/checks" ] || [ -n "$(find "$SL_STATE/checks" -mmin +360 2>/dev/null)" ]; then
+  busy "Checking your computer (about a minute)..." secure-linux-status --refresh
+fi
+
+show_findings() {
+  local tmp; tmp=$(mktemp)
+  secure-linux-status --av-findings > "$tmp"
+  if grep -q 'FOUND$' "$tmp"; then
+    if [ "$UI" = kdialog ]; then
+      kdialog --title "Antivirus findings" --textbox "$tmp" 760 420
+      ask "Have you dealt with these files? (Deleted them, or checked that they are safe.)" && secure-linux-status --fix av-ack
+    else
+      zenity --text-info --title="Antivirus findings" --width=760 --height=420 --filename="$tmp" \
+        --ok-label="Mark as dealt with" --cancel-label="Close" && secure-linux-status --fix av-ack
+    fi
+  else
+    info "$(cat "$tmp")"
+  fi
+  rm -f "$tmp"
+}
+
+run_fix() {
+  local key=$1
+  case "$key" in
+    "") info "Nothing to fix here: this one is fine." ;;
+    info) info "Nothing is wrong. Some apps were left out because they don't exist for this type of computer.${NL}${NL}You don't need to do anything." ;;
+    restart) ask "Restart the computer now?${NL}${NL}Save your work first. If updates are waiting, they install during the restart (a few minutes)." \
+               && secure-linux-status --fix restart ;;
+    check) busy "Checking your computer (about a minute)..." secure-linux-status --refresh ;;
+    av-findings) show_findings ;;
+    av-ack|snapshots-clean) secure-linux-status --fix "$key" ;;
+    updates) secure-linux-status --fix updates
+             [ "$(sl_profile 2>/dev/null)" = full ] && \
+               info "Discover is opening on its Updates page.${NL}${NL}Press 'Update All'. The updates install when you restart." ;;
+    *) secure-linux-status --fix "$key" ;;
+  esac
+}
+
+dot()  { case "$1" in bad) printf '\xf0\x9f\x94\xb4' ;; warn) printf '\xf0\x9f\x9f\xa0' ;; info) printf '\xf0\x9f\x94\xb5' ;; *) printf '\xf0\x9f\x9f\xa2' ;; esac; }  # red / orange / green circle
+word() { case "$1" in bad) echo "Needs attention" ;; warn) echo "Worth a look" ;; info) echo "For your information" ;; *) echo "OK" ;; esac; }
+
+while true; do
+  mapfile -t ROWS < <(secure-linux-status --rows)
+  fixes=$(secure-linux-status --list-fixes)
+  for k in updates restart repair firmware diag upgrade outside-apps hotspot hwhealth vpn hibernate welcome backup battery ai care guide; do   # tools at the bottom
+    fl=$(printf '%s\n' "$fixes" | awk -F'|' -v k="$k" '$1==k && $2=="yes" {print $3}')
+    [ -n "$fl" ] && ROWS+=("tool|$fl||$k|")
+  done
+  updated=$(cat "$SL_STATE/checks.time" 2>/dev/null || echo "never")
+  text="Green = fine.  Orange = worth a look.  Red = needs attention.${NL}Pick a row and press 'Fix it'.   (Last checked: $updated)"
+
+  if [ "$UI" = zenity ]; then
+    args=()
+    for r in "${ROWS[@]}"; do
+      IFS='|' read -r st label detail fix fl <<<"$r"
+      [ "$st" = info ] && fix=info
+      if [ "$st" = tool ]; then args+=("${fix:-none}" "   >" "$label" "" "Open")
+      else args+=("${fix:-none}" "$(dot "$st") $(word "$st")" "$label" "$detail" "${fl:-}"); fi
+    done
+    out=$(zenity --list --title="$TITLE" --width=1000 --height=660 --text="$text" \
+      --column=key --column="Status" --column="Check" --column="Details" --column="Fix" \
+      --hide-column=1 --print-column=1 --ok-label="Fix it" --cancel-label="Close" \
+      --extra-button="Check again" --extra-button="Terminal view" "${args[@]}" 2>/dev/null)
+    rc=$?
+    case "$out" in
+      "Check again") run_fix check; continue ;;
+      "Terminal view") exec secure-linux-terminal --no-hold secure-linux-status --terminal ;;
+    esac
+    [ $rc -eq 0 ] || exit 0
+    key=${out%%|*}; [ "$key" = none ] && key=""
+    run_fix "$key"
+  else
+    args=(); i=0; keys=()
+    for r in "${ROWS[@]}"; do
+      IFS='|' read -r st label detail fix fl <<<"$r"
+      [ "$st" = info ] && fix=info
+      i=$((i + 1)); keys[$i]=$fix
+      if [ "$st" = tool ]; then args+=("r$i" "      > $label")
+      else args+=("r$i" "$(dot "$st")  $label${detail:+  -  $detail}${fl:+     [Fix: $fl]}"); fi
+    done
+    args+=(check "      > Check again" terminal "      > Terminal view")
+    out=$(kdialog --title "$TITLE" --geometry 1000x660 --menu "$text" "${args[@]}" 2>/dev/null) || exit 0
+    case "$out" in
+      check) run_fix check ;;
+      terminal) exec secure-linux-terminal --no-hold secure-linux-status --terminal ;;
+      r*) run_fix "${keys[${out#r}]:-}" ;;
+    esac
+  fi
+done

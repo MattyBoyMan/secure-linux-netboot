@@ -1,0 +1,18 @@
+#!/bin/bash
+# secure-linux-progress (Debian): a small window that shows how far the first-start setup has got.
+# Opens at login while the setup is still running and closes by itself when it is finished.
+P=/var/lib/secure-linux/progress
+case "${1:-}" in -h|--help) sed -n '2,3p' "$0"; exit 0 ;; esac
+[ -f "$P" ] || exit 0
+grep -q '^done' "$P" 2>/dev/null && exit 0
+command -v zenity >/dev/null 2>&1 || exit 0
+(
+  while true; do
+    if grep -q '^done' "$P" 2>/dev/null; then echo "100"; exit 0; fi
+    IFS='|' read -r n t text < "$P"
+    echo "# Step $n of $t: $text"
+    sleep 3
+  done
+) | zenity --progress --pulsate --auto-close --no-cancel --width=520 --title="Secure Linux is setting up your computer" \
+    --text="Starting..." 2>/dev/null
+exit 0

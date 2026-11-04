@@ -1,0 +1,51 @@
+#!/bin/bash
+# secure-linux-parts (Debian): finds what hardware this computer has and installs the software to USE it (disc burning for
+# a DVD drive, scanner and printer drivers, Bluetooth, fingerprint, drawing tablet, game controllers ...).
+#   secure-linux-parts --check       show every device found and what is installed / missing (changes nothing; default)
+#   secure-linux-parts --install     install what is missing (needs the administrator password and the internet)
+#   secure-linux-parts --reassert    put back software that this tool installed earlier and that went missing
+#   secure-linux-parts --hotplug     (used when a new device is plugged in) tell the user and install its software
+#   secure-linux-parts --json | --no-drivers | --quiet | --help     see the shared tool's help
+# This is the Debian wrapper of the shared tool (linux/bin/secure-linux-parts): same discovery of devices, but the packages
+# are Debian's (see files/hardware/parts.map) and they come from Debian's own archive. Nothing else is downloaded.
+set -u
+SL_ROOT=${SL_ROOT:-/usr/local/lib/secure-linux}
+# shellcheck source=../lib/compat.sh
+. "$SL_ROOT/lib/compat.sh"
+# shellcheck source=../lib/common.sh
+. "$SL_ROOT/lib/common.sh"
+export SL_STATE SL_ETC   # the shared tool reads these (they are the system folders; tests point them at a fake root)
+SELF=$(readlink -f "$0" 2>/dev/null || echo "$0")
+SHARED=$(sl_need_shared secure-linux-parts) || exit 1
+
+# find the Debian package map
+MAP=""
+for c in "${SL_PARTS_MAP:-}" "$SL_ROOT/files/hardware/parts.map" "$(dirname "$SELF")/../files/hardware/parts.map"; do
+  [ -n "$c" ] && [ -r "$c" ] && { MAP=$c; break; }
+done
+[ -n "$MAP" ] || { echo "secure-linux-parts: the Debian package list (files/hardware/parts.map) is missing. Run 'Repair setup'." >&2; exit 3; }
+
+# actions that change the system need administrator rights: get them for THIS wrapper, so the environment below is rebuilt as root
+for a in "$@"; do
+  case "$a" in --install|install|--reassert|--hotplug) sl_elevate_self "$SELF" "$@" ;; esac
+done
+
+TMPD=$(mktemp -d) || exit 1
+trap 'rm -rf "$TMPD"' EXIT
+sl_compat_shims "$TMPD/bin" || exit 1
+sl_compat_osrelease "$TMPD/os-release"
+export SL_PARTS_MAP=$MAP SL_TEST_OSRELEASE=$TMPD/os-release
+export SL_PROFILE=${SL_PROFILE:-lite}
+if [ -z "${SL_PARTS_ONLINE:-}" ]; then
+  if sl_online_deb; then export SL_PARTS_ONLINE=yes; else export SL_PARTS_ONLINE=no; fi
+fi
+# Offline fallback: firmware .deb files from the USB stick's offline pool (copied here by the installer). The
+# package-manager stand-in (lib/compat.sh) installs matching packages with dpkg -i instead of apt; everything else
+# still waits for the internet.
+if [ "$SL_PARTS_ONLINE" = no ] && _fw_pool=$(sl_offline_fw_dir 2>/dev/null); then
+  export SL_PARTS_ONLINE=yes SL_PARTS_OFFLINE=1 SL_OFFLINE_FW_DIR=$_fw_pool
+  echo "No internet: firmware packages come from the USB stick's offline pool; everything else waits for the internet."
+fi
+export PATH="$TMPD/bin:$PATH"
+"$SHARED" "$@" 2>&1 | sl_say_debian
+exit "${PIPESTATUS[0]}"

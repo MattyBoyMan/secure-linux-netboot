@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Make a Disk Recovery Key
+GenericName=Spare key for the encrypted disk
+Comment=A spare password for your encrypted disk, in case you forget the disk password. Shown once; you can print it.
+Exec=/usr/local/bin/secure-linux-terminal --hold /usr/local/bin/secure-linux-recovery-key create
+Icon=dialog-password
+Terminal=false
+Categories=System;Security;
+Keywords=recovery;key;disk;encryption;luks;password;

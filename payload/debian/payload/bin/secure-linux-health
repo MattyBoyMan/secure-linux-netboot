@@ -1,0 +1,85 @@
+#!/bin/bash
+# secure-linux-health (Debian): checks the health of EVERY part of this computer and says, in plain English, what is wrong and
+# what to do. Wrapper of the shared tool (linux/bin/secure-linux-health + hw/health/*.sh, which are plain bash and work on
+# Debian as they are): the only change is that package advice names Debian packages (files/hardware/health-packages.map)
+# and the Fedora package-tool advice becomes "apt" advice.
+#   secure-linux-health [--quick|--full] [--part NAME] [--json] [--gui] [--summary] [--list] [--elevate] [--help]
+# Exit code: 0 = nothing wrong, 1 = warnings, 2 = at least one failure.
+set -u
+SL_ROOT=${SL_ROOT:-/usr/local/lib/secure-linux}
+# shellcheck source=../lib/compat.sh
+. "$SL_ROOT/lib/compat.sh"
+# shellcheck source=../lib/common.sh
+. "$SL_ROOT/lib/common.sh"
+export SL_STATE SL_ETC   # the shared tool reads these (they are the system folders; tests point them at a fake root)
+SELF=$(readlink -f "$0" 2>/dev/null || echo "$0")
+SHARED=$(sl_need_shared secure-linux-health) || exit 1
+PMAP=""
+for c in "${SL_HEALTH_PMAP:-}" "$SL_ROOT/files/hardware/health-packages.map" "$(dirname "$SELF")/../files/hardware/health-packages.map"; do
+  [ -n "$c" ] && [ -r "$c" ] && { PMAP=$c; break; }
+done
+export SL_PROFILE=${SL_PROFILE:-lite}
+
+# Debian wording: Fedora package names -> Debian names, the Fedora firmware-update advice -> the apt way
+debianise() {
+  local sedargs=() f d
+  if [ -n "$PMAP" ]; then
+    while IFS='=' read -r f d; do
+      case "$f" in ''|'#'*) continue ;; esac
+      [ "$f" = "$d" ] && continue
+      sedargs+=(-e "s/Package: $f\b/Package: $d/g" -e "s/\"package\": \"$f\"/\"package\": \"$d\"/g")
+    done < "$PMAP"
+  fi
+  sedargs+=(-e 's/sudo d[n]f upgrade linux-firmware/sudo apt update \&\& sudo apt install --only-upgrade firmware-linux-free firmware-linux-nonfree firmware-misc-nonfree/g')
+  sedargs+=(-e 's/alsa-sof-firmware/firmware-sof-signed/g' -e 's/Fedora/Debian/g')
+  sed "${sedargs[@]}"
+}
+# The reports the shared tool saves must carry the Debian names too
+fix_saved() {
+  local d="${1:-${SL_STATE:-/var/lib/secure-linux}/health}" f
+  for f in "$d/latest.txt" "$d/latest.json" "$d/part-latest.txt" "$d/part-latest.json"; do
+    [ -w "$f" ] && debianise < "$f" > "$f.new" && mv -f "$f.new" "$f"
+  done
+}
+
+# split the options this wrapper handles itself
+ARGS=(); GUI=0; ELEV=0
+for a in "$@"; do
+  case "$a" in --gui) GUI=1 ;; --elevate) ELEV=1 ;; *) ARGS+=("$a") ;; esac
+done
+case " ${ARGS[*]:-} " in *" --help "*|*" -h "*|*" --list "*) exec "$SHARED" "${ARGS[@]}" ;; esac
+
+# more detail (drive health, memory sticks, kernel log) needs the administrator password: run THIS wrapper again as root
+if [ "$ELEV" = 1 ] && [ "$(id -u)" -ne 0 ]; then sl_elevate_self "$SELF" "${ARGS[@]}"; fi
+
+run_report() {   # run_report ARGS...   -> report on stdout (Debian wording), exit code of the check
+  local out rc; out=$(mktemp) || return 3
+  "$SHARED" "$@" > "$out"; rc=$?
+  debianise < "$out"; rm -f "$out"
+  [ "$(id -u)" -eq 0 ] && fix_saved
+  return $rc
+}
+
+if [ "$GUI" = 1 ]; then
+  # window: measure as administrator when possible, then show the plain-text report (zenity, else the terminal)
+  GOUT=$(mktemp -d); chmod 755 "$GOUT"; trap 'rm -rf "$GOUT"' EXIT
+  if [ "$(id -u)" -ne 0 ] && [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ] && command -v pkexec >/dev/null 2>&1 && [ -z "${SL_HEALTH_NO_PKEXEC:-}" ]; then
+    pkexec "$SELF" "${ARGS[@]}" --no-interactive --out "$GOUT" >/dev/null 2>&1; rc=$?
+    [ "$rc" -gt 2 ] && { "$SHARED" "${ARGS[@]}" --no-interactive --out "$GOUT" >/dev/null 2>&1; rc=$?; }
+  else
+    "$SHARED" "${ARGS[@]}" --no-interactive --out "$GOUT" >/dev/null 2>&1; rc=$?
+  fi
+  f="$GOUT/latest.txt"; [ -s "$f" ] || f="$GOUT/part-latest.txt"
+  if [ -s "$f" ]; then
+    debianise < "$f" > "$GOUT/report-debian.txt"
+    if [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ] && command -v zenity >/dev/null 2>&1; then
+      zenity --text-info --title="Secure Linux hardware health" --width=760 --height=560 --filename="$GOUT/report-debian.txt" 2>/dev/null
+    else cat "$GOUT/report-debian.txt"; fi
+  else
+    echo "The hardware check could not run. Open 'Secure Linux Status & Fixes' and choose 'Repair setup'."; rc=3
+  fi
+  exit "$rc"
+fi
+
+run_report "${ARGS[@]}"
+exit $?

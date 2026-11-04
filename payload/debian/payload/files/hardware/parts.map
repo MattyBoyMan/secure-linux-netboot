@@ -1,0 +1,47 @@
+# parts.map (Debian) - which software each kind of hardware needs, with Debian package names (apt).
+# Same format and same ids as linux/files/hardware/parts.map (the Fedora one), so secure-linux-parts (the shared script)
+# reads it unchanged: the Debian wrapper bin/secure-linux-parts points SL_PARTS_MAP at this file.
+#
+# id | rule | packages on every profile | extra on FULL (not used on Debian) | extra on LITE (Xfce/LXQt) | units to enable | title | why
+#
+# Rule atoms (see the Fedora file): always, sys:GLOB, dev:GLOB, pci:CLASS[/VENDOR[/DEVICE]], usbif:CC, usbdev:CC, usbid:VVVV[:PPPP],
+# usbname:w1,w2, input:w1,w2, dmi:FIELD=w1,w2.  ";" = OR, "+" = AND.   "@drivers" = handled by secure-linux-drivers.
+# Package names were looked up on packages.debian.org / qa.debian.org (madison) for BOTH bookworm (Debian 12) and trixie
+# (Debian 13) on 2026-11-03: every name below exists in both. Differences from the Fedora file are listed in
+# docs/notes/debian-parts-verify.md. Packages from "non-free-firmware" (firmware-sof-signed) need that component, which the
+# Debian preseed of this kit enables. Nothing from outside Debian's own archive is ever listed here.
+# Not in Debian 12 or 13 (so not listed): touchegg, game-devices-udev (steam-devices does the same job).
+#
+health-tools|always|smartmontools nvme-cli lm-sensors usbutils pciutils dmidecode ethtool iw libinput-tools alsa-utils v4l-utils edid-decode fwupd|-|stress-ng memtester vulkan-tools mesa-utils vainfo wireplumber|-|Hardware health tools|These let Secure Linux test your drives, memory, processor, sound, screen and more (secure-linux-health).
+repair-tools|always|gddrescue testdisk ntfs-3g exfatprogs dosfstools f2fs-tools gdisk efibootmgr cryptsetup lvm2|-|chntpw|-|Repair and data-rescue tools|Used by secure-linux-repair to fix disks, boot problems and to copy files off a failing drive.
+audio|sys:class/sound/card*|alsa-utils pipewire-alsa wireplumber|-|-|-|Sound (speakers, headphones, microphone)|Plays and records sound through the modern sound system (PipeWire).
+audio-sof|pci:0401/8086;pci:0403/8086|firmware-sof-signed alsa-ucm-conf|-|-|-|Intel sound firmware|Newer Intel laptops need this firmware file or the speakers and microphone stay silent.
+optical|sys:block/sr*|xorriso wodim eject cdparanoia|-|xfburn|-|CD / DVD / Blu-ray drive|Lets you read, copy and burn discs (Xfburn).
+scanner|usbif:06;usbname:scanner,scanjet,canoscan,lide|sane-utils libsane1 sane-airscan|-|simple-scan|-|Scanner|Scanning drivers (SANE) plus a simple scanning program.
+printer|usbif:07;sys:class/usb/lp*;dev:usb/lp*|cups cups-filters printer-driver-gutenprint cups-browsed cups-client|-|system-config-printer|cups.socket|Printer|The printing system (CUPS) with drivers for most printers; Settings > Printers adds yours.
+printer-hp|usbif:07+usbid:03f0|hplip|-|-|-|HP printer or scanner|HP's own driver (HPLIP) gives full printing, scanning and ink levels.
+printer-epson|usbif:07+usbid:04b8|printer-driver-escpr|-|-|-|Epson printer|Epson's driver for inkjet printers (ESC/P-R).
+printer-brother|usbif:07+usbid:04f9|printer-driver-brlaser|-|-|-|Brother printer|Driver for Brother laser printers.
+touchpad|input:touchpad,trackpad,synaptics,etps,clickpad|libinput-tools xserver-xorg-input-libinput|-|-|-|Touchpad gestures|Two-finger scroll and tap work already; this adds the tools to tune them.
+fingerprint|usbname:fingerprint,fprint,validity,authentec,egis,upek;usbid:138a;usbid:27c6;usbid:1c7a;usbid:08ff;usbid:147e|fprintd libpam-fprintd|-|-|-|Fingerprint reader|Register a finger in Settings > Users. We do NOT switch your login to fingerprints on our own.
+bluetooth|sys:class/bluetooth/hci*;usbdev:e0|bluez bluez-obexd libspa-0.2-bluetooth|-|blueman|bluetooth.service|Bluetooth|Connects headphones, mice, keyboards and phones; the PipeWire Bluetooth package gives the headphone sound.
+wacom|usbid:056a;usbid:256c;usbid:28bd;usbid:5543|libwacom-common xserver-xorg-input-wacom|-|-|-|Drawing tablet|Pressure-sensitive pens and tablet buttons (Wacom, Huion, XP-Pen).
+gamepad|input:xbox,gamepad,controller,dualshock,dualsense,joystick,wireless controller;sys:class/input/js*|steam-devices|-|-|-|Game controller|Lets games see your controller (Debian's steam-devices package only adds the access rules; it does not install Steam).
+webcam|sys:class/video4linux/video*;usbif:0e|v4l-utils|-|cheese|-|Webcam|Tools to test and adjust the camera plus a simple camera app.
+gpu-nvidia|pci:03/10de|@drivers|-|-|-|NVIDIA graphics card|NVIDIA's own driver is faster than the open one; Debian keeps it in "non-free" and it needs a restart (secure-linux-drivers).
+gpu-amd|pci:03/1002|@drivers|-|-|-|AMD graphics|Firmware for AMD graphics (secure-linux-drivers).
+gpu-intel|pci:03/8086|@drivers|-|-|-|Intel graphics|Intel graphics work with the open drivers that are already built in (secure-linux-drivers checks).
+wifi-chip|pci:0280|@drivers|-|-|-|Wi-Fi chip|The right firmware for your Wi-Fi chip, and the Broadcom driver when your chip needs it (secure-linux-drivers).
+apple-mac|dmi:sys_vendor=apple|@drivers|-|-|-|Apple Mac hardware|Mac hardware needs a few extra pieces (secure-linux-drivers).
+sdcard|sys:class/mmc_host/mmc*|-|-|-|-|SD / memory-card reader|Built into Linux: put a card in and it appears in the file manager. Nothing to install.
+smartcard|usbif:0b;usbname:smart card,smartcard,cac reader,gemalto,acs acr|pcscd libccid pcsc-tools opensc|-|-|pcscd.socket|Smart-card / NFC reader|Lets Linux read ID cards, bank cards and NFC tags.
+security-key|usbid:1050;usbname:fido,security key,solokey,titan key|libfido2-1 fido2-tools yubikey-manager|-|-|-|Security key (YubiKey, FIDO)|Tools to manage your hardware security key.
+mouse3d|usbid:046d:c62b;usbid:046d:c626;usbid:256f|spacenavd|-|-|-|3D mouse|Driver for 3Dconnexion space mice.
+logitech|usbid:046d:c52b;usbid:046d:c534;usbid:046d:c548;usbid:046d:c547|solaar|-|-|-|Logitech wireless receiver|Solaar pairs and configures Logitech Unifying/Bolt mice and keyboards.
+phone-android|usbname:android,pixel,galaxy,oneplus,xiaomi,huawei,mtp|libmtp-common mtp-tools gvfs-backends|-|-|-|Android phone or camera|Copy photos and files from a phone or camera in the file manager.
+phone-iphone|usbname:iphone,ipad|libimobiledevice-utils usbmuxd ifuse|-|-|-|iPhone / iPad|Copy photos from an iPhone or iPad.
+modem|usbname:modem,wwan,quectel,sierra wireless,huawei mobile,lte;sys:class/net/wwan*|modemmanager mobile-broadband-provider-info usb-modeswitch|-|-|ModemManager.service|Mobile-broadband modem (SIM card)|Lets the network menu use a SIM-card modem.
+sensors-iio|sys:bus/iio/devices/iio:device*|iio-sensor-proxy|-|-|-|Screen-rotation and light sensors|Rotates the screen when you turn a convertible and dims it in the dark.
+thunderbolt|sys:bus/thunderbolt/devices/*;pci:0c0340|bolt|-|-|-|Thunderbolt / USB4|Asks before a new Thunderbolt device is allowed to talk to the computer.
+tpm|sys:class/tpm/tpm0|tpm2-tools|-|-|-|TPM security chip|Tools for unlocking the disk with the TPM.
+ups|usbid:051d;usbid:0764|nut|-|-|-|Battery backup (UPS)|Monitors a UPS and shuts down safely when the power fails.

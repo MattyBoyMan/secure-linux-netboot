@@ -1,0 +1,77 @@
+#!/bin/bash
+# secure-linux-vpn (Debian): one switch for your VPN. Same commands as on the Fedora setup (the shared tool does the work):
+#
+#   secure-linux-vpn status [--short]   what is on right now (short: private|home|warp|off|both)
+#   secure-linux-vpn setup              first-time NordVPN sign-in and simple yes/no questions
+#   secure-linux-vpn private            NordVPN on (Cloudflare WARP off): hides your internet from the network
+#   secure-linux-vpn home               reach your home server from anywhere (NordVPN + Meshnet, or Cloudflare WARP if chosen)
+#   secure-linux-vpn meshnet on|off|status
+#   secure-linux-vpn warp [TEAM]        use Cloudflare WARP / Zero Trust instead of NordVPN for "home" (64-bit only)
+#   secure-linux-vpn off                no VPN (the kill switch is switched off too, so you stay online)
+#   secure-linux-vpn available          what this computer can use: NordVPN, Cloudflare WARP, WireGuard
+#   secure-linux-vpn wireguard import FILE.conf | on NAME | off NAME | list
+#                                       your own WireGuard VPN (from your router, a friend or a VPN company), kept in the network menu
+# What is available depends on the computer: NordVPN and WARP have 64-bit programs (WARP: 64-bit only); 32-bit computers can
+# use WireGuard. WireGuard is part of Linux itself and works everywhere.
+set -u
+SL_ROOT=${SL_ROOT:-/usr/local/lib/secure-linux}
+# shellcheck source=../lib/common.sh
+. "$SL_ROOT/lib/common.sh"
+# shellcheck source=../lib/compat.sh
+. "$SL_ROOT/lib/compat.sh"
+ARCH=$(sl_arch)
+have() { command -v "$1" >/dev/null 2>&1; }
+say() { printf '%s\n' "$*"; }
+usage() { sed -n '2,/^# use WireGuard/p' "$0" | sed 's/^# \{0,1\}//'; }
+
+cmd_available() {
+  say "What this computer ($ARCH) can use:"
+  if [ "$ARCH" = amd64 ]; then
+    say "  NordVPN          yes   $(have nordvpn && echo '(installed)' || echo '(not installed yet: run Repair setup in Secure Linux Status)')"
+    say "  Cloudflare WARP  yes   $(have warp-cli && echo '(installed)' || echo '(optional: secure-linux-choice set warp yes, then Repair setup)')"
+  else
+    say "  NordVPN          no    NordVPN does not officially support 32-bit computers. Its software repository does carry a 32-bit build;"
+    say "                         you can try it yourself with: secure-linux-choice set nordvpn_i386 yes, then Repair setup. It is untested here."
+    say "  Cloudflare WARP  no    Cloudflare only makes WARP for 64-bit computers."
+  fi
+  say "  WireGuard        yes   $(have wg && echo '(installed)' || echo '(installs with Repair setup)')  Use your own WireGuard file: secure-linux-vpn wireguard import FILE.conf"
+}
+
+cmd_wireguard() {
+  case "${1:-list}" in
+    import)
+      [ -n "${2:-}" ] && [ -f "$2" ] || { say "Usage: secure-linux-vpn wireguard import /path/to/file.conf"; return 2; }
+      have nmcli || { say "NetworkManager (nmcli) is not available."; return 1; }
+      local f=$2 name
+      name=$(basename "$f" .conf | tr -c '\nA-Za-z0-9_-' '-')
+      [ "$(id -u)" -eq 0 ] || { exec pkexec "$(readlink -f "$0")" wireguard import "$(readlink -f "$f")"; }
+      if nmcli connection import type wireguard file "$f"; then
+        nmcli connection modify "$name" connection.autoconnect no 2>/dev/null
+        say "Imported as '$name'. It stays OFF until you turn it on: secure-linux-vpn wireguard on $name  (or use the network menu)."
+      else say "That file could not be imported. Is it a WireGuard .conf file (it starts with [Interface])?"; return 1; fi ;;
+    on)  [ -n "${2:-}" ] || { say "Usage: secure-linux-vpn wireguard on NAME"; return 2; }; nmcli connection up "$2" ;;
+    off) [ -n "${2:-}" ] || { say "Usage: secure-linux-vpn wireguard off NAME"; return 2; }; nmcli connection down "$2" ;;
+    list|status) if have nmcli; then nmcli -t -f NAME,TYPE,DEVICE connection show | awk -F: '$2=="wireguard"{printf "%s  %s\n", $1, ($3==""?"(off)":"(on)")}'; fi ;;
+    *) say "Use: secure-linux-vpn wireguard import FILE.conf | on NAME | off NAME | list"; return 2 ;;
+  esac
+}
+
+case "${1:-}" in
+  -h|--help|help|"") usage; exit 0 ;;
+  available) cmd_available; exit 0 ;;
+  wireguard) shift; cmd_wireguard "$@"; exit $? ;;
+esac
+
+# the shared tool does NordVPN / WARP; they exist only where the vendors make them
+if [ "$ARCH" != amd64 ]; then
+  case "$1" in
+    status) if [ "${2:-}" = --short ]; then echo off; else say "VPN: no NordVPN or Cloudflare WARP on a 32-bit computer. WireGuard works: secure-linux-vpn available"; fi; exit 0 ;;
+  esac
+  if ! have nordvpn; then
+    say "NordVPN and Cloudflare WARP are not available for this 32-bit computer."
+    say "WireGuard works everywhere: see  secure-linux-vpn available  and  secure-linux-vpn wireguard import FILE.conf"
+    exit 0
+  fi
+fi
+SHARED=$(sl_need_shared secure-linux-vpn) || exit 1
+exec "$SHARED" "$@"

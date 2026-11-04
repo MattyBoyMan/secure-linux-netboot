@@ -1,0 +1,308 @@
+#!/bin/bash
+# secure-linux-snapshot (Debian): automatic system snapshots before updates, and going back to one.
+#
+#   secure-linux-snapshot list                 the snapshots there are (taken before updates)
+#   secure-linux-snapshot create [--reason TEXT]
+#                                              take one now (administrator; used before repairs and risky changes)
+#   secure-linux-snapshot rollback [NAME]      go back to a snapshot: the system part of the disk returns to that time
+#                                              at the next restart (your files in /home are NOT changed). Asks first.
+#   secure-linux-snapshot prune                remove snapshots that are old, too many, or full
+#   secure-linux-snapshot status [--short]     one line: how the snapshots are doing
+#   (internal) create --auto       called by apt before packages change (a hook); throttled, never blocks apt
+#   (internal) finish              called at start-up after a rollback to put the kernel files back in step
+#   --dry-run before the command: show what would happen, change nothing
+#
+# How it works: this computer's system disk is LVM (logical volumes inside the encrypted disk). A snapshot is an LVM
+# snapshot of the root volume: it costs no time to make and only uses room when files change afterwards. The installer
+# leaves 10 percent of the disk pool free for this. At most 2 snapshots are kept (choice snapshot_keep), none older than
+# 14 days (snapshot_days), each 1 to 4 GB. A snapshot that fills up is dropped (it stops working when full).
+# Why LVM and not Timeshift/snapper: those copy files (slow and big on an old drive) or need btrfs; this disk is ext4 on LVM.
+# Turn it off: secure-linux-choice set snapshots no
+set -u
+export LC_ALL=C
+SL_ROOT=${SL_ROOT:-/usr/local/lib/secure-linux}
+# shellcheck source=../lib/common.sh
+. "$SL_ROOT/lib/common.sh"
+SELF=$(readlink -f "$0" 2>/dev/null || echo "$0")
+PFX=sl-snap-
+SDIR=$SL_STATE/snapshots                       # index + stamps (outside the snapshot's own copy of /var, see rollback)
+BOOTD=$R/boot
+PENDING=$BOOTD/secure-linux-rollback-pending   # lives on /boot, so it survives going back
+GIB=1073741824
+NOW=${SL_SNAP_NOW:-$(date +%s)}
+DRY=${SL_SNAP_DRY:-0}; AUTO=0; QUIET=0; REASON=""
+have() { command -v "$1" >/dev/null 2>&1; }
+say() { [ "$QUIET" = 1 ] || printf '%s\n' "$*"; }
+usage() { sed -n '2,/^# Turn it off/p' "$SELF" | sed 's/^# \{0,1\}//'; }
+
+# ---------------------------------------------------------------- the root volume
+find_root() {   # sets VG, LV, LVSIZE (bytes), VGFREE (bytes); returns 1 if the system isn't on LVM
+  local src out
+  src=$(findmnt -no SOURCE / 2>/dev/null | sed 's/\[.*//')
+  have lvs || { WHY="the disk-pool tools (lvm2) are not installed"; return 1; }
+  [ -n "$src" ] || { WHY="the system volume could not be found"; return 1; }
+  out=$(lvs --noheadings --separator '|' --units b --nosuffix -o vg_name,lv_name,lv_size "$src" 2>/dev/null | head -n1 | tr -d ' ')
+  [ -n "$out" ] || { WHY="this computer's system disk is not LVM"; return 1; }
+  IFS='|' read -r VG LV LVSIZE <<< "$out"
+  LVSIZE=${LVSIZE%%.*}
+  VGFREE=$(vgs --noheadings --units b --nosuffix -o vg_free "$VG" 2>/dev/null | tr -d ' '); VGFREE=${VGFREE%%.*}; VGFREE=${VGFREE:-0}
+  return 0
+}
+snap_rows() {   # name|size|used%|time|attr|origin   for every Secure Linux snapshot of the root volume
+  lvs --noheadings --separator '|' --units b --nosuffix -o lv_name,lv_size,snap_percent,lv_time,lv_attr,origin "$VG" 2>/dev/null \
+    | sed 's/^ *//; s/ *| */|/g; s/ *$//' | awk -F'|' -v p="$PFX" 'index($1, p) == 1' | sort
+}
+age_days() {   # age_days "2026-11-03 02:15:00 +1100" -> whole days
+  local t; t=$(date -d "$1" +%s 2>/dev/null) || { echo 0; return; }
+  echo $(( (NOW - t) / 86400 ))
+}
+reason_of() { grep "^$1|" "$SDIR/index" 2>/dev/null | tail -n1 | cut -d'|' -f3; }
+pending_name() { sed -n '1p' "$PENDING" 2>/dev/null | sed 's|.*/||'; }
+need_root() { [ "$(id -u)" -eq 0 ] || { [ "$DRY" = 1 ] && return 0; exec pkexec "$SELF" "${ORIG[@]}"; }; }
+run() { if [ "$DRY" = 1 ]; then echo "  [dry run] would run: $*"; return 0; fi; "$@"; }
+
+# ---------------------------------------------------------------- create
+cmd_create() {
+  local name size dir cap want kernels
+  if [ "$(sl_choice_get snapshots yes)" = no ]; then say "Snapshots are switched off (secure-linux-choice set snapshots yes to turn them on)."; return 0; fi
+  need_root
+  find_root || { say "Snapshots are not available: $WHY."; mkdir -p "$SDIR"; echo "$WHY" > "$SDIR/unavailable" 2>/dev/null; return 0; }
+  mkdir -p "$SDIR"
+  if have flock; then exec 9>"${SL_SNAP_LOCK:-$SDIR/lock}"; flock -n 9 || { say "Another snapshot is being made right now."; return 0; }; fi
+  if [ "$AUTO" = 1 ]; then
+    # one automatic snapshot per 2 days is enough: it is the state BEFORE the latest updates, and each snapshot slows writes a little
+    local last=0 gap=$(( $(sl_choice_get snapshot_gap_hours 48) * 3600 ))
+    # the stamp file holds the epoch of the last auto snapshot; stamps written by older kits are
+    # empty files, so fall back to the file's modified time for those
+    if [ -f "$SDIR/last-auto" ]; then
+      last=$(cat "$SDIR/last-auto" 2>/dev/null)
+      case "$last" in ''|*[!0-9]*) last=$(stat -c %Y "$SDIR/last-auto" 2>/dev/null || echo 0) ;; esac
+    fi
+    [ $((NOW - last)) -lt "$gap" ] && return 0
+    [ -e "$PENDING" ] && return 0                      # a rollback is waiting for the restart: leave the volumes alone
+  fi
+  # room: size 1-4 GB (10 percent of the system volume), never more than 60 percent of what is free
+  cap=$(( VGFREE * 60 / 100 ))
+  size=$(( LVSIZE / 10 )); [ "$size" -lt "$GIB" ] && size=$GIB; [ "$size" -gt $((4 * GIB)) ] && size=$((4 * GIB))
+  [ "$size" -gt "$cap" ] && size=$cap
+  if [ "$size" -lt "$GIB" ]; then
+    WHY="there is not enough free room in the disk pool ($((VGFREE / 1048576)) MB free; 1 GB needed)"
+    say "Snapshots are not available: $WHY."; echo "$WHY" > "$SDIR/unavailable"; return 0
+  fi
+  rm -f "$SDIR/unavailable"
+  name=$PFX$(date -d "@$NOW" +%Y%m%d-%H%M%S)
+  dir=$SL_STATE/snapshots/$name                      # written BEFORE the snapshot, so the snapshot contains it
+  mkdir -p "$dir"
+  kernels=$(cd "$R/" && ls boot/vmlinuz-* boot/config-* boot/System.map-* 2>/dev/null | tr '\n' ' ')
+  # shellcheck disable=SC2086
+  [ -n "$kernels" ] && ( cd "$R/" && tar -czf "$dir/boot-kernels.tar.gz" $kernels 2>/dev/null )
+  uname -r > "$dir/kernel" 2>/dev/null
+  say "Taking a system snapshot ($name, $((size / 1048576)) MB of room)..."
+  if run lvcreate --snapshot --name "$name" --size "${size}b" "$VG/$LV" >/dev/null 2>&1 || [ "$DRY" = 1 ]; then
+    printf '%s|%s|%s|%s\n' "$name" "$(date -d "@$NOW" '+%Y-%m-%d %H:%M')" "${REASON:-before an update}" "$size" >> "$SDIR/index"
+    [ "$AUTO" = 1 ] && [ "$DRY" != 1 ] && echo "$NOW" > "$SDIR/last-auto"
+    [ "$DRY" = 1 ] || say "Done."
+  else
+    rm -rf "$dir"; say "The snapshot could not be made (the disk pool may be busy). Updates carry on without it."; return 0
+  fi
+  cmd_prune "quiet"
+  return 0
+}
+
+# ---------------------------------------------------------------- prune
+cmd_prune() {
+  local keep days n=0 name size used time attr origin age removed=0 rows pend
+  need_root
+  find_root || return 0
+  keep=$(sl_choice_get snapshot_keep 2); days=$(sl_choice_get snapshot_days 14)
+  case "$keep" in ''|*[!0-9]*) keep=2 ;; esac; case "$days" in ''|*[!0-9]*) days=14 ;; esac
+  [ "$keep" -lt 1 ] && keep=1; [ "$keep" -gt 4 ] && keep=4
+  pend=$(pending_name)
+  rows=$(snap_rows | sort -t'|' -k4)                 # oldest first
+  # drop: full or invalid, and too old
+  while IFS='|' read -r name size used time attr origin; do
+    [ -n "$name" ] || continue
+    [ "$name" = "$pend" ] && continue
+    age=$(age_days "$time")
+    if [ "${attr:0:1}" = S ] || [ "${used%%.*}" -ge 95 ] 2>/dev/null; then
+      say "Removing $name: it is full, so it no longer works."; run lvremove -f "$VG/$name" >/dev/null 2>&1; removed=$((removed + 1)); continue
+    fi
+    if [ "$age" -gt "$days" ]; then
+      say "Removing $name: it is $age days old."; run lvremove -f "$VG/$name" >/dev/null 2>&1; removed=$((removed + 1))
+    fi
+  done <<< "$rows"
+  # too many: remove the oldest
+  if [ "$DRY" != 1 ]; then rows=$(snap_rows | sort -t'|' -k4); fi
+  n=$(printf '%s\n' "$rows" | grep -c .)
+  while IFS='|' read -r name size used time attr origin; do
+    [ -n "$name" ] || continue
+    [ "$n" -le "$keep" ] && break
+    [ "$name" = "$pend" ] && continue
+    # (dry run: rows were not refreshed, so a row removed above may be counted again; harmless)
+    say "Removing $name: only $keep snapshots are kept."; run lvremove -f "$VG/$name" >/dev/null 2>&1; n=$((n - 1)); removed=$((removed + 1))
+  done <<< "$rows"
+  [ "$removed" -eq 0 ] && [ "${1:-}" != quiet ] && say "Nothing to remove."
+  # forget index lines of snapshots that are gone
+  if [ "$DRY" != 1 ] && [ -f "$SDIR/index" ]; then
+    local live; live=$(snap_rows | cut -d'|' -f1)
+    grep -F -f <(printf '%s\n' "$live" | sed '/^$/d; s/$/|/') "$SDIR/index" > "$SDIR/index.new" 2>/dev/null; mv -f "$SDIR/index.new" "$SDIR/index" 2>/dev/null
+  fi
+  return 0
+}
+
+# ---------------------------------------------------------------- list / status
+cmd_list() {
+  local rows name size used time attr origin i=0 age
+  find_root || { echo "Snapshots are not available: $WHY."; return 0; }
+  rows=$(snap_rows)
+  if [ -z "$rows" ]; then
+    echo "There are no snapshots yet. One is taken automatically before the next software update."
+    [ -f "$SDIR/unavailable" ] && echo "(Not available: $(cat "$SDIR/unavailable"))"
+    return 0
+  fi
+  echo "System snapshots (a frozen copy of the system part of the disk, taken before updates):"
+  while IFS='|' read -r name size used time attr origin; do
+    [ -n "$name" ] || continue
+    i=$((i + 1)); age=$(age_days "$time")
+    printf '  %d) %s   %s MB of room, %s%% used, %s day(s) old%s  (%s)\n' "$i" "$name" "$((${size%%.*} / 1048576))" "${used%%.*}" "$age" \
+      "$( [ "${attr:0:1}" = S ] && echo ', FULL - no longer works' )" "$(reason_of "$name")"
+  done <<< "$rows"
+  [ -e "$PENDING" ] && echo "A going-back is waiting for the next restart: $(pending_name)."
+  return 0
+}
+cmd_status() {
+  local rows n=0 worst="" name size used time attr origin newest="" nd=0 a
+  if [ "$(sl_choice_get snapshots yes)" = no ]; then echo "off"; return 0; fi
+  if ! find_root; then echo "unavailable|$WHY"; return 0; fi
+  rows=$(snap_rows)
+  while IFS='|' read -r name size used time attr origin; do
+    [ -n "$name" ] || continue
+    n=$((n + 1)); a=$(age_days "$time"); [ -z "$newest" ] || [ "$a" -lt "$nd" ] && { newest=$name; nd=$a; }
+    if [ "${attr:0:1}" = S ] || [ "${used%%.*}" -ge 85 ] 2>/dev/null; then worst=$name; fi
+  done <<< "$rows"
+  if [ -e "$PENDING" ]; then echo "pending|$(pending_name)"
+  elif [ -n "$worst" ]; then echo "full|$worst"
+  elif [ "$n" -eq 0 ]; then
+    if [ -f "$SDIR/unavailable" ]; then echo "unavailable|$(cat "$SDIR/unavailable")"
+    elif [ "$VGFREE" -lt "$GIB" ]; then echo "unavailable|there is not enough free room in the disk pool"
+    else echo "none"; fi
+  else echo "ok|$n|$nd"; fi
+  return 0
+}
+
+# ---------------------------------------------------------------- rollback
+cmd_rollback() {
+  local want=${1:-} rows names=() name size used time attr origin i=0 pick a
+  need_root
+  find_root || { echo "Going back isn't possible: $WHY."; return 1; }
+  rows=$(snap_rows)
+  [ -n "$rows" ] || { echo "There are no snapshots to go back to."; return 0; }
+  while IFS='|' read -r name size used time attr origin; do
+    [ -n "$name" ] || continue
+    i=$((i + 1)); names[i]=$name
+  done <<< "$rows"
+  cmd_list
+  if [ -z "$want" ]; then
+    if [ "$DRY" = 1 ]; then pick=${names[i]}; else
+      read -rp "Which snapshot do you want to go back to? (number, Enter = cancel) " a || a=""
+      [[ "$a" =~ ^[0-9]+$ ]] && [ "$a" -ge 1 ] && [ "$a" -le "$i" ] || { echo "Cancelled. Nothing was changed."; return 0; }
+      pick=${names[a]}
+    fi
+  else pick=$want; fi
+  printf '%s\n' "$rows" | cut -d'|' -f1 | grep -qx "$pick" || { echo "'$pick' is not one of the snapshots listed above. Nothing was changed."; return 1; }
+  if [ "$(printf '%s\n' "$rows" | grep "^$pick|" | cut -d'|' -f5 | cut -c1)" = S ]; then
+    echo "That snapshot is full, so it no longer works. Pick another one."; return 1
+  fi
+  cat <<EOF
+
+  GOING BACK TO $pick
+  - The system part of the disk (programs, updates, system settings) returns to how it was then.
+  - Your documents, photos and downloads in /home are NOT changed.
+  - Anything installed or updated since then is undone. Automatic updates will install again later; if one bad
+    update caused the trouble, ask for help before the next update runs.
+  - It happens when the computer restarts. The first start takes a little longer, then one more restart finishes the job.
+  - Other snapshots are removed first (they would be out of date). You cannot undo going back.
+EOF
+  if [ "$DRY" = 1 ]; then echo "  (dry run: you would have to type  ROLL BACK  to continue)"; else
+    read -rp "  Type  ROLL BACK  to go ahead (anything else cancels): " a || a=""
+    [ "$a" = "ROLL BACK" ] || { echo "Cancelled. Nothing was changed."; return 0; }
+  fi
+  # other snapshots first
+  for ((a = 1; a <= i; a++)); do [ "${names[a]}" = "$pick" ] || run lvremove -f "$VG/${names[a]}" >/dev/null 2>&1; done
+  if [ "$DRY" = 1 ]; then echo "  [dry run] would write $PENDING and run: lvconvert --merge $VG/$pick"; return 0; fi
+  mkdir -p "$BOOTD"; printf '%s\n' "$pick" > "$PENDING"
+  if lvconvert --merge "$VG/$pick" >/dev/null 2>&1; then
+    sl_alert snapshot-rollback "Going back to an earlier system state" "The computer will go back to $pick when it restarts." "Restart the computer"
+    echo; echo "Done. Restart the computer to finish going back."
+    read -rp "Restart now? [y/N] " a || a=""
+    case "$a" in [Yy]*) systemctl reboot ;; esac
+  else
+    rm -f "$PENDING"
+    echo "The disk pool refused to go back to $pick. Nothing was changed. (The snapshot may be full, or the disk pool busy.)"
+    return 1
+  fi
+  return 0
+}
+
+# ---------------------------------------------------------------- finish (after the restart that merged the snapshot)
+cmd_finish() {
+  local name dir tarball ver moved=0 f keep="" k
+  [ -e "$PENDING" ] || return 0
+  name=$(pending_name)
+  dir=$SL_STATE/snapshots/$name
+  tarball=$dir/boot-kernels.tar.gz
+  # kernel files of the old state that /boot no longer has (the update that is being undone may have removed them)
+  [ -f "$tarball" ] && run tar -xzf "$tarball" -C "$R/" --skip-old-files 2>/dev/null
+  # kernels of the rolled-back system = the ones that have modules in /lib/modules
+  for f in "$R"/boot/vmlinuz-*; do
+    [ -e "$f" ] || continue
+    ver=${f##*/vmlinuz-}
+    if [ -d "$R/lib/modules/$ver" ]; then
+      keep="$keep $ver"
+      [ -e "$R/boot/initrd.img-$ver" ] || run update-initramfs -c -k "$ver"
+    else
+      # a newer kernel from the undone update: no modules for it any more -> set its files aside (not deleted)
+      run mkdir -p "$R/boot/secure-linux-rollback-moved"
+      for k in vmlinuz initrd.img config System.map; do [ -e "$R/boot/$k-$ver" ] && run mv "$R/boot/$k-$ver" "$R/boot/secure-linux-rollback-moved/"; done
+      moved=$((moved + 1))
+    fi
+  done
+  run update-grub
+  run rm -f "$PENDING"
+  sl_clear snapshot-rollback
+  if [ "$moved" -gt 0 ]; then
+    sl_event rollback-done "Going back is almost finished" "The system is back to how it was. Restart once more to start on the older kernel."
+  else
+    sl_event rollback-done "Going back finished" "The system is back to how it was before the update."
+  fi
+  return 0
+}
+
+# ---------------------------------------------------------------- main
+ORIG=("$@")
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --dry-run|-n) DRY=1; shift ;; --auto) AUTO=1; shift ;; --quiet|-q) QUIET=1; shift ;;
+    --reason) REASON=${2:-}; shift 2 ;; --reason=*) REASON=${1#--reason=}; shift ;;
+    *) break ;;
+  esac
+done
+CMD=${1:-help}; [ $# -gt 0 ] && shift
+# options after the command
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --dry-run|-n) DRY=1 ;; --auto) AUTO=1 ;; --quiet|-q) QUIET=1 ;; --reason) REASON=${2:-}; shift ;; --reason=*) REASON=${1#--reason=} ;;
+    --short) ;; *) POS=${POS:-}${POS:+ }$1 ;;
+  esac
+  shift
+done
+case "$CMD" in
+  create) if [ "$AUTO" = 1 ]; then cmd_create >/dev/null 2>&1 || true; exit 0; else cmd_create; fi ;;
+  list) cmd_list ;;
+  prune) cmd_prune ;;
+  rollback) cmd_rollback ${POS:-} ;;
+  status) cmd_status ;;
+  finish) cmd_finish ;;
+  -h|--help|help) usage ;;
+  *) echo "Unknown command '$CMD'." >&2; usage; exit 2 ;;
+esac

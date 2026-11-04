@@ -1,0 +1,93 @@
+#!/bin/bash
+# secure-linux-scan (Debian): the weekly virus scan (ClamAV) of your files, and the way to look at what it found.
+#
+#   secure-linux-scan                 scan now: everyone's home folders and the temporary folders (this is what the weekly timer runs)
+#   secure-linux-scan DIR             scan one folder
+#   secure-linux-scan status          when the last scan ran and what it found
+#   secure-linux-scan findings        list what the last scan found
+#   secure-linux-scan ack             mark the findings as dealt with (removes the reminder)
+# Nothing is ever deleted or moved. A suspicious file is listed; you decide. Updates of the virus list come from
+# clamav-freshclam (automatic). ClamAV needs about 1.2 GB of memory to load its list, so it is only installed on computers
+# with 1.5 GB or more; smaller ones get a plain note in Secure Linux Status instead.
+set -u
+export LC_ALL=C
+SL_ROOT=${SL_ROOT:-/usr/local/lib/secure-linux}
+# shellcheck source=../lib/common.sh
+. "$SL_ROOT/lib/common.sh"
+SELF=$(readlink -f "$0" 2>/dev/null || echo "$0")
+AVDIR=$SL_LOGDIR/clamscan
+have() { command -v "$1" >/dev/null 2>&1; }
+latest() { ls -1 "$AVDIR"/*.log 2>/dev/null | sort | tail -n1; }
+found_lines() { grep 'FOUND$' "$1" 2>/dev/null; }
+usage() { sed -n '2,12p' "$SELF" | sed 's/^# \{0,1\}//'; }
+
+cmd_status() {
+  local l n; l=$(latest)
+  if ! have clamscan; then echo "The virus scanner (ClamAV) is not installed on this computer."; return 0; fi
+  [ -n "$l" ] || { echo "No virus scan has run yet. The first one runs within a week."; return 0; }
+  n=$(found_lines "$l" | grep -c .)
+  echo "Latest scan: $(basename "$l" .log)   Suspicious files: $n"
+  [ "$n" -gt 0 ] && echo "Look at them with: secure-linux-scan findings"
+  return 0
+}
+cmd_findings() {
+  local l; l=$(latest)
+  [ -n "$l" ] || { echo "No virus scan has run yet."; return 0; }
+  echo "Latest weekly scan: $(basename "$l" .log)"
+  if found_lines "$l" >/dev/null; then
+    echo "Suspicious files (nothing was deleted):"; echo
+    found_lines "$l" | sed 's/^/  /'
+    echo
+    echo "What to do: if you don't know a file, delete it (or ask someone you trust)."
+    echo "Then run: secure-linux-scan ack"
+  else echo "Nothing suspicious was found."; fi
+}
+cmd_ack() {
+  [ "$(id -u)" -eq 0 ] || exec pkexec "$SELF" ack
+  local l; l=$(latest)
+  mkdir -p "$SL_STATE"; basename "${l:-none}" > "$SL_STATE/av-acked"
+  sl_clear antivirus-found
+  echo "Marked as dealt with."
+}
+cmd_scan() {
+  local targets=() log n opts t d
+  have clamscan || { echo "The virus scanner (ClamAV) is not installed on this computer. (It needs 1.5 GB of memory or more.)"; return 0; }
+  [ "$(id -u)" -eq 0 ] || exec pkexec "$SELF" "$@"
+  # No virus list yet (never downloaded, e.g. no internet): use the one staged from the USB stick's offline pack
+  sl_seed_clamav_db
+  if [ $# -gt 0 ] && [ "$1" != now ]; then targets=("$@")
+  else
+    for d in "$R"/home/*/ "$R"/root "$R"/tmp "$R"/var/tmp; do [ -d "$d" ] && targets+=("${d%/}"); done
+  fi
+  [ ${#targets[@]} -gt 0 ] || { echo "Nothing to scan."; return 0; }
+  mkdir -p "$AVDIR"
+  log=$AVDIR/$(date +%Y%m%d-%H%M).log
+  rm -f "$log"   # clamscan APPENDS to its log: a re-scan in the same minute must not count the previous run's findings
+  opts=(--recursive --infected --no-summary --max-filesize=100M --max-scansize=300M --cross-fs=no --log="$log"
+        --exclude-dir='/\.cache(/|$)' --exclude-dir='/\.var/app/.*/cache(/|$)')
+  echo "Scanning ${targets[*]} (this runs quietly in the background and can take a while)..."
+  clamscan "${opts[@]}" "${targets[@]}" >/dev/null 2>&1
+  [ -s "$log" ] || { echo "clamscan produced no log (it may have failed to load its virus list). Check: sudo freshclam"; sl_alert antivirus-failed "The virus scan could not run" "ClamAV did not start properly (its virus list may be missing)." "Run: sudo freshclam   then secure-linux-scan"; return 1; }
+  sl_clear antivirus-failed
+  n=$(found_lines "$log" | grep -c .)
+  printf '%s|%s\n' "$(date '+%Y-%m-%d %H:%M')" "$n" > "$SL_STATE/av-last"
+  if [ "$n" -gt 0 ]; then
+    sl_alert antivirus-found "The virus scanner found something" "$n suspicious file(s) were found in the weekly scan. Nothing was deleted." "Open 'Secure Linux Status' and choose 'Show antivirus findings'"
+    echo "Found $n suspicious file(s). Nothing was deleted. See: secure-linux-scan findings"
+  else
+    sl_clear antivirus-found
+    echo "Nothing suspicious was found."
+  fi
+  # keep the last 12 logs
+  ls -1 "$AVDIR"/*.log 2>/dev/null | sort | head -n -12 | while read -r t; do rm -f "$t"; done
+  return 0
+}
+
+case "${1:-now}" in
+  -h|--help|help) usage ;;
+  status) cmd_status ;;
+  findings) cmd_findings ;;
+  ack) cmd_ack ;;
+  now) cmd_scan ;;
+  *) cmd_scan "$@" ;;
+esac

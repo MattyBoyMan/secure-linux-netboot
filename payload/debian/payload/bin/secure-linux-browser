@@ -1,0 +1,84 @@
+#!/bin/bash
+# secure-linux-browser (Debian): which web browser opens links - in Xfce's "Preferred Applications", in the app menu and everywhere.
+#
+#   secure-linux-browser get                    which one is set for you now
+#   secure-linux-browser set firefox|librewolf  use that browser for links (also saved as your choice for the next Repair setup)
+#   secure-linux-browser apply                  (setup uses this) set the saved choice ONLY if you have not picked one yourself
+#   --user NAME                                  act for that account (setup runs as the administrator)
+# What it changes in your home folder: ~/.config/xfce4/helpers.rc and ~/.local/share/xfce4/helpers/custom-WebBrowser.desktop
+# (what Xfce's Settings > Default Applications reads), ~/.config/mimeapps.list (what every other program reads).
+set -u
+SL_ROOT=${SL_ROOT:-/usr/local/lib/secure-linux}
+# shellcheck source=../lib/common.sh
+. "$SL_ROOT/lib/common.sh"
+have() { command -v "$1" >/dev/null 2>&1; }
+WHO=""
+ARGS=()
+while [ $# -gt 0 ]; do case "$1" in --user) WHO=${2:-}; shift 2 ;; *) ARGS+=("$1"); shift ;; esac; done
+set -- "${ARGS[@]:-}"
+[ -n "$WHO" ] || { [ "$(id -u)" -eq 0 ] && WHO=$(sl_user) || WHO=$(id -un); }
+HOME_DIR=$(getent passwd "$WHO" | cut -d: -f6); HOME_DIR=${HOME_DIR:-$HOME}
+CFG=$HOME_DIR/.config; HELP=$HOME_DIR/.local/share/xfce4/helpers
+
+info_of() {   # info_of NAME -> "desktop-file|command|label"
+  case "$1" in
+    firefox) echo "firefox-esr.desktop|firefox-esr|Firefox ESR" ;;
+    librewolf) echo "librewolf.desktop|librewolf|LibreWolf" ;;
+    *) return 1 ;;
+  esac
+}
+cur_helper() { sed -n 's/^WebBrowser=//p' "$CFG/xfce4/helpers.rc" 2>/dev/null | tail -n1; }
+cur_name() {
+  local f=$HELP/custom-WebBrowser.desktop
+  if [ "$(cur_helper)" = custom-WebBrowser ] && [ -f "$f" ]; then
+    case "$(sed -n 's/^X-XFCE-Commands=//p' "$f" | head -n1)" in librewolf*) echo librewolf ;; firefox*) echo firefox ;; *) echo other ;; esac
+  else echo ""; fi
+}
+put_line() {   # put_line FILE KEY VALUE   set KEY=VALUE (replace or append)
+  local f=$1 k=$2 v=$3
+  mkdir -p "$(dirname "$f")"; touch "$f"
+  if grep -q "^$k=" "$f"; then sed -i "s|^$k=.*|$k=$v|" "$f"; else printf '%s=%s\n' "$k" "$v" >> "$f"; fi
+}
+do_set() {   # do_set NAME [nosave]
+  local name=$1 nosave=${2:-} info desktop cmd label m
+  info=$(info_of "$name") || { echo "Choose firefox or librewolf." >&2; return 2; }
+  IFS='|' read -r desktop cmd label <<< "$info"
+  mkdir -p "$HELP" "$CFG/xfce4"
+  cat > "$HELP/custom-WebBrowser.desktop" <<EOT
+[Desktop Entry]
+NoDisplay=true
+Version=1.0
+Encoding=UTF-8
+Type=X-XFCE-Helper
+X-XFCE-Category=WebBrowser
+X-XFCE-CommandsWithParameter=$cmd "%s"
+Icon=$cmd
+Name=$label
+X-XFCE-Commands=$cmd
+EOT
+  put_line "$CFG/xfce4/helpers.rc" WebBrowser custom-WebBrowser
+  # every other program: the standard "default applications" list
+  [ -f "$CFG/mimeapps.list" ] && grep -q '^\[Default Applications\]' "$CFG/mimeapps.list" || printf '[Default Applications]\n' >> "$CFG/mimeapps.list"
+  for m in text/html x-scheme-handler/http x-scheme-handler/https; do
+    if grep -q "^$m=" "$CFG/mimeapps.list"; then sed -i "s|^$m=.*|$m=$desktop|" "$CFG/mimeapps.list"
+    else sed -i "/^\[Default Applications\]/a $m=$desktop" "$CFG/mimeapps.list"; fi
+  done
+  if [ "$(id -u)" -eq 0 ]; then chown -R "$WHO": "$HOME_DIR/.local/share/xfce4" "$CFG/xfce4" "$CFG/mimeapps.list" 2>/dev/null; fi
+  if have xdg-settings && [ "$(id -u)" -ne 0 ]; then xdg-settings set default-web-browser "$desktop" >/dev/null 2>&1; fi
+  if [ -n "$nosave" ]; then :; elif [ "$(id -u)" -eq 0 ]; then sl_choice_set default_browser "$name"; else have secure-linux-choice && secure-linux-choice set default_browser "$name" >/dev/null 2>&1; fi
+  echo "Links now open in $label."
+}
+
+case "${1:-get}" in
+  get) n=$(cur_name); echo "${n:-not set by you (the system default is used: $(sl_choice_get default_browser librewolf))}" ;;
+  set) [ -n "${2:-}" ] || { echo "Use: secure-linux-browser set firefox|librewolf"; exit 2; }; do_set "$2" ;;
+  apply)
+    # the person's own pick (Xfce Preferred Applications, or an earlier set) always wins
+    if [ -n "$(cur_helper)" ]; then echo "You already chose a browser; leaving it."; exit 0; fi
+    want=$(sl_choice_get default_browser librewolf)
+    if [ "$want" = librewolf ] && ! sl_pkg_installed librewolf; then want=firefox; fi
+    sl_pkg_installed firefox-esr || [ "$want" != firefox ] || { echo "No browser installed yet; nothing to set."; exit 0; }
+    do_set "$want" nosave ;;
+  -h|--help|help) sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//' ;;
+  *) echo "Unknown command '$1'." >&2; exit 2 ;;
+esac

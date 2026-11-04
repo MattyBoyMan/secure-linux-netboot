@@ -1,0 +1,17 @@
+#!/bin/bash
+# secure-linux-firstboot (Debian): started by secure-linux-firstboot.service on the first start.
+# Waits for the internet (never gives up: the person can connect to Wi-Fi at any time), then runs the Secure Linux
+# setup once. Shutdown is blocked while it runs. Later problems are fixed with "Repair setup" in Secure Linux Status.
+SL_ROOT=${SL_ROOT:-/usr/local/lib/secure-linux}
+STATE=/var/lib/secure-linux
+case "${1:-}" in -h|--help) sed -n '2,5p' "$0"; exit 0 ;; esac
+mkdir -p "$STATE"
+until curl -fsS --max-time 10 -o /dev/null https://deb.debian.org/debian/dists/ 2>/dev/null; do
+  printf '0|?|Waiting for the internet (connect to Wi-Fi: click the network icon)\n' > "$STATE/progress"
+  sleep "${SL_FIRSTBOOT_WAIT:-15}"
+done
+systemd-inhibit --what=shutdown:sleep:idle --who="Secure Linux" --why="Setting up apps" --mode=block \
+  "$SL_ROOT/setup.sh"
+rc=$?
+touch "$STATE/firstboot.done"
+exit $rc

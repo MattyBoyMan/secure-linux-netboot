@@ -1,0 +1,249 @@
+#!/bin/bash
+# secure-linux-drivers (Debian): drivers that need a decision - Broadcom Wi-Fi, NVIDIA graphics - and the Secure Boot key they need.
+#
+#   secure-linux-drivers [check]    look at this computer's Wi-Fi chip and graphics card and say what is on offer (changes nothing)
+#   secure-linux-drivers install    offer each driver this computer could use; installs only what you say yes to
+#   secure-linux-drivers broadcom   the Broadcom Wi-Fi driver (broadcom-sta-dkms, from Debian's "non-free" section)
+#   secure-linux-drivers nvidia     the NVIDIA graphics driver (nvidia-driver, "non-free"; Debian 13, 64-bit only)
+#   secure-linux-drivers enroll-key approve the driver's signing key for Secure Boot (one time; a blue screen appears at restart)
+#   secure-linux-drivers broadcom|nvidia --yes   (used by the welcome wizard after you said yes there: no second question)
+#   secure-linux-drivers --help
+# Nothing here installs by itself: every driver is explained first (what it is, why it is "non-free", what could go wrong)
+# and waits for your yes. Without a keyboard to answer (a background run) it only leaves a note in Secure Linux Status.
+# Why not automatic: these drivers are not open source, they need a restart, and with Secure Boot on they need a key you approve.
+# The open drivers already in Linux are used until then: Wi-Fi chips work with the open driver in most cases, graphics cards
+# use the open "nouveau" driver (slower for games and 3D, fine for everyday use).
+set -u
+export LC_ALL=C
+SL_ROOT=${SL_ROOT:-/usr/local/lib/secure-linux}
+# shellcheck source=../lib/common.sh
+. "$SL_ROOT/lib/common.sh"
+SELF=$(readlink -f "$0" 2>/dev/null || echo "$0")
+SYS=$R/sys
+have() { command -v "$1" >/dev/null 2>&1; }
+say() { printf '%s\n' "$*"; }
+usage() { sed -n '2,/^# use the open/p' "$SELF" | sed 's/^# \{0,1\}//'; }
+
+# PCI ids (Broadcom 14e4) that the open Linux drivers do NOT run, so the "wl" driver is the way to get Wi-Fi: Debian wiki "wl"
+WL_IDS=" 0576 4311 4312 4315 4328 4329 432a 432b 432c 432d 4331 4353 4357 4358 4359 4360 4365 43a0 43b1 4727 "
+
+# ---------------------------------------------------------------- finding things (sysfs only)
+pci_each() {   # prints  vendor device class  for every PCI device (lower case hex, no 0x)
+  local d v dv c
+  for d in "$SYS"/bus/pci/devices/*; do
+    [ -r "$d/vendor" ] || continue
+    v=$(tr 'A-F' 'a-f' < "$d/vendor" | sed 's/^0x//'); dv=$(tr 'A-F' 'a-f' < "$d/device" 2>/dev/null | sed 's/^0x//')
+    c=$(tr 'A-F' 'a-f' < "$d/class" 2>/dev/null | sed 's/^0x//')
+    printf '%s %s %s\n' "$v" "${dv:-0000}" "${c:-000000}"
+  done
+}
+has_wifi_if() { local i; for i in "$SYS"/class/net/*; do [ -e "$i/wireless" ] || [ -e "$i/phy80211" ] && return 0; done; return 1; }
+broadcom_id() {   # prints the PCI device id of a Broadcom Wi-Fi chip the open drivers do not run, or nothing
+  local v d c
+  while read -r v d c; do
+    [ "$v" = 14e4 ] || continue
+    case "$c" in 0280*|0200*|0207*) ;; *) continue ;; esac
+    case "$WL_IDS" in *" $d "*) printf '%s' "$d"; return 0 ;; esac
+  done < <(pci_each)
+  return 1
+}
+nvidia_present() { local v d c; while read -r v d c; do [ "$v" = 10de ] && case "$c" in 03*) return 0 ;; esac; done < <(pci_each); return 1; }
+sb_on() {
+  if have mokutil; then mokutil --sb-state 2>/dev/null | grep -qi "SecureBoot enabled"; return; fi   # the firmware tool answers; the raw variable is only the fallback
+  local f; f=$(ls "$SYS"/firmware/efi/efivars/SecureBoot-* 2>/dev/null | head -n1)
+  [ -n "$f" ] && [ "$(od -An -t u1 "$f" 2>/dev/null | awk '{print $NF}')" = 1 ]
+}
+online() { case "${SL_PARTS_ONLINE:-}" in yes) return 0 ;; no) return 1 ;; esac; curl -fsS --max-time 8 -o /dev/null https://deb.debian.org/debian/ 2>/dev/null; }
+headers_pkg() {   # the kernel-headers package that matches the running kernel flavour
+  local k; k=$(uname -r 2>/dev/null)
+  case "$k" in *686-pae*) echo linux-headers-686-pae ;; *-686*) echo linux-headers-686 ;; *-amd64*|*) [ "$(sl_arch)" = i386 ] && echo linux-headers-686-pae || echo linux-headers-amd64 ;; esac
+}
+ask() {   # ask "question" -> 0 for yes (needs a person; no answer = no). --yes: the person already said yes (the welcome wizard asked)
+  local q=$1 a=""
+  [ "${YES:-0}" = 1 ] && return 0
+  if [ -n "${SL_DRIVERS_ANSWERS:-}" ]; then   # tests: "broadcom=yes,nvidia=no"
+    a=$(printf ',%s,' "$SL_DRIVERS_ANSWERS" | sed -n "s/.*,${2:-x}=\([a-z]*\),.*/\1/p" | head -n1); [ "$a" = yes ]; return
+  fi
+  [ -t 0 ] || return 1
+  read -rp "$q [y/N] " a || return 1
+  case "$a" in [Yy]*) return 0 ;; *) return 1 ;; esac
+}
+interactive() { [ -n "${SL_DRIVERS_ANSWERS:-}" ] || [ "${YES:-0}" = 1 ] || [ -t 0 ]; }
+need_root() { [ "$(id -u)" -eq 0 ] || { have pkexec && [ -n "${DISPLAY:-}" ] && exec pkexec "$SELF" "${ARGS[@]}"; exec sudo "$SELF" "${ARGS[@]}"; }; }
+
+# ---------------------------------------------------------------- the "non-free" section of Debian's archive
+enable_nonfree() {
+  local f changed=0
+  for f in "$R"/etc/apt/sources.list.d/*.sources; do
+    [ -f "$f" ] || continue
+    grep -qE '^Components:(.*[[:space:]])?non-free([[:space:]].*)?$' "$f" && continue   # the exact word: non-free-firmware is a different section
+    grep -qE '^Components:' "$f" || continue
+    cp -n "$f" "$f.secure-linux-bak" 2>/dev/null
+    sed -i -E '/^URIs:.*debian/,/^$/ s/^(Components:.*)$/\1 non-free/' "$f"; changed=1
+  done
+  f=$R/etc/apt/sources.list
+  if [ -f "$f" ] && grep -qE '^deb .*debian' "$f" && ! grep -qE '^deb .*[[:space:]]non-free([[:space:]]|$)' "$f"; then
+    cp -n "$f" "$f.secure-linux-bak" 2>/dev/null
+    sed -i -E '/^deb .*debian/ s/^(deb .*[ ])(main)(.*)$/\1\2\3 non-free/' "$f"; changed=1
+  fi
+  if [ "$changed" = 1 ]; then sl_apt_update_force; fi
+  return 0
+}
+sl_apt_update_force() { SL_APT_UPDATED=""; sl_apt_update; }
+
+# ---------------------------------------------------------------- Secure Boot key for the DKMS modules
+cmd_enroll_key() {
+  need_root
+  if ! sb_on; then say "Secure Boot is off on this computer, so no key is needed."; return 0; fi
+  have mokutil || sl_pkg_install --no-recommends mokutil
+  sl_pkg_install --no-recommends dkms        # dkms makes its own signing key the first time it is installed
+  local pub=$R/var/lib/dkms/mok.pub
+  [ -f "$pub" ] || { say "The signing key has not been made yet. Install a driver first (secure-linux-drivers install), then run this again."; return 1; }
+  if mokutil --test-key "$pub" 2>&1 | grep -qi 'already enrolled'; then say "The key is already approved."; return 0; fi
+  cat <<'EOF'
+
+  SECURE BOOT KEY
+  ---------------
+  Secure Boot only starts programs it has been told to trust. The driver is signed with a key made on THIS computer, and
+  you now tell the firmware to trust that key. You will choose a one-time password now (any 8+ characters; write it down).
+  When the computer restarts, a BLUE screen appears: choose "Enroll MOK", then "Continue", "Yes", type that password, and Reboot.
+  If you miss the blue screen the driver will not load; run this again.
+EOF
+  ask "Set the one-time password now?" enroll || { say "Not now. Nothing was changed."; return 0; }
+  mokutil --import "$pub" && say "Done. Restart the computer and approve the key on the blue screen."
+}
+
+# ---------------------------------------------------------------- Broadcom Wi-Fi
+cmd_broadcom() {
+  local id; id=$(broadcom_id) || { say "No Broadcom Wi-Fi chip that needs the extra driver was found."; return 0; }
+  if has_wifi_if; then say "A Wi-Fi chip (Broadcom $id) is already working with the open driver. No extra driver is needed."; return 0; fi
+  sl_pkg_installed broadcom-sta-dkms && { say "The Broadcom driver is installed. If Wi-Fi is still missing, restart; with Secure Boot on, run: secure-linux-drivers enroll-key"; return 0; }
+  interactive && need_root
+  cat <<EOF
+
+  BROADCOM WI-FI DRIVER
+  ---------------------
+  Your Wi-Fi chip (Broadcom $id) is one the open drivers in Linux do not run. Broadcom's own driver ("wl", package
+  broadcom-sta-dkms) does. It is in Debian's "non-free" section: it works, but its source is not open, and it
+  is built on this computer for each kernel (it needs the kernel headers, a few hundred MB, and the internet to download).
+  It will be installed from Debian's own archive only. Alternatives: a cable or phone USB tethering, or a cheap USB Wi-Fi
+  adapter (most work without any extra driver).
+EOF
+  if ! interactive; then
+    sl_event wifi-driver-offer "Your Wi-Fi chip needs an extra driver" "Open a terminal and run: sudo secure-linux-drivers broadcom   (needs a cable or phone tethering for the download)."
+    say "(No keyboard to answer; left a note in Secure Linux Status.)"; return 0
+  fi
+  if ! online; then
+    # Offline fallback: the free Broadcom FIRMWARE (firmware-brcm80211) may be in the USB stick's offline pool; many
+    # Broadcom chips work with it and the open driver. The wl driver itself stays online-only (its dkms build needs
+    # the kernel headers and a download). The shared pool helper does the install + reporting (B1); the find below
+    # only decides whether the question is worth asking at all (it isn't, when this firmware isn't in the pool).
+    _b_deb=""
+    _b_pool=$(sl_offline_fw_dir 2>/dev/null) && _b_deb=$(find "$_b_pool" -maxdepth 3 -name 'firmware-brcm80211_*.deb' 2>/dev/null | sort | tail -n1)
+    if [ -n "$_b_deb" ]; then
+      say "No internet right now, but the USB stick's offline firmware pool is available."
+      if ask "Install the free Broadcom Wi-Fi FIRMWARE (firmware-brcm80211) from the USB stick? Some Broadcom chips work with it and the open driver. The separate wl driver still needs the internet." broadcom-fw; then
+        need_root
+        if sl_offline_fw_install firmware-brcm80211; then say "Firmware installed from the USB stick. Restart the computer and check whether Wi-Fi appears."; fi
+      fi
+    fi
+    say "No internet right now: the driver has to be downloaded. Plug in a cable or use phone USB tethering, then run this again."
+    return 1
+  fi
+  ask "Install the Broadcom Wi-Fi driver now?" broadcom || { say "Not installed. Nothing was changed."; return 0; }
+  need_root
+  enable_nonfree
+  sl_pkg_install --no-recommends dkms "$(headers_pkg)" broadcom-sta-dkms || { say "The driver could not be installed. Nothing else was changed."; return 1; }
+  sl_choice_set wifi_driver broadcom-sta
+  modprobe -r b43 ssb bcma brcmsmac 2>/dev/null || true
+  modprobe wl 2>/dev/null || true
+  if sb_on; then say "Secure Boot is on, so the driver also needs its key approved:"; cmd_enroll_key; fi
+  say "Done. Restart the computer; the Wi-Fi list should then appear in the network menu."
+}
+
+# ---------------------------------------------------------------- NVIDIA
+cmd_nvidia() {
+  local det
+  nvidia_present || { say "No NVIDIA graphics card was found."; return 0; }
+  if [ "$(sl_arch)" != amd64 ] || [ "$(sl_debian_major)" != 13 ]; then
+    say "NVIDIA's driver is offered only on 64-bit Debian 13. This computer keeps the open driver (nouveau), which is fine for everyday use."
+    return 0
+  fi
+  if [ "$(sl_choice_get nvidia_driver)" = nouveau ]; then say "You chose to keep the open driver (nouveau). To change: secure-linux-choice set nvidia_driver nvidia, then run this again."; return 0; fi
+  sl_pkg_installed nvidia-driver && { say "The NVIDIA driver is installed."; return 0; }
+  det=""
+  if have nvidia-detect; then det=$(nvidia-detect 2>/dev/null); fi
+  if have nvidia-detect && ! printf '%s' "$det" | grep -q 'nvidia-driver$'; then
+    say "NVIDIA's current driver does not support this card (it needs an older 'legacy' driver). This computer keeps the open driver (nouveau)."
+    say "(nvidia-detect says: $(printf '%s' "$det" | tail -n 3 | tr '\n' ' '))"; return 0
+  fi
+  interactive && need_root
+  cat <<'EOF'
+
+  NVIDIA GRAPHICS DRIVER
+  ----------------------
+  Your graphics card works now with the open driver (nouveau): fine for the desktop, video and office work, slower for 3D
+  and games. NVIDIA's own driver (package nvidia-driver) is faster for 3D, but:
+    - it is in Debian's "non-free" section (works, source not open);
+    - it needs a restart;
+    - with Secure Boot ON it needs a key you approve once on a blue screen at restart; if you skip that, the screen can fall
+      back to basic graphics (the repair tool has "Black or garbled screen" -> go back to nouveau);
+    - it is not needed for everyday use. If this computer is for email, web and documents, say no.
+EOF
+  if ! interactive; then
+    sl_event nvidia-driver-offer "A faster graphics driver is available" "Open a terminal and run: sudo secure-linux-drivers nvidia   (optional; the open driver works already)."
+    say "(No keyboard to answer; left a note in Secure Linux Status.)"; return 0
+  fi
+  online || { say "No internet right now: the driver has to be downloaded. Try again when you are online."; return 1; }
+  ask "Install NVIDIA's driver?" nvidia || { say "Not installed. The open driver stays."; sl_choice_set nvidia_driver nouveau 2>/dev/null; return 0; }
+  need_root
+  enable_nonfree
+  if sb_on; then
+    sl_pkg_install --no-recommends dkms mokutil
+    say "Secure Boot is on, so the driver's key comes first."
+    cmd_enroll_key
+    if ! { mokutil --list-new 2>/dev/null | grep -qi . || mokutil --test-key "$R/var/lib/dkms/mok.pub" 2>&1 | grep -qi 'already enrolled'; }; then
+      say "The key was not set up, so the driver is not installed (it would not load). Run this again when you are ready."; return 0
+    fi
+  fi
+  sl_pkg_install --no-recommends dkms "$(headers_pkg)" nvidia-driver firmware-misc-nonfree || { say "The driver could not be installed. Nothing else was changed."; return 1; }
+  sl_choice_set nvidia_driver nvidia
+  say "Done. Restart the computer to start using the NVIDIA driver."
+  if sb_on; then say "Remember: approve the key on the blue screen at the restart."; fi
+  return 0   # not the result of the sb_on check above: the install succeeded
+}
+
+# ---------------------------------------------------------------- check / install
+cmd_check() {
+  local any=0 id
+  if id=$(broadcom_id) && ! has_wifi_if && ! sl_pkg_installed broadcom-sta-dkms; then
+    any=1; say "[OFFER] Broadcom Wi-Fi chip ($id): the open drivers do not run it. Run: sudo secure-linux-drivers broadcom"
+  fi
+  if nvidia_present && [ "$(sl_arch)" = amd64 ] && [ "$(sl_debian_major)" = 13 ] && ! sl_pkg_installed nvidia-driver && [ "$(sl_choice_get nvidia_driver)" != nouveau ]; then
+    any=1; say "[OFFER] NVIDIA graphics card: optional faster driver. Run: sudo secure-linux-drivers nvidia"
+  elif nvidia_present; then say "[OK]    NVIDIA graphics card: using $(sl_pkg_installed nvidia-driver && echo "NVIDIA's driver" || echo 'the open driver (nouveau)')."
+  fi
+  [ "$any" = 0 ] && say "No extra drivers are needed for this computer."
+  if [ "$any" = 1 ] && [ "${QUIET:-0}" = 1 ] && [ "$(id -u)" -eq 0 ]; then
+    sl_event drivers-offer "Extra drivers are available" "Some hardware in this computer can use an extra driver (optional). Open a terminal and run: secure-linux-drivers check"
+  fi
+  return 0
+}
+cmd_install() {
+  cmd_broadcom
+  cmd_nvidia
+  return 0
+}
+
+ARGS=("$@"); QUIET=0; YES=0
+for a in "$@"; do case "$a" in --quiet) QUIET=1 ;; --yes) YES=1 ;; esac; done
+case "${1:-check}" in
+  -h|--help|help) usage ;;
+  check|status) cmd_check ;;
+  install|reassert) cmd_install ;;
+  broadcom) cmd_broadcom ;;
+  nvidia) cmd_nvidia ;;
+  enroll-key|enroll) cmd_enroll_key ;;
+  reinstall) cmd_install ;;
+  *) echo "Unknown command '$1'." >&2; usage; exit 2 ;;
+esac

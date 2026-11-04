@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Hardware Health Check
+GenericName=Is every part of my computer OK?
+Comment=Checks the drive, memory, processor, battery, screen, sound, USB ports and everything else, in plain English
+Exec=/usr/local/bin/secure-linux-health --gui
+Icon=utilities-system-monitor
+Terminal=false
+Categories=System;Settings;HardwareSettings;
+Keywords=hardware;health;check;test;smart;battery;memory;ssd;drive;

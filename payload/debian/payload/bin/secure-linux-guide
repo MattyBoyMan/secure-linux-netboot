@@ -1,0 +1,22 @@
+#!/bin/bash
+# secure-linux-guide: open the START-HERE guide, or show this computer's status.
+#   secure-linux-guide            open the guide in the web browser
+#   secure-linux-guide where      print where the guide file is
+#   secure-linux-guide status     the status list (same as secure-linux-status)
+case "${1:-open}" in
+  -h|--help|help) sed -n '2,6p' "$0"; exit 0 ;;
+  status) exec secure-linux-status ;;
+esac
+guide=""
+for f in /usr/share/secure-linux/START-HERE.html /usr/local/share/secure-linux/START-HERE.html; do
+  [ -f "$f" ] && { guide=$f; break; }
+done
+if [ -z "$guide" ]; then
+  echo "The guide file isn't on this computer. It is on the USB stick: linux-setup/START-HERE.html"
+  exit 1
+fi
+case "${1:-open}" in
+  where) echo "$guide" ;;
+  open) xdg-open "$guide" >/dev/null 2>&1 || { echo "Open this file in your web browser: $guide"; exit 1; } ;;
+  *) echo "Unknown option: $1 (see --help)" >&2; exit 2 ;;
+esac

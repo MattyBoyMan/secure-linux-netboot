@@ -1,0 +1,33 @@
+{
+  "created": "2026-11-02T00:00:00Z",
+  "updated": "2026-11-02T00:00:00Z",
+  "name": "000-secure-linux-allow-root-downloads",
+  "description": "Secure Linux: always allow curl/wget run by the system (Secure Linux update scripts)",
+  "enabled": true,
+  "precedence": true,
+  "nolog": true,
+  "action": "allow",
+  "duration": "always",
+  "operator": {
+    "type": "list",
+    "operand": "list",
+    "sensitive": false,
+    "data": "[{\"type\": \"regexp\", \"operand\": \"process.path\", \"sensitive\": false, \"data\": \"^/usr/bin/(curl|wget)$\", \"list\": []}, {\"type\": \"simple\", \"operand\": \"user.id\", \"sensitive\": false, \"data\": \"0\", \"list\": []}]",
+    "list": [
+      {
+        "type": "regexp",
+        "operand": "process.path",
+        "sensitive": false,
+        "data": "^/usr/bin/(curl|wget)$",
+        "list": []
+      },
+      {
+        "type": "simple",
+        "operand": "user.id",
+        "sensitive": false,
+        "data": "0",
+        "list": []
+      }
+    ]
+  }
+}

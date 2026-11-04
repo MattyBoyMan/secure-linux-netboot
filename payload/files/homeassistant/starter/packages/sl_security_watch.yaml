@@ -1,0 +1,72 @@
+# =====================================================================================================
+# sl_security_watch.yaml  -  "somebody got a password wrong": a phone alert in seconds
+# =====================================================================================================
+# WHAT IT DOES   Home Assistant already notices failed logins and puts a message in the bell icon. This
+#                package sends that same message to your phone straight away.
+# WHY            One mistyped password is normal. A string of them from a strange address means someone is
+#                guessing. You want to know in minutes. (Combined with ip_ban_enabled in the secure defaults,
+#                repeat guessers get blocked automatically.)
+# WHAT TO DO WHEN IT FIRES  If it was you, ignore it. If not: check Settings > System > Logs for the address,
+#                make sure nothing is port-forwarded on your router, turn on two-step login for every account.
+# VERIFY         It listens for the notification id "http-login", which Home Assistant's web server uses
+#                (checked in Home Assistant's source). The message fields available inside are
+#                trigger.notification.title / message; if a future version renames them the alert still
+#                arrives, with plain wording.
+# NEEDS          sl_helpers.yaml (for script.sl_notify)
+
+automation:
+  - alias: "Security watch: failed login"
+    id: sl_login_alert
+    description: "Sends Home Assistant's failed-login notice to your phone."
+    mode: queued
+    max: 5
+    triggers:
+      - trigger: persistent_notification
+        update_type:
+          - added
+          - updated
+        notification_id: http-login
+    actions:
+      - action: script.sl_notify
+        data:
+          title: "Failed login to Home Assistant"
+          message: "{{ trigger.notification.message | default('Someone used a wrong password. Check Settings > System > Logs.') }}"
+          urgent: true
+
+  # Two more watchers that need no setup:
+  # - a door or window opens while Away mode (everyone out, see the Away mode blueprint) is on
+  - alias: "Security watch: door opened while Away mode is on"
+    id: sl_away_door
+    description: "Urgent alert if a door or window opens while nobody is meant to be home."
+    mode: queued
+    triggers:
+      - trigger: template
+        value_template: >
+          {{ is_state('input_boolean.sl_away_mode', 'on')
+             and (states.binary_sensor | selectattr('attributes.device_class', 'defined')
+                  | selectattr('attributes.device_class', 'in', ['door', 'window', 'garage_door', 'opening'])
+                  | selectattr('state', 'eq', 'on') | list | count > 0) }}
+    actions:
+      - action: script.sl_notify
+        data:
+          title: "Opened while you're away"
+          message: >
+            {{ states.binary_sensor | selectattr('attributes.device_class', 'defined')
+               | selectattr('attributes.device_class', 'in', ['door', 'window', 'garage_door', 'opening'])
+               | selectattr('state', 'eq', 'on') | map(attribute='name') | join(', ') }} opened while Away mode is on.
+          urgent: true
+
+  # - Home Assistant itself restarted (so an unexpected restart or update doesn't go unnoticed)
+  - alias: "Security watch: Home Assistant restarted"
+    id: sl_restart_notice
+    description: "A quiet note each time Home Assistant starts, so an unexpected restart is noticed."
+    mode: single
+    triggers:
+      - trigger: homeassistant
+        event: start
+    actions:
+      - delay: "00:01:00"
+      - action: script.sl_notify
+        data:
+          title: "Home Assistant started"
+          message: "It started at {{ now().strftime('%H:%M') }}. If you didn't restart or update it, look at Settings > System > Logs."

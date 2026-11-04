@@ -1,0 +1,18 @@
+{
+  "created": "2026-11-02T00:00:00Z",
+  "updated": "2026-11-02T00:00:00Z",
+  "name": "050-secure-linux-apps-system",
+  "description": "Secure Linux: allow desktop and system apps installed by Secure Linux (no question; block lists still apply)",
+  "enabled": true,
+  "precedence": false,
+  "nolog": true,
+  "action": "allow",
+  "duration": "always",
+  "operator": {
+    "type": "regexp",
+    "operand": "process.path",
+    "sensitive": false,
+    "data": "^/usr/(bin/(plasmashell|plasma-discover|gnome-software|firefox|librewolf|git|steam|qflipper|immich-go|yt-dlp|kdeconnect-app)|libexec/(kf6/kioworker|kf5/kioslave5|git-core/git-remote-https?)|lib64/firefox/firefox|local/bin/immich-go|lib/cups/backend/.*|sbin/cupsd)$",
+    "list": []
+  }
+}

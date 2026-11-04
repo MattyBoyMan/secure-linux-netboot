@@ -1,0 +1,18 @@
+{
+  "created": "2026-11-02T00:00:00Z",
+  "updated": "2026-11-02T00:00:00Z",
+  "name": "000-secure-linux-allow-rpm-ostree",
+  "description": "Secure Linux: always allow system updates on the atomic setup",
+  "enabled": true,
+  "precedence": true,
+  "nolog": true,
+  "action": "allow",
+  "duration": "always",
+  "operator": {
+    "type": "regexp",
+    "operand": "process.path",
+    "sensitive": false,
+    "data": "^/usr/(bin/rpm-ostree|libexec/rpm-ostreed)$",
+    "list": []
+  }
+}

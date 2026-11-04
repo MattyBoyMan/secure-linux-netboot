@@ -1,0 +1,11 @@
+# Secure Linux: app telemetry (usage reporting) endpoints. Regular expressions, one per line (kept small: the
+# OpenSnitch wiki advises < 300 regexps). Only endpoints whose blocking breaks nothing.
+# Mozilla (LibreWolf/Firefox usage pings; LibreWolf already turns these off)
+^(.+\.)?telemetry\.mozilla\.org$
+^incoming\.telemetry\.mozilla\.org$
+# Microsoft (VSCodium extensions, .NET tools)
+^dc\.services\.visualstudio\.com$
+^(.+\.)?events\.data\.microsoft\.com$
+^vortex(-win)?\.data\.microsoft\.com$
+# KDE (KUserFeedback, opt-in usage statistics)
+^telemetry\.kde\.org$

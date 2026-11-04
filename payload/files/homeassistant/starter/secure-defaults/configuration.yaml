@@ -1,0 +1,60 @@
+# =====================================================================================================
+# configuration.yaml  -  SECURE DEFAULTS for Home Assistant (a starting point you can read line by line)
+# =====================================================================================================
+# HOW TO USE   If you are starting fresh, this can be your configuration.yaml. If you already have one,
+#              DON'T replace it: copy only the parts you want (the comments say what each does), or let
+#              secure-linux-ha-secure --apply add the safe bits for you (it shows you first and can undo).
+#              Always run   secure-linux-ha validate   before restarting Home Assistant.
+# SECRETS      Passwords and keys go in secrets.yaml (see secrets.yaml.example), written here as:
+#                  password: !secret my_password
+
+# ---- the basics ------------------------------------------------------------------------------------
+homeassistant:
+  name: Home
+  # Packages = ready-made feature files. Anything you drop into the 'packages' folder is loaded.
+  packages: !include_dir_named packages
+  # Tell Home Assistant its web addresses if you use HTTPS (otherwise leave commented out):
+  # internal_url: "https://ha.home"
+  # external_url: "https://ha.home"
+  # SECURITY: do NOT add an 'auth_providers: - type: trusted_networks' block. It lets devices skip the password.
+
+default_config:
+
+# ---- the web server: this is the part that faces your network -----------------------------------------
+http:
+  # Block an address after too many wrong passwords. The ban is OFF unless you give a number.
+  ip_ban_enabled: true
+  login_attempts_threshold: 5
+  # Only if a reverse proxy (Caddy) sits in front of Home Assistant on the SAME computer:
+  # use_x_forwarded_for: true
+  # trusted_proxies:
+  #   - 127.0.0.1
+  #   - ::1
+  #   - 172.16.0.0/12      # Docker's private network, if Caddy runs in a container
+  # Never use 0.0.0.0/0 here: that trusts the whole world to claim any address it likes.
+  # cors_allowed_origins: leave it unset. Never use "*".
+
+# ---- keep logs useful but quiet -----------------------------------------------------------------------
+logger:
+  default: warning
+  logs:
+    homeassistant.components.http.ban: warning   # failed logins show up here
+
+# ---- keep the database a sensible size -----------------------------------------------------------------
+recorder:
+  purge_keep_days: 14
+
+# ---- your own automations, scripts and scenes (the UI writes these files) ----------------------------------
+automation: !include automations.yaml
+script: !include scripts.yaml
+scene: !include scenes.yaml
+
+# ---- the starter dashboard ---------------------------------------------------------------------------
+lovelace:
+  dashboards:
+    sl-starter:
+      mode: yaml
+      title: Home (starter)
+      icon: mdi:home-heart
+      show_in_sidebar: true
+      filename: dashboards/sl_starter.yaml

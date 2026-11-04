@@ -1,0 +1,31 @@
+# =====================================================================================================
+# sl_update_digest.yaml  -  one weekly message: "these updates are waiting"
+# =====================================================================================================
+# WHAT IT DOES   Sunday 10am: lists everything with an update available (Home Assistant itself, add-ons,
+#                ESPHome devices, integrations, firmware) and reminds you of the safe routine.
+# WHY            Security fixes only help once installed. A weekly nudge beats forgetting for six months.
+# THE SAFE ROUTINE  1) make a backup, 2) read the release notes (link in the Updates page),
+#                3) update ONE thing at a time, 4) check it works.  The server kit's safe-update.sh does step 1 for you.
+# NEEDS          sl_helpers.yaml (for script.sl_notify)
+
+automation:
+  - alias: "Updates: weekly digest"
+    id: sl_update_digest
+    description: "Sunday 10am: lists all available updates and the safe update routine."
+    mode: single
+    triggers:
+      - trigger: time
+        at: "10:00:00"
+    conditions:
+      - condition: time
+        weekday:
+          - sun
+      - condition: template
+        value_template: "{{ states.update | selectattr('state', 'eq', 'on') | list | count > 0 }}"
+    actions:
+      - action: script.sl_notify
+        data:
+          title: "Updates waiting"
+          message: >
+            {{ states.update | selectattr('state', 'eq', 'on') | map(attribute='name') | join(', ') }}.
+            Back up first, read the release notes, then update one at a time.

@@ -1,0 +1,68 @@
+#!/bin/bash
+# Secure Linux network dispatcher (installed by steps/20-network.sh to /etc/NetworkManager/dispatcher.d/,
+# mode 0755). NetworkManager runs it as root whenever a connection goes up or down.
+#
+# At home (every active Wi-Fi/Ethernet connection is in the firewall "home" zone):
+#   Syncthing and Avahi (local network announcements) are started again.
+# Anywhere else (hotel, cafe, unknown networks, firewall "public" zone):
+#   Syncthing (syncthing@<user>) is stopped unless the choice syncthing_lan_only=no, and Avahi is stopped so
+#   the computer doesn't announce its name. (The firewall already blocks KDE Connect, LocalSend, Syncthing
+#   and mDNS there, in and out.)
+# The saved home Wi-Fi (choice home_ssid) is put in the home zone automatically the first time it connects,
+# but only if it is password-protected (an open network with the same name is never trusted).
+#
+# Manual run: 50-secure-linux "" refresh       Writes /run/secure-linux/location (home|away|offline).
+SL_ROOT=${SL_ROOT:-/usr/local/lib/secure-linux}
+. "$SL_ROOT/lib/common.sh" 2>/dev/null || exit 0
+SEC_PREFIX=${SL_SEC_PREFIX:-}
+
+IFACE=${1:-} ACTION=${2:-refresh}
+case "$ACTION" in
+  up|down|reapply|connectivity-change|refresh|dhcp4-change|dhcp6-change) ;;
+  *) exit 0 ;;
+esac
+
+# 1. Saved home Wi-Fi seen for the first time: put it in the home zone.
+if [ "$ACTION" = up ] && [ -n "${CONNECTION_UUID:-}" ]; then
+  home_ssid=$(sl_choice_get home_ssid "$(sl_build_get HOME_WIFI_SSID)")
+  [ "$home_ssid" = - ] && home_ssid=""
+  if [ -n "$home_ssid" ]; then
+    info=$(nmcli -g connection.type,802-11-wireless.ssid,connection.zone,802-11-wireless-security.key-mgmt \
+           connection show "$CONNECTION_UUID" 2>/dev/null)
+    ctype=$(sed -n 1p <<<"$info"); ssid=$(sed -n 2p <<<"$info"); zone=$(sed -n 3p <<<"$info"); km=$(sed -n 4p <<<"$info")
+    if [ "$ctype" = 802-11-wireless ] && [ "$ssid" = "$home_ssid" ] && [ -z "$zone" ] && [ -n "$km" ] && [ "$km" != none ]; then
+      logger -t secure-linux "Home Wi-Fi '$ssid' recognised: putting it in the home firewall zone"
+      nmcli connection modify "$CONNECTION_UUID" connection.zone home
+      nmcli device reapply "$IFACE" >/dev/null 2>&1 || firewall-cmd --zone=home --change-interface="$IFACE" >/dev/null 2>&1
+    fi
+  fi
+fi
+
+# 2. Where are we? home only if every active Wi-Fi/Ethernet connection is a home connection.
+home=0 away=0
+while IFS=: read -r uuid ctype; do
+  case "$ctype" in 802-11-wireless|802-3-ethernet) ;; *) continue ;; esac
+  z=$(nmcli -g connection.zone connection show "$uuid" 2>/dev/null)
+  if [ "$z" = home ] || [ "$z" = trusted ]; then home=1; else away=1; fi
+done < <(nmcli -t -f UUID,TYPE connection show --active 2>/dev/null)
+if [ $away = 1 ]; then where=away; elif [ $home = 1 ]; then where=home; else where=offline; fi
+mkdir -p "$SEC_PREFIX/run/secure-linux"
+prev=$(cat "$SEC_PREFIX/run/secure-linux/location" 2>/dev/null)
+echo "$where" > "$SEC_PREFIX/run/secure-linux/location"
+
+# 3. Start or stop the services that talk to the local network.
+user=$(sl_user)
+st_unit="syncthing@$user.service"
+if [ "$where" = home ]; then
+  [ -n "$user" ] && systemctl -q is-enabled "$st_unit" 2>/dev/null && systemctl --no-block start "$st_unit"
+  if systemctl -q is-enabled avahi-daemon.service 2>/dev/null; then
+    systemctl --no-block start avahi-daemon.socket avahi-daemon.service
+  fi
+else
+  if [ -n "$user" ] && [ "$(sl_choice_get syncthing_lan_only yes)" != no ]; then
+    systemctl --no-block stop "$st_unit"
+  fi
+  systemctl --no-block stop avahi-daemon.socket avahi-daemon.service
+fi
+[ "$prev" != "$where" ] && logger -t secure-linux "Network location is now: $where"
+exit 0

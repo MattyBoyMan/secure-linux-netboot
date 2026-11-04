@@ -1,0 +1,18 @@
+{
+  "created": "2026-11-02T00:00:00Z",
+  "updated": "2026-11-02T00:00:00Z",
+  "name": "000-secure-linux-allow-cloudflared",
+  "description": "Secure Linux: always allow Cloudflare Tunnel client",
+  "enabled": true,
+  "precedence": true,
+  "nolog": true,
+  "action": "allow",
+  "duration": "always",
+  "operator": {
+    "type": "regexp",
+    "operand": "process.path",
+    "sensitive": false,
+    "data": "^/usr/(local/)?bin/cloudflared$",
+    "list": []
+  }
+}

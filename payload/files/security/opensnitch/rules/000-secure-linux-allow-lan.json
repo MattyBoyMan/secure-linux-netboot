@@ -1,0 +1,18 @@
+{
+  "created": "2026-11-02T00:00:00Z",
+  "updated": "2026-11-02T00:00:00Z",
+  "name": "000-secure-linux-allow-lan",
+  "description": "Secure Linux: always allow the local network, home server (Immich) and Meshnet",
+  "enabled": true,
+  "precedence": true,
+  "nolog": true,
+  "action": "allow",
+  "duration": "always",
+  "operator": {
+    "type": "lists",
+    "operand": "lists.nets",
+    "sensitive": false,
+    "data": "/etc/opensnitchd/secure-linux-lists/lan",
+    "list": []
+  }
+}

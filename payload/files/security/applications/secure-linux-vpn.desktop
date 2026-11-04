@@ -1,0 +1,21 @@
+[Desktop Entry]
+Type=Application
+Name=Secure Linux VPN
+Comment=Sign in to NordVPN and choose private, home or off
+Exec=/usr/local/bin/secure-linux-terminal /usr/local/bin/secure-linux-vpn setup
+Icon=network-vpn
+Terminal=false
+Categories=Network;
+Actions=private;home;off;
+
+[Desktop Action private]
+Name=Private (NordVPN on)
+Exec=/usr/local/bin/secure-linux-terminal /usr/local/bin/secure-linux-vpn private
+
+[Desktop Action home]
+Name=Home access (reach your home server)
+Exec=/usr/local/bin/secure-linux-terminal /usr/local/bin/secure-linux-vpn home
+
+[Desktop Action off]
+Name=VPN off
+Exec=/usr/local/bin/secure-linux-terminal /usr/local/bin/secure-linux-vpn off

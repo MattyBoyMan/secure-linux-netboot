@@ -1,0 +1,18 @@
+{
+  "created": "2026-11-02T00:00:00Z",
+  "updated": "2026-11-02T00:00:00Z",
+  "name": "050-secure-linux-apps-flatpak",
+  "description": "Secure Linux: allow the apps installed by Secure Linux (no question; block lists still apply)",
+  "enabled": true,
+  "precedence": false,
+  "nolog": true,
+  "action": "allow",
+  "duration": "always",
+  "operator": {
+    "type": "regexp",
+    "operand": "process.env.FLATPAK_ID",
+    "sensitive": false,
+    "data": "^(io\\.gitlab\\.librewolf\\-community|org\\.torproject\\.torbrowser\\-launcher|io\\.github\\.ungoogled_software\\.ungoogled_chromium|org\\.mozilla\\.firefox|com\\.bitwarden\\.desktop|org\\.signal\\.Signal|com\\.tutanota\\.Tutanota|com\\.valvesoftware\\.Steam|com\\.heroicgameslauncher\\.hgl|net\\.davidotek\\.pupgui2|com\\.discordapp\\.Discord|dev\\.vencord\\.Vesktop|org\\.localsend\\.localsend_app|com\\.vscodium\\.codium|com\\.jeffser\\.Alpaca|net\\.cozic\\.joplin_desktop|io\\.ente\\.auth|org\\.qbittorrent\\.qBittorrent|org\\.gnome\\.World\\.PikaBackup|org\\.nickvision\\.tubeconverter|io\\.github\\.flattool\\.Warehouse|com\\.usebottles\\.bottles|it\\.mijorus\\.gearlever|org\\.upscayl\\.Upscayl|com\\.obsproject\\.Studio|org\\.kde\\.kdenlive|org\\.gimp\\.GIMP|org\\.kde\\.krita|org\\.inkscape\\.Inkscape|org\\.blender\\.Blender|io\\.missioncenter\\.MissionCenter|app\\.immich\\.Immich)$",
+    "list": []
+  }
+}

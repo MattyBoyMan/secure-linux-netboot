@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Hotel / Cafe Wi-Fi Login
+Comment=Pause the VPN and private DNS for a few minutes so a Wi-Fi login page can load
+Exec=/usr/local/bin/secure-linux-hotspot
+Icon=network-wireless
+Terminal=false
+Categories=Network;
+Keywords=captive;portal;hotel;wifi;login;

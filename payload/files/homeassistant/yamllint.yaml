@@ -1,0 +1,17 @@
+# yamllint settings for Home Assistant files (used by: secure-linux-ha validate).
+# Gentle on purpose: Home Assistant writes on/off/yes/no, long lines and comments, and beginners shouldn't be
+# told off for those. Real mistakes (bad indentation, tabs, duplicate keys, broken syntax) still stop you.
+extends: relaxed
+rules:
+  line-length: disable
+  truthy: disable
+  comments: disable
+  comments-indentation: disable
+  document-start: disable
+  indentation:
+    spaces: consistent
+    indent-sequences: consistent
+  key-duplicates: enable
+  trailing-spaces: disable
+  empty-lines: disable
+  new-line-at-end-of-file: disable

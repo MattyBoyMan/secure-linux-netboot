@@ -1,0 +1,33 @@
+{
+  "created": "2026-11-03T00:00:00Z",
+  "updated": "2026-11-03T00:00:00Z",
+  "name": "000-secure-linux-allow-ollama",
+  "description": "Secure Linux: local AI (Ollama) may reach only its own model download sites (this computer and your home network are always allowed by the local-network rule)",
+  "enabled": true,
+  "precedence": true,
+  "nolog": true,
+  "action": "allow",
+  "duration": "always",
+  "operator": {
+    "type": "list",
+    "operand": "list",
+    "sensitive": false,
+    "data": "[{\"type\": \"regexp\", \"operand\": \"process.path\", \"sensitive\": false, \"data\": \"^/usr/(local/)?bin/ollama$\", \"list\": []}, {\"type\": \"regexp\", \"operand\": \"dest.host\", \"sensitive\": false, \"data\": \"^(.+\\\\.)?(ollama\\\\.com|ollama\\\\.ai|huggingface\\\\.co|hf\\\\.co|r2\\\\.cloudflarestorage\\\\.com)$\", \"list\": []}]",
+    "list": [
+      {
+        "type": "regexp",
+        "operand": "process.path",
+        "sensitive": false,
+        "data": "^/usr/(local/)?bin/ollama$",
+        "list": []
+      },
+      {
+        "type": "regexp",
+        "operand": "dest.host",
+        "sensitive": false,
+        "data": "^(.+\\.)?(ollama\\.com|ollama\\.ai|huggingface\\.co|hf\\.co|r2\\.cloudflarestorage\\.com)$",
+        "list": []
+      }
+    ]
+  }
+}

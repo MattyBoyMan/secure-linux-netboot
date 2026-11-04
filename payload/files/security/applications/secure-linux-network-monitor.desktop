@@ -1,0 +1,20 @@
+[Desktop Entry]
+Type=Application
+Name=Network Monitor
+GenericName=Which apps use the internet
+Comment=See which apps connect to the internet, and change what each app may do
+Exec=opensnitch-ui
+TryExec=opensnitch-ui
+Icon=opensnitch-ui
+Terminal=false
+Categories=System;Monitor;Network;Security;
+Keywords=network;firewall;opensnitch;internet;apps;privacy;blocked;
+Actions=pause;resume;
+
+[Desktop Action pause]
+Name=Pause network protection for 15 minutes
+Exec=/usr/local/bin/secure-linux-netguard pause 15
+
+[Desktop Action resume]
+Name=Switch network protection back on
+Exec=/usr/local/bin/secure-linux-netguard resume

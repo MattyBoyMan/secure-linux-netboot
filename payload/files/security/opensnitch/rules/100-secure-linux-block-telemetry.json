@@ -1,0 +1,18 @@
+{
+  "created": "2026-11-02T00:00:00Z",
+  "updated": "2026-11-02T00:00:00Z",
+  "name": "100-secure-linux-block-telemetry",
+  "description": "Secure Linux: block app usage-reporting (telemetry) addresses",
+  "enabled": true,
+  "precedence": true,
+  "nolog": false,
+  "action": "reject",
+  "duration": "always",
+  "operator": {
+    "type": "lists",
+    "operand": "lists.domains_regexp",
+    "sensitive": false,
+    "data": "/etc/opensnitchd/secure-linux-lists/telemetry",
+    "list": []
+  }
+}

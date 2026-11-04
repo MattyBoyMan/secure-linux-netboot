@@ -1,0 +1,9 @@
+[Unit]
+Description=Secure Linux: network protection weekly summary (Sunday evening)
+
+[Timer]
+OnCalendar=Sun 18:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

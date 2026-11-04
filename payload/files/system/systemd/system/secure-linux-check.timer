@@ -1,0 +1,10 @@
+[Unit]
+Description=Secure Linux health check (10 minutes after start, then every 6 hours)
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=6h
+Persistent=true
+
+[Install]
+WantedBy=timers.target

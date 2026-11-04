@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Create Diagnostics File
+GenericName=Help file for support
+Comment=Saves a zip on your Desktop that helps someone fix a problem (no passwords inside)
+Exec=/usr/local/bin/secure-linux-terminal --hold /usr/local/bin/secure-linux-diag
+Icon=help-about
+Terminal=false
+Categories=System;
+Keywords=diagnostics;support;help;logs;

@@ -1,0 +1,11 @@
+[Unit]
+Description=Secure Linux: update the network block lists every week
+
+[Timer]
+OnBootSec=20min
+OnCalendar=weekly
+RandomizedDelaySec=6h
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,15 @@
+// Secure Linux: let the logged-in administrator (wheel) start the read-only health check, the antivirus scan and
+// the outside-apps check from the Status window without typing a password. Nothing else is allowed.
+polkit.addRule(function(action, subject) {
+    if (action.id == "org.freedesktop.systemd1.manage-units" &&
+        subject.local && subject.active && subject.isInGroup("wheel")) {
+        var unit = action.lookup("unit");
+        var verb = action.lookup("verb");
+        if ((unit == "secure-linux-check.service" ||
+             unit == "secure-linux-clamscan.service" ||
+             unit == "secure-linux-outside-apps.service") &&
+            (verb == "start" || verb == "restart")) {
+            return polkit.Result.YES;
+        }
+    }
+});

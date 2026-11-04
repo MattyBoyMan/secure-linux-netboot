@@ -1,0 +1,12 @@
+#!/bin/sh
+# Secure Linux: MediaTek MT7922 (mt7921e driver) Wi-Fi sometimes doesn't come back after sleep/hibernate.
+# Only active when the hardware test recorded such a failure (flag file below): the driver is unloaded before
+# sleeping and loaded again after waking. Installed by 35-storage.sh into systemd's system-sleep folder.
+# systemd runs this as: secure-linux-mt7921e pre|post suspend|hibernate|hybrid-sleep|suspend-then-hibernate
+FLAG=/var/lib/secure-linux/mt7921e-resume-fix
+[ -f "$FLAG" ] || exit 0
+case "$1" in
+  pre)  modprobe -r mt7921e 2>/dev/null ;;
+  post) modprobe mt7921e 2>/dev/null; logger -t secure-linux "reloaded mt7921e Wi-Fi driver after $2" ;;
+esac
+exit 0

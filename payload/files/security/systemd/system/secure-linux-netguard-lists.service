@@ -1,0 +1,12 @@
+[Unit]
+Description=Secure Linux: download the newest block lists (dangerous sites, trackers)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+# A list that fails its sanity check or doesn't download is simply skipped (the last good copy stays), so a
+# non-zero exit here is not an error worth showing.
+ExecStart=-/usr/local/bin/secure-linux-netguard update-lists
+Nice=15
+IOSchedulingClass=idle

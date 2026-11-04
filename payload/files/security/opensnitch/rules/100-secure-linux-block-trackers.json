@@ -1,0 +1,18 @@
+{
+  "created": "2026-11-02T00:00:00Z",
+  "updated": "2026-11-02T00:00:00Z",
+  "name": "100-secure-linux-block-trackers",
+  "description": "Secure Linux: block known trackers and ad servers (StevenBlack hosts)",
+  "enabled": true,
+  "precedence": true,
+  "nolog": false,
+  "action": "reject",
+  "duration": "always",
+  "operator": {
+    "type": "lists",
+    "operand": "lists.domains",
+    "sensitive": false,
+    "data": "/etc/opensnitchd/secure-linux-lists/trackers",
+    "list": []
+  }
+}

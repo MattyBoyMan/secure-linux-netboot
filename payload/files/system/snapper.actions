@@ -1,0 +1,9 @@
+# Secure Linux: a snapper "pre" snapshot before and a "post" snapshot after every dnf transaction,
+# so any update or install can be undone in Btrfs Assistant (or from the boot menu snapshot).
+# Installed as /etc/dnf/libdnf5-plugins/actions.d/secure-linux-snapper.actions (needs libdnf5-plugin-actions).
+# Format (man libdnf5-actions): callback_name:package_filter:direction:options:command
+# Spaces inside a command are escaped with "\ ". Output lines "tmp.NAME=value" set a variable; "tmp.NAME" unsets it.
+# VERIFY on Fedora 44 (taken from the snapper example in `man libdnf5-actions`).
+pre_transaction::::/usr/bin/sh -c echo\ "tmp.cmd=$(ps\ -o\ command\ --no-headers\ -p\ '${pid}')"
+pre_transaction::::/usr/bin/sh -c echo\ "tmp.snapper_pre_number=$(snapper\ -c\ root\ create\ -t\ pre\ -c\ number\ -p\ -d\ '${tmp.cmd}')"
+post_transaction::::/usr/bin/sh -c [\ -n\ "${tmp.snapper_pre_number}"\ ]\ &&\ snapper\ -c\ root\ create\ -t\ post\ --pre-number\ "${tmp.snapper_pre_number}"\ -c\ number\ -d\ "${tmp.cmd}"\ ;\ echo\ tmp.snapper_pre_number\ ;\ echo\ tmp.cmd

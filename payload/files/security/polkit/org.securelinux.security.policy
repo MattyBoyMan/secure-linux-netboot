@@ -1,0 +1,65 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<!-- Secure Linux (installed by steps/20-network.sh to /usr/share/polkit-1/actions/) -->
+<policyconfig>
+  <vendor>The Complete Secure Linux Package</vendor>
+  <action id="org.securelinux.dns">
+    <description>Pause or resume encrypted DNS for a Wi-Fi login page</description>
+    <message>Secure Linux needs permission to change DNS settings</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>yes</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/bin/secure-linux-dns</annotate>
+  </action>
+  <action id="org.securelinux.zone">
+    <description>Mark a network as your home network</description>
+    <message>Secure Linux needs your password to change which networks are trusted</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/bin/secure-linux-zone</annotate>
+  </action>
+  <action id="org.securelinux.vpn">
+    <description>Change VPN settings</description>
+    <message>Secure Linux needs your password to change VPN settings</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/bin/secure-linux-vpn</annotate>
+  </action>
+  <!-- install.sh re-runs itself as "pkexec /bin/bash <itself>" when started by hand (the setup already runs
+       it as administrator). Tied to that one script, so the prompt says what is being asked. -->
+  <action id="org.securelinux.opensnitch-install">
+    <description>Set up network protection (OpenSnitch)</description>
+    <message>Secure Linux needs your password to install and set up network protection (it asks once about each new app that wants the internet)</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <!-- L8: exec.path says /bin/bash; on Fedora /bin is a symlink to /usr/bin, so pkexec resolves it
+         to /usr/bin/bash either way - the entry is cosmetic, not a different program. -->
+    <annotate key="org.freedesktop.policykit.exec.path">/bin/bash</annotate>
+    <annotate key="org.freedesktop.policykit.exec.argv1">/usr/local/lib/secure-linux/files/security/opensnitch/install.sh</annotate>
+  </action>
+  <!-- secure-linux-fleet-join re-runs itself with pkexec when started by the person at the keyboard
+       (the wizard's fleet page and the Toolbox run it as a normal user). Tied to that one helper,
+       so the password prompt says what is being asked. -->
+  <action id="org.securelinux.fleet-join">
+    <description>Join your home fleet</description>
+    <message>Secure Linux needs your password to let your main computer look after this PC</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/bin/secure-linux-fleet-join</annotate>
+  </action>
+</policyconfig>

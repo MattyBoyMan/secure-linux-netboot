@@ -1,0 +1,33 @@
+{
+  "created": "2026-11-03T00:00:00Z",
+  "updated": "2026-11-03T00:00:00Z",
+  "name": "050-secure-linux-services",
+  "description": "Secure Linux: allow background services of the system itself (run by the computer, from the system folders); block lists still apply",
+  "enabled": true,
+  "precedence": false,
+  "nolog": true,
+  "action": "allow",
+  "duration": "always",
+  "operator": {
+    "type": "list",
+    "operand": "list",
+    "sensitive": false,
+    "data": "[{\"type\": \"simple\", \"operand\": \"user.id\", \"sensitive\": false, \"data\": \"0\", \"list\": []}, {\"type\": \"regexp\", \"operand\": \"process.path\", \"sensitive\": false, \"data\": \"^/usr/(sbin|libexec|lib|lib64)/.*$\", \"list\": []}]",
+    "list": [
+      {
+        "type": "simple",
+        "operand": "user.id",
+        "sensitive": false,
+        "data": "0",
+        "list": []
+      },
+      {
+        "type": "regexp",
+        "operand": "process.path",
+        "sensitive": false,
+        "data": "^/usr/(sbin|libexec|lib|lib64)/.*$",
+        "list": []
+      }
+    ]
+  }
+}

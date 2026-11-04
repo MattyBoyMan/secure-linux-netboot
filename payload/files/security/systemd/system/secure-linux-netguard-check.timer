@@ -1,0 +1,10 @@
+[Unit]
+Description=Secure Linux: check every 30 minutes that network protection is running
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=30min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

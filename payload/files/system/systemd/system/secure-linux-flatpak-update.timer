@@ -1,0 +1,10 @@
+[Unit]
+Description=Update Flatpak apps daily
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+RandomizedDelaySec=1h
+
+[Install]
+WantedBy=timers.target

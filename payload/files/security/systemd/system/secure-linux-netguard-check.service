@@ -1,0 +1,6 @@
+[Unit]
+Description=Secure Linux: network protection health check (restart if stopped, end pauses)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/secure-linux-netguard check

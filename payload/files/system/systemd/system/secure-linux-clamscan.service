@@ -1,0 +1,17 @@
+# Weekly antivirus scan of the main user's Downloads and Desktop folders (never deletes anything).
+# ClamAV itself is installed by the experience steps; this unit does nothing until /usr/bin/clamscan exists.
+# Each run writes /var/log/secure-linux/clamscan/YYYY-MM-DD.log (12 newest kept); secure-linux-check alerts only
+# on the FOUND lines of the latest run (alert id antivirus-found) until "Mark as dealt with" is chosen.
+# SELinux: clamscan runs here inside an unconfined system service, so it can read the home folder. The boolean
+# antivirus_can_scan_system (VERIFY: name in the Fedora 44 policy) only matters for the confined ClamAV domain
+# (clamd, ClamTk on-demand scans); 90-finish.sh switches it on when ClamAV is installed.
+[Unit]
+Description=Secure Linux weekly antivirus scan
+ConditionPathExists=/usr/bin/clamscan
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/secure-linux-check --antivirus-scan
+Nice=19
+IOSchedulingClass=idle
+TimeoutStartSec=6h

@@ -1,0 +1,6 @@
+[Unit]
+Description=Secure Linux: weekly summary of what network protection blocked
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/secure-linux-netguard summary

@@ -1,0 +1,14 @@
+# Daily: update Flatpak apps, remove unused runtimes, warn about end-of-life runtimes, and back up the
+# LibreWolf profile before a LibreWolf major update (see secure-linux-check --flatpak-update).
+[Unit]
+Description=Update Flatpak apps and tidy up
+Wants=network-online.target
+After=network-online.target
+ConditionPathExists=/usr/bin/flatpak
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/secure-linux-check --flatpak-update
+Nice=10
+IOSchedulingClass=idle
+TimeoutStartSec=2h

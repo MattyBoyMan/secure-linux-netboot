@@ -1,0 +1,262 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<!-- Secure Linux: one clear password prompt for every helper that re-runs itself with pkexec.
+     Installed by steps/00-early.sh to /usr/share/polkit-1/actions/. Each action is tied to one program path
+     (and, for the Home Assistant helper, to its first argument), so the prompt says what is being asked.
+     Keep this list in step with: grep -n pkexec linux/bin/*  (tests/integration/run.sh checks it). -->
+<policyconfig>
+  <vendor>The Complete Secure Linux Package</vendor>
+  <action id="org.securelinux.check">
+    <description>Check this computer's security and health</description>
+    <message>Secure Linux needs your password to check the computer's security settings (it only looks, it changes nothing)</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/bin/secure-linux-check</annotate>
+  </action>
+  <action id="org.securelinux.diag">
+    <description>Make a diagnostics file</description>
+    <message>Secure Linux needs your password to collect system information for a diagnostics file (private details are blanked out)</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/bin/secure-linux-diag</annotate>
+  </action>
+  <action id="org.securelinux.diagnose">
+    <description>Find and fix problems on this computer</description>
+    <message>Secure Linux needs your password to fix the problems it found on this computer (it shows you each step first)</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/bin/secure-linux-diagnose</annotate>
+  </action>
+  <action id="org.securelinux.drivers">
+    <description>Install or check drivers</description>
+    <message>Secure Linux needs your password to look at, or install, drivers for this computer's hardware</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/bin/secure-linux-drivers</annotate>
+  </action>
+  <action id="org.securelinux.family">
+    <description>Set up a safe account for children or visitors</description>
+    <message>Secure Linux needs your password to create or change a children's or visitor account</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/bin/secure-linux-family</annotate>
+  </action>
+  <action id="org.securelinux.firmware">
+    <description>Update firmware</description>
+    <message>Secure Linux needs your password to update the firmware (low-level software) of this computer or its disk</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/bin/secure-linux-firmware</annotate>
+  </action>
+  <action id="org.securelinux.ha-token">
+    <description>Save a Home Assistant access token</description>
+    <message>Secure Linux needs your password to save your Home Assistant access token in a file only the administrator can read</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/bin/secure-linux-ha</annotate>
+    <annotate key="org.freedesktop.policykit.exec.argv1">token-set</annotate>
+  </action>
+  <action id="org.securelinux.ha-backup">
+    <description>Back up Home Assistant through its API</description>
+    <message>Secure Linux needs your password to read your saved Home Assistant token and ask Home Assistant for a backup</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/bin/secure-linux-ha</annotate>
+    <annotate key="org.freedesktop.policykit.exec.argv1">backup</annotate>
+  </action>
+  <action id="org.securelinux.ha">
+    <description>Change Home Assistant settings kept on this computer</description>
+    <message>Secure Linux needs your password to change its Home Assistant settings</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/bin/secure-linux-ha</annotate>
+  </action>
+  <action id="org.securelinux.ha-secure">
+    <description>Run the Home Assistant security check</description>
+    <message>Secure Linux needs your password to read your saved Home Assistant token for the security check (it only reads, it changes nothing in Home Assistant)</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/bin/secure-linux-ha-secure</annotate>
+  </action>
+  <action id="org.securelinux.health">
+    <description>Check the health of this computer's parts</description>
+    <message>Secure Linux needs your password to read the health reports of the disk, battery and other parts</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/bin/secure-linux-health</annotate>
+  </action>
+  <action id="org.securelinux.hibernate">
+    <description>Change hibernate settings</description>
+    <message>Secure Linux needs your password to change what happens when you close the lid</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/bin/secure-linux-hibernate</annotate>
+  </action>
+  <action id="org.securelinux.migrate">
+    <description>Bring things over from Windows</description>
+    <message>Secure Linux needs your password to save your choices or install an app while moving over from Windows</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/bin/secure-linux-migrate</annotate>
+  </action>
+  <action id="org.securelinux.outside-apps">
+    <description>Update apps that do not come from Fedora</description>
+    <message>Secure Linux needs your password to check and update apps that come from outside Fedora's own software list</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/bin/secure-linux-outside-apps</annotate>
+  </action>
+  <action id="org.securelinux.parts">
+    <description>Install software for this computer's hardware</description>
+    <message>Secure Linux needs your password to install the software your computer's parts (printer, scanner, disc drive and so on) need</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/bin/secure-linux-parts</annotate>
+  </action>
+  <action id="org.securelinux.repair">
+    <description>Repair this computer</description>
+    <message>Secure Linux needs your password to repair this computer (it shows you each step first)</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/bin/secure-linux-repair</annotate>
+  </action>
+  <action id="org.securelinux.upgrade">
+    <description>Upgrade Fedora</description>
+    <message>Secure Linux needs your password to upgrade Fedora to the next version (your files and apps stay)</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/bin/secure-linux-upgrade</annotate>
+  </action>
+  <action id="org.securelinux.setup">
+    <description>Repair the Secure Linux setup</description>
+    <message>Secure Linux needs your password to put its settings back the way they should be</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/lib/secure-linux/setup.sh</annotate>
+  </action>
+  <action id="org.securelinux.fido2">
+    <description>Set up a security key (FIDO2)</description>
+    <message>Secure Linux needs your password to set up or remove a security key for logging in or unlocking your disk</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/bin/secure-linux-fido2</annotate>
+  </action>
+  <action id="org.securelinux.mok-remove">
+    <description>Remove the Secure Boot setup key</description>
+    <message>Secure Linux needs your password to remove the key it added to Secure Boot during setup</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/bin/secure-linux-mok-remove</annotate>
+  </action>
+  <action id="org.securelinux.netguard">
+    <description>Change the app firewall</description>
+    <message>Secure Linux needs your password to change which programs may use the internet</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/bin/secure-linux-netguard</annotate>
+  </action>
+  <action id="org.securelinux.recovery-key">
+    <description>Make a disk recovery key</description>
+    <message>Secure Linux needs your password to make a recovery key for your encrypted disk</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/bin/secure-linux-recovery-key</annotate>
+  </action>
+  <action id="org.securelinux.tpm-pin">
+    <description>Set the start-up PIN for your disk</description>
+    <message>Secure Linux needs your password to change the PIN that unlocks your disk at start-up</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/bin/secure-linux-tpm-pin</annotate>
+  </action>
+  <action id="org.securelinux.update-now">
+    <description>Install updates now</description>
+    <message>Secure Linux is installing the latest updates for this computer and its apps</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>yes</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/bin/secure-linux-update-now</annotate>
+  </action>
+  <action id="org.securelinux.hwtest-marker">
+    <description>Note a Wi-Fi problem found by the hardware test</description>
+    <message>Secure Linux needs your password to note that Wi-Fi did not come back after sleep, so the repair tools can fix it</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/bin/secure-linux-hwtest-marker</annotate>
+  </action>
+</policyconfig>

@@ -1,0 +1,11 @@
+[Unit]
+Description=Secure Linux: let a connected VPN's DNS win, otherwise use encrypted DNS
+After=systemd-resolved.service
+Wants=systemd-resolved.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/secure-linux-dns sync
+
+[Install]
+WantedBy=multi-user.target

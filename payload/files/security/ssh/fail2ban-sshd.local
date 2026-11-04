@@ -1,0 +1,7 @@
+# Secure Linux: block an address for an hour after 5 wrong SSH logins (installed by steps/25-security.sh)
+[sshd]
+enabled = true
+backend = systemd
+maxretry = 5
+findtime = 10m
+bantime = 1h

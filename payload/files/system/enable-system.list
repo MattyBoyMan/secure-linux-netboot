@@ -1,0 +1,8 @@
+# Enabled by 00-early.sh on every profile (full-only timers are enabled by their own step instead)
+secure-linux-check.timer
+secure-linux-flatpak-update.timer
+secure-linux-clamscan.timer
+secure-linux-btrfs-scrub.timer
+secure-linux-outside-apps.timer
+secure-linux-wear.timer
+secure-linux-server-watch.timer

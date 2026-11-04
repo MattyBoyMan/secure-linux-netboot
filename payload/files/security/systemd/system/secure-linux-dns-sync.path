@@ -1,0 +1,11 @@
+[Unit]
+Description=Secure Linux: watch for VPNs changing DNS settings
+After=systemd-resolved.service
+
+[Path]
+# systemd-resolved rewrites this file whenever a connection's DNS servers change (VPN up/down)
+PathChanged=/run/systemd/resolve/resolv.conf
+Unit=secure-linux-dns-sync.service
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,13 @@
+[Unit]
+Description=Secure Linux: tell you when a block list stops something, with Allow buttons
+After=opensnitch.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/secure-linux-netguard watch
+Restart=always
+RestartSec=10
+Nice=10
+
+[Install]
+WantedBy=multi-user.target

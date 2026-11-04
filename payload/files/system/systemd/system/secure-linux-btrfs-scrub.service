@@ -1,0 +1,11 @@
+# Monthly Btrfs scrub: reads every block and checks it against its checksum. Errors -> alert scrub-errors.
+# Does nothing if / is not Btrfs.
+[Unit]
+Description=Secure Linux monthly disk data check (Btrfs scrub)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/secure-linux-check --scrub
+Nice=19
+IOSchedulingClass=idle
+TimeoutStartSec=12h

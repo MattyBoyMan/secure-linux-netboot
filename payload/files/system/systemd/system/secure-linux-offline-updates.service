@@ -1,0 +1,17 @@
+# Full profile only (enabled by 30-updates.sh): download all updates through PackageKit (the same engine Discover
+# uses) and prepare them to install during the next restart. Nothing is installed while you work.
+# pkcon exit codes: 0 = done, 5 = nothing to do. VERIFY: `pkcon update --only-download` writes PackageKit's
+# prepared-update and `pkcon offline-trigger` arms /system-update (same flow as GNOME Software / Discover).
+[Unit]
+Description=Secure Linux: prepare updates to install at the next restart
+Wants=network-online.target
+After=network-online.target
+ConditionPathExists=/usr/bin/pkcon
+ConditionPathExists=!/run/ostree-booted
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/secure-linux-upgrade --prepare-offline-updates
+Nice=10
+IOSchedulingClass=idle
+TimeoutStartSec=3h

@@ -1,0 +1,10 @@
+[Unit]
+Description=Secure Linux weekly antivirus scan
+
+[Timer]
+OnCalendar=weekly
+Persistent=true
+RandomizedDelaySec=2h
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,336 @@
+#!/bin/bash
+# secure-linux-vpn: one switch for your VPN. NordVPN and Cloudflare WARP are never on at the same time.
+#
+#   secure-linux-vpn status [--short]   what is on right now (short: private|home|warp|off|both)
+#   secure-linux-vpn setup              first-time NordVPN sign-in and simple yes/no questions
+#   secure-linux-vpn private            NordVPN on (Cloudflare WARP off): hides your internet from the network
+#   secure-linux-vpn home               reach your home server (photos, files) from anywhere:
+#                                       NordVPN + Meshnet (default), or Cloudflare WARP if you chose it
+#   secure-linux-vpn meshnet on|off|status
+#                                       NordVPN Meshnet (free with a Nord account): your own devices reach each
+#                                       other privately from anywhere, with or without the VPN connected
+#   secure-linux-vpn warp [TEAM]        use Cloudflare WARP / Zero Trust instead of NordVPN for "home"
+#   secure-linux-vpn off                no VPN (the kill switch is switched off too, so you stay online)
+#   secure-linux-vpn wireguard import FILE.conf | on NAME | off NAME | list
+#                                       your own WireGuard VPN (from your router, a friend or a VPN provider),
+#                                       kept in the network menu; it stays off until you turn it on
+#   secure-linux-vpn import FILE.conf   same as "wireguard import"
+#
+# Your choice is saved (vpn_mode) and the welcome wizard and status app show it.
+#
+# Photos (Immich) from anywhere, the simple way = Meshnet:
+#   On the home server (once):  install NordVPN (https://downloads.nordcdn.com/apps/linux/install.sh),
+#     nordvpn login --token TOKEN    (token: Nord Account > NordVPN > Advanced settings > Get access token)
+#     nordvpn set meshnet on
+#   On this computer:  secure-linux-vpn meshnet on   then  secure-linux-vpn meshnet status
+#     shows the server's Meshnet name (e.g. something.nord). Immich away from home: http://THAT-NAME:8080
+#   Phone: NordVPN app > Meshnet > on; in the Immich app add the same address as a second server URL.
+# Other option: Cloudflare Tunnel (cloudflared on the server + Cloudflare Access login). Caveat: Cloudflare's
+#   Free/Pro plans reject uploads bigger than 100 MB in one request, so long phone videos may fail to upload
+#   through the tunnel; upload those at home or over Meshnet.
+set -u   # no pipefail: "cmd | grep -q" must not fail when grep stops reading early
+SL_ROOT=${SL_ROOT:-/usr/local/lib/secure-linux}
+. "$SL_ROOT/lib/common.sh"
+. "$SL_ROOT/files/security/lib-security.sh"
+
+usage() { sed -n '2,31p' "$(sec_self)" | sed 's/^# \{0,1\}//'; }
+say() { printf '%s\n' "$*"; }
+have() { command -v "$1" >/dev/null 2>&1; }
+
+# ---------------------------------------------------------------- root-only actions (via pkexec)
+# Only these exact operations can be run as root through this helper.
+root_op() {
+  if [ "$(id -u)" -eq 0 ]; then root_do "$@"; else pkexec "$(sec_self)" _root "$@"; fi
+}
+root_do() {
+  case "$1" in
+    warp-on)  systemctl enable --now warp-svc.service ;;
+    warp-off) systemctl disable --now warp-svc.service ;;
+    wg-install-tools) dnf -y install wireguard-tools ;;
+    wg-import)
+      [ -f "${2:-}" ] || { echo "No such file: ${2:-}" >&2; return 2; }
+      case "${3:-}" in ""|*[!A-Za-z0-9_.-]*) echo "Not allowed as a connection name: ${3:-}" >&2; return 2 ;; esac
+      nmcli connection import type wireguard file "$2" \
+        && nmcli connection modify "$3" connection.autoconnect no ;;
+    set-choice)
+      case "$2" in
+        vpn_mode|nord_killswitch|nord_autoconnect|nord_lan_discovery|nord_threat_protection|warp) ;;
+        *) echo "Not allowed: $2" >&2; return 1 ;;
+      esac
+      case "$3" in *[!a-z0-9_.-]*) echo "Not allowed: $3" >&2; return 1 ;; esac
+      sl_choice_set "$2" "$3" ;;
+    *) echo "Unknown action" >&2; return 1 ;;
+  esac
+}
+choice() { if [ "$(id -u)" -eq 0 ]; then sl_choice_set "$1" "$2"; else root_op set-choice "$1" "$2"; fi; }
+dns_sync() { "$SEC_BIN/secure-linux-dns" sync >/dev/null 2>&1; return 0; }
+
+# ---------------------------------------------------------------- NordVPN
+have_nord() { command -v nordvpn >/dev/null 2>&1; }
+nord_usable() {
+  have_nord || { say "NordVPN isn't installed. Open 'Secure Linux Status' and choose Repair."; return 1; }
+  if [ "$(id -u)" -ne 0 ] && ! id -nG 2>/dev/null | grep -qw nordvpn; then
+    say "Almost there: please log out and log back in (or restart), then try again. (Your account was just given permission to use NordVPN.)"
+    return 1
+  fi
+  return 0
+}
+nord_connected()   { nordvpn status 2>/dev/null | grep -qi '^Status: Connected'; }
+nord_server()      { nordvpn status 2>/dev/null | sed -n 's/^Hostname: *\([^.]*\)\..*/\1/p' | head -1; }
+nord_setting_on()  { nordvpn settings 2>/dev/null | grep -qiE "^$1: *(enabled|on)"; }
+nord_killswitch_on() { nord_setting_on 'Kill Switch'; }
+nord_meshnet_on()  { nord_setting_on 'Meshnet'; }
+nord_logged_in()   { nordvpn account >/dev/null 2>&1 && ! nordvpn account 2>/dev/null | grep -qi 'not logged in'; }
+# Only an active paid subscription may get a kill switch (a lapsed account + kill switch = no internet)
+nord_active_sub()  { nordvpn account 2>/dev/null | grep -qiE 'VPN Service: *Active'; }
+
+nord_apply_settings() {
+  local subnet; subnet=$(sl_build_get HOME_SUBNET)
+  # LAN discovery: phones and the home server on the same Wi-Fi stay reachable while the VPN is on
+  if [ "$(sl_choice_get nord_lan_discovery yes)" = yes ]; then
+    nord_setting_on 'LAN Discovery' || nordvpn set lan-discovery on >/dev/null 2>&1
+  fi
+  if [ -n "$subnet" ] && ! nordvpn settings 2>/dev/null | grep -qF "$subnet"; then
+    nordvpn allowlist add subnet "$subnet" >/dev/null 2>&1 \
+      || say "(Note: NordVPN didn't add $subnet to its allow list; LAN discovery already covers your home network.)"
+  fi
+  if [ "$(sl_choice_get nord_threat_protection yes)" = yes ]; then
+    nord_setting_on 'Threat Protection Lite' || nordvpn set threatprotectionlite on >/dev/null 2>&1
+  fi
+  case "$(sl_choice_get nord_autoconnect yes)" in
+    yes) nord_setting_on 'Auto-connect' || nordvpn set autoconnect on >/dev/null 2>&1 ;;
+    *)   nord_setting_on 'Auto-connect' && nordvpn set autoconnect off >/dev/null 2>&1 ;;
+  esac
+  return 0
+}
+nord_killswitch_apply() {   # only after a working connection, only with consent + active subscription
+  if [ "$(sl_choice_get nord_killswitch no)" = yes ] && nord_connected && nord_active_sub; then
+    nord_killswitch_on || nordvpn set killswitch on >/dev/null 2>&1
+  fi
+  return 0
+}
+nord_down() {   # disconnect NordVPN without ever leaving a kill switch that blocks the internet
+  have_nord || return 0
+  nord_killswitch_on && nordvpn set killswitch off >/dev/null 2>&1
+  nord_setting_on 'Auto-connect' && nordvpn set autoconnect off >/dev/null 2>&1
+  nord_connected && nordvpn disconnect >/dev/null 2>&1
+  return 0
+}
+nord_up() {
+  nord_usable || return 1
+  nord_logged_in || { say "You're not signed in to NordVPN yet. Run: secure-linux-vpn setup"; return 1; }
+  nord_apply_settings
+  if ! nord_connected; then
+    say "Connecting to NordVPN..."
+    nordvpn connect ${1:+"$1"} >/dev/null 2>&1
+  fi
+  nord_connected || { say "NordVPN couldn't connect. Check the Wi-Fi works, then try again."; return 1; }
+  nord_killswitch_apply
+  return 0
+}
+
+# ---------------------------------------------------------------- Cloudflare WARP
+have_warp() { command -v warp-cli >/dev/null 2>&1; }
+warp_svc_active() { systemctl is-active --quiet warp-svc.service 2>/dev/null; }
+warp_connected() { warp_svc_active && warp-cli status 2>/dev/null | grep -qiE 'Status update: *Connected'; }
+warp_down() { have_warp && warp_svc_active && warp-cli disconnect >/dev/null 2>&1; return 0; }
+warp_up() {
+  have_warp || { say "Cloudflare WARP isn't installed on this computer."; return 1; }
+  warp_svc_active || root_op warp-on || return 1
+  local i; for i in 1 2 3 4 5; do warp-cli status >/dev/null 2>&1 && break; sleep 1; done
+  if warp-cli registration show 2>&1 | grep -qiE 'missing|not registered|no registration'; then
+    say "Cloudflare WARP isn't signed in yet. Run: secure-linux-vpn warp YOUR-TEAM-NAME  (or without a team name for free WARP)"
+    return 1
+  fi
+  warp-cli connect >/dev/null 2>&1
+  for i in 1 2 3 4 5 6 7 8 9 10; do warp_connected && return 0; sleep 1; done
+  say "Cloudflare WARP couldn't connect."; return 1
+}
+
+# ---------------------------------------------------------------- modes
+current_mode() {
+  local n=0 w=0
+  have_nord && nord_connected && n=1
+  have_warp && warp_connected && w=1
+  if [ $n = 1 ] && [ $w = 1 ]; then echo both
+  elif [ $n = 1 ]; then if nord_meshnet_on; then echo home; else echo private; fi
+  elif [ $w = 1 ]; then echo warp
+  else echo off; fi
+}
+
+mode_private() {
+  warp_down                                   # never both
+  nord_up || { dns_sync; return 1; }
+  choice vpn_mode private
+  dns_sync
+  say "Private mode is on: NordVPN is connected$(nord_killswitch_on && echo ', with the kill switch')."
+}
+mode_home() {
+  if [ "$(sl_choice_get warp no)" = yes ] && ! family_block; then
+    nord_down                                 # never both: NordVPN fully off before WARP starts
+    warp_up || { dns_sync; return 1; }
+    choice vpn_mode home; dns_sync
+    say "Home mode is on (Cloudflare WARP): your home server is reachable through your Zero Trust network."
+  else
+    warp_down
+    nord_usable || return 1
+    nord_meshnet_on || nordvpn set meshnet on >/dev/null 2>&1
+    nord_up || { dns_sync; return 1; }
+    choice vpn_mode home; dns_sync
+    say "Home mode is on (NordVPN + Meshnet): your home server is reachable by its Meshnet name."
+    say "See it with: nordvpn meshnet peer list"
+  fi
+}
+mode_off() {
+  nord_down; warp_down
+  choice vpn_mode off; dns_sync
+  say "VPN is off. (Encrypted DNS still protects your lookups.)"
+}
+
+family_block() {
+  if [ "$(sl_choice_get family_dns no)" = yes ]; then
+    say "The family filter is on, and Cloudflare WARP would bypass it. Turn on the matching filter in your"
+    say "Cloudflare Zero Trust dashboard (Gateway > DNS policies), then run: secure-linux-dns family off"
+    return 0
+  fi
+  return 1
+}
+
+cmd_meshnet() {
+  case "${1:-status}" in
+    on)
+      nord_usable || return 1
+      nord_logged_in || { say "Sign in to NordVPN first: secure-linux-vpn setup"; return 1; }
+      nord_meshnet_on || nordvpn set meshnet on >/dev/null 2>&1
+      nord_meshnet_on || { say "Meshnet couldn't be switched on. Try again in a minute."; return 1; }
+      if [ "$(sl_choice_get warp no)" = yes ]; then choice warp no; fi
+      say "Meshnet is on. Your devices:"
+      nordvpn meshnet peer list 2>/dev/null
+      say "Your home server appears here once it has Meshnet on too (see: secure-linux-vpn --help)." ;;
+    off)
+      nord_usable || return 1
+      nord_meshnet_on && nordvpn set meshnet off >/dev/null 2>&1
+      say "Meshnet is off." ;;
+    status)
+      if have_nord && nord_meshnet_on; then say "Meshnet: on"; nordvpn meshnet peer list 2>/dev/null
+      else say "Meshnet: off (turn on with: secure-linux-vpn meshnet on)"; fi ;;
+    *) say "Use: secure-linux-vpn meshnet on|off|status"; return 2 ;;
+  esac
+}
+
+cmd_warp() {
+  family_block && return 1
+  have_warp || { say "Cloudflare WARP isn't installed on this computer (it's on the laptop setup only)."; return 1; }
+  if [ "$(sl_choice_get warp no)" != yes ]; then
+    sec_ask "Use Cloudflare WARP / Zero Trust (instead of NordVPN) to reach your home network when you're away?" no || return 0
+    choice warp yes
+  fi
+  warp_svc_active || root_op warp-on || return 1
+  local i; for i in 1 2 3 4 5; do warp-cli status >/dev/null 2>&1 && break; sleep 1; done
+  if warp-cli registration show 2>&1 | grep -qiE 'missing|not registered|no registration'; then
+    sec_ask "Cloudflare asks you to accept its terms of service (https://www.cloudflare.com/application/terms/). Accept?" no || return 1
+    say "A browser window opens to sign in to Cloudflare..."
+    warp-cli --accept-tos registration new ${1:+"$1"} || { say "Cloudflare sign-in didn't finish. Try again later."; return 1; }
+  fi
+  mode_home
+}
+
+cmd_setup() {
+  if [ "$(id -u)" -eq 0 ]; then say "Please run this as yourself, not as root: secure-linux-vpn setup"; return 1; fi
+  sec_need_terminal setup
+  nord_usable || { sec_pause; return 1; }
+  say "NordVPN setup"
+  say "-------------"
+  if ! nord_logged_in; then
+    say "Step 1: sign in. A browser window opens; sign in to your NordVPN account there."
+    nordvpn login
+    say ""
+    for _ in 1 2 3; do
+      nord_logged_in && break
+      sec_ask "Finished signing in in the browser?" yes || break
+    done
+    nord_logged_in || { say "Not signed in yet. Run 'secure-linux-vpn setup' again when you're ready."; sec_pause; return 1; }
+  fi
+  say "Signed in to NordVPN."
+  if nord_active_sub; then
+    if sec_ask "Turn on the kill switch? If the VPN ever drops, the internet is blocked until it reconnects, so nothing leaks. (Recommended on public Wi-Fi. You can switch it off later with: secure-linux-vpn off)" no; then
+      choice nord_killswitch yes; else choice nord_killswitch no; fi
+  else
+    say "Your NordVPN subscription doesn't look active, so the kill switch stays off (it would block your internet)."
+    choice nord_killswitch no
+  fi
+  if sec_ask "Connect to NordVPN automatically every time the computer starts?" yes; then choice nord_autoconnect yes; else choice nord_autoconnect no; fi
+  if sec_ask "Let your phone and home server still find this computer while the VPN is on (LAN discovery)? Needed for KDE Connect, LocalSend and Syncthing." yes; then
+    choice nord_lan_discovery yes; else choice nord_lan_discovery no; nordvpn set lan-discovery off >/dev/null 2>&1; fi
+  if sec_ask "Use NordVPN Threat Protection Lite (blocks ads and dangerous sites while the VPN is on)?" yes; then
+    choice nord_threat_protection yes; else choice nord_threat_protection no; nordvpn set threatprotectionlite off >/dev/null 2>&1; fi
+  nord_apply_settings
+  if sec_ask "Connect to NordVPN now?" yes; then mode_private; fi
+  sec_pause "Done. Press Enter to close. "
+}
+
+cmd_status() {
+  local m; m=$(current_mode)
+  [ "${1:-}" = --short ] && { echo "$m"; return 0; }
+  case "$m" in
+    private) say "VPN: NordVPN is connected (private mode)." ;;
+    home)    say "VPN: NordVPN is connected with Meshnet (home mode: your home server is reachable)." ;;
+    warp)    say "VPN: Cloudflare WARP is connected (home mode through Zero Trust)." ;;
+    both)    say "VPN: WARNING, NordVPN and Cloudflare WARP are both on. Run: secure-linux-vpn private" ;;
+    off)     say "VPN: off." ;;
+  esac
+  if have_nord && [ "$m" != off ]; then
+    say "  Server: $(nord_server)   Kill switch: $(nord_killswitch_on && echo on || echo off)   Meshnet: $(nord_meshnet_on && echo on || echo off)"
+  fi
+  say "Saved choice: $(sl_choice_get vpn_mode 'not chosen yet')$( [ "$(sl_choice_get warp no)" = yes ] && echo ' (home uses Cloudflare WARP)')"
+  "$SEC_BIN/secure-linux-dns" status 2>/dev/null
+  return 0
+}
+
+# ---------------------------------------------------------------- WireGuard (your own .conf files, kept in the network menu)
+# The same commands as on the Debian setup. WireGuard is part of Linux itself; the small wireguard-tools
+# package is installed once, and only after asking.
+cmd_wireguard() {
+  case "${1:-list}" in
+    import)
+      [ -n "${2:-}" ] && [ -f "$2" ] || { say "Usage: secure-linux-vpn wireguard import /path/to/file.conf"; return 2; }
+      have nmcli || { say "NetworkManager (nmcli) is not available."; return 1; }
+      local f=$2 name
+      grep -q '^\[Interface\]' "$f" && grep -q '^\[Peer\]' "$f" \
+        || { say "That doesn't look like a WireGuard file (it should have [Interface] and [Peer] sections). Nothing was changed."; return 2; }
+      name=$(basename "$f" .conf | tr -c '\nA-Za-z0-9_-' '-')
+      if ! have wg && ! rpm -q wireguard-tools >/dev/null 2>&1; then
+        sec_ask "To use a WireGuard file, one small tool (wireguard-tools) is installed from Fedora first. Install it now?" no \
+          || { say "Nothing was installed. You can import the file later with: secure-linux-vpn wireguard import \"$f\""; return 0; }
+        root_op wg-install-tools || { say "The WireGuard tool could not be installed (no internet?). Try again when you're online."; return 1; }
+      fi
+      if root_op wg-import "$(readlink -f "$f")" "$name"; then
+        say "Imported as '$name'. It stays OFF until you turn it on: secure-linux-vpn wireguard on $name  (or use the network menu)."
+      else
+        say "That file could not be imported. Is it a WireGuard .conf file from your router or VPN provider?"
+        return 1
+      fi ;;
+    on)  [ -n "${2:-}" ] || { say "Usage: secure-linux-vpn wireguard on NAME"; return 2; }; nmcli connection up "$2" ;;
+    off) [ -n "${2:-}" ] || { say "Usage: secure-linux-vpn wireguard off NAME"; return 2; }; nmcli connection down "$2" ;;
+    list|status) if have nmcli; then nmcli -t -f NAME,TYPE,DEVICE connection show | awk -F: '$2=="wireguard"{printf "%s  %s\n", $1, ($3==""?"(off)":"(on)")}'; fi ;;
+    *) say "Use: secure-linux-vpn wireguard import FILE.conf | on NAME | off NAME | list"; return 2 ;;
+  esac
+}
+
+case "${1:-}" in
+  -h|--help|help|"") usage ;;
+  status)  shift; cmd_status "$@" ;;
+  setup)   cmd_setup ;;
+  private) mode_private ;;
+  home)    mode_home ;;
+  off)     mode_off ;;
+  warp)    shift; cmd_warp "$@" ;;
+  meshnet) shift; cmd_meshnet "$@" ;;
+  wireguard) shift; cmd_wireguard "$@" ;;
+  import)  shift; cmd_wireguard import "$@" ;;
+  _apply)  # (setup step) re-apply saved NordVPN settings if signed in; never connects or disconnects
+           have_nord && nord_logged_in && { nord_apply_settings; nord_killswitch_apply; } ; exit 0 ;;
+  _root)   shift; [ "$(id -u)" -eq 0 ] || exit 1; root_do "$@" ;;
+  _set-choice) shift; [ "$(id -u)" -eq 0 ] || exit 1; root_do set-choice "$@" ;;
+  *) echo "Unknown command '$1'." >&2; usage; exit 2 ;;
+esac

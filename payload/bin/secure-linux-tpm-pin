@@ -1,0 +1,95 @@
+#!/bin/bash
+# secure-linux-tpm-pin: unlock the disk at start-up with a short PIN (checked by the laptop's TPM chip)
+# instead of the long disk password. Optional; your disk password always keeps working.
+#
+#   secure-linux-tpm-pin status     is the PIN unlock on?
+#   secure-linux-tpm-pin enable     explain honestly, then set it up (asks for your disk password and a new PIN)
+#   secure-linux-tpm-pin disable    remove the PIN unlock (the disk password keeps working)
+set -u   # no pipefail: "cmd | grep -q" must not fail when grep stops reading early
+SL_ROOT=${SL_ROOT:-/usr/local/lib/secure-linux}
+. "$SL_ROOT/lib/common.sh"
+. "$SL_ROOT/files/security/lib-security.sh"
+DRACUT_CONF=$SEC_DRACUT_DIR/50-secure-linux-tpm2.conf
+
+usage() { sed -n '2,8p' "$(sec_self)" | sed 's/^# \{0,1\}//'; }
+
+have_tpm() { [ -e "$SEC_PREFIX/sys/class/tpm/tpm0" ] || systemd-cryptenroll --tpm2-device=list 2>/dev/null | grep -q '/dev/'; }
+
+cmd_status() {
+  local dev; dev=$(sec_luks_dev) || { echo "No encrypted disk found."; return 0; }
+  if [ "$(id -u)" -ne 0 ]; then
+    [ "$(sl_choice_get tpm_pin no)" = yes ] && echo "PIN unlock: on" || echo "PIN unlock: off"; return 0
+  fi
+  if sec_luks_has "$dev" tpm2; then echo "PIN unlock: on"; else echo "PIN unlock: off"; fi
+}
+
+warning() {
+  cat <<'EOF'
+
+  START-UP PIN (TPM) - PLEASE READ
+  --------------------------------
+  This lets you type a short PIN at start-up instead of your long disk password.
+  Honest facts before you decide:
+   - It is a CONVENIENCE, not extra security. On this laptop's AMD Ryzen 7730U the TPM is built into
+     the processor's firmware ("fTPM"). Researchers showed in 2023 ("faulTPM") that someone with the
+     laptop and a few hours of hardware work can extract its secrets.
+   - Fedora's start-up image isn't measured into the TPM (only Secure Boot state, PCR 7, is checked),
+     so a skilled attacker with the laptop has more ways in than with a long password.
+   - Your long disk password ALWAYS keeps working (and your recovery key, if you made one).
+   - After a BIOS update or changing Secure Boot settings the PIN may stop working once: just type
+     your disk password, then run "secure-linux-tpm-pin disable" and "enable" again.
+  If the laptop could be stolen by someone who'd target your data, keep using the long password.
+
+EOF
+}
+
+cmd_enable() {
+  sec_need_terminal enable
+  sec_need_root enable
+  sec_sb_applies || { sec_pause; return 0; }
+  local dev name
+  dev=$(sec_luks_dev) || { echo "No encrypted disk found."; sec_pause; return 1; }
+  if sec_luks_has "$dev" tpm2; then echo "PIN unlock is already on."; sl_choice_set tpm_pin yes; sec_pause; return 0; fi
+  have_tpm || { echo "This computer has no usable TPM chip, so PIN unlock isn't possible."; sec_pause; return 1; }
+  name=$(sec_luks_name "$dev")
+  [ -n "$name" ] || { echo "Couldn't find the disk in /etc/crypttab; not changing anything."; sec_pause; return 1; }
+  warning
+  sec_ask "Set up a start-up PIN anyway?" no || { echo "Nothing changed."; sec_pause; return 0; }
+  echo
+  echo "First type your CURRENT disk password, then choose a PIN (at least 6 digits/letters) twice."
+  if ! systemd-cryptenroll --tpm2-device=auto --tpm2-with-pin=yes --tpm2-pcrs=7 "$dev"; then
+    echo "That didn't work. Nothing was changed."; sec_pause; return 1
+  fi
+  sec_crypttab_opt add "$name" tpm2-device=auto
+  mkdir -p "$SEC_DRACUT_DIR"
+  printf '%s\n' '# Secure Linux: TPM2 unlock support in the start-up image (secure-linux-tpm-pin)' \
+    'add_dracutmodules+=" tpm2-tss "' > "$DRACUT_CONF"
+  if ! sec_dracut_regen; then
+    echo "Updating the start-up image failed, so the PIN isn't used yet. Your disk password still works."
+  fi
+  sl_choice_set tpm_pin yes
+  echo "Done. At the next start-up, type your PIN. (Your disk password still works too.)"
+  sec_pause "Press Enter to close. "
+}
+
+cmd_disable() {
+  sec_need_root disable
+  local dev name
+  dev=$(sec_luks_dev) || { echo "No encrypted disk found."; return 0; }
+  name=$(sec_luks_name "$dev")
+  if sec_luks_has "$dev" tpm2; then
+    systemd-cryptenroll --wipe-slot=tpm2 "$dev" || { echo "Couldn't remove the PIN unlock."; return 1; }
+  fi
+  [ -n "$name" ] && sec_crypttab_opt remove "$name" tpm2-device=auto
+  if [ -f "$DRACUT_CONF" ]; then rm -f "$DRACUT_CONF"; sec_dracut_regen; fi
+  sl_choice_set tpm_pin no
+  echo "PIN unlock is off. Use your disk password at start-up."
+}
+
+case "${1:-}" in
+  -h|--help|help|"") usage ;;
+  status)  cmd_status ;;
+  enable)  cmd_enable ;;
+  disable) cmd_disable ;;
+  *) echo "Unknown command '$1'." >&2; usage; exit 2 ;;
+esac

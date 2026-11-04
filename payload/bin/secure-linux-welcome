@@ -1,0 +1,470 @@
+#!/bin/bash
+# secure-linux-welcome: the friendly first-login wizard (VPN, home Wi-Fi, battery, recovery key, backups,
+# browser, AI, Syncthing, hardware check, Secure Boot key). Every question can be skipped; it picks up
+# where you left off at the next login, and you can go through it again any time.
+#   secure-linux-welcome                  run the wizard (only the questions not answered yet)
+#   secure-linux-welcome --again          go through every question again ("Welcome & Setup Choices")
+#   secure-linux-welcome --page NAME      one question: browser homewifi vpn battery recovery backup ai
+#                                         syncthing netguard hwtest tpmpin mok
+#   secure-linux-welcome --add-family-member   create a standard account for someone else
+#   secure-linux-welcome --status         what has been answered
+# Extra pages from other areas are plugged in from $SL_ROOT/wizard.d/*.sh (run after ours).
+# Autostart runs it with --autostart: after the wizard is finished it only shows a small notice while
+# setup is still installing apps. Tests: SL_WIZARD_ANSWERS="page=answer,..." (see tests/experience).
+set -u   # no pipefail: "cmd | grep -q" must not fail when grep stops reading early
+SL_ROOT=${SL_ROOT:-/usr/local/lib/secure-linux}
+. "$SL_ROOT/lib/common.sh"
+. "$SL_ROOT/files/experience/exp-lib.sh"
+
+SELF=/usr/local/bin/secure-linux-welcome; [ -x "$SELF" ] || SELF=$(readlink -f "$0")   # polkit names /usr/local/bin
+# Keys the fleet enrolment (85-fleet) and "apps you used" (55) pages save, added with those features.
+SAVE_KEYS=" default_browser librewolf_keep_cookies ai_models backup_target welcome_done syncthing_lan_only fleet fleet_enrolled fleet_method fleet_screen fleet_date email_client backup_gui disk_usage disk_utility keepassxc "
+LW=io.gitlab.librewolf-community
+GUIDE=/usr/share/secure-linux/START-HERE.html
+PAGES="browser homewifi vpn battery recovery backup ai syncthing netguard hwtest tpmpin mok"
+
+# ================================================================ root-only actions (via pkexec)
+root_save() {     # --save key value [key value...]   only known keys, only safe characters
+  exp_elevate --save "$@"
+  while [ $# -ge 2 ]; do
+    case "$SAVE_KEYS" in *" $1 "*) ;; *) echo "Refusing unknown choice '$1'" >&2; shift 2; continue ;; esac
+    if printf '%s' "$2" | grep -qE '^[A-Za-z0-9._:,/@~+-]{0,200}$'; then sl_choice_set "$1" "$2"
+    else echo "Refusing unsafe value for $1" >&2; fi
+    shift 2
+  done
+}
+root_create_user() {  # --create-user LOGIN "Full Name"   (password on stdin)
+  exp_elevate --create-user "$@"
+  local login=${1:-} full=${2:-} pw
+  printf '%s' "$login" | grep -qE '^[a-z_][a-z0-9_-]{0,30}$' || { echo "That login name isn't allowed." >&2; return 1; }
+  case "$full" in *:*|*$'\n'*) echo "The full name can't contain ':'." >&2; return 1 ;; esac
+  id "$login" >/dev/null 2>&1 && { echo "There is already an account called $login." >&2; return 1; }
+  IFS= read -r pw || true
+  [ ${#pw} -ge 6 ] || { echo "The password is too short." >&2; return 1; }
+  useradd -m -c "$full" "$login" || return 1
+  printf '%s:%s\n' "$login" "$pw" | chpasswd || { userdel -r "$login"; return 1; }
+  # Standard account (not an administrator). VPN access needs the nordvpn group.
+  getent group nordvpn >/dev/null 2>&1 && usermod -aG nordvpn "$login"
+  echo "Created $login"
+}
+
+# ================================================================ user side
+USTATE=$HOME/.local/state/secure-linux
+DONE=$USTATE/wizard-pages          # answered pages, one per line
+DEFER=$USTATE/wizard-deferred      # pages postponed because something wasn't ready (count per page)
+PENDING=$USTATE/wizard-choices     # key=value not yet saved to /etc/secure-linux/choices
+UI_TITLE="Welcome to your new computer"
+init_user_state() { mkdir -p "$USTATE"; touch "$DONE" "$DEFER" "$PENDING"; }
+
+first_name() { local n; n=$(getent passwd "$USER" 2>/dev/null | cut -d: -f5 | cut -d, -f1); n=${n%% *}; echo "${n:-$USER}"; }
+is_main_user() { [ "$USER" = "$(sl_user)" ]; }
+page_done() { grep -qx "$1" "$DONE"; }
+mark_done() { page_done "$1" || echo "$1" >> "$DONE"; sed -i "/^$1 /d" "$DEFER"; }
+# true if the user already answered (so the page is skipped) - not when going through the questions again
+choice_explicit() { [ "${ASK_AGAIN:-0}" = 1 ] && return 1; grep -q "^$1=" "$SL_ETC/choices" 2>/dev/null || grep -q "^$1=" "$PENDING"; }
+want() { sed -i "/^$1=/d" "$PENDING"; echo "$1=$2" >> "$PENDING"; }   # remember a choice (saved by flush)
+flush() {         # save pending choices with one password prompt
+  [ -s "$PENDING" ] || return 0
+  local args=() k v
+  while IFS='=' read -r k v; do [ -n "$k" ] && args+=("$k" "$v"); done < "$PENDING"
+  if pkexec "$SELF" --save "${args[@]}"; then : > "$PENDING"; else
+    exp_notify "Your choices weren't saved yet" "We'll try again next time you log in."; fi
+}
+progress_text() {
+  local p n t txt; p=$(cat "$SL_STATE/progress" 2>/dev/null)
+  case "$p" in
+    '') echo "Your apps will start installing in a moment. Keep the laptop plugged in and online." ;;
+    done*) echo "Setup has finished: all your apps are installed." ;;
+    *) IFS='|' read -r n t txt <<< "$p"
+       echo "Setting up your apps: step $n of $t ($txt). Keep the laptop plugged in; you can use it meanwhile." ;;
+  esac
+}
+setup_running() { local p; p=$(cat "$SL_STATE/progress" 2>/dev/null); [ -z "$p" ] || [ "${p%%|*}" != done ]; }
+have() { command -v "$1" >/dev/null 2>&1; }
+current_ssid() { have nmcli && nmcli -t -f active,ssid dev wifi 2>/dev/null | sed -n 's/^yes://p' | head -1; }
+to_clipboard() {
+  if have wl-copy; then printf '%s' "$1" | wl-copy
+  elif have xclip; then printf '%s' "$1" | xclip -selection clipboard
+  elif have qdbus; then qdbus org.kde.klipper /klipper setClipboardContents "$1" >/dev/null
+  fi 2>/dev/null
+}
+open_guide() { [ -n "${SL_WIZARD_ANSWERS:-}" ] && { echo "OPEN: $GUIDE"; return; }; xdg-open "$GUIDE" >/dev/null 2>&1 & }
+copy_guide_to_desktop() {
+  local d; d=$(xdg-user-dir DESKTOP 2>/dev/null || echo "$HOME/Desktop"); mkdir -p "$d"
+  [ -f "$GUIDE" ] && [ ! -f "$d/START-HERE.html" ] && cp "$GUIDE" "$d/"
+  return 0
+}
+bg() { if [ -n "${SL_WIZARD_ANSWERS:-}" ]; then "$@"; else "$@" >/dev/null 2>&1 & fi; }
+
+# ---------------------------------------------------------------- pages: return 0 = answered, 1 = ask later
+page_browser() {
+  flatpak info "$LW" >/dev/null 2>&1 || return 1
+  local a; a=$(ui_ask browser "Use LibreWolf as your web browser?
+
+LibreWolf is Firefox with privacy switched on: ads and trackers are blocked, and nothing about you is sent to anyone.
+
+Firefox stays installed too, for the rare website that misbehaves." "Yes, use LibreWolf" "No, use Firefox")
+  case $a in
+    yes) want default_browser librewolf
+         a=$(ui_ask cookies "Stay signed in to websites?
+
+LibreWolf normally forgets everything when you close it. That is very private, but you will sign in to email and other sites every time.
+
+Keep me signed in: logins are kept, like other browsers.
+Forget everything: maximum privacy. You can still keep chosen sites signed in under Settings > Privacy & Security > Cookies > Manage Exceptions." "Keep me signed in" "Forget everything")
+         [ "$a" = yes ] && want librewolf_keep_cookies yes
+         [ "$a" = no ] && want librewolf_keep_cookies no
+         bash "$SL_EXP/user-setup.sh" browser librewolf
+         bash "$SL_EXP/user-setup.sh" librewolf-prefs "$([ "$a" = yes ] && echo yes || echo no)" ;;
+    no) want default_browser firefox; bash "$SL_EXP/user-setup.sh" browser firefox ;;
+  esac
+  return 0
+}
+page_homewifi() {
+  have secure-linux-zone || return 1
+  local ssid; ssid=$(current_ssid)
+  [ -n "$ssid" ] || return 1
+  [ "$(sl_choice_get home_ssid)" = "$ssid" ] && return 0
+  local a; a=$(ui_ask homewifi "You're connected to the Wi-Fi network \"$ssid\".
+
+Is this your home Wi-Fi?
+
+At home, your phone, printer and home server can find this computer. On every other network (cafes, hotels, airports) it stays invisible." "Yes, it's my home" "No")
+  [ "$a" = yes ] && secure-linux-zone set-home
+  return 0
+}
+page_vpn() {
+  have secure-linux-vpn || return 1
+  choice_explicit vpn_mode && return 0
+  local a; a=$(ui_ask vpn "Set up the VPN?
+
+A VPN hides what you do online from whoever runs the Wi-Fi and from your internet provider. It's most useful on public Wi-Fi.
+
+You'll need your NordVPN account. A window opens to sign you in." "Set up VPN" "Not now")
+  [ "$a" = yes ] || return 0
+  ui_terminal secure-linux-vpn setup
+  local m; m=$(ui_choose vpn_mode "How should the VPN normally work?" \
+    private "Private: always hide my internet activity (recommended on the go)" \
+    home "Home: reach my home server (photos, files) from anywhere" \
+    off "Off for now")
+  case $m in private|home|off) secure-linux-vpn "$m" ;; esac
+  return 0
+}
+page_battery() {
+  "$SL_BIN/secure-linux-battery" supported || return 0
+  choice_explicit battery_limit && return 0
+  local a; a=$(ui_ask battery "Keep your battery healthy?
+
+Batteries wear out faster when they sit at 100%. Stopping at 80% can add years of life; the trade-off is a bit less time away from a charger.
+
+Going on a trip? \"Charge to 100% for a Trip\" in the app menu charges fully once, then goes back to 80% when you unplug." "Yes, stop at 80%" "No, charge to 100%")
+  case $a in yes) "$SL_BIN/secure-linux-battery" limit 80 ;; no) "$SL_BIN/secure-linux-battery" limit 100 ;; esac
+  return 0
+}
+page_recovery() {
+  have secure-linux-recovery-key || return 1
+  [ "$(sl_choice_get recovery_key_done no)" = yes ] && return 0
+  local a; a=$(ui_ask recovery "Make a disk recovery key?
+
+Your disk is encrypted: without your disk password nobody can read it. If you ever forget that password, a recovery key is the only way back in.
+
+You'll get a long code to write down or print. Keep it somewhere safe, away from the laptop." "Make it now" "Later")
+  [ "$a" = yes ] && ui_terminal secure-linux-recovery-key
+  return 0
+}
+page_backup() {
+  if ! flatpak info org.gnome.World.PikaBackup >/dev/null 2>&1; then
+    [ "$(sl_profile)" = lite ] && return 0; return 1
+  fi
+  choice_explicit backup_target && return 0
+  local host url target a
+  url=$(sl_choice_get immich_url); [ -n "$url" ] || url=$(sl_build_get IMMICH_URL); host=$(printf '%s' "$url" | sed -E 's#^[a-zA-Z]+://##; s#[/:].*##')
+  if [ -n "$host" ]; then
+    a=$(ui_choose backup "Backups keep a copy of your files somewhere else, in case the laptop is lost, stolen or breaks.
+
+Where would you like to back up?" usb "A USB drive (simplest)" server "My home server ($host)" later "Not now")
+  else
+    a=$(ui_choose backup "Backups keep a copy of your files somewhere else, in case the laptop is lost, stolen or breaks.
+
+Where would you like to back up?" usb "A USB drive (simplest)" later "Not now")
+  fi
+  case $a in
+    usb) ui_info backup_usb "Pika Backup opens next.
+
+1. Plug in your USB drive (ideally one used only for backups).
+2. Click \"Setup Backup\", then choose the drive under \"Location on Disk\".
+3. Choose a password for the backup, and keep it in Bitwarden.
+4. Open \"Schedule\" and switch on daily backups. Pika backs up whenever the drive is plugged in."
+         want backup_target usb; bg flatpak run org.gnome.World.PikaBackup ;;
+    server)
+         target="ssh://$USER@$host/~/backups/$(hostname 2>/dev/null || echo laptop)"
+         echo "$target" > "$USTATE/backup-server-url"; to_clipboard "$target"
+         ui_info backup_server "Pika Backup opens next.
+
+1. Click \"Setup Backup\", then \"Remote Location\".
+2. Paste this address (already copied for you):
+   $target
+   (Change the user name before @ if your server login is different.)
+3. Choose a password for the backup, and keep it in Bitwarden.
+4. Open \"Schedule\" and switch on daily backups.
+
+The server needs BorgBackup installed. On the server type:
+   sudo apt install borgbackup      (Debian / Ubuntu)
+   sudo dnf install borgbackup      (Fedora)
+The \"server\" folder on your USB stick has a guide."
+         want backup_target server; bg flatpak run org.gnome.World.PikaBackup ;;
+    later) ;;   # not recorded: secure-linux-check keeps saying backups aren't set up, which is true
+  esac
+  return 0
+}
+page_ai() {
+  [ "$(sl_profile)" = full ] || return 0
+  have ollama || return 1
+  choice_explicit ai_models && return 0
+  local extra=""
+  [ "$(sl_choice_get ai_abliterated no)" = yes ] && extra="
+
+You also chose the UNFILTERED coding model in the installer. It answers without refusing, which also means it can be confidently wrong or write harmful things. You're responsible for what you do with its answers."
+  local a; a=$(ui_ask ai "Download your private AI models now? (about 6 GB)
+
+They let VSCodium help you write code (the Continue panel) and Alpaca chat with you, entirely on this laptop. Nothing you type is sent to any company.
+
+The download runs in the background, and waits if you're on a phone hotspot.$extra" "Download now" "Not now")
+  case $a in
+    yes) want ai_models "qwen2.5-coder:7b,qwen2.5-coder:1.5b"; flush
+         bg ui_terminal secure-linux-ai setup ;;
+    no) want ai_models none ;;
+  esac
+  bg bash "$SL_EXP/user-setup.sh" continue
+  return 0
+}
+page_syncthing() {
+  [ -f "$HOME/.local/state/syncthing/config.xml" ] || [ -f "$HOME/.config/syncthing/config.xml" ] || return 1
+  local a; a=$(ui_ask syncthing "Protect Syncthing's settings page with a password?
+
+Syncthing keeps folders in sync between your own devices. Its settings page (http://localhost:8384) has no password yet." "Set a password" "Skip")
+  [ "$a" = yes ] || return 0
+  local login pw1 pw2 i
+  login=$(ui_input syncthing_user "Choose a user name for the Syncthing settings page:" "$USER"); login=${login:-$USER}
+  for i in 1 2; do
+    pw1=$(ui_password syncthing_pw "Choose a password (at least 8 characters). Bitwarden can remember it for you:")
+    [ -n "$pw1" ] || return 0
+    pw2=$(ui_password syncthing_pw2 "Type the same password again:")
+    if [ "$pw1" = "$pw2" ] && [ ${#pw1} -ge 8 ]; then
+      printf '%s\n' "$pw1" | bash "$SL_EXP/user-setup.sh" syncthing-password "$login" >/dev/null \
+        && ui_info syncthing_ok "Done. Syncthing's settings page now asks for \"$login\" and your password."
+      return 0
+    fi
+    ui_info syncthing_retry "The passwords didn't match or were too short. Let's try once more."
+  done
+  return 0
+}
+# Network protection (OpenSnitch, set up automatically by the security step): information only,
+# nothing to choose and no choice written.
+page_netguard() {
+  [ "$(sl_profile)" = full ] || return 0
+  ui_info netguard "Network protection is on
+
+It watches which apps use the internet:
+
+- The first time a new app wants to go online, it asks you once. \"Always allow\" is already selected, so one click is enough, and it won't ask about that app again. Apps that came with this computer are already approved.
+
+- It also blocks websites known for malware, phishing, tracking and spying. If it ever blocks something you need, a message pops up with buttons: Allow once, Always allow, or Keep blocked. You are always in charge.
+
+- Once a week it sends a short summary of what it blocked.
+
+Want to look around or change an app's permission? Open \"Network Monitor\" from the app menu."
+  return 0
+}
+page_hwtest() {
+  local a; a=$(ui_ask hwtest "Quick hardware check? (2 minutes)
+
+We'll test the speakers, microphone, camera, keys and Wi-Fi, so any problem shows up now rather than when you need it." "Check now" "Skip")
+  [ "$a" = yes ] && "$SL_BIN/secure-linux-hwtest"
+  return 0
+}
+# Secure Boot extras (PIN unlock, removing the USB stick's key) only make sense when the user kept
+# Secure Boot on (choice secureboot_intent, unset counts as on) AND the firmware reports it enabled.
+secure_boot_on() { have mokutil && mokutil --sb-state 2>/dev/null | grep -qi 'SecureBoot enabled'; }
+SB_NOTED=0
+sb_extras_wanted() {
+  if [ "$(sl_choice_get secureboot_intent on)" != off ] && secure_boot_on; then return 0; fi
+  [ $SB_NOTED = 1 ] || echo "Not needed: Secure Boot is off (your choice)"
+  SB_NOTED=1; return 1
+}
+page_tpmpin() {
+  sb_extras_wanted || return 0
+  have secure-linux-tpm-pin || return 1
+  [ "$(sl_choice_get tpm_pin no)" = yes ] && return 0
+  local a; a=$(ui_ask tpmpin "PIN unlock (optional)
+
+At power-on you could type a short PIN instead of your long disk password. Your long password keeps working as well, so you can always fall back to it.
+
+To be honest with you: on this Ryzen laptop the PIN is a convenience, not extra security. Researchers have published an attack on this kind of security chip, so someone with your laptop and plenty of time and skill could get around it. Your long password is the strongest protection.
+
+Set up a PIN? The next window shows a short warning and walks you through it." "Yes, set up a PIN" "No thanks")
+  [ "$a" = yes ] && ui_terminal secure-linux-tpm-pin enable
+  return 0
+}
+page_mok() {
+  sb_extras_wanted || return 0
+  have secure-linux-mok-remove || return 1
+  [ "$(sl_choice_get mok_removed no)" = yes ] && return 0
+  setup_running && return 1
+  local a; a=$(ui_ask mok "Remove the installer's Secure Boot key?
+
+To start from the USB stick we added a temporary key to the laptop's firmware. Now that everything works, removing it makes Secure Boot strict again.
+
+You'll restart once and confirm on a blue screen; the next window explains exactly what to press." "Remove it" "Later")
+  [ "$a" = yes ] && secure-linux-mok-remove
+  return 0
+}
+
+# ---------------------------------------------------------------- plug-in pages ($SL_ROOT/wizard.d/NN-name.sh)
+# Each page file defines page_title and page_run and uses only these wz_* helpers (see ARCHITECTURE.md).
+# Scripted answers (tests): every wz_* dialog has the key PAGE_N, PAGE = file name without .sh,
+# N = 1, 2, 3... in the order the page asks, e.g. SL_WIZARD_ANSWERS="50-drm_1=yes,50-drm_2=Netflix".
+WZ_PAGE=""
+# The counter lives in a file: pages call helpers inside $(...) subshells, where variables don't stick
+_wz_key() { local n; n=$(( $(cat "$USTATE/wz-counter" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$USTATE/wz-counter"; echo "${WZ_PAGE}_$n"; }
+wz_info()   { ui_info "$(_wz_key)" "$1"; }
+wz_yesno()  { [ "$(ui_ask "$(_wz_key)" "$1")" = yes ]; }
+wz_choice() { local q=$1 o args=(); shift; for o in "$@"; do args+=("$o" "$o"); done
+              local a; a=$(ui_choose "$(_wz_key)" "$q" "${args[@]}"); [ "$a" = skip ] && a=""; echo "$a"; }
+wz_input()  { ui_input "$(_wz_key)" "$1" "${2:-}"; }
+wz_open()   { [ -n "${SL_WIZARD_ANSWERS:-}" ] && { echo "OPEN: $1"; return 0; }; xdg-open "$1" >/dev/null 2>&1 & }
+wz_root()   { pkexec "$@"; }
+wz_done()   { grep -qx "$1" "$USTATE/wz-done" 2>/dev/null || echo "$1" >> "$USTATE/wz-done"; }
+wz_is_done() { grep -qx "$1" "$USTATE/wz-done" 2>/dev/null; }
+run_plugin_pages() {
+  local f
+  for f in "$SL_ROOT"/wizard.d/*.sh; do
+    [ -f "$f" ] || continue
+    # Each page runs in its own subshell: its functions/variables can't clash with ours or each other's
+    ( WZ_PAGE=$(basename "$f" .sh); echo 0 > "$USTATE/wz-counter"; UI_TITLE="Welcome to your new computer"
+      unset -f page_title page_run
+      . "$f" || exit 0
+      declare -F page_run >/dev/null || exit 0
+      declare -F page_title >/dev/null && UI_TITLE=$(page_title)
+      page_run ) || echo "wizard page $(basename "$f") returned an error" >&2
+  done
+  # Pages may change choices the browser preset depends on (e.g. drm): re-apply it (keeps user edits)
+  bash "$SL_EXP/user-setup.sh" librewolf-prefs >/dev/null 2>&1 || true
+}
+
+run_page() {
+  local p=$1 n
+  if "page_$p"; then mark_done "$p"; return 0; fi
+  n=$(sed -n "s/^$p //p" "$DEFER"); n=$(( ${n:-0} + 1 ))
+  sed -i "/^$p /d" "$DEFER"; echo "$p $n" >> "$DEFER"
+  [ "$n" -ge 4 ] && mark_done "$p"           # don't ask forever about something that never becomes ready
+  return 1
+}
+
+wizard() {
+  local p left=0 a
+  if ! is_main_user; then family_welcome; return; fi
+  copy_guide_to_desktop
+  if [ ! -s "$DONE" ]; then
+    a=$(ui_ask welcome "Hello $(first_name), and welcome to your new computer!
+
+$(progress_text)
+
+A few friendly questions come next (about 10 minutes): VPN, home Wi-Fi, battery, backups and more. Every question can be skipped, and you can change any answer later from the app menu: \"Welcome & Setup Choices\"." "Let's start" "Not now")
+    if [ "$a" != yes ]; then
+      open_guide
+      exp_notify "Welcome!" "We'll ask the setup questions next time you log in. The START-HERE guide is on your Desktop."
+      return 0
+    fi
+  fi
+  for p in $PAGES; do
+    page_done "$p" && continue
+    run_page "$p" || left=$((left + 1))
+  done
+  run_plugin_pages
+  bash "$SL_EXP/user-setup.sh" screenlock >/dev/null 2>&1 || true   # in-session (Xfce needs the session bus)
+  if [ $left -eq 0 ]; then
+    want welcome_done yes
+    flush
+    touch "$USTATE/welcomed"
+    ui_info finish "All done. Thank you!
+
+$(progress_text)
+
+The START-HERE guide opens now: it explains every app and what to do if something goes wrong. It's also on your Desktop.
+
+Change any answer later: app menu > \"Welcome & Setup Choices\".
+Something not right? App menu > \"Secure Linux Status\"."
+    open_guide
+  else
+    flush
+    ui_info later "Thanks! $left question(s) need setup to finish first. We'll ask them next time you log in.
+
+$(progress_text)"
+  fi
+}
+
+family_welcome() {
+  copy_guide_to_desktop
+  ui_info family_welcome "Hello $(first_name), and welcome!
+
+This is your own account: your files, settings and browser are separate from everyone else's on this computer.
+
+The START-HERE guide opens now and explains everything. It's also on your Desktop."
+  open_guide
+  touch "$USTATE/welcomed"
+}
+
+add_family_member() {
+  UI_TITLE="Add a family member"
+  local login full pw1 pw2
+  ui_info family_intro "Everyone who uses this computer should have their own account.
+
+They get their own files, settings and browser, and they can't change system settings or install system software without your password (a \"standard\" account). They can still use the VPN and install apps from the app store.
+
+You'll choose a login name and a first password for them. They can change it later in System Settings > Users."
+  login=$(ui_input family_login "Their login name (lowercase, no spaces), for example: sam")
+  [ -n "$login" ] || return 0
+  printf '%s' "$login" | grep -qE '^[a-z_][a-z0-9_-]{0,30}$' || { ui_info family_bad "\"$login\" can't be used: use lowercase letters and numbers only, starting with a letter."; return 1; }
+  full=$(ui_input family_name "Their name as shown on the login screen, for example: Sam Smith" "$login")
+  pw1=$(ui_password family_pw "A first password for $login (at least 6 characters):"); [ -n "$pw1" ] || return 0
+  pw2=$(ui_password family_pw2 "Type the same password again:")
+  [ "$pw1" = "$pw2" ] || { ui_info family_mismatch "The passwords didn't match. Nothing was changed; please try again."; return 1; }
+  if printf '%s\n' "$pw1" | pkexec "$SELF" --create-user "$login" "${full:-$login}"; then
+    ui_info family_done "Done! $login can now log in: on the login screen, choose their name.
+
+At their first login they get a short welcome and the START-HERE guide."
+  else
+    ui_info family_failed "The account couldn't be created (maybe the name is already taken). Nothing was changed."
+    return 1
+  fi
+}
+
+status() {
+  echo "Welcome wizard for $USER: $([ -f "$USTATE/welcomed" ] && echo finished || echo 'not finished')"
+  local p
+  for p in $PAGES; do printf '  %-11s %s\n' "$p" "$(page_done "$p" && echo answered || echo -)"; done
+  [ -s "$PENDING" ] && { echo "  Not saved yet:"; sed 's/^/    /' "$PENDING"; }
+  echo "  $(progress_text)"
+}
+
+case "${1:-}" in --save|--create-user|-h|--help) ;; *) init_user_state ;; esac
+case "${1:-}" in
+  --save) shift; root_save "$@" ;;
+  --create-user) shift; root_create_user "$@" ;;
+  --add-family-member) add_family_member ;;
+  --autostart)
+    if [ -f "$USTATE/welcomed" ]; then
+      [ -s "$PENDING" ] && flush
+      setup_running && exp_notify "Still setting up" "$(progress_text)" system-software-update
+      exit 0
+    fi
+    [ -n "${SL_WIZARD_ANSWERS:-}" ] || sleep 8      # let the desktop settle after login
+    wizard ;;
+  --again) : > "$DONE"; : > "$DEFER"; : > "$USTATE/wz-done"; rm -f "$USTATE/welcomed"; ASK_AGAIN=1; wizard ;;
+  --page) ASK_AGAIN=1; [ -n "${2:-}" ] && case " $PAGES " in *" $2 "*) run_page "$2"; flush ;; *) echo "Unknown page: $2"; exit 1 ;; esac ;;
+  --status) status ;;
+  -h|--help) sed -n '2,14p' "$0" ;;
+  '') wizard ;;
+  *) sed -n '2,14p' "$0"; exit 1 ;;
+esac

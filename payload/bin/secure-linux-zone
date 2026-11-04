@@ -1,0 +1,99 @@
+#!/bin/bash
+# secure-linux-zone: tell the computer which networks are your home network.
+#
+#   secure-linux-zone status [--short]    which network you're on and whether it counts as home
+#                                         (short: home|away|offline)
+#   secure-linux-zone set-home [NAME]     trust this network as home (default: the one you're connected to now)
+#   secure-linux-zone unset-home [NAME]   stop trusting it (default: the one you're connected to now)
+#   secure-linux-zone list                every saved network and whether it is home
+#
+# At home, your phone apps (KDE Connect, LocalSend, Syncthing), printers and network names work.
+# Everywhere else the firewall blocks them in both directions and Syncthing is paused.
+set -u   # no pipefail: "cmd | grep -q" must not fail when grep stops reading early
+SL_ROOT=${SL_ROOT:-/usr/local/lib/secure-linux}
+. "$SL_ROOT/lib/common.sh"
+. "$SL_ROOT/files/security/lib-security.sh"
+DISPATCHER=${SL_SEC_DISPATCHER:-$SEC_PREFIX/etc/NetworkManager/dispatcher.d/50-secure-linux}
+
+usage() { sed -n '2,12p' "$(sec_self)" | sed 's/^# \{0,1\}//'; }
+
+# Active Wi-Fi/Ethernet connections: UUID:TYPE:DEVICE:NAME
+active_physical() {
+  nmcli -t -f UUID,TYPE,DEVICE,NAME connection show --active 2>/dev/null \
+    | awk -F: '$2=="802-11-wireless" || $2=="802-3-ethernet"'
+}
+
+# Find a saved connection by name/UUID; default = the current Wi-Fi/Ethernet connection
+pick_connection() {
+  local want=${1:-} line
+  if [ -z "$want" ]; then
+    line=$(active_physical | head -1)
+    [ -n "$line" ] || { echo "You're not connected to a network right now. Connect first, then try again." >&2; return 1; }
+    printf '%s\n' "$line"; return 0
+  fi
+  line=$(nmcli -t -f UUID,TYPE,DEVICE,NAME connection show 2>/dev/null | awk -F: -v w="$want" '$1==w || $4==w {print; exit}')
+  [ -n "$line" ] || { echo "No saved network called '$want'. Run 'secure-linux-zone list' to see the names." >&2; return 1; }
+  printf '%s\n' "$line"
+}
+
+refresh() {
+  [ -x "$DISPATCHER" ] && "$DISPATCHER" "" refresh >/dev/null 2>&1
+  return 0
+}
+
+cmd_set() {   # cmd_set home|"" NAME
+  local zone=$1 line uuid ctype dev name ssid
+  line=$(pick_connection "${2:-}") || return 1
+  IFS=: read -r uuid ctype dev name <<<"$line"
+  nmcli connection modify "$uuid" connection.zone "$zone" || { echo "Couldn't change the network settings." >&2; return 1; }
+  if [ -n "$dev" ]; then
+    nmcli device reapply "$dev" >/dev/null 2>&1 || firewall-cmd --zone="${zone:-public}" --change-interface="$dev" >/dev/null 2>&1
+  fi
+  if [ "$ctype" = 802-11-wireless ]; then
+    ssid=$(nmcli -g 802-11-wireless.ssid connection show "$uuid" 2>/dev/null)
+    if [ "$zone" = home ] && [ -n "$ssid" ]; then sl_choice_set home_ssid "$ssid"
+    elif [ -z "$zone" ] && [ "$(sl_choice_get home_ssid "$(sl_build_get HOME_WIFI_SSID)")" = "$ssid" ]; then
+      sl_choice_set home_ssid -     # "-" = no home Wi-Fi (an empty value would fall back to the USB builder's)
+    fi
+  fi
+  refresh
+  if [ "$zone" = home ]; then
+    echo "'$name' is now your home network: your phone apps and printers can reach this computer here."
+  else
+    echo "'$name' is no longer trusted: this computer is hidden from other devices on it."
+  fi
+}
+
+cmd_status() {
+  local short=${1:-} line uuid ctype dev name z where=offline any=0 home=0 away=0
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    IFS=: read -r uuid ctype dev name <<<"$line"; any=1
+    z=$(nmcli -g connection.zone connection show "$uuid" 2>/dev/null)
+    if [ "$z" = home ] || [ "$z" = trusted ]; then home=1; [ -z "$short" ] && echo "Connected to '$name' ($dev): HOME network (phone apps and printers allowed)."
+    else away=1; [ -z "$short" ] && echo "Connected to '$name' ($dev): public network (this computer is hidden)."; fi
+  done < <(active_physical)
+  [ $away = 1 ] && where=away || { [ $home = 1 ] && where=home; }
+  if [ "$short" = --short ]; then echo "$where"; return 0; fi
+  [ $any = 0 ] && echo "Not connected to any network."
+  [ "$where" = home ] && echo "Syncthing and local network names: on." || echo "Syncthing and local network names: paused until you're home."
+  return 0
+}
+
+cmd_list() {
+  local uuid ctype dev name z
+  while IFS=: read -r uuid ctype dev name; do
+    case "$ctype" in 802-11-wireless|802-3-ethernet) ;; *) continue ;; esac
+    z=$(nmcli -g connection.zone connection show "$uuid" 2>/dev/null)
+    printf '  %-6s %s\n' "$([ "$z" = home ] && echo HOME || echo -)" "$name"
+  done < <(nmcli -t -f UUID,TYPE,DEVICE,NAME connection show 2>/dev/null)
+}
+
+case "${1:-}" in
+  -h|--help|help|"") usage ;;
+  status) shift; cmd_status "${1:-}" ;;
+  list) cmd_list ;;
+  set-home)   shift; sec_need_root set-home "$@"; cmd_set home "${1:-}" ;;
+  unset-home) shift; sec_need_root unset-home "$@"; cmd_set "" "${1:-}" ;;
+  *) echo "Unknown command '$1'." >&2; usage; exit 2 ;;
+esac

@@ -1,0 +1,592 @@
+#!/bin/bash
+# secure-linux-toolbox: the single front door of Secure Linux - on the installed computer and on the USB stick.
+#   secure-linux-toolbox              open the Toolbox (it first runs a quick check that only LOOKS, then shows green / amber / red)
+#   secure-linux-toolbox --autopilot  "Look after my computer": check, then fix the safe things, update, tidy and check again.
+#                                     You say yes once. Nothing risky is ever done without its own, separate yes.
+#   secure-linux-toolbox --screen NAME  go straight to one screen: autopilot problems fixall health rescue trouble windows
+#                                     clean security updates backup help advanced settings
+#   secure-linux-toolbox --check      print the quick check as text and stop (exit 0 healthy, 1 attention, 2 problem)
+#   secure-linux-toolbox --dry-run    show what every step would do, change nothing
+#   secure-linux-toolbox --gui | --tui | --plain   choose the look (default: automatic). --ascii and --contrast also help.
+#   secure-linux-toolbox --no-check   skip the first quick check
+# Also installed as the command  toolbox  and as "Secure Linux Toolbox" in the menu. Plain English, one step at a time.
+# Needs: lib/sl-ui.sh (look and feel). Engines: secure-linux-diagnose (finds problems), secure-linux-repair (fixes them),
+# secure-linux-health (hardware). If the problem finder is missing, the hardware check is used instead.
+# Test hooks: SL_DIAGNOSE, SL_REPAIR, SL_HEALTH (paths), SL_TB_STATE, SL_TB_REPORT_DIR, SL_STICK, SL_TB_ROOTCMD, SL_TB_UPDATES,
+# SL_TB_CLEAN_BYTES, SL_TB_ASSUME_MOUNTED, SL_TB_SRC_MNT, SL_TB_DST_DIR, SL_UI_QLOG (every question asked is logged there).
+set -u
+SELF=$(readlink -f "$0" 2>/dev/null || echo "$0"); HERE=$(dirname "$SELF")
+SL_ROOT=${SL_ROOT:-/usr/local/lib/secure-linux}
+[ -r "$SL_ROOT/lib/sl-ui.sh" ] || SL_ROOT=$(cd "$HERE/.." 2>/dev/null && pwd)
+if [ ! -r "$SL_ROOT/lib/sl-ui.sh" ]; then echo "secure-linux-toolbox: cannot find lib/sl-ui.sh (looked in $SL_ROOT)." >&2; exit 3; fi
+HLIB=$SL_ROOT/hw/health
+# shellcheck source=../lib/sl-ui.sh
+. "$SL_ROOT/lib/sl-ui.sh"
+. "$HLIB/lib.sh"; . "$HLIB/repair-lib.sh"
+. "$SL_ROOT/lib/sl-toolbox-more.sh"
+usage() { sed -n '2,/^# Test hooks/p' "$SELF" | sed 's/^# \{0,1\}//'; }
+
+TB_ORIG_ARGS=("$@"); TB_SOURCE=none; TB_DRY=0; TB_DRY_FLAG=""; TB_SCREEN=""; TB_CHECK_ONLY=0; TB_NOCHECK=0; TB_AUTOPILOT=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    --gui) export SL_UI=gui ;; --tui) export SL_UI=rich ;; --plain) export SL_UI=plain ;;
+    --ascii) export SL_UI_ASCII=1 ;; --contrast) export SL_UI_THEME=contrast ;;
+    --dry-run|-n) TB_DRY=1; TB_DRY_FLAG=--dry-run; RP_DRY=1 ;;
+    --autopilot) TB_AUTOPILOT=1 ;;
+    --screen) shift; TB_SCREEN=${1:-} ;;
+    --screen=*) TB_SCREEN=${1#--screen=} ;;
+    --check) TB_CHECK_ONLY=1 ;;
+    --no-check) TB_NOCHECK=1 ;;
+    --version) echo "secure-linux-toolbox 1.0"; exit 0 ;;
+    *) echo "Unknown option: $1  (try --help)" >&2; exit 3 ;;
+  esac
+  shift
+done
+
+TB_STATE=${SL_TB_STATE:-${XDG_STATE_HOME:-${HOME:-/tmp}/.local/state}/secure-linux/toolbox}
+mkdir -p "$TB_STATE" 2>/dev/null
+TB_TMP=$(mktemp -d "${TMPDIR:-/tmp}/sl-toolbox.XXXXXX" 2>/dev/null || echo "${TMPDIR:-/tmp}/sl-toolbox.$$"); mkdir -p "$TB_TMP"
+declare -a TB_LOG=()
+trap 'ui_cleanup; tb_cleanup_mounts; rm -rf "$TB_TMP"' EXIT
+trap 'echo; echo "Stopped. Nothing is left half-done."; exit 130' INT
+# --check is a plain text report (scripts, ssh, review harnesses). Never let it pick the GUI renderer:
+# GUI output is buffered for a window that is never shown, so the report would come out empty (L2).
+if [ "$TB_CHECK_ONLY" = 1 ]; then
+  [ -z "${SL_UI:-}" ] && [ ! -t 1 ] && SL_UI=plain
+else
+  ui_prefer_gui   # real windows on a desktop, even when started from a terminal (owner's rule)
+fi
+ui_init
+# started from a menu icon on a desktop that has no window toolkit (no kdialog / zenity): open our own terminal window
+if [ "$UI_MODE" = plain ] && [ "$UI_TTY" = 0 ] && [ -z "${SL_UI:-}" ] && [ -z "${SL_TB_NO_RELAUNCH:-}" ] && [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ] && _ui_have secure-linux-terminal; then
+  exec secure-linux-terminal --hold "$SELF" "${TB_ORIG_ARGS[@]}"
+fi
+UI_APP="Secure Linux Toolbox"
+SLH_TITLE="Secure Linux Toolbox"
+
+# ---------------------------------------------------------------- the engines
+tb_find() {   # tb_find ENV_OVERRIDE command-name -> path
+  local v=${!1:-}; [ -n "$v" ] && { printf '%s' "$v"; return 0; }
+  if [ -e "$SL_ROOT/bin/$2" ]; then printf '%s' "$SL_ROOT/bin/$2"; return 0; fi
+  command -v "$2" 2>/dev/null
+}
+TB_DIAG=$(tb_find SL_DIAGNOSE secure-linux-diagnose)
+TB_REPAIR=$(tb_find SL_REPAIR secure-linux-repair)
+TB_HEALTH=$(tb_find SL_HEALTH secure-linux-health)
+tb_x() { local p=$1; shift; if [ -x "$p" ]; then "$p" "$@"; else bash "$p" "$@"; fi; }
+
+# JSON (flat objects in an array) -> one line per object, fields joined by ASCII 31, list values by ASCII 29, newlines as ASCII 30
+tb_json_records() {
+  awk -v FIELDS="$1" '
+  function ws() { while (p <= n && index(" \t\r\n", substr(s, p, 1))) p++ }
+  function hexv(h,   i, c, v) { v = 0; h = tolower(h); for (i = 1; i <= length(h); i++) { c = index("0123456789abcdef", substr(h, i, 1)); if (!c) return 63; v = v * 16 + c - 1 } return v }
+  function uni(h,   v) { v = hexv(h); if (v == 8211 || v == 8212) return "-"; if (v == 8216 || v == 8217) return "\047"; if (v == 8220 || v == 8221) return "\042"; if (v == 8230) return "..."; if (v == 160) return " "; if (v >= 32 && v < 127) return sprintf("%c", v); return "?" }
+  function str(   r, c, e) { p++; r = ""; while (p <= n) { c = substr(s, p, 1); if (c == "\"") { p++; return r }
+      if (c == "\\") { p++; e = substr(s, p, 1); if (e == "n") r = r NL; else if (e == "t" || e == "r") r = r " "; else if (e == "u") { r = r uni(substr(s, p + 1, 4)); p += 4 } else r = r e } else r = r c; p++ } return r }
+  function emit(   i, o) { o = ""; for (i = 1; i <= nf; i++) o = o (i > 1 ? US : "") rec[f[i]]; print o; delete rec }
+  function val(depth,   c, r, t, k) {
+    ws(); c = substr(s, p, 1)
+    if (c == "\"") return str()
+    if (c == "[") { p++; r = ""; ws(); if (substr(s, p, 1) == "]") { p++; return "" }
+      while (p <= n) { t = val(depth + 1); r = (r == "" ? "" : r GS) t; ws(); c = substr(s, p, 1); p++; if (c != ",") break } return r }
+    if (c == "{") { p++; ws(); if (substr(s, p, 1) == "}") { p++; if (depth <= 1) emit(); return "" }
+      while (p <= n) { ws(); k = str(); ws(); p++; t = val(depth + 1); if (depth <= 1) rec[k] = t; ws(); c = substr(s, p, 1); p++; if (c != ",") break }
+      if (depth <= 1) emit(); return "" }
+    r = ""; while (p <= n && !index(",]} \t\r\n", substr(s, p, 1))) { r = r substr(s, p, 1); p++ } return r }
+  BEGIN { US = "\037"; GS = "\035"; NL = "\036"; RS = "\001"; nf = split(FIELDS, f, ",") }
+  { s = $0; n = length(s); p = index(s, "["); q = index(s, "{"); if (!p || (q && q < p)) p = q; if (!p) next; val(0); ok = 1 }
+  END { if (!ok) exit 3 }'
+}
+tb_nl() { TB_V=${1//$'\036'/$'\n'}; }
+
+# ---------------------------------------------------------------- the list of problems
+declare -a I_ID=() I_SEV=() I_TITLE=() I_WHAT=() I_WHY=() I_SAFE=() I_AUTO=() I_ACT=() I_ARGS=() I_SUM=() I_BAK=() I_TIME=() I_LEARN=()
+I_N=0; N_FAIL=0; N_WARN=0; N_INFO=0; N_OK=0; N_ATTN=0
+declare -a FIX_SAFE=() FIX_ASK=() NO_FIX=()
+tb_add_issue() {   # id sev title what why safe auto act args sum bak time learn
+  I_ID[I_N]=$1; I_SEV[I_N]=$2; I_TITLE[I_N]=$3; I_WHAT[I_N]=$4; I_WHY[I_N]=$5; I_SAFE[I_N]=$6; I_AUTO[I_N]=$7; I_ACT[I_N]=$8; I_ARGS[I_N]=$9
+  I_SUM[I_N]=${10}; I_BAK[I_N]=${11}; I_TIME[I_N]=${12}; I_LEARN[I_N]=${13}; I_N=$((I_N + 1))
+}
+tb_load_records() {   # FILE of diagnose records -> arrays (worst first)
+  local rank id sev title what why safe auto act args sum bak tm learn
+  I_ID=(); I_SEV=(); I_TITLE=(); I_WHAT=(); I_WHY=(); I_SAFE=(); I_AUTO=(); I_ACT=(); I_ARGS=(); I_SUM=(); I_BAK=(); I_TIME=(); I_LEARN=(); I_N=0
+  for rank in fail warn info ok; do
+    while IFS=$'\037' read -r id sev title what why safe auto act args sum bak tm learn; do
+      [ -n "$id" ] || continue
+      case $sev in ok|info|warn|fail) ;; *) sev=info ;; esac
+      [ "$sev" = "$rank" ] || continue
+      tb_nl "$what"; what=$TB_V; tb_nl "$why"; why=$TB_V; tb_nl "$sum"; sum=$TB_V; tb_nl "$learn"; learn=$TB_V
+      [ -n "$title" ] || title=$id
+      tb_add_issue "$id" "$sev" "$title" "$what" "$why" "${safe:-asks}" "${auto:-false}" "$act" "$args" "$sum" "$bak" "$tm" "$learn"
+    done < "$1"
+  done
+}
+tb_health_records() {   # health --json text on stdin -> records part,item,status,meaning,what_to_do,detail
+  grep -E '^ *\{"part"' | sed 's/,$//' | paste -sd, - | sed 's/^/[/; s/$/]/' | tb_json_records part,item,status,meaning,what_to_do,detail
+}
+tb_health_fallback() {   # no problem finder: turn the hardware check into the same list
+  local part item st meaning todo detail sev rec=$TB_TMP/hw.rec
+  I_N=0; I_ID=(); I_SEV=(); I_TITLE=(); I_WHAT=(); I_WHY=(); I_SAFE=(); I_AUTO=(); I_ACT=(); I_ARGS=(); I_SUM=(); I_BAK=(); I_TIME=(); I_LEARN=()
+  [ -n "$TB_HEALTH" ] || return 1
+  tb_x "$TB_HEALTH" --json --quick --no-save --no-interactive 2>/dev/null | tb_health_records > "$rec" || return 1
+  while IFS=$'\037' read -r part item st meaning todo detail; do
+    case $st in WARN) sev=warn ;; FAIL) sev=fail ;; OK) sev=ok ;; *) continue ;; esac
+    tb_add_issue "health:$part${item:+:$item}" "$sev" "${meaning:0:70}" "$meaning" "This part of your computer is not working as well as it should." safe false "" "" "" "" "" "${todo:-}"
+  done < "$rec"
+  TB_SOURCE=health
+  return 0
+}
+tb_count() {
+  local i; N_FAIL=0; N_WARN=0; N_INFO=0; N_OK=0; FIX_SAFE=(); FIX_ASK=(); NO_FIX=()
+  for ((i = 0; i < I_N; i++)); do
+    case ${I_SEV[i]} in
+      fail) N_FAIL=$((N_FAIL + 1)) ;; warn) N_WARN=$((N_WARN + 1)) ;; info) N_INFO=$((N_INFO + 1)) ;; ok) N_OK=$((N_OK + 1)) ;;
+    esac
+    case ${I_SEV[i]} in fail|warn) ;; *) continue ;; esac
+    if [ "${I_AUTO[i]}" = true ] && [ -n "${I_ACT[i]}" ]; then
+      if [ "${I_SAFE[i]}" = safe ]; then FIX_SAFE+=("$i"); else FIX_ASK+=("$i"); fi
+    else NO_FIX+=("$i"); fi
+  done
+  N_ATTN=$((N_FAIL + N_WARN))
+}
+tb_collect() {   # tb_collect quick|full  -> fills the arrays; read-only
+  local f=$TB_TMP/diag.json rec=$TB_TMP/diag.rec ok=0
+  TB_SOURCE=engine
+  if [ -n "$TB_DIAG" ] && [ -e "$TB_DIAG" ]; then
+    tb_x "$TB_DIAG" --json "--${1:-quick}" > "$f" 2>"$TB_TMP/diag.err"
+    tb_json_records id,severity,title,what,why,safe_level,auto_fixable,fix_action,fix_args,fix_summary,backup_first,time_estimate,learn_more < "$f" > "$rec" && ok=1
+  fi
+  if [ $ok = 1 ]; then tb_load_records "$rec"; else tb_health_fallback || { I_N=0; TB_SOURCE=none; }; fi
+  tb_count
+}
+tb_refresh() { ui_task "Checking your computer (this only looks)" tb_collect quick; }
+
+# ---------------------------------------------------------------- words
+tb_safe_text() {
+  case ${I_SAFE[$1]} in
+    safe) echo "Safe. Nothing you made (photos, documents) is changed." ;;
+    asks) echo "Mostly safe, but it will ask you a question while it works." ;;
+    *) echo "Risky. Only go ahead if you understand it may not be undoable." ;;
+  esac
+}
+tb_hw_name() {
+  case $1 in
+    cpu) echo "Processor" ;; ram) echo "Memory" ;; storage) echo "Drives" ;; filesystem) echo "Drive formats" ;; optical) echo "CD/DVD drive" ;;
+    usb) echo "USB ports" ;; keyboard) echo "Keyboard" ;; pointer) echo "Mouse and touchpad" ;; audio) echo "Sound" ;; bluetooth) echo "Bluetooth" ;;
+    camera) echo "Camera" ;; display) echo "Screen" ;; graphics) echo "Graphics" ;; wifi) echo "Wi-Fi" ;; ethernet) echo "Network cable" ;;
+    battery) echo "Battery" ;; ac) echo "Charger" ;; thermal) echo "Heat and fans" ;; tpm) echo "Security chip" ;; sdcard) echo "Memory card slot" ;;
+    fingerprint) echo "Fingerprint reader" ;; sensors) echo "Sensors" ;; printers) echo "Printers and scanners" ;; thunderbolt) echo "Fast ports" ;;
+    fwupd) echo "Built-in software" ;; bios) echo "Start-up software" ;; kernel) echo "System messages" ;; *) echo "Other devices" ;;
+  esac
+}
+
+# ---------------------------------------------------------------- reports
+tb_report_write() {   # tb_report_write "headline"  -> writes the report to the home folder and to the stick when present
+  local stamp d name txt=$TB_TMP/report.txt i stick
+  printf -v stamp '%(%Y-%m-%d-%H%M)T' -1
+  slh_rdv _a "$SLH_SYS/class/dmi/id/sys_vendor"; slh_rdv _b "$SLH_SYS/class/dmi/id/product_name"
+  {
+    printf 'Secure Linux Toolbox report - %s\nComputer: %s %s\n\n%s\n\n' "$stamp" "${_a:-}" "${_b:-}" "$1"
+    printf 'What we found (before):\n'; for ((i = 0; i < ${#B_TITLE[@]}; i++)); do printf '  - [%s] %s\n' "${B_SEV[i]}" "${B_TITLE[i]}"; done
+    printf '\nWhat we did:\n'; if [ ${#TB_LOG[@]} -gt 0 ]; then printf '  - %s\n' "${TB_LOG[@]}"; else echo "  - Nothing was changed."; fi
+    printf '\nStill needs you (after):\n'; local n=0; for ((i = 0; i < I_N; i++)); do case ${I_SEV[i]} in warn|fail) printf '  - [%s] %s\n' "${I_SEV[i]}" "${I_TITLE[i]}"; n=1 ;; esac; done
+    [ $n = 0 ] && echo "  - Nothing."
+  } > "$txt"
+  d=${SL_TB_REPORT_DIR:-${HOME:-/tmp}}; name="Secure-Linux-Report-$stamp.txt"
+  TB_REPORT_SAVED=""
+  cp "$txt" "$d/$name" 2>/dev/null && TB_REPORT_SAVED="$d/$name"
+  stick=$(slh_find_stick 2>/dev/null) && [ -n "$stick" ] && [ -w "$stick" ] && { mkdir -p "$stick/secure-linux-reports" 2>/dev/null && cp "$txt" "$stick/secure-linux-reports/$name" 2>/dev/null && TB_REPORT_SAVED="$TB_REPORT_SAVED and the stick"; }
+  return 0
+}
+
+# ---------------------------------------------------------------- fixing
+declare -a PL_KIND=() PL_TITLE=() PL_SUM=() PL_BAK=() PL_TIME=() PL_SAFE=() PL_RES=() B_ID=() B_SEV=() B_TITLE=()
+tb_plan_reset() { PL_KIND=(); PL_TITLE=(); PL_SUM=(); PL_BAK=(); PL_TIME=(); PL_SAFE=(); PL_RES=(); }
+tb_plan_add() { PL_KIND+=("$1"); PL_TITLE+=("$2"); PL_SUM+=("$3"); PL_BAK+=("$4"); PL_TIME+=("$5"); PL_SAFE+=("${6:-safe}"); }
+tb_snapshot_before() { B_ID=(); B_SEV=(); B_TITLE=(); local i; for ((i = 0; i < I_N; i++)); do case ${I_SEV[i]} in warn|fail) B_ID+=("${I_ID[i]}"); B_SEV+=("${I_SEV[i]}"); B_TITLE+=("${I_TITLE[i]}") ;; esac; done; }
+tb_fix_args() {   # tb_fix_args INDEX [typed] -> TB_FA = the secure-linux-repair arguments (approval already collected by us)
+  local i=$1 typed=${2:-}; local -a fa=()
+  TB_FA=(--action "${I_ACT[i]}")
+  if [ "$TB_DRY" = 1 ]; then TB_FA+=(--dry-run); else TB_FA+=(--approved); fi
+  [ -n "$typed" ] && TB_FA+=(--approved-typed)
+  IFS=$'\035' read -ra fa <<< "${I_ARGS[i]}"
+  [ ${#fa[@]} -gt 0 ] && TB_FA+=(-- "${fa[@]}")
+  return 0
+}
+tb_run_fix() { tb_fix_args "$@"; tb_x "$TB_REPAIR" "${TB_FA[@]}"; }
+tb_plan_show() {   # one plain summary of everything that is about to happen
+  local i n=${#PL_KIND[@]} rows=() baks=() nobak=()
+  ui_h2 "Here is what we will do ($n step$( [ "$n" = 1 ] || echo s))"
+  for ((i = 0; i < n; i++)); do rows+=("$((i + 1)). ${PL_TITLE[i]}|${PL_SUM[i]}|${PL_TIME[i]}"); done
+  ui_table "Step|What changes|Time" "${rows[@]}"
+  for ((i = 0; i < n; i++)); do
+    if [ -n "${PL_BAK[i]}" ]; then baks+=("${PL_TITLE[i]}: ${PL_BAK[i]}"); else nobak+=("${PL_TITLE[i]}"); fi
+  done
+  ui_h2 "Saved first, so it can be undone"
+  if [ ${#baks[@]} -gt 0 ]; then ui_list "${baks[@]}"; else ui_say "Nothing needs saving: none of these steps change anything you made."; fi
+  ui_h2 "Cannot be undone"
+  if [ ${#nobak[@]} -gt 0 ]; then ui_list "${nobak[@]}"; ui_say "These only tidy up things the computer can make again. None of your own files are touched."; else ui_say "Nothing in this list is permanent."; fi
+}
+tb_plan_run() {   # runs every planned step in order, with a progress bar. Sets PL_RES (ok|fail) per step.
+  local i n=${#PL_KIND[@]} rc k pct
+  ui_progress_begin "Looking after your computer"
+  for ((i = 0; i < n; i++)); do
+    pct=$((i * 100 / n)); ui_progress "$pct" "${PL_TITLE[i]}"
+    ui_step_begin "${PL_TITLE[i]}"
+    k=${PL_KIND[i]}
+    case $k in
+      fix:*) tb_run_fix "${k#fix:}" >"$TB_TMP/step.$i.log" 2>&1; rc=$? ;;
+      updates) if [ "$TB_DRY" = 1 ]; then rc=0; else tb_updates_run >"$TB_TMP/step.$i.log" 2>&1; rc=$?; fi ;;
+      clean) if [ "$TB_DRY" = 1 ]; then rc=0; else tb_clean_run >"$TB_TMP/step.$i.log" 2>&1; rc=$?; fi ;;
+      *) rc=0 ;;
+    esac
+    if [ $rc -eq 0 ]; then PL_RES[i]=ok; ui_step_end ok; TB_LOG+=("$( [ "$TB_DRY" = 1 ] && echo 'Would do' || echo Did): ${PL_TITLE[i]}")
+    else PL_RES[i]=fail; ui_step_end fail "did not finish"; TB_LOG+=("Could not finish: ${PL_TITLE[i]}"); fi
+  done
+  ui_progress 100 "All steps done"; ui_progress_end
+}
+tb_result() {   # before / after screen and the saved report
+  local i j found rows=() fixed=0 left=0 head
+  for ((i = 0; i < ${#B_ID[@]}; i++)); do
+    found=0; for ((j = 0; j < I_N; j++)); do [ "${I_ID[j]}" = "${B_ID[i]}" ] && case ${I_SEV[j]} in warn|fail) found=1 ;; esac; done
+    if [ $found = 0 ]; then rows+=("${B_TITLE[i]}|Fixed"); fixed=$((fixed + 1)); else rows+=("${B_TITLE[i]}|Still needs you"); left=$((left + 1)); fi
+  done
+  for ((j = 0; j < I_N; j++)); do
+    case ${I_SEV[j]} in warn|fail) found=0; for ((i = 0; i < ${#B_ID[@]}; i++)); do [ "${I_ID[j]}" = "${B_ID[i]}" ] && found=1; done
+      [ $found = 0 ] && { rows+=("${I_TITLE[j]}|New since the first check"); left=$((left + 1)); } ;; esac
+  done
+  if [ "$left" -eq 0 ]; then head="Your computer looks healthy"; ui_banner ok "$head" "$( [ $fixed -gt 0 ] && echo "We fixed $fixed thing$( [ $fixed = 1 ] || echo s ). Nothing else needs attention." || echo 'Nothing needed fixing.')"
+  else head="$left thing$( [ $left = 1 ] || echo s ) still need$( [ $left = 1 ] && echo s ) you"; ui_banner warn "$head" "$( [ $fixed -gt 0 ] && echo "We fixed $fixed. The rest need your say-so, one at a time.")"; fi
+  [ ${#rows[@]} -gt 0 ] && ui_table "What we found|Result" "${rows[@]}"
+  tb_report_write "$head"
+  [ -n "$TB_REPORT_SAVED" ] && ui_say "A report was saved: $TB_REPORT_SAVED"
+}
+tb_fixall() {
+  ui_push "Fix everything safely"; ui_header "Fix everything safely"
+  tb_count
+  if [ ${#FIX_SAFE[@]} -eq 0 ]; then
+    ui_banner ok "Nothing to fix automatically" "$( [ $N_ATTN -gt 0 ] && echo 'Some problems need your decision. Choose "Look at the problems" to go through them.' || echo 'Your computer looks healthy.')"
+    ui_pop; ui_wait; return 0
+  fi
+  tb_plan_reset; tb_snapshot_before
+  local i; for i in "${FIX_SAFE[@]}"; do tb_plan_add "fix:$i" "${I_TITLE[i]}" "${I_SUM[i]:-${I_WHAT[i]}}" "${I_BAK[i]}" "${I_TIME[i]:-a minute}"; done
+  tb_plan_show
+  [ ${#FIX_ASK[@]} -gt 0 ] && ui_say "${#FIX_ASK[@]} more problem(s) need your decision one by one, so they are not in this list."
+  if ! ui_yesno "Fix all ${#PL_KIND[@]} of these now?" y "Fix everything" "Not now"; then ui_say "Nothing was changed."; ui_pop; ui_wait; return 0; fi
+  tb_plan_run
+  ui_task "Checking again" tb_collect quick
+  tb_result; ui_pop; ui_wait
+}
+tb_issue() {   # one problem as a card with the three buttons
+  local i=$1 w typed
+  ui_push "${I_TITLE[i]}"
+  while :; do
+    ui_header "A problem we found"
+    ui_card "${I_SEV[i]}" "${I_TITLE[i]}" "What this means" "${I_WHAT[i]}" "Why it matters" "${I_WHY[i]}" "What we would do" "${I_SUM[i]:-We cannot fix this one automatically. Choose Tell me more.}" \
+      "How safe is it?" "$(tb_safe_text "$i")" "Saved first" "${I_BAK[i]}" "How long?" "${I_TIME[i]}"
+    if [ "${I_AUTO[i]}" = true ] && [ -n "${I_ACT[i]}" ]; then
+      ui_menu "What would you like to do?" "fix|Fix it|${I_SUM[i]:0:40}" "later|Not now|Change nothing" "more|Tell me more|Explain it in more detail" || { ui_pop; return 0; }
+    else
+      UI_MENU_DEFAULT=1 ui_menu "What would you like to do?" "more|Tell me more|What you can do about it" "later|Not now|Change nothing" || { ui_pop; return 0; }
+    fi
+    case $UI_REPLY in
+      later) ui_say "Nothing was changed."; ui_pop; return 0 ;;
+      more) tb_learn "$i" ;;
+      fix)
+        typed=""
+        if [ "${I_SAFE[i]}" = risky ] && [ "$TB_DRY" != 1 ]; then
+          ui_card fail "This one cannot easily be undone" "What could go wrong" "${I_SUM[i]}" "Before you go on" "${I_BAK[i]:-Nothing is saved first. Make sure your files are copied somewhere else (choose Rescue my files)}"
+          if ui_typed "I UNDERSTAND" "To make sure this is on purpose, type the words below. Anything else cancels and nothing changes."; then typed=yes
+          else ui_say "Nothing was changed."; ui_wait; continue; fi
+        fi
+        if [ "${I_SAFE[i]}" = asks ]; then
+          ui_say "This fix will ask you a question while it works. Answer it, and we carry on."
+          tb_fix_args "$i" "$typed"; tb_term "$TB_REPAIR" "${TB_FA[@]}"; w=$?
+        else
+          ui_task "Fixing: ${I_TITLE[i]}" tb_run_fix "$i" "$typed"; w=$?
+        fi
+        TB_LOG+=("$( [ $w = 0 ] && echo Fixed || echo 'Could not fix'): ${I_TITLE[i]}")
+        if [ $w = 0 ]; then ui_banner ok "Done" "${I_TITLE[i]} is fixed."; else ui_error "That fix did not finish." "Your files are safe. Try Tell me more, or ask a helper and show them the saved report." "see $UI_TASK_LOG"; fi
+        tb_refresh; ui_pop; ui_wait; return 0 ;;
+    esac
+  done
+}
+tb_learn() {
+  local i=$1 l=${I_LEARN[$1]:-} out=""
+  if [ -n "$l" ] && [[ $l != *" "* ]] && _ui_have secure-linux-explain; then out=$(secure-linux-explain --print --no-ai "${I_TITLE[i]}" 2>/dev/null | head -n 12); fi
+  ui_card info "More about: ${I_TITLE[i]}" "In short" "${I_WHAT[i]}" "What you can do" "${l:-Ask a helper and show them the saved report. We never change anything without your yes.}" "From the guide" "$out"
+  ui_wait
+}
+tb_problems() {
+  ui_push "The problems"
+  while :; do
+    ui_header "The problems we found"
+    local -a items=(); local i
+    for ((i = 0; i < I_N; i++)); do
+      case ${I_SEV[i]} in warn|fail) items+=("$i|${I_TITLE[i]:0:30}|$( [ "${I_SEV[i]}" = fail ] && echo 'Problem' || echo 'Attention'): $( [ "${I_AUTO[i]}" = true ] && echo 'we can fix it' || echo 'needs a look')") ;; esac
+    done
+    if [ ${#items[@]} -eq 0 ]; then ui_banner ok "No problems" "Your computer looks healthy."; ui_pop; ui_wait; return 0; fi
+    ui_menu "Pick one to read about it" "${items[@]}" || break
+    tb_issue "$UI_REPLY"
+  done
+  ui_pop
+}
+
+# ---------------------------------------------------------------- the autopilot
+tb_probe_misc() {   # read-only checks: backups, security
+  TB_BACKUP_NOTE=""; TB_SEC_NOTE=""
+  if _ui_have secure-linux-backup-check; then secure-linux-backup-check >/dev/null 2>&1 || TB_BACKUP_NOTE="The backup check found something to look at."; fi
+  if _ui_have secure-linux-status; then secure-linux-status --json >"$TB_TMP/status.json" 2>/dev/null; fi
+  return 0
+}
+tb_probe_updates() { TB_UPD=$(tb_updates_count); TB_UPD=${TB_UPD:-0}; }
+tb_probe_clean() { TB_CLEAN=$(tb_clean_measure); TB_CLEAN=${TB_CLEAN:-0}; }
+tb_probe_hw() { TB_HW_BAD=0; [ -n "$TB_HEALTH" ] && { tb_x "$TB_HEALTH" --summary --quick --no-save >"$TB_TMP/hw.sum" 2>/dev/null; case $? in 1|2) TB_HW_BAD=1 ;; esac; }; return 0; }
+tb_autopilot() {
+  ui_push "Look after my computer"; ui_header "Look after my computer"
+  ui_say "We will look at your computer, fix what is safe to fix, and tell you what we did. You only need to say yes once, and only if there is something to change."
+  TB_LOG=()
+  ui_task "Looking for problems" tb_collect quick
+  ui_task "Checking the hardware" tb_probe_hw
+  ui_task "Checking backups and security" tb_probe_misc
+  ui_task "Checking for updates" tb_probe_updates
+  ui_task "Looking for clutter" tb_probe_clean
+  tb_snapshot_before; tb_plan_reset
+  local i; for i in "${FIX_SAFE[@]}"; do tb_plan_add "fix:$i" "${I_TITLE[i]}" "${I_SUM[i]:-${I_WHAT[i]}}" "${I_BAK[i]}" "${I_TIME[i]:-a minute}"; done
+  [ "${TB_UPD:-0}" -gt 0 ] && tb_plan_add updates "Install $TB_UPD update(s)" "Newer versions of programs and the system" "" "a few minutes"
+  [ "${TB_CLEAN:-0}" -ge 200000000 ] && tb_plan_add clean "Free up $(tb_human "$TB_CLEAN") of space" "Clears picture previews, update downloads and old logs" "" "under a minute"
+  if [ ${#PL_KIND[@]} -eq 0 ]; then
+    tb_result
+    [ "$TB_HW_BAD" = 1 ] && ui_traffic warn "Hardware" "A part of the computer reported a problem. Choose \"Check my hardware\" on the home screen."
+    ui_pop; ui_wait; return 0
+  fi
+  tb_plan_show
+  [ ${#FIX_ASK[@]} -gt 0 ] && ui_say "${#FIX_ASK[@]} other problem(s) need your decision, so they are left for you to look at afterwards."
+  if ! ui_yesno "Go ahead and look after your computer?" y "Yes, go ahead" "Not now"; then ui_say "Nothing was changed."; ui_pop; ui_wait; return 0; fi
+  tb_plan_run
+  ui_task "Checking again" tb_collect quick
+  tb_result
+  [ "$TB_HW_BAD" = 1 ] && ui_traffic warn "Hardware" "A part of the computer reported a problem. Choose \"Check my hardware\" on the home screen."
+  ui_pop; ui_wait
+}
+
+# ---------------------------------------------------------------- hardware health, step by step
+tb_health_flow() {
+  ui_push "Check my hardware"; ui_header "Check my hardware"
+  [ -n "$TB_HEALTH" ] || { ui_error "The hardware checker is not on this system." "Reinstall or repair Secure Linux, or ask a helper." "secure-linux-health not found"; ui_pop; return 1; }
+  local mode=quick p parts rows=() n=0 total k out nbad=0 st name sev
+  ui_menu "How thorough?" "standard|Standard (about a minute)|Recommended. Looks at every part" "quick|Quick (under a minute)|Skips the slower tests" "full|Full (about 5 minutes)|Adds tests where you listen and look" || { ui_pop; return 0; }
+  mode=$UI_REPLY
+  parts=$(tb_x "$TB_HEALTH" --list 2>/dev/null); total=$(printf '%s\n' "$parts" | grep -c .)
+  [ "$mode" = quick ] && parts=$(printf '%s\n' "$parts" | grep -vx fwupd)
+  ui_progress_begin "Testing every part"
+  for p in $parts; do
+    n=$((n + 1)); ui_progress $((n * 100 / total)) "$(tb_hw_name "$p")"
+    ui_step_begin "Checking: $(tb_hw_name "$p")"
+    out=$(tb_x "$TB_HEALTH" --part "$p" --json --no-save --no-interactive "--$([ "$mode" = full ] && echo full || echo quick)" 2>/dev/null | tb_health_records)
+    sev=ok; k=""
+    while IFS=$'\037' read -r _p item st meaning todo detail; do
+      case $st in FAIL) sev=fail; rows+=("$(tb_hw_name "$p")|Problem|$meaning ${todo:+Next: $todo}"); nbad=$((nbad + 1)) ;;
+        WARN) [ $sev = fail ] || sev=warn; rows+=("$(tb_hw_name "$p")|Attention|$meaning ${todo:+Next: $todo}"); nbad=$((nbad + 1)) ;; NOT-PRESENT) k=absent ;; esac
+    done <<< "$out"
+    [ -z "$out" ] && sev=skip
+    ui_step_end "$sev" "$( [ "$k" = absent ] && [ $sev = ok ] && echo 'not in this computer')"
+  done
+  ui_progress 100 "Finished"; ui_progress_end
+  if [ $nbad -eq 0 ]; then ui_banner ok "Every part looks healthy" "Nothing needs attention."; else
+    ui_banner warn "$nbad thing(s) to look at" "Here is what each one means and what to do."; ui_table "Part|Result|What it means" "${rows[@]}"; fi
+  TB_LOG+=("Hardware check ($mode): $nbad item(s) to look at")
+  if [ "$mode" = full ] && ui_yesno "Now try the listen-and-look tests (speaker, microphone, camera, screen, keys)?" y "Yes, start" "Skip"; then
+    tb_term "$TB_HEALTH" --interactive --part keyboard,pointer,audio,camera,display --"$mode" --no-save
+  fi
+  ui_pop; ui_wait
+}
+
+# ---------------------------------------------------------------- other tiles
+tb_security() {
+  ui_push "Security check"; ui_header "Security check"
+  local f=$TB_TMP/sec.txt
+  if _ui_have secure-linux-status; then ui_task "Looking at your security settings" bash -c 'secure-linux-status --text > "$0" 2>&1' "$f"; ui_text_file "Security check" "$f"
+  else ui_error "The security checker is not installed here." "On the installed computer it is called secure-linux-status. From the stick, install Secure Linux first." "secure-linux-status not found"; fi
+  ui_pop
+}
+tb_backup() {
+  ui_push "Back up"; ui_header "Back up"
+  if _ui_have secure-linux-backup-check; then ui_task "Checking your backups" secure-linux-backup-check; ui_say "$( [ "$UI_TASK_RC" = 0 ] && echo 'Your backups look fine.' || echo 'Your backups need a look.')"; fi
+  ui_card info "Backing up your files" "Why" "A backup is a second copy somewhere else. If this computer breaks or is lost, you still have your photos and documents." "How" "Plug in an external drive and choose the button below. We copy your own files across without changing anything."
+  if ui_yesno "Copy my files to an external drive now?" y "Yes, back up" "Not now"; then tb_rescue_files; fi
+  ui_pop
+}
+tb_fleet() {
+  ui_push "Join a home fleet"; ui_header "Join a home fleet"
+  ui_card info "Join a home fleet" \
+    "What it means" "Your main computer (the fleet laptop) can help look after this PC over your home network: check it is healthy and install its updates. Screen help is a separate question, and also only if you say yes." \
+    "Your say" "Every step asks you first. Saying no (or closing the window) leaves everything exactly as it is." \
+    "Privacy" "Home network only: no cloud company is involved, and nothing leaves home."
+  if ui_yesno "Join your home fleet now?" n "Yes, join" "Not now"; then
+    tb_term "$SL_ROOT/bin/secure-linux-fleet-join"; ui_wait
+  else
+    ui_say "Nothing was changed. You can join any time from here."; ui_wait
+  fi
+  ui_pop
+}
+tb_trouble() {
+  ui_push "Will not start, or locked out"
+  while :; do
+    ui_header "Will not start, or locked out"
+    ui_menu "What is happening?" \
+      "boot|My computer will not start|Finds the cause and offers a fix" \
+      "diag|Find out what is wrong|Only looks. Changes nothing" \
+      "linuxpw|I forgot my Linux password|Your own computer only" \
+      "winpw|I forgot my Windows password|Your own computer only" \
+      "windows|Windows needs help|Checks, start-up repair, files" || break
+    case $UI_REPLY in
+      boot) tb_term "$TB_REPAIR" --action boot $TB_DRY_FLAG ;;
+      diag) tb_term "$TB_REPAIR" --auto-diagnose $TB_DRY_FLAG ;;
+      linuxpw) tb_password_notice && tb_term "$TB_REPAIR" --action password $TB_DRY_FLAG ;;
+      winpw) tb_password_notice && tb_term "$TB_REPAIR" --action windows $TB_DRY_FLAG ;;
+      windows) tb_windows_help ;;
+    esac
+  done
+  ui_pop
+}
+tb_help() {
+  ui_push "Get help"
+  local q f hits
+  while :; do
+    ui_header "Get help"
+    ui_menu "How can we help?" "search|Search the guide|Type a few words" "explain|Explain an error message|Paste what you saw" "report|Show my last report|What we found and did" || break
+    case $UI_REPLY in
+      search) ui_input "What do you want to know? (for example: wifi, printer, slow)" && if _ui_have secure-linux-explain; then secure-linux-explain --search $UI_REPLY >"$TB_TMP/search.txt" 2>&1; ui_text_file "Search results" "$TB_TMP/search.txt"; else ui_say "The guide search is not installed here."; ui_wait; fi ;;
+      explain) ui_input "Paste or type the message you saw" && if _ui_have secure-linux-explain; then secure-linux-explain --print "$UI_REPLY" >"$TB_TMP/explain.txt" 2>&1; ui_text_file "What it means" "$TB_TMP/explain.txt"; else ui_say "The explain tool is not installed here."; ui_wait; fi ;;
+      report) f=$(ls -1t "${SL_TB_REPORT_DIR:-${HOME:-/tmp}}"/Secure-Linux-Report-*.txt 2>/dev/null | head -n 1); if [ -n "$f" ]; then ui_text_file "Last report" "$f"; else ui_say "There is no report yet. Choose Look after my computer first."; ui_wait; fi ;;
+    esac
+  done
+  ui_pop
+}
+tb_desc() { local d; d=$(sed -n '2p' "$1" 2>/dev/null | sed 's/^# *[^:]*: *//'); printf '%s' "${d:0:60}"; }
+tb_advanced() {
+  ui_push "Advanced"
+  local f items name d act
+  while :; do
+    ui_header "Advanced: every tool"
+    ui_say "These are the original tools, for people who like to see everything. Each one explains itself first and has a safe preview where it can."
+    items=()
+    for f in "$SL_ROOT"/bin/secure-linux-*; do [ -e "$f" ] || continue; name=${f##*/}; [ "$name" = secure-linux-toolbox ] && continue; items+=("$name|${name#secure-linux-}|$(tb_desc "$f")"); done
+    ui_menu "Pick a tool" "${items[@]}" || break
+    name=$UI_REPLY; f=$SL_ROOT/bin/$name
+    ui_header "$name"
+    ui_card info "${name#secure-linux-}" "What it does" "$(tb_desc "$f")" "Is there a preview?" "$(grep -q -- '--dry-run' "$f" 2>/dev/null && echo 'Yes: Preview changes nothing and shows what would happen.' || echo 'No preview for this one. It explains itself with Show what it does.')"
+    local -a opts=("help|Show what it does|Prints its help. Changes nothing")
+    grep -q -- '--dry-run' "$f" 2>/dev/null && opts+=("preview|Preview (changes nothing)|Shows what would happen")
+    opts+=("run|Run it now|It asks before it changes anything")
+    ui_menu "What next?" "${opts[@]}" || continue
+    case $UI_REPLY in
+      help) "$f" --help >"$TB_TMP/help.txt" 2>&1; ui_text_file "$name --help" "$TB_TMP/help.txt" ;;
+      preview) tb_term "$f" --dry-run ;;
+      run) tb_term "$f"; ui_wait ;;
+    esac
+  done
+  ui_pop
+}
+tb_settings() {
+  ui_push "Settings"; ui_header "Settings"
+  local pref=$UI_PREF; mkdir -p "${pref%/*}" 2>/dev/null
+  ui_menu "Make it easier to read" "contrast|Strong colours (high contrast)|Brighter, easier on tired eyes" "plain|Plain text (for screen readers)|No boxes or colours" "normal|Back to the normal look|Calm colours and boxes" || { ui_pop; return 0; }
+  case $UI_REPLY in
+    contrast) printf 'theme=contrast\n' > "$pref" ;;
+    plain) printf 'mode=plain\n' > "$pref" ;;
+    normal) : > "$pref" ;;
+  esac
+  ui_reinit; UI_APP="Secure Linux Toolbox"; ui_say "Saved. The new look is used from now on."
+  ui_pop; ui_wait
+}
+tb_more() {
+  ui_push "Advanced / Show me more"
+  while :; do
+    ui_header "Advanced / Show me more"
+    ui_menu "More things you can do" \
+      "clean|Clean up and speed up|Frees space safely" \
+      "security|Security check|Is everything locked down?" \
+      "updates|Updates|Install waiting updates" \
+      "backup|Back up my files|Copy them to an external drive" \
+      "fleet|Join a home fleet|Lets your main computer help look after this PC - only if you say yes" \
+      "help|Get help|Search the guide, explain an error" \
+      "advanced|Every original tool|With a safe preview" \
+      "settings|Easier to read|High contrast and plain text" || break
+    case $UI_REPLY in
+      clean) tb_clean_flow ;; security) tb_security ;; updates) tb_updates_flow ;; backup) tb_backup ;;
+      fleet) tb_fleet ;; help) tb_help ;; advanced) tb_advanced ;; settings) tb_settings ;;
+    esac
+  done
+  ui_pop
+}
+
+# ---------------------------------------------------------------- where are we running?
+tb_detect() {
+  TB_ENV=$(rp_env); TB_LIVE=0; [ "$TB_ENV" != installed ] && TB_LIVE=1
+  local fs; fs=$(lsblk -rno FSTYPE 2>/dev/null)
+  TB_HAS_WIN=0; TB_HAS_LINUX=0
+  printf '%s\n' "$fs" | grep -qE '^(ntfs|BitLocker)$' && TB_HAS_WIN=1
+  printf '%s\n' "$fs" | grep -qE '^(btrfs|ext4|xfs|f2fs|crypto_LUKS)$' && TB_HAS_LINUX=1
+  TB_WINONLY=0; [ $TB_LIVE = 1 ] && [ $TB_HAS_WIN = 1 ] && [ $TB_HAS_LINUX = 0 ] && TB_WINONLY=1
+  [ -n "${SL_TB_WINONLY:-}" ] && { TB_WINONLY=1; TB_HAS_WIN=1; }
+}
+tb_home() {
+  local first=1 head sub
+  ui_push "Home"
+  while :; do
+    ui_header "Home"; [ $first = 1 ] && ui_logo; first=0
+    if [ "$TB_SOURCE" = none ]; then ui_banner info "We could not run the check" "You can still use everything below."
+    elif [ "$N_ATTN" -eq 0 ]; then ui_banner ok "Your computer looks healthy" "We checked $((N_OK + N_INFO)) things and nothing needs fixing."
+    else
+      [ "$N_FAIL" -gt 0 ] && head=fail || head=warn
+      ui_banner "$head" "$N_ATTN thing$( [ "$N_ATTN" = 1 ] || echo s ) need$( [ "$N_ATTN" = 1 ] && echo s ) attention" "${#FIX_SAFE[@]} can be fixed safely with one tap."
+      local i shown=0
+      for ((i = 0; i < I_N && shown < 3; i++)); do case ${I_SEV[i]} in warn|fail) ui_traffic "${I_SEV[i]}" "${I_TITLE[i]}"; shown=$((shown + 1)) ;; esac; done
+    fi
+    [ "$TB_WINONLY" = 1 ] && ui_card info "This computer only has Windows" "Good to know" "Linux is not installed yet. You can still check the hardware, rescue your files and get Windows help. To install Linux, restart and choose SET UP THIS COMPUTER in the stick's menu."
+    local -a it=("autopilot|Look after my computer|Checks, fixes, updates - one tap")
+    [ ${#FIX_SAFE[@]} -gt 0 ] && it+=("fixall|Fix everything safely|${#FIX_SAFE[@]} fix(es), one OK from you")
+    [ "$N_ATTN" -gt 0 ] && it+=("problems|Look at the problems|One at a time, in plain English")
+    it+=("health|Check my hardware|Drive, memory, battery and more" "rescue|Rescue my files|Copy them to another drive, safely")
+    if [ "$TB_WINONLY" = 1 ]; then it+=("windows|Windows help|Start-up, password, disk check"); else it+=("trouble|Will not start, or locked out|Start-up repair, passwords"); fi
+    it+=("more|Advanced / Show me more|Updates, clean up, every tool")
+    UI_MENU_BACK="Quit" ui_menu "What would you like to do?" "${it[@]}" || break
+    case $UI_REPLY in
+      autopilot) tb_autopilot ;; fixall) tb_fixall ;; problems) tb_problems ;; health) tb_health_flow ;; rescue) tb_rescue_files ;;
+      trouble) tb_trouble ;; windows) tb_windows_help ;; more) tb_more ;;
+    esac
+  done
+  ui_pop
+  ui_say "Goodbye. Your computer was not changed unless you said yes."
+}
+
+# ---------------------------------------------------------------- main
+tb_detect
+case $TB_SCREEN in
+  rescue|windows|clean|updates|security|backup|help|advanced|settings|trouble|health) TB_NOCHECK=1 ;;
+esac
+need_check=0
+{ [ -z "$TB_SCREEN" ] || [ "$TB_SCREEN" = problems ] || [ "$TB_SCREEN" = fixall ] || [ "$TB_CHECK_ONLY" = 1 ]; } && need_check=1
+[ "$TB_NOCHECK" = 1 ] && [ "$TB_CHECK_ONLY" = 0 ] && need_check=0
+if [ $need_check = 1 ]; then
+  [ "$TB_CHECK_ONLY" = 1 ] || { ui_header "Secure Linux Toolbox"; ui_say "First, a quick look at your computer. This only looks. It changes nothing."; }
+  tb_refresh
+fi
+if [ "$TB_CHECK_ONLY" = 1 ]; then
+  if [ "$N_ATTN" -eq 0 ]; then ui_banner ok "Your computer looks healthy" "We checked $((N_OK + N_INFO)) things."; exit 0; fi
+  ui_banner "$( [ "$N_FAIL" -gt 0 ] && echo fail || echo warn )" "$N_ATTN thing(s) need attention"
+  for ((i = 0; i < I_N; i++)); do case ${I_SEV[i]} in warn|fail) ui_traffic "${I_SEV[i]}" "${I_TITLE[i]}" "${I_WHAT[i]}" ;; esac; done
+  [ "$N_FAIL" -gt 0 ] && exit 2; exit 1
+fi
+if [ "$TB_AUTOPILOT" = 1 ]; then tb_autopilot; exit 0; fi
+case $TB_SCREEN in
+  "") tb_home ;;
+  autopilot) tb_autopilot ;; problems) tb_problems ;; fixall) tb_fixall ;; health) tb_health_flow ;; rescue) tb_rescue_files ;;
+  trouble) tb_trouble ;; windows) tb_windows_help ;; clean) tb_clean_flow ;; security) tb_security ;; updates) tb_updates_flow ;;
+  backup) tb_backup ;; help) tb_help ;; advanced) tb_advanced ;; settings) tb_settings ;;
+  *) echo "Unknown screen '$TB_SCREEN'. Screens: autopilot problems fixall health rescue trouble windows clean security updates backup help advanced settings" >&2; exit 3 ;;
+esac
+exit 0

@@ -1,0 +1,196 @@
+#!/bin/bash
+# secure-linux-upgrade: guided upgrade to the next Fedora version (B10). Your files and apps stay.
+# Checks the charger and free space, takes a snapshot, installs pending updates, checks that extra software
+# sources (RPM Fusion, NordVPN, Cloudflare WARP, VS Code ...) are ready for the new version, downloads the
+# upgrade, and asks before restarting to install it. After the restart setup re-checks everything by itself.
+#   secure-linux-upgrade            guided upgrade (offered from the 4th week after a release)
+#   secure-linux-upgrade --now      don't wait for the 4th week
+#   secure-linux-upgrade --to N     upgrade to Fedora N
+# Internal (used by timers/units): --post, --prepare-offline-updates, --snapshot-before-offline-update
+set -u   # no pipefail: "cmd | grep -q" must not fail when grep stops reading early
+export LC_ALL=C
+SL_ROOT=${SL_ROOT:-/usr/local/lib/secure-linux}
+# shellcheck source=../lib/common.sh
+. "$SL_ROOT/lib/common.sh"
+have() { command -v "$1" >/dev/null 2>&1; }
+PENDING=$SL_STATE/upgrade-pending
+PAUSED=$SL_STATE/upgrade-paused-repos
+
+case "${1:-}" in -h|--help) sed -n '2,10p' "$0"; exit 0 ;; esac
+
+# ---------------------------------------------------------------- internal modes (root, non-interactive)
+case "${1:-}" in
+  --snapshot-before-offline-update)
+    have snapper && snapper -c root get-config >/dev/null 2>&1 \
+      && snapper -c root create -c number -d "Before updates installed at restart"
+    exit 0 ;;
+  --prepare-offline-updates)
+    # Full profile: download updates with PackageKit and arm them to install at the next restart.
+    # pkcon: 0 = done, 5 = nothing to do. VERIFY: --only-download prepares the offline update on F44.
+    have pkcon || exit 0
+    pkcon -p refresh >/dev/null 2>&1
+    pkcon -y -p --only-download update; rc=$?
+    if [ $rc -eq 0 ]; then pkcon offline-trigger; exit $?; fi
+    [ $rc -eq 5 ] && exit 0
+    exit $rc ;;
+  --post)
+    # After the restart: finish an upgrade (run by secure-linux-post-upgrade.service)
+    [ -f "$PENDING" ] || { systemctl disable secure-linux-post-upgrade.service >/dev/null 2>&1; exit 0; }
+    target=$(sed -n 1p "$PENDING"); tries=$(sed -n 2p "$PENDING")
+    cur=$( . /etc/os-release; echo "${VERSION_ID:-}")
+    if [ "$cur" != "$target" ] && ! sl_is_atomic; then
+      tries=$(( ${tries:-0} + 1 ))
+      if [ "$tries" -ge 3 ]; then
+        sl_alert upgrade-failed "The Fedora upgrade didn't happen" \
+          "Your computer is still on Fedora $cur (nothing was lost). Open 'Secure Linux Status & Fixes' and choose 'Upgrade Fedora' to try again." \
+          "Open 'Secure Linux Status & Fixes' and choose 'Upgrade Fedora'."
+        rm -f "$PENDING"; systemctl disable secure-linux-post-upgrade.service
+      else
+        printf '%s\n%s\n' "$target" "$tries" > "$PENDING"
+      fi
+      exit 0
+    fi
+    # re-enable repositories paused for the upgrade, if they work on the new version now
+    if [ -f "$PAUSED" ]; then
+      while read -r repo; do
+        [ -n "$repo" ] || continue
+        if dnf -q makecache --repo="$repo" >/dev/null 2>&1 || dnf -q makecache --repo="$repo" --setopt="$repo.enabled=1" >/dev/null 2>&1; then
+          dnf config-manager setopt "$repo.enabled=1" && echo "re-enabled $repo"
+        else
+          echo "$repo still isn't ready for Fedora $cur; leaving it off"
+          echo "$repo" >> "$PAUSED.still"
+        fi
+      done < "$PAUSED"
+      rm -f "$PAUSED"; [ -f "$PAUSED.still" ] && mv "$PAUSED.still" "$PAUSED"
+    fi
+    "$SL_ROOT/setup.sh" --repair
+    rm -f "$PENDING"
+    sl_clear upgrade-failed
+    sl_event "fedora-$cur-upgraded" "Fedora $cur is ready" "The upgrade finished and setup re-checked everything. Your files and apps are where you left them."
+    if [ -s "$PAUSED" ]; then
+      sl_alert upgrade-repos "Some extra software can't update yet" \
+        "These software sources aren't ready for Fedora $cur yet: $(tr '\n' ' ' < "$PAUSED"). They are switched off for now; 'Repair setup' switches them back on later." \
+        "Open 'Secure Linux Status & Fixes' and choose 'Repair setup' in a week or two."
+    fi
+    systemctl disable secure-linux-post-upgrade.service
+    exit 0 ;;
+esac
+
+# ---------------------------------------------------------------- guided upgrade (interactive)
+[ -t 0 ] || exec secure-linux-terminal --hold "$(readlink -f "$0")" "$@"
+[ "$(id -u)" -eq 0 ] || { echo "Your password is needed to upgrade Fedora."; exec pkexec "$(readlink -f "$0")" "$@"; }
+
+NOW_FLAG="" TARGET=""
+while [ $# -gt 0 ]; do
+  case "$1" in --now) NOW_FLAG=1 ;; --to) TARGET=${2:-}; shift ;; esac
+  shift
+done
+yes_no() { local a; read -rp "  $1 [y/N] " a; [ "$a" = y ] || [ "$a" = Y ]; }
+say() { printf '\n  %s\n' "$*"; }
+cur=$( . /etc/os-release; echo "${VERSION_ID:-}")
+[ -n "$TARGET" ] || TARGET=$((cur + 1))
+
+echo; echo "  UPGRADE FEDORA $cur -> $TARGET"; echo "  (Your files, settings and apps stay. It takes about an hour, including a long restart.)"
+
+# Is the new version out, and is it at least 3 weeks old?
+latest=$(curl -fsS --max-time 20 https://fedoraproject.org/releases.json 2>/dev/null | grep -oE '"version": *"[0-9]+"' | grep -oE '[0-9]+' | sort -n | tail -1)
+if [ -z "$latest" ]; then say "Can't reach the internet. Connect and try again."; exit 1; fi
+if [ "$latest" -lt "$TARGET" ]; then say "Fedora $TARGET isn't out yet. Nothing to do: you're up to date."; exit 0; fi
+case "$TARGET" in 45) rel=$(date -d 2026-11-03 +%s) ;; *) rel=$(cat "$SL_STATE/fedora-seen/$TARGET" 2>/dev/null) ;; esac
+age=$(( ($(date +%s) - ${rel:-$(date +%s)}) / 86400 ))
+if [ -z "$NOW_FLAG" ] && [ "$age" -lt 21 ]; then
+  say "Fedora $TARGET is only $age days old. We wait until its 4th week so early problems get fixed first."
+  say "You'll get a notification when it's time. (Experts: secure-linux-upgrade --now)"
+  exit 0
+fi
+
+# Charger
+on_ac=1
+for ps in /sys/class/power_supply/*; do
+  [ -f "$ps/type" ] || continue
+  case "$(cat "$ps/type")" in
+    Mains|USB) [ "$(cat "$ps/online" 2>/dev/null)" = 1 ] && { on_ac=1; break; } ;;
+    Battery) on_ac=0 ;;
+  esac
+done
+while [ "$on_ac" = 0 ]; do
+  say "Please plug in the charger (the upgrade must not run out of battery)."
+  read -rp "  Press Enter when it's plugged in (or type q to stop). " a; [ "$a" = q ] && exit 0
+  on_ac=0
+  for ps in /sys/class/power_supply/*; do
+    case "$(cat "$ps/type" 2>/dev/null)" in Mains|USB) [ "$(cat "$ps/online" 2>/dev/null)" = 1 ] && on_ac=1 ;; esac
+  done
+done
+
+# Free space
+free_gb=$(df --output=avail -BG / | tail -1 | tr -dc 0-9)
+if [ "${free_gb:-0}" -lt 15 ]; then
+  say "Only ${free_gb} GB free; the upgrade needs at least 15 GB."
+  say "Free some space (Filelight shows what's big; emptying the Trash helps), then try again."
+  exit 1
+fi
+
+say "Ready: charger connected, ${free_gb} GB free."
+yes_no "Start the upgrade to Fedora $TARGET now?" || exit 0
+
+if sl_is_atomic; then
+  origin=$(rpm-ostree status --json 2>/dev/null | grep -m1 -oE '"(container-image-reference|origin)" *: *"[^"]+"' | sed -E 's/.*: *"([^"]+)"/\1/')
+  [ -n "$origin" ] || { say "Couldn't read the current system image."; exit 1; }
+  new=$(printf '%s' "$origin" | sed -E "s#/$cur/#/$TARGET/#; s#:$cur\$#:$TARGET#")
+  [ "$new" != "$origin" ] || { say "Couldn't work out the new image name from: $origin"; exit 1; }
+  say "Switching $origin"; say "     to $new"
+  yes_no "Continue?" || exit 0
+  rpm-ostree rebase "$new" || { say "The upgrade download failed. Nothing changed. Try again later."; exit 1; }
+  printf '%s\n0\n' "$TARGET" > "$PENDING"; systemctl enable secure-linux-post-upgrade.service >/dev/null 2>&1
+  yes_no "Done. Restart now to start Fedora $TARGET?" && systemctl reboot
+  exit 0
+fi
+
+say "1/5  Taking a snapshot (an undo point)..."
+if have snapper && snapper -c root get-config >/dev/null 2>&1; then
+  snapper -c root create -c number -d "Before upgrade to Fedora $TARGET" && echo "  Snapshot taken."
+else
+  echo "  (Snapshots aren't set up on this computer; skipping.)"
+fi
+
+say "2/5  Installing waiting updates first..."
+dnf -y upgrade --refresh || { say "Updates failed. Fix that first (Status window > Install updates now)."; exit 1; }
+
+say "3/5  Checking extra software sources are ready for Fedora $TARGET..."
+: > "$PAUSED.new"
+mapfile -t repos < <(dnf repo list --enabled 2>/dev/null | awk 'NR > 1 {print $1}')
+for repo in "${repos[@]}"; do
+  case "$repo" in fedora|updates|updates-testing|fedora-cisco-openh264|""|*-debuginfo|*-source) continue ;; esac
+  if dnf -q makecache --releasever="$TARGET" --repo="$repo" >/dev/null 2>&1; then
+    echo "  ok: $repo"
+  else
+    echo "  NOT READY: $repo has nothing for Fedora $TARGET yet."
+    if yes_no "Switch '$repo' off until it's ready? (Its apps keep working; they just don't update for a while.)"; then
+      echo "$repo" >> "$PAUSED.new"
+    else
+      say "OK. The upgrade can't continue with '$repo' on. Try again in a week or two."; rm -f "$PAUSED.new"; exit 1
+    fi
+  fi
+done
+
+say "4/5  Downloading Fedora $TARGET (this takes a while)..."
+disable_args=()
+while read -r repo; do [ -n "$repo" ] && disable_args+=("--disablerepo=$repo"); done < "$PAUSED.new"
+if ! dnf -y system-upgrade download --releasever="$TARGET" "${disable_args[@]}"; then
+  say "The download failed. Nothing has changed on your computer. Choose 'Create a diagnostics file' if it keeps failing."
+  rm -f "$PAUSED.new"; exit 1
+fi
+# switch paused repos off for real (re-enabled automatically after the upgrade when they're ready)
+while read -r repo; do [ -n "$repo" ] && dnf config-manager setopt "$repo.enabled=0"; done < "$PAUSED.new"
+cat "$PAUSED.new" >> "$PAUSED" 2>/dev/null; rm -f "$PAUSED.new"
+printf '%s\n0\n' "$TARGET" > "$PENDING"
+systemctl enable secure-linux-post-upgrade.service >/dev/null 2>&1
+
+say "5/5  Everything is downloaded."
+say "The computer will restart, install Fedora $TARGET (30-60 minutes, don't switch it off), and restart again."
+if yes_no "Save your work. Restart and install now?"; then
+  # dnf5: `dnf offline reboot` (VERIFY on F44; older syntax `dnf system-upgrade reboot` as fallback)
+  dnf -y offline reboot || dnf -y system-upgrade reboot
+else
+  say "OK. To install later: open 'Secure Linux Status & Fixes' and choose 'Upgrade Fedora' again."
+fi

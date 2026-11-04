@@ -1,0 +1,33 @@
+#!/bin/bash
+# secure-linux-update-now: install all updates now (needs root; asks for the password once through
+# pkexec when started by the logged-in user). Used by the Status window's "Install updates now" action.
+# Safe to run any time: the system's own update tools decide what needs doing.
+#   secure-linux-update-now      install updates (dnf, or rpm-ostree on the atomic setup, plus Flatpak apps)
+set -u   # no pipefail: "cmd | grep -q" must not fail when grep stops reading early
+export LC_ALL=C
+SL_ROOT=${SL_ROOT:-/usr/local/lib/secure-linux}
+# shellcheck source=../lib/common.sh
+. "$SL_ROOT/lib/common.sh"
+have() { command -v "$1" >/dev/null 2>&1; }
+
+case "${1:-}" in -h|--help) sed -n '2,5p' "$0"; exit 0 ;; esac
+SELF=/usr/local/bin/secure-linux-update-now; [ -x "$SELF" ] || SELF=$(readlink -f "$0")   # polkit names /usr/local/bin
+[ "$(id -u)" -eq 0 ] || exec pkexec "$SELF"
+
+PROFILE=$(sl_profile); sl_is_atomic && PROFILE=atomic
+rc=0
+echo "Installing updates. This can take a while; what happens is shown here."
+if [ "$PROFILE" = atomic ]; then
+  rpm-ostree upgrade || rc=1
+else
+  dnf -y upgrade --refresh || rc=1
+fi
+have flatpak && { flatpak update --system -y --noninteractive || rc=1; }
+echo
+if [ $rc -eq 0 ]; then
+  echo "Updates are installed."
+  [ "$PROFILE" = atomic ] && echo "Restart to start using the update."
+else
+  echo "Some updates could not be installed. Trying again later usually helps; if it keeps happening, open Secure Linux Status and choose 'Repair setup'."
+fi
+exit $rc

@@ -1,0 +1,17 @@
+[Unit]
+Description=Secure Linux: first-start app setup
+DefaultDependencies=no
+Wants=network-online.target
+After=network-online.target basic.target
+Conflicts=shutdown.target
+Before=shutdown.target
+ConditionPathExists=!/var/lib/secure-linux/firstboot.done
+
+[Service]
+# Type=exec: the login screen never waits for the (long) setup; the wait for the internet happens inside the script
+Type=exec
+TimeoutStartSec=infinity
+ExecStart=/usr/local/bin/secure-linux-firstboot
+
+[Install]
+WantedBy=multi-user.target

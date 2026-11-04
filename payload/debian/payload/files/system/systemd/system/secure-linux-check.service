@@ -1,0 +1,11 @@
+[Unit]
+Description=Secure Linux health check
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/secure-linux-check
+Nice=10
+IOSchedulingClass=idle
+TimeoutStartSec=20min

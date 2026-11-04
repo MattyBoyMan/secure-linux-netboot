@@ -1,0 +1,12 @@
+[Unit]
+Description=Secure Linux: finish going back to an earlier system snapshot (put the kernel files in step)
+ConditionPathExists=/boot/secure-linux-rollback-pending
+After=local-fs.target
+Before=multi-user.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/secure-linux-snapshot finish
+
+[Install]
+WantedBy=multi-user.target

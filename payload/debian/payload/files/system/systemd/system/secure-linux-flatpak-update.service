@@ -1,0 +1,12 @@
+[Unit]
+Description=Secure Linux: update Flatpak apps
+ConditionPathExists=/usr/bin/flatpak
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/flatpak update --system -y --noninteractive
+Nice=10
+IOSchedulingClass=idle
+TimeoutStartSec=30min

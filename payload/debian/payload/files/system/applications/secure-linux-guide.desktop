@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Secure Linux Guide (START-HERE)
+GenericName=Beginner's guide
+Comment=Open the beginner's guide to this computer
+Exec=/usr/local/bin/secure-linux-guide
+Icon=help-browser
+Terminal=false
+Categories=System;Documentation;
+Keywords=guide;help;start;beginner;

@@ -1,0 +1,7 @@
+[Unit]
+Description=Secure Linux desktop notifications
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/secure-linux-notify
+TimeoutStartSec=20min

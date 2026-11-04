@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=Secure Linux notifications
+Comment=Shows plain-English alerts after you log in
+Exec=/usr/local/bin/secure-linux-notify --login
+NoDisplay=true
+X-GNOME-Autostart-enabled=true

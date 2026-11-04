@@ -1,0 +1,2 @@
+# Enabled for every user by 00-early.sh (systemctl --global enable)
+secure-linux-notify.timer

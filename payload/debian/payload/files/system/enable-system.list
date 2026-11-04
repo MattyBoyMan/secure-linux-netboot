@@ -1,0 +1,3 @@
+# Enabled by 00-early.sh on every start (the first-start service is enabled by 01-firstboot.sh instead)
+secure-linux-check.timer
+secure-linux-flatpak-update.timer

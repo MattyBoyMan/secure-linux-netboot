@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=VPN Setup
+GenericName=NordVPN / WireGuard
+Comment=Hide your internet traffic on public Wi-Fi (NordVPN account needed, 64-bit computers)
+Exec=/usr/local/bin/secure-linux-terminal --hold /usr/local/bin/secure-linux-vpn setup
+Icon=network-vpn
+Terminal=false
+Categories=Network;Security;
+Keywords=vpn;nordvpn;wireguard;privacy;

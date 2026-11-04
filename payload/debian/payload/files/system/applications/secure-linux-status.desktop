@@ -1,0 +1,15 @@
+[Desktop Entry]
+Type=Application
+Name=Secure Linux Status & Fixes
+GenericName=System health
+Comment=See if everything is protected and up to date, with one-click fixes
+Exec=/usr/local/bin/secure-linux-status-gui
+Icon=security-high
+Terminal=false
+Categories=System;Settings;
+Keywords=status;health;security;updates;repair;fix;
+Actions=terminal;
+
+[Desktop Action terminal]
+Name=Terminal view
+Exec=/usr/local/bin/secure-linux-terminal --no-hold /usr/local/bin/secure-linux-status

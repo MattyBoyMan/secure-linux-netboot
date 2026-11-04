@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=Secure Linux setup progress
+Comment=Shows how far the first-start setup has got
+Exec=/usr/local/bin/secure-linux-progress
+NoDisplay=true
+X-GNOME-Autostart-enabled=true

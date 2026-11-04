@@ -1,0 +1,4 @@
+# Enabled by 00-early.sh (Debian protection area: virus scan, snapshots)
+secure-linux-scan.timer
+secure-linux-snapshot.timer
+secure-linux-rollback-finish.service

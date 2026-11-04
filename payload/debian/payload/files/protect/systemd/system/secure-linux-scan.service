@@ -1,0 +1,13 @@
+[Unit]
+Description=Secure Linux weekly virus scan (ClamAV)
+ConditionPathExists=/usr/bin/clamscan
+# not on battery: a scan keeps the processor busy
+ConditionACPower=true
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/secure-linux-scan now
+Nice=19
+IOSchedulingClass=idle
+CPUQuota=60%
+TimeoutStartSec=6h

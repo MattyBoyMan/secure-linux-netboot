@@ -1,0 +1,11 @@
+[Unit]
+Description=Secure Linux: update Flatpak apps every day
+
+[Timer]
+OnBootSec=20min
+OnUnitActiveSec=1d
+Persistent=true
+RandomizedDelaySec=30min
+
+[Install]
+WantedBy=timers.target

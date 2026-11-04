@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Hotel / Cafe Wi-Fi Login
+GenericName=Wi-Fi login page
+Comment=Pause encrypted DNS for 15 minutes so a hotel or cafe sign-in page can load
+Exec=/usr/local/bin/secure-linux-terminal /usr/local/bin/secure-linux-dns open
+Icon=network-wireless
+Terminal=false
+Categories=Network;
+Keywords=wifi;hotel;cafe;login;captive;portal;

@@ -1,0 +1,9 @@
+[Unit]
+Description=Secure Linux: tidy the system snapshots (remove old, full and surplus ones)
+ConditionPathExists=/usr/local/bin/secure-linux-snapshot
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/secure-linux-snapshot prune --quiet
+Nice=19
+IOSchedulingClass=idle

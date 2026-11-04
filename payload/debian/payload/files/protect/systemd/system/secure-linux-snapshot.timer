@@ -1,0 +1,10 @@
+[Unit]
+Description=Secure Linux: tidy the system snapshots once a day
+
+[Timer]
+OnBootSec=30min
+OnUnitActiveSec=1d
+Persistent=true
+
+[Install]
+WantedBy=timers.target

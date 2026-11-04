@@ -1,0 +1,149 @@
+#!/bin/bash
+# secure-linux-repair: a guided repair menu for a computer that will not start, has a damaged disk, broken software, no
+# network, a black screen, a forgotten password - and for rescuing your files first. Plain English, one step at a time.
+#
+#   secure-linux-repair                     the menu (works on the installed system, from SystemRescue on the USB stick,
+#                                           and from the Fedora installer's rescue shell)
+#   secure-linux-repair --auto-diagnose     only LOOK: finds the likely cause and says which menu item fixes it
+#   secure-linux-repair --action NAME       go straight to one menu item (see --list)
+#   secure-linux-repair --dry-run           show everything that WOULD be done, change nothing (combine with any action)
+#   secure-linux-repair --target DIR        the broken Fedora is already mounted at DIR (e.g. /mnt/sysimage)
+#   secure-linux-repair --list              list the action names
+#   secure-linux-repair --action NAME --approved [--approved-typed] [--non-interactive] [-- ARGS...]
+#                                           used by the Secure Linux Toolbox AFTER it collected your yes (and, for risky
+#                                           fixes, your typed words): no second "Go ahead?" question. Problems found by
+#                                           secure-linux-diagnose are fixed through fix_* functions in hw/health/fix-*.sh;
+#                                           those refuse to run without --approved. --non-interactive also makes the
+#                                           dangerous menu items (password, clone, factory, wipe) refuse without --approved.
+#
+# Every step that changes something shows what it will do and waits for an explicit yes (typed words for the dangerous
+# ones). A safety copy of the boot files is made first. A drive that says it is failing (SMART) gets a loud warning before
+# anything writes to it: rescue your files first. Nothing here ever wipes a drive without you typing its name.
+set -u
+export LC_ALL=C
+SELF=$(readlink -f "$0" 2>/dev/null || echo "$0"); HERE=$(dirname "$SELF")
+SL_ROOT=${SL_ROOT:-/usr/local/lib/secure-linux}
+HLIB=""
+for c in "$SL_ROOT/hw/health" "$HERE/../hw/health"; do [ -r "$c/lib.sh" ] && { HLIB=$c; break; }; done
+[ -n "$HLIB" ] || { echo "secure-linux-repair: cannot find hw/health/lib.sh next to $0." >&2; exit 3; }
+[ -d "$SL_ROOT/hw" ] || SL_ROOT=$(cd "$HLIB/../.." && pwd)
+SLH_TITLE="Repair this computer"
+# shellcheck source=../hw/health/lib.sh
+. "$HLIB/lib.sh"; . "$HLIB/repair-lib.sh"; . "$HLIB/repair-boot.sh"; . "$HLIB/repair-disk.sh"; . "$HLIB/repair-misc.sh"
+RP_BIN_DIR=$HERE
+ORIG_ARGS=("$@")
+usage() { sed -n '2,/^# anything writes/p' "$SELF" | sed 's/^# \{0,1\}//'; }
+ACTIONS="diagnose health data boot fs snapshot kernel gpu packages network windows password malware clone factory wipe"
+# the problem finder's one-purpose fixes (secure-linux-diagnose -> hw/health/kb) are actions too: fix-*
+FIXES=""; declare -F rp_fix_ids >/dev/null && FIXES=$(rp_fix_ids | tr '\n' ' ') && FIXES=${FIXES% }
+
+for _f in "$HLIB"/fix-*.sh ${SL_REPAIR_FIXDIR:+"$SL_REPAIR_FIXDIR"/fix-*.sh}; do [ -r "$_f" ] && . "$_f"; done     # the problem finder's fixes (optional; SL_REPAIR_FIXDIR is a test hook)
+RP_APPROVED=0; RP_APPROVED_TYPED=0; RP_NONINT=0; FIX_ARGS=()
+rp_risk() {   # rp_risk ACTION -> safe | asks | risky (a fix_NAME_risk function can say; otherwise a fixed table)
+  local f="fix_${1//-/_}_risk"
+  if declare -F "$f" >/dev/null; then "$f"; return; fi
+  case "$1" in diagnose|health|data|snapshot|network) echo safe ;; password|clone|factory|wipe) echo risky ;; *) echo asks ;; esac
+}
+ACTION=""; AUTO=0; LIST=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    --approved) RP_APPROVED=1 ;;
+    --approved-typed) RP_APPROVED_TYPED=1 ;;
+    --non-interactive) RP_NONINT=1 ;;
+    --) shift; FIX_ARGS=("$@"); break ;;
+    --dry-run|-n) RP_DRY=1 ;;
+    --auto-diagnose) AUTO=1 ;;
+    --action) shift; ACTION=${1:-} ;;
+    --action=*) ACTION=${1#--action=} ;;
+    --target) shift; RP_WANT_TARGET=${1:-} ;;
+    --list) LIST=1 ;;
+    *) echo "Unknown option: $1  (try --help)" >&2; exit 3 ;;
+  esac
+  shift
+done
+if [ "$LIST" = 1 ]; then for a in $ACTIONS; do printf '%-10s %s\n' "$a" "$(rp_action_label "$a")"; done; for a in $FIXES; do printf '%-10s %s\n' "$a " "$(rp_fix_label "$a" 2>/dev/null)"; done; exit 0; fi
+IS_FIX=0; [ -n "$ACTION" ] && { case " $FIXES " in *" $ACTION "*) IS_FIX=1 ;; *) declare -F "fix_${ACTION//-/_}" >/dev/null && IS_FIX=1 ;; esac; }
+if [ -n "$ACTION" ] && [ "$IS_FIX" = 0 ] && ! printf ' %s ' "$ACTIONS" | grep -q " $ACTION "; then echo "Unknown action '$ACTION'. Actions: $ACTIONS" >&2; exit 3; fi
+[ "$RP_APPROVED" = 1 ] || RP_APPROVED_TYPED=0       # typed words only count together with an approval
+if [ -n "$ACTION" ] && [ "$RP_APPROVED" = 0 ] && [ "$RP_DRY" != 1 ]; then
+  if [ "$IS_FIX" = 1 ] || { [ "$RP_NONINT" = 1 ] && [ "$(rp_risk "$ACTION")" = risky ]; }; then
+    echo "The action '$ACTION' changes things, so it needs your approval first: the Secure Linux Toolbox asks for it and then passes --approved. Nothing was changed." >&2
+    exit 4
+  fi
+fi
+export RP_APPROVED RP_APPROVED_TYPED
+
+# real changes need administrator rights; a dry run and a look around do not
+if [ "$RP_DRY" != 1 ] && ! slh_is_root; then
+  if have sudo && [ -t 0 ]; then exec sudo "$SELF" "${ORIG_ARGS[@]}"; fi
+  if have pkexec; then exec pkexec "$SELF" "${ORIG_ARGS[@]}"; fi
+  echo "This needs administrator rights: run it with sudo." >&2; exit 1
+fi
+trap rp_cleanup EXIT
+trap 'echo; echo "Stopped. Unmounting everything that was opened..."; exit 130' INT
+
+banner() {
+  if declare -F ui_header >/dev/null; then
+    UI_APP="Secure Linux"; ui_header "Repair this computer"
+    ui_say "Running from: $(rp_env_name "$(rp_env)")"
+    [ "$RP_DRY" = 1 ] && ui_banner warn "DRY RUN: nothing will be changed" "You only see what would happen."
+    ui_say "Every change is explained first and waits for your yes."
+    return 0
+  fi
+  echo
+  echo "=================================================================="
+  echo "  Repair this computer  (Secure Linux)"
+  echo "  Running from: $(rp_env_name "$(rp_env)")"
+  [ "$RP_DRY" = 1 ] && echo "  DRY RUN: nothing will be changed. You only see what would happen."
+  echo "  Every change is explained first and waits for your yes."
+  echo "=================================================================="
+}
+run_action() {
+  if [ "$IS_FIX" = 1 ] && ! printf ' %s ' "$ACTIONS" | grep -q " $1 "; then
+    case " $FIXES " in *" $1 "*) rp_fix_run "$1" ${FIX_ARGS[@]+"${FIX_ARGS[@]}"}; return $? ;; esac
+    "fix_${1//-/_}" "${FIX_ARGS[@]}"; return $?
+  fi
+  case "$1" in
+    diagnose) act_diagnose ;; health) act_health ;; data) act_data ;; boot) act_boot ;; fs) act_fs ;; snapshot) act_snapshot ;;
+    kernel) act_kernel ;; gpu) act_gpu ;; packages) act_packages ;; network) act_network ;; windows) act_windows ;;
+    password) act_password ;; malware) act_malware ;; clone) act_clone ;; factory) act_factory ;; wipe) act_wipe ;;
+  esac
+}
+menu_label() {   # friendly one-line names for the menu (the --list names stay as they are)
+  case "$1" in
+    diagnose) echo "Find out what is wrong|Only looks. Changes nothing" ;; health) echo "Check the health of every part|Drive, memory, battery and more" ;;
+    data) echo "Rescue my files|Copy them to another drive first" ;; boot) echo "Computer won't start|Repairs the start-up" ;;
+    fs) echo "Check and repair a drive|Looks for damage on a drive" ;; snapshot) echo "Go back to an earlier copy|Undo recent changes to the system" ;;
+    kernel) echo "Start with an older version|Use the previous system version" ;; gpu) echo "Black or garbled screen|Switches to safe graphics" ;;
+    packages) echo "Repair software|Fixes damaged programs and updates" ;; network) echo "Fix Wi-Fi / internet|Gets you back online" ;;
+    windows) echo "Windows on this computer|Start-up menu, password, files" ;; password) echo "Forgot my Linux login password|Your own computer only" ;;
+    malware) echo "Scan for viruses|Looks for harmful files" ;; clone) echo "Back up or clone a whole drive|An exact copy of a drive" ;;
+    factory) echo "Reset to factory state|Starts the settings afresh" ;; wipe) echo "Wipe before selling|Erases a drive for good" ;;
+    *) echo "$1|" ;;
+  esac
+}
+menu() {   # prints the chosen action name (empty = quit). The screen is drawn by lib/sl-ui.sh; it shows 6 items a page.
+  local entries=() a
+  if declare -F ui_menu >/dev/null; then
+    for a in $ACTIONS; do entries+=("$a|$(menu_label "$a")"); done
+    UI_MENU_BACK="Quit" ui_menu "What is wrong? If you are not sure, press Enter." "${entries[@]}" >&2 && printf '%s' "$UI_REPLY"
+    return 0
+  fi
+  for a in $ACTIONS; do entries+=("$a|$(rp_action_label "$a")"); done
+  slh_menu "What is wrong? (if unsure, choose 1)" "${entries[@]}"
+}
+
+banner
+if [ "$AUTO" = 1 ]; then act_diagnose; exit 0; fi
+if [ -n "$ACTION" ]; then
+  [ "$IS_FIX" = 1 ] && [ -n "${RP_WANT_TARGET:-}" ] && RP_TARGET=$RP_WANT_TARGET   # check and fix the system at --target, not the live one
+  run_action "$ACTION"; exit 0
+fi
+while true; do
+  c=$(menu)
+  [ -n "$c" ] || { echo "Goodbye. Nothing else was changed."; break; }
+  run_action "$c"
+  rp_pause
+done
+exit 0

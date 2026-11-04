@@ -1,0 +1,127 @@
+#!/bin/bash
+# secure-linux-ha-setup: a guided set-up of Home Assistant on your home server, step by step.
+#
+#   secure-linux-ha-setup               start the guide (every question waits for you; nothing happens until you say yes)
+#   secure-linux-ha-setup --dry-run     show what it WOULD do without connecting anywhere
+#
+# It helps you choose between:
+#   A) Home Assistant OS on its own small computer (the recommended way)
+#   B) Home Assistant Container on the home server you already have (the one running Immich)
+# For B it copies the server kit (server/homeassistant) to your server over SSH and, if you say yes, runs it there.
+set -u   # no pipefail: "cmd | grep -q" must not fail when grep stops reading early
+SL_ROOT=${SL_ROOT:-/usr/local/lib/secure-linux}
+. "$SL_ROOT/lib/common.sh"
+. "$SL_ROOT/files/homeassistant/ha-lib.sh"
+
+DRY=no
+case "${1:-}" in -h|--help) sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;; --dry-run) DRY=yes ;; esac
+say() { ha_say "$@"; }
+ask() { local a; printf '%s ' "$1" >&2; IFS= read -r a || a=""; printf '%s' "$a"; }
+yesno() { local a; a=$(ask "$1 (yes/no)"); [ "$a" = yes ]; }
+save() {   # save KEY VALUE  (uses the choice helper; dry-run only says what it would save)
+  if [ $DRY = yes ]; then say "  [dry run] would save $1=$2"; return 0; fi
+  "$SL_ROOT/bin/secure-linux-choice" set "$1" "$2" >/dev/null 2>&1 || say "  (I couldn't save $1; run: secure-linux-choice set $1 $2)"
+}
+kit_dir() {
+  local d
+  for d in "$SL_ROOT/server/homeassistant" "${HA_KIT_DIR:-/nonexistent}" "$PWD/server/homeassistant" "$HOME/server/homeassistant"; do
+    [ -f "$d/install-ha-container.sh" ] && { echo "$d"; return 0; }
+  done
+  return 1
+}
+
+say "Home Assistant on your home server: guided set-up"
+say "=================================================="
+say "Home Assistant is the brain of a smart home. It runs on a small always-on computer (a server), not on this laptop."
+say "This laptop gets a Home Assistant window (app menu), and your phone gets the Home Assistant app."
+say ""
+say "Two ways to run it. Think of it as: A = an appliance, B = a DIY dish on a server you already run."
+say ""
+say "  A) Home Assistant OS on its own small computer (a Raspberry Pi 4/5 or a mini PC). RECOMMENDED."
+say "       + Easiest: updates, backups and add-ons (Zigbee, MQTT, ESPHome) are one click in the web page"
+say "       + Official, most tested, and it is what the guides and forums assume"
+say "       - Needs a small extra computer (about A\$120 to A\$300) and it can't share a machine with Immich"
+say ""
+say "  B) Home Assistant Container on your existing home server (next to Immich), using Docker or Podman."
+say "       + No new hardware; one box runs everything"
+say "       - No add-on store: Mosquitto, Zigbee2MQTT, ESPHome and friends are separate containers (our kit sets them up)"
+say "       - You do the updates yourself (our kit makes a backup first and shows you what changes)"
+say "       - Sharing a machine means Immich and Home Assistant restart together after a reboot"
+say ""
+choice=$(ask "Which do you want? Type A or B (or Enter to stop for now):")
+case $choice in
+  a|A)
+    say ""
+    say "Home Assistant OS: what to do"
+    say "  1. Buy a Raspberry Pi 4/5 (with a good power supply and a 64 GB+ SSD or A2 SD card) or use a spare mini PC."
+    say "  2. Download the image for your device from https://www.home-assistant.io/installation/ ONLY (the official site)."
+    say "  3. Write it with Impression (already installed: app menu > Impression) or balenaEtcher."
+    say "  4. Plug it into your router with a cable (not Wi-Fi) and power it on. Wait about 20 minutes the first time."
+    say "  5. Open http://homeassistant.local:8123 and make the owner account (use a long password and turn on two-step login)."
+    say ""
+    if yesno "Open the official download page now?"; then
+      [ $DRY = yes ] && say "  [dry run] would open https://www.home-assistant.io/installation/" || { ha_have xdg-open && xdg-open https://www.home-assistant.io/installation/ >/dev/null 2>&1 & }
+    fi
+    save ha_have_server no-os-appliance
+    say ""
+    say "When it's running: secure-linux-ha discover --save   (finds homeassistant.local and remembers it)"
+    ;;
+  b|B)
+    say ""
+    say "Container on your home server"
+    def=$(sl_build_get IMMICH_URL); def=${def#*://}; def=${def%%[:/]*}
+    target=$(ask "Your server's login (like matt@${def:-10.0.30.42}):")
+    [ -n "$target" ] || { say "Okay, stopping. Run this again when you're ready."; exit 0; }
+    ha_valid_target "$target" || { say "'$target' doesn't look like name@address. Try again later."; exit 1; }
+    if [ $DRY = yes ]; then
+      say "  [dry run] would test: ssh -o BatchMode=yes $target true"
+    else
+      if ! ssh -o BatchMode=yes -o ConnectTimeout=8 -- "$target" true 2>/dev/null; then
+        say "I can't log in to $target without a password prompt."
+        say "Set up SSH keys first (it's safer than passwords):"
+        say "   ssh-keygen -t ed25519          (press Enter at the questions; add a passphrase if you like)"
+        say "   ssh-copy-id $target            (asks for the server's password once)"
+        say "Then run this guide again."
+        exit 1
+      fi
+    fi
+    kit=$(kit_dir) || { say "I can't find the server kit (server/homeassistant) on this computer. It's on your Secure Linux USB stick under linux/server/homeassistant."; exit 1; }
+    say "Found the server kit: $kit"
+    say ""
+    say "It will: install Home Assistant (Container) with a pinned version, open it only to your home network,"
+    say "optionally add Mosquitto (MQTT with a password), Zigbee2MQTT, ESPHome, Node-RED, a Matter server and HTTPS with Caddy."
+    say "Each extra is a question you answer on the server. Nothing is forwarded to the internet."
+    if yesno "Copy the kit to $target (into ~/ha-kit) now?"; then
+      if [ $DRY = yes ]; then say "  [dry run] would run: scp -r -- $kit $target:ha-kit"
+      else
+        ssh -o BatchMode=yes -- "$target" 'mkdir -p ha-kit' && scp -r -- "$kit" "$target:ha-kit/" \
+          && scp -r -- "$SL_ROOT/files/homeassistant/starter" "$target:ha-kit/" || { say "The copy failed. Check the connection and try again."; exit 1; }
+      fi
+      say "Copied."
+      say ""
+      say "Now run the installer ON THE SERVER. You can do it here (it opens a normal login session you can watch):"
+      say "   ssh -t $target 'sudo bash ~/ha-kit/homeassistant/install-ha-container.sh'"
+      if yesno "Run it now?"; then
+        if [ $DRY = yes ]; then say "  [dry run] would run the installer over ssh"
+        else ssh -t -- "$target" 'sudo bash ~/ha-kit/homeassistant/install-ha-container.sh'; fi
+      else
+        say "No problem. Run that command when you're ready, or log in to the server and run it there."
+      fi
+    fi
+    save ha_ssh "$target"
+    save ha_have_server yes
+    srv=${target#*@}
+    say ""
+    if yesno "Set http://$srv:8123 as the address of your Home Assistant? (you can change it any time)"; then save ha_url "http://$srv:8123"; fi
+    ;;
+  *) say "Okay, nothing done. Run secure-linux-ha-setup when you want to start."; exit 0 ;;
+esac
+say ""
+say "Next steps (all optional, in this order):"
+say "  1. Open it:                      secure-linux-ha open"
+say "  2. Phone app (Android):          install 'Home Assistant' from the Play Store or F-Droid, sign in with your address"
+say "  3. Security check (A to F):      secure-linux-ha-secure --guided"
+say "  4. Ready-made automations:       secure-linux-ha starter list"
+say "  5. Lessons:                      secure-linux-ha-learn"
+say "  6. Reach it from away safely:    use NordVPN Meshnet. Never port-forward on your router."
+exit 0

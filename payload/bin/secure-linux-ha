@@ -1,0 +1,324 @@
+#!/bin/bash
+# secure-linux-ha: your front door to Home Assistant (the smart-home brain that runs on your home server).
+#
+#   secure-linux-ha open                 open Home Assistant in its own window (address = your saved ha_url)
+#   secure-linux-ha status               is it answering? what's installed? when was the last security check?
+#   secure-linux-ha doctor               find problems and say how to fix each one, in plain English
+#   secure-linux-ha backup [--api]       save a copy of your Home Assistant settings (--api asks Home Assistant to make its own)
+#   secure-linux-ha update-check         is a newer Home Assistant out? what to do before updating
+#   secure-linux-ha validate [FOLDER]    check your YAML files for mistakes BEFORE you restart Home Assistant
+#   secure-linux-ha snapshot [FOLDER]    save a restore point of your settings (Git; secrets are left out)
+#   secure-linux-ha rollback [FOLDER]    go back to an earlier restore point (shows the list, asks first)
+#   secure-linux-ha starter list|install [NAME|all]|dashboard     ready-made automations, safe to add
+#   secure-linux-ha token-set [--delete] save a Home Assistant access token in a private (root-only) file
+#   secure-linux-ha discover [--save]    look for homeassistant.local on your network
+#   secure-linux-ha local enable|start|stop|status|open|logs|update|relax|reset
+#                                        a private "try it" Home Assistant on THIS laptop only (needs Podman)
+#   secure-linux-ha help
+# See also: secure-linux-ha-setup (set up your home server), secure-linux-ha-secure (security check A-F),
+#           secure-linux-ha-learn (lessons).
+set -u   # no pipefail: "cmd | grep -q" must not fail when grep stops reading early
+SL_ROOT=${SL_ROOT:-/usr/local/lib/secure-linux}
+. "$SL_ROOT/lib/common.sh"
+. "$SL_ROOT/files/homeassistant/ha-lib.sh"
+
+usage() { sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//'; }
+say() { ha_say "$@"; }
+ask() { local a; printf '%s ' "$1" >&2; IFS= read -r a || a=""; printf '%s' "$a"; }   # waits; no timeout
+tok_file() { sl_choice_get ha_token_file "$HA_TOKEN_FILE_DEFAULT"; }
+
+# ---------------------------------------------------------------------------------------------- open / status
+cmd_open() {
+  local url; url=$(ha_url)
+  ha_valid_url "$url" || { say "The saved address '$url' doesn't look right. Fix it with: secure-linux-choice set ha_url http://homeassistant.local:8123"; return 1; }
+  if ! ha_probe "$url"; then
+    say "Home Assistant isn't answering at $url right now."
+    say "(Is the server switched on? Are you on your home Wi-Fi, or connected with Meshnet? Try: secure-linux-ha doctor)"
+    ha_have notify-send && notify-send -a "Home Assistant" "Home Assistant isn't answering" "Check the server is on and you're on your home Wi-Fi or Meshnet." 2>/dev/null
+  fi
+  ha_open_url "$url"
+}
+
+cmd_status() {
+  local url code last
+  url=$(ha_url)
+  say "Home Assistant"
+  say "  Address I open:  $url$([ -z "$(sl_choice_get ha_url)" ] && echo '  (the default; change it with: secure-linux-choice set ha_url ADDRESS)')"
+  if ha_probe "$url"; then say "  Answering:       yes"; else say "  Answering:       NO (server off, wrong address, or you're away from home without Meshnet)"; fi
+  case $url in https://*) say "  Encrypted:       yes (HTTPS)" ;; *) say "  Encrypted:       no (plain http: fine at home, use HTTPS or a VPN away from home)" ;; esac
+  say "  Access token:    $([ -r "$(tok_file)" ] && echo 'saved (private file)' || { [ -e "$(tok_file)" ] && echo 'saved (root-only)' || echo 'not set (only needed for the API security check)'; })"
+  say "  Remote access:   $(sl_choice_get ha_remote_mode 'not told yet (secure-linux-ha-secure --checklist)')"
+  say "  Home server SSH: $(sl_choice_get ha_ssh 'not set')"
+  if ha_have podman && podman ps --format '{{.Names}}' 2>/dev/null | grep -qx "$HA_LOCAL_UNIT"; then say "  Try-it copy:     running on this laptop (http://127.0.0.1:8123)"
+  elif [ "$(sl_choice_get ha_local no)" = yes ]; then say "  Try-it copy:     ready, not running (secure-linux-ha local start)"
+  else say "  Try-it copy:     off"; fi
+  say "  Tools:           $(for t in hass-cli esphome yamllint; do ha_have "$t" && printf '%s ' "$t"; done)$(ha_have hass-cli || printf ' (hass-cli missing)')"
+  if ha_have flatpak; then
+    flatpak info --system "$HA_BUTLER" >/dev/null 2>&1 && say "  Desktop app:     Butler (native window) and the Home Assistant launcher"
+  fi
+  last=$(cat "$HA_USTATE/ha-last-check" 2>/dev/null)
+  say "  Last security check: ${last:-never (run: secure-linux-ha-secure --guided)}"
+  return 0
+}
+
+# ---------------------------------------------------------------------------------------------- doctor
+cmd_doctor() {
+  local url problems=0 host p
+  url=$(ha_url)
+  say "Home Assistant health check"; say "---------------------------"
+  ok()   { say "  ok   $*"; }
+  bad()  { say "  FIX  $*"; problems=$((problems+1)); }
+  info() { say "  info $*"; }
+  if ha_valid_url "$url"; then ok "Address looks valid: $url"; else bad "The address '$url' isn't valid. secure-linux-choice set ha_url http://homeassistant.local:8123"; fi
+  host=${url#*://}; host=${host%%[:/]*}
+  if getent hosts "$host" >/dev/null 2>&1 || [[ $host =~ ^[0-9.]+$ ]]; then ok "The name '$host' resolves"
+  else bad "The name '$host' doesn't resolve. Names ending .local need mDNS: sudo dnf install nss-mdns avahi, and the server must be on the same network. Or use its number (like 10.0.30.50) with: secure-linux-choice set ha_url http://10.0.30.50:8123"; fi
+  if ha_probe "$url"; then ok "Home Assistant answers at $url"; else bad "Nothing answers at $url. Is the server on? Same Wi-Fi/Meshnet? Is the port right (8123, or 443 with https)?"; fi
+  case $url in https://*) ok "HTTPS in use" ;; *) info "Plain http. Fine on your home network; add HTTPS (server kit: add-caddy.sh) for peace of mind." ;; esac
+  if [ -e "$(tok_file)" ]; then
+    if [ -r "$(tok_file)" ] && [ "$(stat -c '%a' "$(tok_file)" 2>/dev/null)" != 600 ] && [ -n "$(stat -c '%a' "$(tok_file)" 2>/dev/null)" ]; then bad "Token file permissions are not 600: sudo chmod 600 $(tok_file)"; else ok "Token file is private"; fi
+  else info "No access token saved (only needed for the API security check): secure-linux-ha token-set"; fi
+  if ha_have avahi-resolve-host-name || ha_have avahi-browse; then ok "Avahi tools installed (can find homeassistant.local)"; else info "Avahi tools missing: sudo dnf install avahi-tools nss-mdns (lets me find homeassistant.local)"; fi
+  ha_have python3 && python3 -c 'import yaml' 2>/dev/null && ok "python3-pyyaml present (needed by the checker)" || bad "python3-pyyaml is missing: sudo dnf install python3-pyyaml"
+  ha_have yamllint && ok "yamllint installed" || info "yamllint not installed: sudo dnf install yamllint (optional, tidier YAML checking)"
+  ha_have hass-cli && ok "hass-cli installed (command-line control)" || info "hass-cli not installed: pipx install homeassistant-cli (optional)"
+  ha_have git && ok "git installed (restore points)" || bad "git is missing: sudo dnf install git (needed for restore points)"
+  if ha_have flatpak; then
+    flatpak info --system "$HA_CHROMIUM" >/dev/null 2>&1 && ok "Ungoogled Chromium present (Home Assistant opens as its own app window)" \
+      || info "Ungoogled Chromium isn't installed, so Home Assistant opens in LibreWolf instead. That's fine."
+  fi
+  local d; d=$(ha_config_dir)
+  if [ -f "$d/configuration.yaml" ]; then
+    ok "Config folder found: $d"
+    [ -d "$d/.git" ] && ok "Restore points are on (Git)" || info "No restore points yet: secure-linux-ha snapshot"
+    [ -f "$d/secrets.yaml" ] && [ "$(stat -c '%a' "$d/secrets.yaml" 2>/dev/null)" != 600 ] && bad "secrets.yaml should be private: chmod 600 $d/secrets.yaml"
+  else info "No local config folder at $d (that's normal if your Home Assistant lives on the server; use --config / --ssh in the security check)."; fi
+  say ""
+  if [ $problems = 0 ]; then say "No problems found."; else say "$problems thing(s) to fix (marked FIX)."; fi
+  return 0
+}
+
+# ---------------------------------------------------------------------------------------------- backup
+cmd_backup() {
+  local mode=files dir="" out="" enc=ask a
+  while [ $# -gt 0 ]; do case $1 in
+    --api) mode=api ;; --dir) dir=$2; shift ;; --out) out=$2; shift ;; --no-encrypt) enc=no ;; --encrypt) enc=yes ;;
+    *) say "I don't know '$1'. Try: secure-linux-ha backup --help"; return 2 ;; esac; shift; done
+  if [ "$mode" = api ]; then
+    [ -e "$(tok_file)" ] || { say "I need an access token for that: secure-linux-ha token-set"; return 1; }
+    [ -r "$(tok_file)" ] || { exec pkexec "$(readlink -f "$0")" backup --api; }
+    python3 "$HA_ENGINE" backup-now --url "$(ha_url)" --token-file "$(tok_file)"
+    return $?
+  fi
+  dir=${dir:-$(ha_config_dir)}
+  [ -f "$dir/configuration.yaml" ] || { say "There is no Home Assistant config in $dir."; say "If your Home Assistant is on the server, use its own backup: Settings > System > Backups, or: secure-linux-ha backup --api"; return 1; }
+  out=${out:-${HOME:-/root}/HomeAssistant-backups}
+  ( umask 077; mkdir -p "$out" ); chmod 700 "$out" 2>/dev/null
+  local f="$out/ha-config-$(date +%Y-%m-%d-%H%M).tar.gz"
+  ( umask 077; tar -C "$dir" --exclude='home-assistant_v2.db*' --exclude='*.log*' --exclude='./deps' --exclude='./tts' --exclude='./.cloud' --exclude='./backups' \
+      -czf "$f" . ) || { say "The backup didn't work. Is there enough space?"; rm -f "$f"; return 1; }
+  chmod 600 "$f"
+  say "Saved: $f ($(du -h "$f" | cut -f1))"
+  say "This file contains your secrets (passwords, keys). Keep it somewhere private. Pika Backup (encrypted) is ideal."
+  if [ "$enc" = ask ] && ha_have gpg && [ -t 0 ]; then a=$(ask "Encrypt it with a passphrase now? (yes/no)"); [ "$a" = yes ] && enc=yes || enc=no; fi
+  if [ "$enc" = yes ]; then
+    ha_have gpg || { say "gpg isn't installed (sudo dnf install gnupg2), so the file stays unencrypted."; return 0; }
+    gpg --symmetric --cipher-algo AES256 -o "$f.gpg" "$f" && { shred -u "$f" 2>/dev/null || rm -f "$f"; say "Encrypted copy: $f.gpg (the plain one was removed). Keep the passphrase in Bitwarden."; }
+  fi
+  return 0
+}
+
+# ---------------------------------------------------------------------------------------------- update-check
+cmd_update_check() {
+  local inst="" latest="" d tuple dir=""
+  while [ $# -gt 0 ]; do case $1 in --installed) inst=$2; shift ;; --dir) dir=$2; shift ;; esac; shift; done
+  d=${dir:-$(ha_config_dir)}
+  [ -z "$inst" ] && [ -f "$d/.HA_VERSION" ] && inst=$(tr -d '[:space:]' < "$d/.HA_VERSION")
+  if [ -z "$inst" ] && [ -r "$(tok_file)" ]; then inst=$(python3 "$HA_ENGINE" version --url "$(ha_url)" --token-file "$(tok_file)" 2>/dev/null); fi
+  if [ -z "$inst" ] && ha_have podman && podman ps --format '{{.Names}}' 2>/dev/null | grep -qx "$HA_LOCAL_UNIT"; then
+    inst=$(podman exec "$HA_LOCAL_UNIT" cat /config/.HA_VERSION 2>/dev/null)
+  fi
+  latest=$(curl -fsS --max-time 15 https://version.home-assistant.io/stable.json 2>/dev/null \
+           | python3 -c 'import sys,json; print(json.load(sys.stdin)["homeassistant"]["default"])' 2>/dev/null)
+  local inst_show=$inst latest_show=$latest
+  [ -n "$inst" ] || inst_show="unknown - tell me with --installed 2026.10.2, or save a token: secure-linux-ha token-set"
+  [ -n "$latest" ] || latest_show="unknown - could not reach version.home-assistant.io"
+  say "Installed: $inst_show"
+  say "Newest:    $latest_show"
+  if [ -n "$inst" ] && [ -n "$latest" ]; then
+    if [ "$inst" = "$latest" ]; then say "You're up to date."
+    else
+      local im lm
+      im=$(printf '%s' "$inst" | awk -F. '{print $1*12+$2}'); lm=$(printf '%s' "$latest" | awk -F. '{print $1*12+$2}')
+      if [ "$lm" -gt "$im" ] 2>/dev/null; then say "You are $((lm-im)) monthly release(s) behind."; else say "A patch update is available."; fi
+    fi
+  fi
+  say ""
+  say "The safe update routine (takes 10 minutes):"
+  say "  1. Back up first:          secure-linux-ha backup --api   (or on the server: safe-update.sh does it for you)"
+  say "  2. Read the release notes: https://www.home-assistant.io/blog/categories/release-notes/"
+  say "     Look for the 'Backward-incompatible changes' section for integrations you use."
+  say "  3. Update ONE thing at a time (Home Assistant first, then add-ons, then devices)."
+  say "  4. Check your key automations still run. If not: restore the backup."
+  return 0
+}
+
+# ---------------------------------------------------------------------------------------------- validate / snapshot / rollback
+dir_arg() { if [ -n "${1:-}" ] && [ "${1#-}" = "$1" ]; then echo "$1"; else ha_config_dir; fi; }
+cmd_validate() { ha_validate "$(dir_arg "${1:-}")"; }
+cmd_snapshot() { local d; d=$(dir_arg "${1:-}"); ha_snapshot "$d" "${2:-Snapshot $(date '+%F %H:%M')}"; }
+
+cmd_rollback() {
+  local d="" pick="" yes=no target n line
+  while [ $# -gt 0 ]; do case $1 in --yes) yes=yes ;; --dir) d=$2; shift ;; *) pick=$1 ;; esac; shift; done
+  d=${d:-$(ha_config_dir)}
+  ha_have git || { say "git isn't installed."; return 1; }
+  [ -d "$d/.git" ] || { say "No restore points exist for $d yet. Make one now with: secure-linux-ha snapshot"; return 1; }
+  say "Restore points for $d (newest first):"
+  git -C "$d" log -n 12 --format='%h|%ad|%s' --date=format:'%d %b %Y %H:%M' 2>/dev/null | awk -F'|' '{printf "  %2d)  %s   %s   %s\n", NR, $1, $2, $3}'
+  if [ -z "$pick" ]; then
+    pick=$(ask "Go back to which one? (type its number, or press Enter to cancel)")
+    [ -z "$pick" ] && { say "No changes made."; return 0; }
+  fi
+  if [[ $pick =~ ^[0-9]{1,2}$ ]]; then target=$(git -C "$d" log -n 12 --format=%H | sed -n "${pick}p"); else target=$(git -C "$d" rev-parse --verify --quiet "$pick^{commit}"); fi
+  [ -n "$target" ] || { say "I couldn't find that restore point."; return 1; }
+  line=$(git -C "$d" log -n 1 --format='%h  %s' "$target")
+  say ""; say "You are about to put your settings back to: $line"
+  say "Your CURRENT files are saved first as a restore point, so you can undo the undo."
+  say "Passwords in secrets.yaml are not touched (they are kept out of Git on purpose)."
+  if [ $yes != yes ]; then n=$(ask "Type yes to go ahead:"); [ "$n" = yes ] || { say "No changes made."; return 0; }; fi
+  ha_snapshot "$d" "Before rolling back to ${target:0:7}" >/dev/null
+  # remove files that did not exist at the target, then restore everything else from it
+  git -C "$d" diff --name-only --diff-filter=A "$target" HEAD 2>/dev/null | while IFS= read -r f; do git -C "$d" rm -q -f -- "$f" 2>/dev/null; done
+  git -C "$d" checkout "$target" -- . 2>/dev/null || { say "That didn't work; nothing was changed beyond the safety restore point."; return 1; }
+  git -C "$d" add -A >/dev/null 2>&1
+  ha_git "$d" commit -q -m "Rolled back to ${target:0:7}" >/dev/null 2>&1
+  say "Done. Your settings are back to ${target:0:7}. Restart Home Assistant (Developer tools > YAML > Restart) to use them."
+  return 0
+}
+
+# ---------------------------------------------------------------------------------------------- starter kit
+cmd_starter() {
+  local sub=${1:-list}; shift 2>/dev/null
+  local dir="" names=()
+  while [ $# -gt 0 ]; do case $1 in --dir) dir=$2; shift ;; *) names+=("$1") ;; esac; shift; done
+  dir=${dir:-$(ha_config_dir)}
+  case $sub in
+    list) python3 "$HA_ENGINE" starter-list --starter "$(ha_starter_dir)" ;;
+    install|dashboard)
+      [ -f "$dir/configuration.yaml" ] || { say "There is no configuration.yaml in $dir. Use --dir to point at your Home Assistant config folder."; return 1; }
+      [ $sub = dashboard ] && names=(dashboard)
+      [ ${#names[@]} -eq 0 ] && names=(all)
+      ha_snapshot "$dir" "Before adding the Secure Linux starter kit" >/dev/null
+      python3 "$HA_ENGINE" starter-install --config "$dir" --starter "$(ha_starter_dir)" --names "$(IFS=,; echo "${names[*]}")" || { say "Nothing was kept. To check by hand: secure-linux-ha rollback"; return 1; }
+      ha_snapshot "$dir" "Added Secure Linux starter kit (${names[*]})" >/dev/null
+      say "Next: secure-linux-ha validate   then restart Home Assistant. Then set your phone in the helper 'Phone notify service'." ;;
+    *) say "Use: secure-linux-ha starter list | install [NAME|all] | dashboard"; return 2 ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------------------------- token
+cmd_token() {
+  local f; f=$(tok_file)
+  if [ "$(id -u)" -ne 0 ]; then exec pkexec "$(readlink -f "$0")" token-set "$@"; fi
+  if [ "${1:-}" = --delete ]; then rm -f "$f"; sl_choice_set ha_token_file ""; say "Token file removed. Also delete the token in Home Assistant: Profile > Security > Long-lived access tokens."; return 0; fi
+  say "A long-lived access token lets tools like the security checker read Home Assistant (read-only checks)."
+  say "Make one: Home Assistant > your name (bottom-left) > Security > Long-lived access tokens > Create token."
+  say "Name it 'laptop security check'. Copy it. It's shown only once. Paste it below (you won't see it as you paste)."
+  local tok=""
+  if [ -t 0 ]; then IFS= read -rsp "Token: " tok; echo; else IFS= read -r tok; fi
+  tok=$(printf '%s' "$tok" | tr -d '[:space:]')
+  [ -n "$tok" ] || { say "No token entered. Nothing saved."; return 1; }
+  case $tok in *[!A-Za-z0-9._-]*) say "That doesn't look like a Home Assistant token (unexpected characters). Nothing saved."; return 1 ;; esac
+  mkdir -p "$(dirname "$f")"
+  ( umask 077; printf '%s\n' "$tok" > "$f.new" ) && mv -f "$f.new" "$f" && chmod 600 "$f"
+  tok=""
+  sl_choice_set ha_token_file "$f"
+  say "Saved to $f (readable only by the administrator)."
+  if out=$(python3 "$HA_ENGINE" version --url "$(ha_url)" --token-file "$f" 2>&1); then say "It works: Home Assistant $out answered."
+  else say "Saved, but I couldn't test it just now (${out:-no answer}). That's okay if the server is off or you're away from home."; fi
+}
+
+# ---------------------------------------------------------------------------------------------- discover
+cmd_discover() {
+  local u; u=$(ha_discover) || { say "I couldn't find homeassistant.local. If your server is on, it may use a different name. Look at your router's list of devices, then:"; say "  secure-linux-choice set ha_url http://THE-ADDRESS:8123"; return 1; }
+  say "Found Home Assistant at $u"
+  if [ "${1:-}" = --save ]; then "$SL_ROOT/bin/secure-linux-choice" set ha_url "$u" && say "Saved as your address."; fi
+}
+
+# ---------------------------------------------------------------------------------------------- local (rootless podman quadlet)
+quadlet_dir() { echo "${XDG_CONFIG_HOME:-${HOME:-/root}/.config}/containers/systemd"; }
+local_seed() {
+  local c=$HA_LOCAL_DIR/config s; s=$(ha_starter_dir)
+  ( umask 077; mkdir -p "$c/packages" "$c/dashboards" "$c/blueprints/automation" )
+  [ -f "$c/configuration.yaml" ] && return 0
+  cp "$s/secure-defaults/configuration.yaml" "$c/configuration.yaml"
+  : > "$c/automations.yaml"; echo "[]" > "$c/automations.yaml"; : > "$c/scripts.yaml"; echo "[]" > "$c/scenes.yaml"
+  cp "$s"/packages/sl_helpers.yaml "$s"/packages/sl_security_watch.yaml "$s"/packages/sl_battery_alerts.yaml "$c/packages/"
+  cp "$s/dashboards/sl_starter.yaml" "$c/dashboards/"
+  cp -r "$s/blueprints/automation/secure_linux" "$c/blueprints/automation/"
+  ha_snapshot "$c" "Fresh try-it copy with the Secure Linux starter kit" >/dev/null
+}
+local_enable() {
+  ha_have podman || { say "Podman isn't installed: sudo dnf install podman"; return 1; }
+  local q tz tpl; q=$(quadlet_dir)
+  tz=$(timedatectl show -p Timezone --value 2>/dev/null); tz=${tz:-Australia/Melbourne}
+  mkdir -p "$q/$HA_LOCAL_UNIT.container.d"
+  tpl=$(cat "$HA_FILES/quadlet/$HA_LOCAL_UNIT.container.in")
+  tpl=${tpl//@CONFIG@/$HA_LOCAL_DIR/config}; tpl=${tpl//@TZ@/$tz}
+  printf '%s\n' "$tpl" > "$q/$HA_LOCAL_UNIT.container"
+  [ -f "$q/$HA_LOCAL_UNIT.container.d/10-harden.conf" ] || cp "$HA_FILES/quadlet/10-harden.conf" "$q/$HA_LOCAL_UNIT.container.d/10-harden.conf"
+  local_seed
+  systemctl --user daemon-reload 2>/dev/null
+  say "The try-it copy is set up (not running). Start it with: secure-linux-ha local start"
+}
+local_wait() {
+  local i; for i in $(seq 1 60); do ha_probe http://127.0.0.1:8123 && return 0; sleep 2; done; return 1
+}
+cmd_local() {
+  local sub=${1:-status}; shift 2>/dev/null
+  case $sub in
+    enable) local_enable ;;
+    start)
+      [ -f "$(quadlet_dir)/$HA_LOCAL_UNIT.container" ] || local_enable || return 1
+      if ! podman image exists ghcr.io/home-assistant/home-assistant:stable 2>/dev/null && [ "${1:-}" != --yes ]; then
+        a=$(ask "The first start downloads Home Assistant (about 1.5 GB) from ghcr.io. Continue? (yes/no)"); [ "$a" = yes ] || { say "Okay, nothing started."; return 0; }
+      fi
+      say "Starting (the first time can take several minutes)..."
+      systemctl --user start "$HA_LOCAL_UNIT.service" || { say "It didn't start. See why: secure-linux-ha local logs   (if it's a permissions complaint: secure-linux-ha local relax)"; return 1; }
+      if local_wait; then say "Ready: http://127.0.0.1:8123  (secure-linux-ha local open). Only this laptop can reach it."
+      else say "It's still starting. Give it a few more minutes, then: secure-linux-ha local open"; fi ;;
+    stop) systemctl --user stop "$HA_LOCAL_UNIT.service" && say "Stopped." ;;
+    status) if systemctl --user is-active --quiet "$HA_LOCAL_UNIT.service" 2>/dev/null; then say "The try-it copy is running at http://127.0.0.1:8123"; else say "The try-it copy is not running."; fi ;;
+    open) ha_open_url http://127.0.0.1:8123 ;;
+    logs) journalctl --user -u "$HA_LOCAL_UNIT.service" -n 60 --no-pager 2>/dev/null || podman logs --tail 60 "$HA_LOCAL_UNIT" ;;
+    relax)
+      rm -f "$(quadlet_dir)/$HA_LOCAL_UNIT.container.d/10-harden.conf"; systemctl --user daemon-reload 2>/dev/null
+      say "The extra sandbox settings are removed (it's still rootless and still only reachable from this laptop). Start again: secure-linux-ha local start" ;;
+    update)
+      a=$(ask "Update the try-it copy to the newest Home Assistant? A restore point is saved first. (yes/no)"); [ "$a" = yes ] || { say "No changes."; return 0; }
+      ha_snapshot "$HA_LOCAL_DIR/config" "Before updating the try-it copy" >/dev/null
+      podman pull ghcr.io/home-assistant/home-assistant:stable && systemctl --user restart "$HA_LOCAL_UNIT.service" && say "Updated." ;;
+    reset)
+      a=$(ask "This DELETES the try-it copy and everything in it. Type DELETE to confirm:"); [ "$a" = DELETE ] || { say "Nothing deleted."; return 0; }
+      systemctl --user stop "$HA_LOCAL_UNIT.service" 2>/dev/null; rm -rf "${HA_LOCAL_DIR:?}/config"; local_seed; say "Fresh start ready." ;;
+    *) say "Use: secure-linux-ha local enable|start|stop|status|open|logs|update|relax|reset"; return 2 ;;
+  esac
+}
+
+case "${1:-help}" in
+  open) cmd_open ;;
+  status) cmd_status ;;
+  doctor) cmd_doctor ;;
+  backup) shift; cmd_backup "$@" ;;
+  update-check|updates) shift; cmd_update_check "$@" ;;
+  validate|check-config) shift; cmd_validate "$@" ;;
+  snapshot) shift; cmd_snapshot "$@" ;;
+  rollback) shift; cmd_rollback "$@" ;;
+  starter) shift; cmd_starter "$@" ;;
+  token-set|token) shift; cmd_token "$@" ;;
+  discover) shift; cmd_discover "$@" ;;
+  local) shift; cmd_local "$@" ;;
+  help|-h|--help) usage ;;
+  *) usage; exit 2 ;;
+esac

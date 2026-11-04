@@ -1,0 +1,104 @@
+#!/bin/bash
+# secure-linux-drivers: drivers for this computer (graphics, Wi-Fi, Macs), and the Secure Boot driver key.
+#
+#   secure-linux-drivers [status]     what hardware this is, which drivers are in use, anything waiting
+#   secure-linux-drivers check        the full compatibility report (same as the installer's check)
+#   secure-linux-drivers install      install whatever drivers are missing (the setup step, on its own)
+#   secure-linux-drivers reinstall    rebuild the NVIDIA / Broadcom drivers for every installed kernel, then install
+#   secure-linux-drivers enroll-key   ask Secure Boot to approve the driver key again, with a password YOU choose
+#   secure-linux-drivers parts [...]  software for the other hardware (discs, scanners, printers...): secure-linux-parts
+#   secure-linux-drivers health [...] check the health of every part: secure-linux-health
+#
+# install, reinstall and enroll-key need administrator rights (asks for your password).
+set -u
+SL_ROOT=${SL_ROOT:-/usr/local/lib/secure-linux}
+cmd=${1:-status}
+
+usage() { sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; }
+need_root() { [ "$(id -u)" -eq 0 ] || exec pkexec "$(readlink -f "$0")" "$@"; }
+
+KEY=/etc/pki/akmods/certs/public_key.der
+mod_state() {   # mod_state MODULE -> "loaded vX" / "built vX, not loaded" / "not built"
+  local v; v=$(modinfo -F version "$1" 2>/dev/null)
+  if [ -d "/sys/module/$1" ]; then echo "loaded${v:+ (version $v)}"
+  elif [ -n "$v" ]; then echo "built (version $v) but not loaded$( [ "$(sb_state)" = on ] && ! key_enrolled && echo ': waiting for the Secure Boot key approval')"
+  else echo "not built for this kernel"; fi
+}
+sb_state() { case "$(mokutil --sb-state 2>/dev/null)" in *nabled*) echo on ;; *isabled*) echo off ;; *) echo unknown ;; esac; }
+key_enrolled() { [ -f "$KEY" ] && mokutil --test-key "$KEY" 2>&1 | grep -qi 'already enrolled'; }
+
+status() {
+  . "$SL_ROOT/hw/detect.sh"
+  local -A H; local k v
+  while IFS='=' read -r k v; do [ -n "$k" ] && H[$k]=$v; done < <(hw_all)
+  echo "Computer:  ${H[dmi_vendor]} ${H[dmi_product]}"
+  echo "Processor: ${H[cpu_model]} (${H[cpu_arch]}, x86-64-v${H[cpu_x86_level]})   Memory: ${H[ram_gb]} GB"
+  echo "Start-up:  ${H[firmware]}, Secure Boot ${H[secure_boot]}"
+  echo
+  echo "Graphics:"
+  local i dr
+  for ((i = 1; i <= ${H[gpu_count]:-0}; i++)); do
+    IFS=: read -r gv gd _ gs _ <<< "${H[gpu_$i]}"
+    dr=$(basename "$(readlink -f "/sys/bus/pci/devices/$gs/driver" 2>/dev/null)" 2>/dev/null)
+    echo "  $gv:$gd at $gs: driver ${dr:-none}"
+  done
+  if [ "${H[gpu_nvidia]}" = yes ]; then
+    echo "  NVIDIA ${H[nvidia_family]} -> plan: $(case "${H[nvidia_class]}" in modern) echo "akmod-nvidia" ;; 580xx) echo "akmod-nvidia-580xx" ;; *) echo "open-source nouveau" ;; esac)"
+    [ "${H[nvidia_class]}" != legacy ] && echo "  NVIDIA driver: $(mod_state nvidia)"
+  fi
+  [ "${H[hybrid]}" = yes ] && echo "  Switchable graphics: switcheroo-control $(systemctl is-active switcheroo-control 2>/dev/null)"
+  echo "Wi-Fi: ${H[wifi_vendor]} ${H[wifi_ids]}"
+  [ "${H[wifi_broadcom_driver]}" = wl ] && echo "  Broadcom wl driver: $(mod_state wl)"
+  [ "${H[mac_kind]}" != none ] && echo "Mac: ${H[mac_kind]} ${H[mac_model]}"
+  if [ "${H[mac_kind]}" = intel-t2 ]; then
+    echo "  Kernel: $(uname -r) $(uname -r | grep -q t2 && echo '(t2linux)' || echo '(not the t2linux kernel yet: restart after setup)')"
+    echo "  Apple Wi-Fi firmware: $(ls /usr/lib/firmware/brcm/brcmfmac*apple* >/dev/null 2>&1 && echo installed || echo missing)"
+  fi
+  if [ -f "$KEY" ] && [ "$(sb_state)" = on ]; then
+    if key_enrolled; then echo "Secure Boot driver key: approved"
+    else echo "Secure Boot driver key: NOT approved yet. Restart and choose 'Enroll MOK' on the blue screen (code: see the Secure Linux notification), or run: secure-linux-drivers enroll-key"; fi
+  fi
+  local a
+  for a in /var/lib/secure-linux/alerts.d/drivers-*; do [ -f "$a" ] && echo "Waiting: $(head -n 1 "$a")"; done
+  return 0
+}
+
+run_step() {   # run the setup step on its own, in repair mode unless told otherwise
+  . "$SL_ROOT/lib/common.sh"
+  SL_MODE=${1:-repair}; SL_PROFILE=$(sl_profile); SL_STEP_N=1; SL_STEP_TOTAL=1
+  export SL_MODE SL_PROFILE
+  . "$SL_ROOT/steps/15-drivers.sh"
+}
+
+case "$cmd" in
+  -h|--help|help) usage ;;
+  status) status ;;
+  check) bash "$SL_ROOT/hw/compat-check.sh" ;;
+  install) need_root "$@"; run_step repair ;;
+  reinstall)
+    need_root "$@"
+    for k in $(ls -1 /lib/modules 2>/dev/null); do
+      [ -d "/lib/modules/$k/build" ] || continue
+      echo ">> akmods --force --kernels $k"; timeout 1800 akmods --force --kernels "$k"
+    done
+    rm -f /var/lib/secure-linux/hw/mok-pending
+    run_step repair ;;
+  enroll-key)
+    need_root "$@"
+    [ "$(sb_state)" = on ] || { echo "Secure Boot is off on this computer: no key approval is needed."; exit 0; }
+    [ -f "$KEY" ] || kmodgenca -a
+    if key_enrolled; then echo "The driver key is already approved."; exit 0; fi
+    echo "Choose a short one-time password (numbers are easiest). You type it ONCE on the blue"
+    echo "screen at the next restart: Enroll MOK > Continue > Yes > password > Reboot."
+    echo "That screen uses a US keyboard layout."
+    if mokutil --import "$KEY"; then
+      mkdir -p /var/lib/secure-linux/hw
+      ( umask 077; printf '%s\n%s\n' "(your own password)" "$(cat /proc/sys/kernel/random/boot_id)" > /var/lib/secure-linux/hw/mok-pending )
+      . "$SL_ROOT/lib/common.sh"
+      sl_alert drivers-mok "Restart and approve the driver key" "At the next restart choose Enroll MOK > Continue > Yes on the blue screen and type the password you just chose." "Restart now"
+      echo "Done. Restart now to approve it."
+    fi ;;
+  parts) shift; exec "$SL_ROOT/bin/secure-linux-parts" "$@" ;;
+  health) shift; exec "$SL_ROOT/bin/secure-linux-health" "$@" ;;
+  *) usage; exit 1 ;;
+esac

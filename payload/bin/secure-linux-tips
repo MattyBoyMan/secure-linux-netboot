@@ -1,0 +1,56 @@
+#!/bin/bash
+# secure-linux-tips: one friendly tip a day for your first two weeks (Windows habits -> this desktop).
+#   secure-linux-tips --today      show today's tip (the daily user timer runs this; once a day at most)
+#   secure-linux-tips --init       start the 14-day series (first login; does nothing if already started/off)
+#   secure-linux-tips --on|--off   switch the daily tips on or off for you
+#   secure-linux-tips --list       print every tip for this desktop
+#   secure-linux-tips --poster     open the printable keyboard-shortcut poster
+#   secure-linux-tips --status     where you are in the series
+# After the 14th tip the timer switches itself off for you (systemctl --user mask).
+set -uo pipefail
+SL_ROOT=${SL_ROOT:-/usr/local/lib/secure-linux}
+. "$SL_ROOT/lib/common.sh"
+. "$SL_ROOT/files/comfort/comfort-lib.sh"
+SELF=$(readlink -f "$0")
+STATE=$CF_USTATE/tips
+TIPS=$CF_FILES/tips.tsv
+POSTER=$CF_FILES/shortcut-poster.html
+GUIDE_URL=file:///usr/share/secure-linux/START-HERE.html
+DAYS=14
+
+get() { sed -n "s/^$1=//p" "$STATE" 2>/dev/null | tail -1; }
+put() { mkdir -p "${STATE%/*}"; touch "$STATE"; sed -i "/^$1=/d" "$STATE"; echo "$1=$2" >> "$STATE"; }
+desk() { case $(cf_desktop) in xfce) echo xfce ;; *) echo kde ;; esac; }
+tip_for() {   # tip_for DAY -> "title<TAB>text<TAB>anchor"
+  awk -F'\t' -v d="$1" -v k="$(desk)" '!/^#/ && $1==d && ($2==k || $2=="all") {print $3 "\t" $4 "\t" $5; exit}' "$TIPS"
+}
+stop_timer() { cf_have systemctl && systemctl --user mask secure-linux-tips.timer >/dev/null 2>&1; return 0; }
+
+today() {
+  [ "$(get off)" = 1 ] && { stop_timer; return 0; }
+  [ -n "$(get start)" ] || put start "$(cf_today)"
+  local shown last t title text anchor
+  shown=$(get shown); shown=${shown:-0}; last=$(get last)
+  [ "$shown" -ge "$DAYS" ] && { stop_timer; return 0; }
+  [ "$last" = "$(cf_today)" ] && return 0
+  t=$(tip_for $((shown + 1)))
+  [ -n "$t" ] || { put shown $((shown + 1)); return 0; }
+  IFS=$'\t' read -r title text anchor <<< "$t"
+  cf_notify "Tip $((shown + 1)) of $DAYS: $title" "$text <a href=\"$GUIDE_URL#$anchor\">More in the guide</a>" help-hint
+  put shown $((shown + 1)); put last "$(cf_today)"
+  [ $((shown + 1)) -ge "$DAYS" ] && stop_timer
+  return 0
+}
+
+case "${1:-}" in
+  --today) today ;;
+  --init) [ -n "$(get start)" ] || [ "$(get off)" = 1 ] || { put start "$(cf_today)"; put shown 0; } ;;
+  --on) put off 0; [ -n "$(get start)" ] || { put start "$(cf_today)"; put shown 0; }
+        cf_have systemctl && systemctl --user unmask secure-linux-tips.timer >/dev/null 2>&1; echo "Daily tips: on" ;;
+  --off) put off 1; stop_timer; echo "Daily tips: off" ;;
+  --list) for d in $(seq 1 $DAYS); do t=$(tip_for "$d"); [ -n "$t" ] && printf '%2d. %s\n' "$d" "${t//$'\t'/ - }"; done ;;
+  --poster) cf_open "$POSTER" ;;
+  --status) if [ "$(get off)" = 1 ]; then echo "Daily tips: off"; else echo "Daily tips: ${DAYS} days, $(get shown) shown (last: $(get last))"; fi ;;
+  -h|--help|"") sed -n '2,9p' "$SELF" | sed 's/^# \{0,1\}//' ;;
+  *) sed -n '2,9p' "$SELF" | sed 's/^# \{0,1\}//'; exit 2 ;;
+esac

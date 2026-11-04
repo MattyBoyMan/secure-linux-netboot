@@ -1,0 +1,130 @@
+#!/bin/bash
+# secure-linux-recovery-key: a spare key for your encrypted disk, in case you forget your disk password.
+#
+#   secure-linux-recovery-key [create]        make a recovery key (if there isn't one yet) and show it once
+#   secure-linux-recovery-key status          is there a recovery key already?
+#   secure-linux-recovery-key header-backup DIR
+#                                             save a copy of the disk's encryption header to DIR on a USB drive
+#                                             (rescues the disk if its first few megabytes ever get damaged)
+set -u   # no pipefail: "cmd | grep -q" must not fail when grep stops reading early
+SL_ROOT=${SL_ROOT:-/usr/local/lib/secure-linux}
+. "$SL_ROOT/lib/common.sh"
+. "$SL_ROOT/files/security/lib-security.sh"
+
+usage() { sed -n '2,9p' "$(sec_self)" | sed 's/^# \{0,1\}//'; }
+
+find_dev() {
+  DEV=$(sec_luks_dev) || { echo "This computer's disk isn't encrypted (no LUKS disk found), so there's nothing to do."; return 1; }
+}
+
+cmd_status() {
+  find_dev || return 0
+  if sec_luks_has "$DEV" recovery; then echo "A recovery key exists for $DEV."; else echo "No recovery key yet for $DEV. Run: secure-linux-recovery-key"; fi
+}
+
+cmd_create() {
+  sec_need_terminal create
+  sec_need_root create
+  find_dev || { sec_pause; return 0; }
+  if sec_luks_has "$DEV" recovery; then
+    echo "Your disk already has a recovery key. (For safety it can't be shown again.)"
+    echo "If you lost it, a new one can be made: secure-linux-recovery-key replace"
+    sl_choice_set recovery_key_done yes; sl_clear luks-recovery-key
+    sec_pause "Press Enter to close. "; return 0
+  fi
+  cat <<'EOF'
+
+  DISK RECOVERY KEY
+  -----------------
+  This makes a long spare key that unlocks your disk if you ever forget your disk password.
+  You'll be asked for your CURRENT disk password first (the one you type when the computer starts).
+
+  Then the recovery key is shown ONCE. Save it in TWO places:
+    1. Bitwarden: make a new Secure Note called "Laptop disk recovery key" and paste it in.
+    2. Paper: write it down and keep it at home, NOT in the laptop bag.
+  Never keep it with the laptop: anyone holding both can read everything on it.
+
+EOF
+  sec_pause "Press Enter to continue (or close this window to stop). "
+  local out key
+  out=$(mktemp); chmod 600 "$out"
+  # systemd-cryptenroll asks for the current password on this terminal and prints the new key
+  if ! systemd-cryptenroll --recovery-key "$DEV" > "$out"; then
+    rm -f "$out"; echo; echo "That didn't work (wrong password?). Nothing was changed. Try again any time."
+    sec_pause "Press Enter to close. "; return 1
+  fi
+  key=$(grep -oE '([a-z]{8}-){7}[a-z]{8}' "$out" | head -1)
+  [ -n "$key" ] || key=$(tr -d '\n' < "$out")
+  rm -f "$out"
+  clear 2>/dev/null
+  echo
+  echo "  YOUR DISK RECOVERY KEY (shown only this once):"
+  echo
+  echo "      $key"
+  echo
+  if command -v qrencode >/dev/null 2>&1; then
+    echo "  The same key as a QR code (scan it with the Bitwarden app on your phone, then save as a note):"
+    qrencode -t ANSIUTF8 "$key"
+  fi
+  echo "  1. Save it in Bitwarden (Secure Note)."
+  echo "  2. Write it on paper; keep it at home, never with the laptop."
+  echo "  To use it: at the start-up password box, type this key instead of your password."
+  echo
+  sl_choice_set recovery_key_done yes
+  sl_clear luks-recovery-key
+  local a=""
+  while [ "$a" != saved ]; do read -rp "  Type  saved  and press Enter once you've stored it in both places: " a || break; done
+  clear 2>/dev/null
+  echo "Thank you. The key is no longer on screen."
+}
+
+cmd_replace() {   # lost the old key: remove it and make a new one
+  sec_need_terminal replace
+  sec_need_root replace
+  find_dev || return 0
+  if sec_luks_has "$DEV" recovery; then
+    sec_ask "Remove the old recovery key and make a new one? (Only do this if the old one is lost.)" no || return 0
+    systemd-cryptenroll --wipe-slot=recovery "$DEV" || { echo "Couldn't remove the old key."; sec_pause; return 1; }
+  fi
+  cmd_create
+}
+
+cmd_header_backup() {
+  local dir=${1:-}
+  [ -n "$dir" ] || { echo "Usage: secure-linux-recovery-key header-backup /run/media/$USER/YOUR-USB-DRIVE"; return 2; }
+  sec_need_root header-backup "$dir"
+  [ -d "$dir" ] || { echo "Folder '$dir' doesn't exist. Plug in the USB drive and choose a folder on it."; return 1; }
+  find_dev || return 0
+  local src_disk dst_dev
+  src_disk=$(lsblk -no PKNAME "$DEV" 2>/dev/null | head -1)
+  dst_dev=$(findmnt -no SOURCE --target "$dir" 2>/dev/null)
+  if [ -n "$src_disk" ] && [ -n "$dst_dev" ] && lsblk -sno NAME "$dst_dev" 2>/dev/null | grep -qx "$src_disk"; then
+    echo "That folder is on this computer's own disk. Please choose a folder on a USB drive instead."; return 1
+  fi
+  cat <<'EOF'
+
+  IMPORTANT: this backup still accepts every disk password and recovery key that works TODAY,
+  even if you change or remove them later. Keep the USB drive somewhere safe at home, and
+  delete this file if you ever change your disk password because someone may have seen it.
+
+EOF
+  local f
+  f="$dir/disk-header-$(hostname -s 2>/dev/null || echo laptop)-$(date +%Y%m%d).img"
+  [ -e "$f" ] && { echo "A backup from today is already there: $f"; return 0; }
+  if cryptsetup luksHeaderBackup "$DEV" --header-backup-file "$f"; then
+    chmod 600 "$f"; local u; u=$(sl_user); [ -n "$u" ] && chown "$u": "$f" 2>/dev/null
+    echo "Saved: $f"
+    echo "To restore it one day (from the rescue USB): cryptsetup luksHeaderRestore <disk> --header-backup-file $(basename "$f")"
+  else
+    echo "The backup didn't work. Is the USB drive full or read-only?"; return 1
+  fi
+}
+
+case "${1:-create}" in
+  -h|--help|help) usage ;;
+  create) cmd_create ;;
+  replace) cmd_replace ;;
+  status) cmd_status ;;
+  header-backup) shift; cmd_header_backup "$@" ;;
+  *) echo "Unknown command '$1'." >&2; usage; exit 2 ;;
+esac

@@ -1,0 +1,25 @@
+#!/bin/bash
+# secure-linux-choice: read or save one of your setup choices (/etc/secure-linux/choices).
+#   secure-linux-choice get KEY [DEFAULT]   print the saved value (or DEFAULT)
+#   secure-linux-choice set KEY VALUE       save it (needs your password once; runs as root via pkexec)
+#   secure-linux-choice list                all saved choices
+# KEY: lowercase letters, digits and _ only. VALUE: one line, no control characters, at most 200 chars.
+# Settings take effect at the next "setup.sh --repair" (or right away where a helper applies them).
+set -u   # no pipefail: "cmd | grep -q" must not fail when grep stops reading early
+SL_ROOT=${SL_ROOT:-/usr/local/lib/secure-linux}
+. "$SL_ROOT/lib/common.sh"
+. "$SL_ROOT/files/experience/exp-lib.sh"
+valid_key() { printf '%s' "${1:-}" | grep -qE '^[a-z0-9_]{1,64}$' || { echo "Invalid choice name '${1:-}' (use a-z, 0-9, _)." >&2; exit 2; }; }
+case "${1:-}" in
+  get) valid_key "${2:-}"; sl_choice_get "$2" "${3:-}"; echo ;;
+  set)
+    valid_key "${2:-}"; [ $# -ge 3 ] || { echo "Use: secure-linux-choice set KEY VALUE" >&2; exit 2; }
+    v=$3
+    case "$v" in *[[:cntrl:]]*) echo "Invalid value (control characters)." >&2; exit 2 ;; esac
+    [ ${#v} -le 200 ] || { echo "Value too long." >&2; exit 2; }
+    exp_elevate "$@"
+    sl_choice_set "$2" "$v" ;;
+  list) cat "$SL_ETC/choices" 2>/dev/null ;;
+  -h|--help|help|"") sed -n '2,8p' "$0" ;;
+  *) sed -n '2,8p' "$0"; exit 2 ;;
+esac

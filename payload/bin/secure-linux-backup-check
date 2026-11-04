@@ -1,0 +1,125 @@
+#!/bin/bash
+# secure-linux-backup-check: daily (user timer) check that your backups actually happen.
+#   secure-linux-backup-check            check now (alerts: no backup in 7 days, backups not set up,
+#                                        monthly restore-drill reminder, home-server backup too old)
+#   secure-linux-backup-check --status   print what it found, no notifications
+# Also saves the list of installed apps to ~/.config/secure-linux/apps.txt so it is in your backups.
+# This helper shows no notifications itself. It writes each alert to
+# /var/lib/secure-linux/user-alerts/$USER/<id> (alerts.d format: title, message, action hint); the Secure Linux
+# notifier shows it (once a day at most) and the status app lists it.
+set -u   # no pipefail: "cmd | grep -q" must not fail when grep stops reading early
+SL_ROOT=${SL_ROOT:-/usr/local/lib/secure-linux}
+. "$SL_ROOT/lib/common.sh"
+. "$SL_ROOT/files/experience/exp-lib.sh"
+
+PIKA=$HOME/.var/app/org.gnome.World.PikaBackup/config/pika-backup   # VERIFY: backup.json + history.json
+USTATE=$HOME/.local/state/secure-linux
+UALERTS=$SL_STATE/user-alerts/$USER
+QUIET=0; [ "${1:-}" = --status ] && QUIET=1
+case "${1:-}" in -h|--help) sed -n '2,9p' "$0"; exit 0 ;; esac
+mkdir -p "$USTATE/backup-seen"
+NOW=$(date +%s)
+[ -f "$USTATE/first-seen" ] || date +%s > "$USTATE/first-seen"
+AGE_DAYS=$(( (NOW - $(cat "$USTATE/first-seen")) / 86400 ))
+
+alert() {         # alert ID "Title" "Message" "Hint" [repeat-days]
+  local id=$1 seen="$USTATE/backup-seen/$1" every=${5:-1}
+  if [ $QUIET = 1 ]; then echo "ALERT $1: $2 - $3"; return; fi
+  [ -d "$UALERTS" ] && [ -w "$UALERTS" ] && printf '%s\n%s\n%s\n' "$2" "$3" "$4" > "$UALERTS/$id"
+  # "seen" remembers when this alert was last raised (the restore-drill reminder uses its age below)
+  if [ ! -f "$seen" ] || [ $(( NOW - $(stat -c %Y "$seen") )) -ge $(( every * 86400 - 3600 )) ]; then touch "$seen"; fi
+}
+clear_alert() { rm -f "$UALERTS/$1" "$USTATE/backup-seen/$1" 2>/dev/null; return 0; }
+
+# 1. App list (so a restore can reinstall your apps)
+bash "$SL_EXP/user-setup.sh" applist >/dev/null 2>&1 || true
+
+# 2. Pika Backup: how many backups are set up, and when did one last finish successfully?
+pika_info() {     # prints "<configs> <last-success-epoch or 0>"
+  python3 - "$PIKA" <<'PY' 2>/dev/null || echo "0 0"
+import json, os, sys, datetime
+d = sys.argv[1]
+def load(n):
+    try:
+        with open(os.path.join(d, n)) as f: return json.load(f)
+    except Exception: return None
+cfg = load("backup.json"); hist = load("history.json")
+n = len(cfg) if isinstance(cfg, list) else (len(cfg) if isinstance(cfg, dict) else 0)
+best = 0.0
+def ts(v):
+    try:
+        return datetime.datetime.fromisoformat(str(v).replace("Z", "+00:00")).timestamp()
+    except Exception: return 0.0
+def walk(x):
+    global best
+    if isinstance(x, dict):
+        # a finished run looks like {"end": <time>, "outcome": {"Completed": ...}} (VERIFY Pika format)
+        if "end" in x and "Completed" in json.dumps(x.get("outcome", x.get("result", ""))):
+            best = max(best, ts(x["end"]))
+        if "last_completed" in x and isinstance(x["last_completed"], dict) and "end" in x["last_completed"]:
+            best = max(best, ts(x["last_completed"]["end"]))
+        for v in x.values(): walk(v)
+    elif isinstance(x, list):
+        for v in x: walk(v)
+walk(hist)
+print(n, int(best))
+PY
+}
+if flatpak info org.gnome.World.PikaBackup >/dev/null 2>&1 || [ -d "$PIKA" ]; then
+  read -r NCONF LAST <<< "$(pika_info)"
+  if [ "${NCONF:-0}" -eq 0 ]; then
+    clear_alert backup-old
+    if [ "$AGE_DAYS" -ge 7 ]; then
+      alert backup-none "Backups aren't set up yet" "If this laptop were lost or broke today, your files would be gone." \
+        "Open Pika Backup and set up a backup to a USB drive or your home server (about 5 minutes)." 3
+    fi
+  else
+    clear_alert backup-none
+    if [ "${LAST:-0}" -gt 0 ] && [ $(( (NOW - LAST) / 86400 )) -lt 7 ]; then
+      clear_alert backup-old
+      [ $QUIET = 1 ] && echo "Last backup: $(date -d "@$LAST" '+%a %d %b %H:%M' 2>/dev/null || echo "$LAST")"
+    else
+      days=$([ "${LAST:-0}" -gt 0 ] && echo "$(( (NOW - LAST) / 86400 )) days" || echo "a while")
+      alert backup-old "No backup in $days" "Your files haven't been backed up for $days." \
+        "Plug in your backup drive (or connect to home) and open Pika Backup, then click Back Up Now."
+    fi
+    # Monthly restore drill: a backup you never restored from is only a hope
+    [ -f "$USTATE/restore-drill" ] || touch "$USTATE/restore-drill"
+    if [ $(( (NOW - $(stat -c %Y "$USTATE/restore-drill")) / 86400 )) -ge 30 ]; then
+      alert restore-drill "Monthly backup test" "Take 2 minutes to check you can get a file back from your backup." \
+        "Open Pika Backup > Archives > Browse, copy one file to your Desktop and open it." 30
+      touch "$USTATE/restore-drill"
+    else
+      [ -f "$USTATE/backup-seen/restore-drill" ] && [ $(( NOW - $(stat -c %Y "$USTATE/backup-seen/restore-drill") )) -ge 259200 ] && clear_alert restore-drill
+    fi
+  fi
+fi
+
+# 3. Optional: the home server's own backup health file (see server/README.md). Its address is the saved choice
+#    server_health_url (the old ~/.config/secure-linux/server-health-url file still works). Format, one per line:
+#      status=ok|error      last_backup=<ISO date, e.g. 2026-11-03T02:15:00+11:00>
+url=$(sl_choice_get server_health_url)
+[ -n "$url" ] || { [ -s "$HOME/.config/secure-linux/server-health-url" ] && url=$(head -1 "$HOME/.config/secure-linux/server-health-url"); }
+if [ -n "$url" ]; then
+  if body=$(curl -fsS --max-time 10 "$url" 2>/dev/null); then
+    st=$(printf '%s\n' "$body" | sed -n 's/^status=//p' | head -1 | tr -d '\r ')
+    lb=$(printf '%s\n' "$body" | sed -n 's/^last_backup=//p' | head -1 | tr -d '\r')
+    when=""
+    [ -n "$lb" ] && when=$(date -d "$lb" +%s 2>/dev/null)
+    if [ -z "$when" ]; then   # older servers wrote last_success=<seconds since 1970>
+      when=$(printf '%s\n' "$body" | sed -n 's/^last_success=//p' | head -1 | tr -d '\r ')
+      case "$when" in ''|*[!0-9]*) when="" ;; esac
+    fi
+    if [ -n "$st" ] && [ "$st" != ok ]; then
+      err=$(printf '%s\n' "$body" | sed -n 's/^error=//p' | head -1 | tr -d '\r' | cut -c1-100)
+      alert server-backup "Home server backup problem" "The photo server reports a backup problem${err:+: $err}." \
+        "On the server, run: sudo immich-backup.sh   and read its output."
+    elif [ -n "$when" ] && [ "$when" -gt 0 ] && [ $(( (NOW - when) / 86400 )) -ge 3 ]; then
+      alert server-backup "Home server backup is old" "The photo server hasn't backed up for $(( (NOW - when) / 86400 )) days." \
+        "On the server, run: sudo immich-backup.sh   and read its output."
+    else
+      clear_alert server-backup
+    fi
+  fi
+fi
+exit 0

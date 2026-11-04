@@ -1,0 +1,215 @@
+#!/bin/bash
+# secure-linux-ai: your private, offline AI (Ollama) - models, graphics acceleration, status.
+#   secure-linux-ai status                  what is installed and running
+#   secure-linux-ai setup [--force]         download the coding models you chose (choice ai_models)
+#                                           and import the unfiltered model if you chose it in the installer
+#   secure-linux-ai import-unfiltered       import qwen2.5-coder-unfiltered:7b from the installer's file
+#   secure-linux-ai vulkan on|off           use the Radeon graphics chip for AI (experimental) or not
+#   secure-linux-ai vulkan bench            measure both ways and keep the faster one
+# Downloads wait when you are offline, on a metered connection (phone hotspot) or in battery-saver
+# mode; --force downloads anyway. Everything runs on this computer; nothing you type is sent anywhere.
+set -u   # no pipefail: "cmd | grep -q" must not fail when grep stops reading early
+SL_ROOT=${SL_ROOT:-/usr/local/lib/secure-linux}
+. "$SL_ROOT/lib/common.sh"
+. "$SL_ROOT/files/experience/exp-lib.sh"
+
+UNFILTERED=qwen2.5-coder-unfiltered:7b
+DEFAULT_MODELS=qwen2.5-coder:7b,qwen2.5-coder:1.5b
+DROPIN=$SL_R/etc/systemd/system/ollama.service.d/50-secure-linux-vulkan.conf
+QUIET=0; FORCE=0
+for a in "$@"; do case $a in --quiet) QUIET=1 ;; --force) FORCE=1 ;; esac; done
+say() { [ $QUIET = 1 ] && [ "${1:-}" != "!" ] && return 0; [ "${1:-}" = "!" ] && shift; echo "$*"; }
+
+have_model() { ollama list 2>/dev/null | awk 'NR>1{print $1}' | grep -qx "$1"; }
+wait_ollama() {
+  local i
+  for i in $(seq 1 30); do curl -fsS --max-time 3 http://127.0.0.1:11434/api/version >/dev/null 2>&1 && return 0; sleep 1; done
+  say ! "The AI engine (ollama.service) isn't answering. Try: sudo systemctl restart ollama"; return 1
+}
+download_ok() {   # true if it's a good moment for a big download
+  [ $FORCE = 1 ] && return 0
+  sl_online || { say ! "You're offline. The download will happen later."; return 1; }
+  exp_metered && { say ! "You're on a metered connection (e.g. phone hotspot). Skipping the big download; run 'secure-linux-ai setup --force' to do it anyway."; return 1; }
+  exp_power_saver && { say ! "Battery-saver mode is on. Skipping the big download for now."; return 1; }
+  return 0
+}
+
+cmd_pull() {
+  local models m rc=0
+  models=$(sl_choice_get ai_models "$DEFAULT_MODELS")
+  [ "$models" = none ] && { say "No models chosen (ai_models=none)."; return 0; }
+  wait_ollama || return 1
+  local todo=()
+  for m in $(printf '%s' "$models" | tr ',' ' '); do have_model "$m" || todo+=("$m"); done
+  [ ${#todo[@]} -eq 0 ] && { say "All chosen models are already downloaded."; return 0; }
+  download_ok || return 0
+  for m in "${todo[@]}"; do
+    say ! "Downloading $m (this can take a while; it continues where it left off if interrupted)..."
+    ollama pull "$m" || { say ! "Could not download $m. It will be retried later."; rc=1; }
+  done
+  return $rc
+}
+
+# Qwen2.5 ChatML template (VERIFY against `ollama show qwen2.5-coder:7b --modelfile`; tools/FIM omitted)
+modelfile() {
+  cat <<EOF
+FROM $1
+TEMPLATE """{{- if .Messages }}
+{{- if .System }}<|im_start|>system
+{{ .System }}<|im_end|>
+{{ end }}
+{{- range \$i, \$_ := .Messages }}
+{{- \$last := eq (len (slice \$.Messages \$i)) 1 -}}
+<|im_start|>{{ .Role }}
+{{ .Content }}{{ if not \$last }}<|im_end|>
+{{ end }}
+{{- if and (ne .Role "assistant") \$last }}<|im_end|>
+<|im_start|>assistant
+{{ end }}
+{{- end }}
+{{- else }}
+{{- if .System }}<|im_start|>system
+{{ .System }}<|im_end|>
+{{ end }}{{ if .Prompt }}<|im_start|>user
+{{ .Prompt }}<|im_end|>
+{{ end }}<|im_start|>assistant
+{{ end }}{{ .Response }}{{ if .Response }}<|im_end|>{{ end }}"""
+SYSTEM """You are Qwen, created by Alibaba Cloud. You are a helpful assistant."""
+PARAMETER stop "<|im_start|>"
+PARAMETER stop "<|im_end|>"
+PARAMETER stop "<|endoftext|>"
+PARAMETER num_ctx 8192
+EOF
+}
+
+cmd_import_unfiltered() {
+  [ "$(sl_choice_get ai_abliterated no)" = yes ] || { say "The unfiltered model wasn't chosen in the installer."; return 0; }
+  local dir="$SL_STATE/models" name url sum f
+  name=$(sl_build_get MODEL_FILE); url=$(sl_build_get MODEL_URL); sum=$(sl_build_get MODEL_SHA256 | tr 'A-F' 'a-f')
+  name=${name:-qwen2.5-coder-7b-abliterated.gguf}; f="$dir/$(basename "$name")"
+  if command -v ollama >/dev/null 2>&1 && wait_ollama && have_model "$UNFILTERED"; then
+    say "$UNFILTERED is ready."; [ -f "$f" ] && exp_is_root && rm -f "$f"; return 0
+  fi
+  exp_elevate import-unfiltered "$@"
+  [ -n "$sum" ] || { say ! "No MODEL_SHA256 in build.conf: refusing to use an unverified model file."; return 1; }
+  mkdir -p "$dir"; chmod 0700 "$dir"
+  if [ ! -f "$f" ]; then
+    [ -n "$url" ] || { say ! "The model file is missing and build.conf has no MODEL_URL."; return 1; }
+    download_ok || return 0
+    local avail; avail=$(df -Pk "$dir" 2>/dev/null | awk 'NR==2{print $4}')
+    [ -n "$avail" ] && [ "$avail" -lt 6000000 ] && { say ! "Not enough free disk space (need about 6 GB)."; return 1; }
+    say ! "Downloading the unfiltered model (about 4.7 GB, resumes if interrupted)..."
+    curl -fL --retry 5 --retry-delay 10 -C - -o "$f.part" "$url" || { say ! "Download interrupted; it will continue next time."; return 1; }
+    mv "$f.part" "$f.check"
+  else
+    mv "$f" "$f.check"
+  fi
+  say "Checking the file's fingerprint (SHA-256)..."
+  if [ "$(sha256sum "$f.check" | cut -d' ' -f1)" != "$sum" ]; then
+    rm -f "$f.check"; say ! "The model file is damaged or not the expected one (checksum mismatch). It was deleted."
+    echo "FAILED: unfiltered model checksum mismatch" >> "$SL_FAILS" 2>/dev/null
+    return 1
+  fi
+  mv "$f.check" "$f"
+  wait_ollama || return 1
+  local mf; mf=$(mktemp); modelfile "$f" > "$mf"
+  say ! "Importing into Ollama as $UNFILTERED..."
+  if ollama create "$UNFILTERED" -f "$mf"; then
+    rm -f "$mf" "$f"            # Ollama keeps its own copy (blob); free 4.7 GB
+    say ! "Done: $UNFILTERED is ready (the original file was removed to save space)."
+  else
+    rm -f "$mf"; say ! "Import failed; the file is kept and the import will be retried."; return 1
+  fi
+}
+
+cmd_setup() {
+  command -v ollama >/dev/null 2>&1 || { say ! "Ollama isn't installed yet (it comes with the full setup)."; return 1; }
+  local rc=0
+  cmd_pull || rc=1
+  if [ "$(sl_choice_get ai_abliterated no)" = yes ] && ! have_model "$UNFILTERED"; then
+    if exp_is_root; then cmd_import_unfiltered || rc=1
+    else
+      local q=(); [ $QUIET = 1 ] && q=(--quiet)
+      local self=/usr/local/bin/secure-linux-ai; [ -x "$self" ] || self=$(readlink -f "$0")
+      pkexec "$self" import-unfiltered "${q[@]}" || rc=1
+    fi
+  fi
+  # Point Continue (VSCodium) at the models
+  if exp_is_root; then exp_as_user bash "$SL_EXP/user-setup.sh" continue >/dev/null 2>&1 || true
+  else bash "$SL_EXP/user-setup.sh" continue >/dev/null 2>&1 || true; fi
+  [ $rc = 0 ] && say ! "Local AI is ready. Open Alpaca to chat, or VSCodium (Continue panel) for coding help."
+  return $rc
+}
+
+vulkan_libs() { ls /usr/lib64/ollama/*vulkan* /usr/lib/ollama/*vulkan* /usr/local/lib/ollama/*vulkan* 2>/dev/null | head -1; }
+set_vulkan() {    # set_vulkan on|off   (root)
+  # VERIFY: Ollama >= 0.12.x reads OLLAMA_VULKAN=1 to enable its (experimental) Vulkan backend
+  local want='[Service]
+# Written by secure-linux-ai: use the Radeon iGPU through Vulkan (experimental)
+Environment=OLLAMA_VULKAN=1'
+  sl_choice_set ollama_vulkan "$([ "$1" = on ] && echo yes || echo no)"
+  if [ "$1" = on ]; then
+    [ -f "$DROPIN" ] && [ "$(cat "$DROPIN")" = "$want" ] && return 0     # already on: no restart
+    mkdir -p "$(dirname "$DROPIN")"; printf '%s\n' "$want" > "$DROPIN"
+  else
+    [ -f "$DROPIN" ] || return 0
+    rm -f "$DROPIN"
+  fi
+  systemctl daemon-reload; systemctl try-restart ollama.service
+}
+bench_once() {    # prints tokens/second for a short fixed prompt
+  local m=$1
+  curl -fsS --max-time 600 http://127.0.0.1:11434/api/generate \
+    -d "{\"model\":\"$m\",\"prompt\":\"Write a Python function that checks if a number is prime.\",\"stream\":false,\"options\":{\"num_predict\":128,\"seed\":1,\"temperature\":0}}" \
+    | python3 -c 'import json,sys; d=json.load(sys.stdin); print("%.1f" % (d["eval_count"]/(d["eval_duration"]/1e9)))' 2>/dev/null
+}
+cmd_vulkan() {
+  local sub=${1:-}
+  case $sub in
+    on|off)
+      exp_elevate vulkan "$@"
+      if [ "$sub" = on ] && [ -z "$(vulkan_libs)" ]; then
+        say ! "Note: this Ollama build doesn't seem to include Vulkan support; it will keep using the processor."
+      fi
+      set_vulkan "$sub"; say "Graphics acceleration (Vulkan) is now $sub." ;;
+    bench)
+      exp_elevate vulkan "$@"
+      wait_ollama || return 1
+      local m all; all=$(ollama list 2>/dev/null | awk 'NR>1{print $1}')
+      m=$(echo "$all" | grep -m1 -x 'qwen2.5-coder:1.5b' || echo "$all" | grep -m1 -x 'qwen2.5-coder:7b' || echo "$all" | grep -m1 .)
+      [ -n "$m" ] || { say ! "Download a model first: secure-linux-ai setup"; return 1; }
+      say ! "Measuring speed with $m. This takes a minute or two..."
+      set_vulkan off; wait_ollama; bench_once "$m" >/dev/null; local cpu; cpu=$(bench_once "$m")
+      set_vulkan on;  wait_ollama; bench_once "$m" >/dev/null; local gpu; gpu=$(bench_once "$m")
+      say ! "  Processor only:        ${cpu:-failed} tokens/second"
+      say ! "  Radeon graphics (Vulkan): ${gpu:-failed} tokens/second"
+      if [ -n "$gpu" ] && [ -n "$cpu" ] && python3 -c "import sys; sys.exit(0 if float('$gpu') > float('$cpu')*1.1 else 1)"; then
+        say ! "Vulkan is faster: keeping it on."
+      else
+        set_vulkan off; say ! "The processor is as fast or faster (or Vulkan failed): Vulkan switched off."
+      fi ;;
+    *) sed -n '2,10p' "$0"; return 1 ;;
+  esac
+}
+
+cmd_status() {
+  echo "Local AI status"
+  if ! command -v ollama >/dev/null 2>&1; then echo "  Ollama: not installed"; return 0; fi
+  echo "  Ollama: $(systemctl is-active ollama.service 2>/dev/null) ($(ollama --version 2>/dev/null | grep -oE '[0-9]+\.[0-9.]+' | head -1))"
+  echo "  Graphics acceleration (Vulkan): $([ -f "$DROPIN" ] && echo on || echo off)$([ -z "$(vulkan_libs)" ] && echo ' - this build may not support it')"
+  echo "  Chosen models: $(sl_choice_get ai_models "$DEFAULT_MODELS (not chosen yet)")"
+  echo "  Downloaded models:"; ollama list 2>/dev/null | sed 's/^/    /'
+  [ "$(sl_choice_get ai_abliterated no)" = yes ] && echo "  Unfiltered model: $(have_model "$UNFILTERED" && echo ready || echo 'not imported yet (run: secure-linux-ai setup)')"
+  local h; h=$(exp_is_root && sl_user_home || echo "$HOME")
+  echo "  VSCodium Continue config: $([ -f "$h/.continue/config.yaml" ] && echo "$h/.continue/config.yaml" || echo 'not set up yet')"
+}
+
+case "${1:-}" in
+  setup) shift; cmd_setup "$@" ;;
+  pull) cmd_pull ;;
+  import-unfiltered) shift; cmd_import_unfiltered "$@" ;;
+  vulkan) shift; cmd_vulkan "$@" ;;
+  status|"") cmd_status ;;
+  -h|--help|help) sed -n '2,10p' "$0" ;;
+  *) sed -n '2,10p' "$0"; exit 1 ;;
+esac

@@ -1,0 +1,109 @@
+#!/bin/bash
+# secure-linux-hotspot: Hotel / cafe / airport Wi-Fi login helper.
+#
+#   secure-linux-hotspot [MINUTES]   pause the VPN and encrypted DNS so the Wi-Fi's login page can load,
+#                                    open the login page, then put everything back exactly as it was.
+#
+# Protection comes back when you press Enter, when you close the window, or after MINUTES (default 15),
+# whichever is first. A kill switch is only switched back on if it was on before AND the VPN reconnected
+# (so you're never left without internet).
+set -u   # no pipefail: "cmd | grep -q" must not fail when grep stops reading early
+SL_ROOT=${SL_ROOT:-/usr/local/lib/secure-linux}
+. "$SL_ROOT/lib/common.sh"
+. "$SL_ROOT/files/security/lib-security.sh"
+
+PORTAL_URL=http://detectportal.firefox.com/canonical.html
+STATE_DIR=${XDG_STATE_HOME:-$HOME/.local/state}/secure-linux
+PENDING=$STATE_DIR/hotspot-pending
+
+case "${1:-}" in
+  -h|--help|help) sed -n '2,10p' "$(sec_self)" | sed 's/^# \{0,1\}//'; exit 0 ;;
+esac
+MINUTES=${1:-15}; case "$MINUTES" in ''|*[!0-9]*) MINUTES=15 ;; esac
+if [ "$(id -u)" -eq 0 ]; then echo "Please run this as yourself (not root)."; exit 1; fi
+sec_need_terminal "$@"
+
+have() { command -v "$1" >/dev/null 2>&1; }
+nord_connected()   { have nordvpn && nordvpn status 2>/dev/null | grep -qi '^Status: Connected'; }
+nord_server()      { nordvpn status 2>/dev/null | sed -n 's/^Hostname: *\([^.]*\)\..*/\1/p' | head -1; }
+nord_killswitch_on() { have nordvpn && nordvpn settings 2>/dev/null | grep -qiE '^Kill Switch: *(enabled|on)'; }
+warp_connected()   { have warp-cli && systemctl is-active --quiet warp-svc.service 2>/dev/null \
+                     && warp-cli status 2>/dev/null | grep -qiE 'Status update: *Connected'; }
+
+RESTORED=0
+restore() {
+  [ "$RESTORED" = 1 ] && return 0
+  RESTORED=1
+  trap '' HUP INT TERM PIPE
+  # The window may already be gone: keep a log instead of writing to a closed terminal.
+  [ -t 1 ] || exec >>"$STATE_DIR/hotspot.log" 2>&1
+  echo; echo "Switching protection back on..."
+  # shellcheck disable=SC1090
+  [ -f "$PENDING" ] && . "$PENDING"
+  if [ "${DNS_WAS:-encrypted}" != paused ] && [ "${DNS_WAS:-}" != off ]; then   # encrypted, family or vpn
+    "$SEC_BIN/secure-linux-dns" secure >/dev/null 2>&1
+  fi
+  if [ "${WARP_WAS:-0}" = 1 ]; then
+    warp-cli connect >/dev/null 2>&1 && echo "  Cloudflare WARP: reconnected."
+  fi
+  if [ "${NORD_WAS:-0}" = 1 ]; then
+    nordvpn connect ${NORD_SERVER:+"$NORD_SERVER"} >/dev/null 2>&1
+    local i; for i in $(seq 1 20); do nord_connected && break; sleep 1; done
+    if nord_connected; then
+      echo "  NordVPN: reconnected${NORD_SERVER:+ to $NORD_SERVER}."
+      if [ "${KS_WAS:-0}" = 1 ]; then nordvpn set killswitch on >/dev/null 2>&1 && echo "  Kill switch: back on."; fi
+    else
+      echo "  NordVPN didn't reconnect. Your kill switch was left OFF so you stay online."
+      echo "  Open 'Secure Linux VPN' (or run: secure-linux-vpn private) to connect again."
+      have notify-send && notify-send -a "Secure Linux" -i network-vpn "VPN didn't reconnect" \
+        "After the Wi-Fi login the VPN couldn't reconnect. Run 'secure-linux-vpn private' to try again." 2>/dev/null
+    fi
+  fi
+  "$SEC_BIN/secure-linux-dns" sync >/dev/null 2>&1
+  rm -f "$PENDING"
+  echo "Protection is back on."
+}
+
+mkdir -p "$STATE_DIR"
+# A previous run was interrupted (power cut, crash): put that state back first.
+if [ -f "$PENDING" ]; then restore; RESTORED=0; fi
+
+# 1. Remember exactly how things are now
+NORD_WAS=0 KS_WAS=0 WARP_WAS=0 NORD_SERVER=""
+nord_connected && { NORD_WAS=1; NORD_SERVER=$(nord_server); }
+nord_killswitch_on && KS_WAS=1
+warp_connected && WARP_WAS=1
+DNS_WAS=$("$SEC_BIN/secure-linux-dns" status --short 2>/dev/null || echo encrypted)
+printf 'NORD_WAS=%s\nKS_WAS=%s\nWARP_WAS=%s\nNORD_SERVER=%q\nDNS_WAS=%q\n' \
+  "$NORD_WAS" "$KS_WAS" "$WARP_WAS" "$NORD_SERVER" "$DNS_WAS" > "$PENDING"
+
+trap restore EXIT
+trap 'exit 130' HUP INT TERM
+
+# 2. Pause
+echo
+echo "  Hotel / cafe Wi-Fi login"
+echo "  ------------------------"
+echo "  Your VPN and encrypted DNS stop these login pages from loading,"
+echo "  so they are paused now (for $MINUTES minutes at most)."
+echo
+[ "$KS_WAS" = 1 ] && nordvpn set killswitch off >/dev/null 2>&1
+[ "$NORD_WAS" = 1 ] && nordvpn disconnect >/dev/null 2>&1
+[ "$WARP_WAS" = 1 ] && warp-cli disconnect >/dev/null 2>&1
+"$SEC_BIN/secure-linux-dns" open "$MINUTES" >/dev/null 2>&1 || echo "  (Couldn't pause encrypted DNS; the page may still not load.)"
+
+# 3. Open the login page (a plain http:// page that the Wi-Fi network can redirect)
+xdg-open "$PORTAL_URL" >/dev/null 2>&1 &
+echo "  1. Connect to the Wi-Fi network, if you haven't already."
+echo "  2. A browser page has opened. Log in / accept the terms there."
+echo "     (If no login page appears, type any web address such as  neverssl.com )"
+echo "  3. When the internet works, come back here and press Enter."
+echo "     Closing this window also switches protection back on."
+echo
+read -r -t $((MINUTES * 60)) -p "  Press Enter when you're online... " _ || echo
+restore
+echo
+echo "  If the internet stops working now, this network blocks private DNS."
+echo "  Fix: turn on the VPN (secure-linux-vpn private), or run this helper again."
+sec_pause "  Press Enter to close this window. "
+exit 0

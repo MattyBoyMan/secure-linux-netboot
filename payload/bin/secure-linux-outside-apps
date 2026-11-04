@@ -1,0 +1,203 @@
+#!/bin/bash
+# secure-linux-outside-apps: keeps software that doesn't come from Fedora's own repositories up to date (A9):
+#   OpenSnitch (app firewall, RPMs from GitHub), the ArtCraft launcher (RPM from GitHub), immich-go (program).
+#   secure-linux-outside-apps --check    compare installed versions with the latest GitHub releases (weekly
+#                                        timer); raises the alert "outside-apps-update" when something is newer
+#   secure-linux-outside-apps --update   download, verify the checksums and install the updates
+#   secure-linux-outside-apps            show what's installed and what's available
+# Downloads are checked before installing: immich-go against its checksums.txt, ArtCraft against SHA256SUMS.txt,
+# OpenSnitch against the SHA-256 digest GitHub shows for each file (if GitHub has none, you are asked first).
+# On an Apple Silicon Mac (ARM) the ARM download is used when its makers publish one. If they don't, the app is
+# skipped with a friendly note (not an error) and listed in /var/lib/secure-linux/skipped-apps, one line per
+# app: "app|reason". A skip is never counted as a failure.
+set -u   # no pipefail: "cmd | grep -q" must not fail when grep stops reading early
+export LC_ALL=C
+SL_ROOT=${SL_ROOT:-/usr/local/lib/secure-linux}
+# shellcheck source=../lib/common.sh
+. "$SL_ROOT/lib/common.sh"
+have() { command -v "$1" >/dev/null 2>&1; }
+STATEF=$SL_STATE/outside-apps
+API=https://api.github.com/repos
+
+case "${1:-}" in -h|--help) sed -n '2,12p' "$0"; exit 0 ;; esac
+MODE=${1:---show}
+# (SL_IN_TERMINAL stops a terminal that can't give us a keyboard from re-launching itself for ever)
+if [ "$MODE" = --update ] && [ ! -t 0 ] && [ -z "${SL_IN_TERMINAL:-}" ]; then exec env SL_IN_TERMINAL=1 secure-linux-terminal --hold "$(readlink -f "$0")" --update; fi
+[ "$(id -u)" -eq 0 ] || exec pkexec "$(readlink -f "$0")" "$MODE"
+
+release_json() { curl -fsSL --max-time 30 -H 'Accept: application/vnd.github+json' "$API/$1/releases/latest"; }
+# json_assets JSON  ->  lines: name|url|digest   (python3 is part of every Fedora desktop)
+json_assets() {
+  python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+for a in d.get("assets", []):
+    print("%s|%s|%s" % (a.get("name",""), a.get("browser_download_url",""), a.get("digest") or ""))' 2>/dev/null | tr -d '\r'
+}
+json_tag() { python3 -c 'import json,sys; print(json.load(sys.stdin).get("tag_name",""))' 2>/dev/null | tr -d '\r'; }
+norm() { printf '%s' "$1" | sed -E 's/^[vV]//; s/[-+].*$//'; }
+newer() { [ "$1" != "$2" ] && [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -1)" = "$2" ]; }   # newer INSTALLED LATEST
+
+# ---------------------------------------------------------------- what is installed
+inst_opensnitch() { rpm -q --qf '%{VERSION}\n' opensnitch 2>/dev/null | head -1 | grep -v 'not installed'; }
+artcraft_pkg() { rpm -qa --qf '%{NAME}\n' 2>/dev/null | grep -m1 -iE '^(artcraft|craft-launcher|craft_launcher|artcraft-launcher)$'; }   # VERIFY package name
+inst_artcraft() { local p; p=$(artcraft_pkg) && [ -n "$p" ] && rpm -q --qf '%{VERSION}\n' "$p" | head -1; }
+IMMICH_BIN=${SL_TEST_SYSROOT:-}/usr/local/bin/immich-go   # (SL_TEST_SYSROOT is only ever set by the test suites)
+inst_immichgo() { [ -x "$IMMICH_BIN" ] && "$IMMICH_BIN" --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1; }
+
+APPS=(opensnitch artcraft immichgo)
+repo_of() { case "$1" in opensnitch) echo evilsocket/opensnitch ;; artcraft) echo storytold/craft-launcher ;; immichgo) echo simulot/immich-go ;; esac; }
+name_of() { case "$1" in opensnitch) echo "OpenSnitch" ;; artcraft) echo "ArtCraft" ;; immichgo) echo "immich-go" ;; esac; }
+
+check_all() {   # writes STATEF lines: app|installed|latest ; prints the names with updates
+  local a i l j tmp; tmp=$(mktemp)
+  for a in "${APPS[@]}"; do
+    sl_is_atomic && [ "$a" != immichgo ] && continue
+    i=$("inst_$a"); [ -n "$i" ] || continue
+    if [ "$a" = opensnitch ] && ! sl_is_x86_64; then   # other CPUs use Fedora's own package: ask Fedora, not GitHub
+      l=$(dnf -q repoquery --latest-limit=1 --qf '%{version}' opensnitch 2>/dev/null | head -1)
+    else
+      j=$(release_json "$(repo_of "$a")") || { echo "Couldn't reach GitHub for $(name_of "$a")." >&2; continue; }
+      l=$(norm "$(printf '%s' "$j" | json_tag)")
+    fi
+    [ -n "$l" ] || continue
+    printf '%s|%s|%s\n' "$a" "$(norm "$i")" "$l" >> "$tmp"
+  done
+  mv -f "$tmp" "$STATEF"; chmod 644 "$STATEF"
+}
+updates_list() { cat "$STATEF" 2>/dev/null | while IFS='|' read -r a i l; do newer "$i" "$l" && echo "$a|$i|$l"; done; }
+
+raise_or_clear() {
+  local list names=""
+  list=$(updates_list)
+  if [ -n "$list" ]; then
+    while IFS='|' read -r a i l; do names="$names$(name_of "$a") $i -> $l, "; done <<<"$list"
+    sl_alert outside-apps-update "Updates for apps from outside Fedora" \
+      "New versions: ${names%, }. Choose 'Update apps from outside Fedora' to install them (checked before installing)." \
+      "Open 'Secure Linux Status & Fixes' and choose 'Update apps from outside Fedora'."
+  else
+    sl_clear outside-apps-update
+  fi
+}
+
+# ---------------------------------------------------------------- updating
+WORK=""
+cleanup() { [ -n "$WORK" ] && rm -rf "$WORK"; }
+trap cleanup EXIT
+fetch() { curl -fsSL --max-time 600 -o "$2" "$1"; }
+
+# upstream's name for this computer's CPU in the download file names (empty = no download for this CPU)
+immich_arch() { case "$(sl_arch)" in x86_64) echo x86_64 ;; aarch64) echo arm64 ;; esac; }
+# skip_unavailable APP "what is missing"  -> a deliberate skip: friendly note, remembered, NOT a failure
+skip_unavailable() { echo "  $2 Skipped: nothing is wrong."; sl_skip_app "$1" "$2" >/dev/null; }
+
+update_immichgo() {
+  local j assets url sums f ia name
+  ia=$(immich_arch)
+  [ -n "$ia" ] || { skip_unavailable immich-go "There is no immich-go download for this type of computer ($(sl_arch))."; return 0; }
+  name="immich-go_Linux_$ia.tar.gz"
+  j=$(release_json simulot/immich-go) || return 1
+  assets=$(printf '%s' "$j" | json_assets)
+  url=$(printf '%s\n' "$assets" | awk -F'|' -v n="$name" '$1 == n {print $2; exit}')
+  sums=$(printf '%s\n' "$assets" | awk -F'|' '$1 == "checksums.txt" {print $2; exit}')
+  if [ -z "$url" ] && [ "$ia" = arm64 ] && printf '%s\n' "$assets" | grep -q '^immich-go_Linux_'; then
+    skip_unavailable immich-go "immich-go's makers don't offer a version for Apple Silicon (ARM) yet."; return 0
+  fi
+  [ -n "$url" ] && [ -n "$sums" ] || { echo "  The immich-go download or its checksums.txt is missing on GitHub."; return 1; }
+  f="$WORK/$name"
+  fetch "$url" "$f" && fetch "$sums" "$WORK/checksums.txt" || { echo "  Download failed."; return 1; }
+  (cd "$WORK" && grep -F "$name" checksums.txt | awk -v n="$name" '$2 == n || $2 == "*" n' | sha256sum -c -) || { echo "  CHECKSUM MISMATCH: not installed."; return 1; }
+  tar -xzf "$f" -C "$WORK" immich-go && install -m 0755 "$WORK/immich-go" "$IMMICH_BIN" \
+    && { have restorecon && restorecon "$IMMICH_BIN"; sl_unskip_app immich-go; echo "  immich-go updated."; }
+}
+
+update_artcraft() {
+  local j assets url sums f base re
+  case "$(sl_arch)" in
+    x86_64) re='linux-x86_64[.]rpm$' ;;
+    aarch64) re='linux-(aarch64|arm64)[.]rpm$' ;;
+    *) skip_unavailable ArtCraft "There is no ArtCraft download for this type of computer ($(sl_arch))."; return 0 ;;
+  esac
+  j=$(release_json storytold/craft-launcher) || return 1
+  assets=$(printf '%s' "$j" | json_assets)
+  url=$(printf '%s\n' "$assets" | awk -F'|' -v re="$re" '$1 ~ re {print $2; exit}')
+  sums=$(printf '%s\n' "$assets" | awk -F'|' '$1 == "SHA256SUMS.txt" {print $2; exit}')
+  if [ -z "$url" ] && [ "$(sl_arch)" = aarch64 ] && printf '%s\n' "$assets" | grep -q 'linux.*[.]rpm|'; then
+    skip_unavailable ArtCraft "ArtCraft's makers don't offer a version for Apple Silicon (ARM) yet."; return 0
+  fi
+  [ -n "$url" ] && [ -n "$sums" ] || { echo "  The ArtCraft download or its SHA256SUMS.txt is missing on GitHub."; return 1; }
+  base=${url##*/}; f="$WORK/$base"
+  fetch "$url" "$f" && fetch "$sums" "$WORK/SHA256SUMS.txt" || { echo "  Download failed."; return 1; }
+  (cd "$WORK" && grep -E "[ *]$(printf '%s' "$base" | sed 's/[.[\*^$]/\\&/g')\$" SHA256SUMS.txt | sed 's/ \*/  /' | sha256sum -c -) \
+    || { echo "  CHECKSUM MISMATCH: not installed."; return 1; }
+  dnf -y install "$f" && { sl_unskip_app ArtCraft; echo "  ArtCraft updated."; }
+}
+
+# Mirrors files/security/opensnitch/install.sh:  full = daemon + window (opensnitch-ui); lite = daemon only (the window
+# is never installed); atomic = not offered.  x86_64 = the project's GitHub release, each file checked against the
+# digest GitHub shows.  Other CPUs (Apple Silicon) = Fedora's own "opensnitch" package, or a clean skip.
+update_opensnitch() {
+  local j name url digest files=() ok=1 want have_daemon=0 want_ui=0 pk=() f
+  if sl_is_atomic; then skip_unavailable OpenSnitch "Network protection isn't offered on the atomic setup."; return 0; fi
+  [ "$(sl_profile)" = full ] && want_ui=1
+  if ! sl_is_x86_64; then
+    dnf -q list --available opensnitch >/dev/null 2>&1 || { skip_unavailable OpenSnitch "Fedora's package list has no opensnitch for $(sl_arch) computers right now."; return 0; }
+    pk=(opensnitch)
+    [ "$want_ui" = 1 ] && dnf -q list --available opensnitch-ui >/dev/null 2>&1 && pk+=(opensnitch-ui)
+    dnf -y install "${pk[@]}" || return 1
+    systemctl try-restart opensnitch >/dev/null 2>&1
+    echo "  OpenSnitch updated (Fedora's own package)."
+    return 0
+  fi
+  j=$(release_json evilsocket/opensnitch) || return 1
+  while IFS='|' read -r name url digest; do
+    case "$name" in
+      opensnitch-ui-[0-9]*.noarch.rpm) [ "$want_ui" = 1 ] || continue ;;
+      opensnitch-[0-9]*.x86_64.rpm) have_daemon=1 ;;
+      *) continue ;;
+    esac
+    fetch "$url" "$WORK/$name" || { echo "  Download failed: $name"; return 1; }
+    if [ -n "$digest" ]; then
+      want=${digest#sha256:}
+      if [ "$(sha256sum "$WORK/$name" | cut -d' ' -f1)" != "$want" ]; then echo "  CHECKSUM MISMATCH: $name (not installed)"; return 1; fi
+      echo "  verified: $name"
+    else
+      ok=0; echo "  WARNING: GitHub lists no checksum for $name, so it can't be verified."
+    fi
+    files+=("$WORK/$name")
+  done < <(printf '%s' "$j" | json_assets)
+  [ "$have_daemon" = 1 ] && [ ${#files[@]} -ge $((1 + want_ui)) ] || { echo "  No OpenSnitch packages found in the latest release."; return 1; }
+  if [ "$ok" = 0 ]; then
+    local a; read -rp "  Install OpenSnitch anyway? (It still comes from the official project page.) [y/N] " a
+    [ "$a" = y ] || [ "$a" = Y ] || { echo "  Skipped."; return 1; }
+  fi
+  dnf -y install "${files[@]}" || return 1
+  systemctl try-restart opensnitch >/dev/null 2>&1
+  echo "  OpenSnitch updated."
+}
+
+case "$MODE" in
+  --check)
+    check_all; raise_or_clear ;;
+  --update)
+    check_all
+    list=$(updates_list)
+    if [ -z "$list" ]; then echo "  Everything is up to date."; sl_clear outside-apps-update; exit 0; fi
+    WORK=$(mktemp -d)
+    mapfile -t ups <<<"$list"
+    for u in "${ups[@]}"; do      # (not a `while read` loop: the updates may ask a question on the keyboard)
+      IFS='|' read -r a i l <<<"$u"
+      echo; echo "$(name_of "$a"): $i -> $l"
+      "update_$a" || echo "  $(name_of "$a") was not updated."
+    done
+    check_all; raise_or_clear ;;
+  --show)
+    check_all
+    [ -s "$STATEF" ] || { echo "None of these apps are installed: OpenSnitch, ArtCraft, immich-go."; exit 0; }
+    while IFS='|' read -r a i l; do
+      if newer "$i" "$l"; then echo "$(name_of "$a"): $i installed, $l available"; else echo "$(name_of "$a"): $i (up to date)"; fi
+    done < "$STATEF"
+    raise_or_clear ;;
+  *) echo "Unknown option: $MODE (see --help)" >&2; exit 2 ;;
+esac
+exit 0

@@ -1,0 +1,194 @@
+#!/bin/bash
+# secure-linux-family: a safe computer for children and visitors.
+#   secure-linux-family                     ask what you need (children / visitors) and set it up
+#   secure-linux-family --wizard children|guest   the same, starting at that topic (used by the welcome wizard)
+#   secure-linux-family filter on|off|status      family filter for websites (secure-linux-dns family ...)
+#   secure-linux-family add-child           make a standard (non-admin) account for a child
+#   secure-linux-family apps                choose which apps each child may use (Parental Controls)
+#   secure-linux-family guest-setup [--quiet]     (root) create the Guest account, wiped at every logout
+#   secure-linux-family guest-remove        (root) remove the Guest account again
+#   secure-linux-family status              what is set up
+# Children's accounts can't install system software or change settings (no administrator rights).
+# App limits are enforced by Flatpak for Flatpak apps (most apps here). They don't limit screen time on
+# KDE/Xfce, and they can't stop someone who knows your password: keep it to yourself.
+set -uo pipefail
+SL_ROOT=${SL_ROOT:-/usr/local/lib/secure-linux}
+. "$SL_ROOT/lib/common.sh"
+. "$SL_ROOT/files/comfort/comfort-lib.sh"
+SELF=$(readlink -f "$0")
+usage() { sed -n '2,14p' "$SELF" | sed 's/^# \{0,1\}//'; }
+G=guest
+need_root() { [ "$(id -u)" -eq 0 ] || exec pkexec "$SELF" "$@"; }
+SYSD=$CF_R/etc/systemd/system
+guest_state() { loginctl show-user "$G" -p State --value 2>/dev/null; }
+
+# ---------------------------------------------------------------- guest (root)
+guest_setup() {
+  need_root guest-setup "$@"
+  local quiet="" uid created=""
+  [ "${1:-}" = --quiet ] && quiet=1
+  if ! getent passwd "$G" >/dev/null 2>&1; then
+    useradd -m -c "Guest" -s /bin/bash "$G" || { echo "Could not create the Guest account." >&2; return 1; }
+    echo "$G:$G" | chpasswd     # well-known password "guest" (told in the wizard and the guide)
+    created=1
+  fi
+  uid=$(id -u "$G")
+  # No admin rights, no VPN control
+  gpasswd -d "$G" wheel >/dev/null 2>&1
+  gpasswd -d "$G" nordvpn >/dev/null 2>&1
+  # The password is public ("guest"), so the guest must never be able to log in over the network:
+  # no SSH, and not through Cockpit (home-server/lite machines).
+  sl_write_file "$CF_R/etc/ssh/sshd_config.d/45-secure-linux-guest.conf" <<'EOT'
+# Secure Linux (comfort): the Guest account has a well-known password, so it can only be used at the keyboard
+DenyUsers guest
+EOT
+  if [ -f "$CF_R/etc/cockpit/disallowed-users" ] && ! grep -qx guest "$CF_R/etc/cockpit/disallowed-users"; then
+    echo guest >> "$CF_R/etc/cockpit/disallowed-users"
+  fi
+  sl_install_file "$CF_FILES/secure-linux-guest-reset.service" "$SYSD/secure-linux-guest-reset.service"
+  # Wipe again when the guest logs out (their user manager stops). "+" = that line runs as root.
+  sl_install_file "$CF_FILES/guest-logout.conf" "$SYSD/user@$uid.service.d/50-secure-linux-guest-reset.conf"
+  if [ -z "$CF_R" ]; then
+    systemctl daemon-reload
+    systemctl enable secure-linux-guest-reset.service >/dev/null 2>&1
+    case $(guest_state) in
+      active|online) ;;
+      *) bash "$CF_FILES/guest-reset.sh" boot ;;
+    esac
+  fi
+  sl_choice_set guest_account yes
+  if [ -z "$quiet" ]; then
+    if [ -n "$created" ]; then echo "Guest account ready (password: guest)."; else echo "Guest account ready."; fi
+  fi
+  return 0
+}
+guest_remove() {
+  need_root guest-remove "$@"
+  local uid
+  uid=$(id -u "$G" 2>/dev/null) || { echo "There is no Guest account."; return 0; }
+  case $(guest_state) in
+    active|online) echo "The guest is still logged in. Try again after they log out." >&2; return 1 ;;
+  esac
+  systemctl disable secure-linux-guest-reset.service >/dev/null 2>&1
+  rm -f "$SYSD/secure-linux-guest-reset.service" "$SYSD/user@$uid.service.d/50-secure-linux-guest-reset.conf"
+  rmdir "$SYSD/user@$uid.service.d" 2>/dev/null
+  rm -f "$CF_R/etc/ssh/sshd_config.d/45-secure-linux-guest.conf"
+  [ -f "$CF_R/etc/cockpit/disallowed-users" ] && sed -i '/^guest$/d' "$CF_R/etc/cockpit/disallowed-users"
+  mountpoint -q "/home/$G" && umount "/home/$G"
+  userdel -r "$G" 2>/dev/null || userdel "$G"
+  systemctl daemon-reload
+  sl_choice_set guest_account no
+  echo "The Guest account is removed."
+}
+
+# ---------------------------------------------------------------- user side
+filter() {
+  cf_have secure-linux-dns || { echo "The family filter needs secure-linux-dns (not installed)." >&2; return 1; }
+  secure-linux-dns family "${1:-status}"
+}
+filter_is_on() { [ "$(filter status 2>/dev/null)" = "Family filter: on" ]; }
+children_accounts() {   # add child accounts (experience's helper makes a standard account)
+  while :; do
+    if cf_have secure-linux-welcome; then secure-linux-welcome --add-family-member
+    else wz_info "Make the account in System Settings > Users > Add New User. Leave Administrator unticked."; fi
+    wz_yesno "Add another child's account?" || break
+  done
+}
+apps_limits() {
+  cf_have malcontent-control || wz_root "$SL_ROOT/bin/secure-linux-migrate" install family_mode=yes
+  if ! cf_have malcontent-control; then
+    wz_info "Parental Controls could not be installed right now (are you online?). Try again later from the app menu: Family Safety."
+    return 0
+  fi
+  wz_info "Parental Controls opens now.
+  1. Click Unlock and type your password.
+  2. Pick the child's account at the top.
+  3. Untick the apps they shouldn't use (for example the Terminal, Steam, or a browser).
+  4. Under software installation, choose an age rating: they can only install apps suitable for that age.
+
+What it can't do: limit screen time on this desktop, or limit apps that aren't Flatpaks. The family filter covers websites for everyone."
+  malcontent-control >/dev/null 2>&1 &
+}
+guest_flow() {
+  if getent passwd "$G" >/dev/null 2>&1; then
+    wz_yesno "The Guest account already exists (password: guest). Keep it?" || pkexec "$SELF" guest-remove
+    return 0
+  fi
+  wz_yesno "Add a Guest account for visitors?
+
+  - On the login screen, visitors choose Guest and type the password: guest
+  - They can browse and use apps, but can't see your files, install system software or change settings.
+  - Everything they do is wiped when they log out (their home folder lives in memory only).
+Visitors don't use your browser or your accounts, so they can't see your passwords." || return 0
+  if pkexec "$SELF" guest-setup; then
+    wz_info "Done! On the login screen there's now a Guest account. Its password is: guest
+
+Tell visitors: anything they save is deleted when they log out, so use a USB stick for things to keep."
+  else
+    wz_info "The Guest account could not be set up. Nothing was changed."
+  fi
+}
+children_flow() {
+  cf_save_choice family_mode yes
+  if ! filter_is_on; then
+    if wz_yesno "Switch on the family filter?
+
+It blocks adult and dangerous websites for everyone on this computer (you too), even when the VPN is on. It uses Cloudflare for Families, privately and encrypted. You can switch it off later in Family Safety."; then
+      if filter on >/dev/null 2>&1; then wz_info "The family filter is on."
+      else wz_info "The family filter could not be switched on right now. Try again later from Family Safety."; fi
+    fi
+  fi
+  if wz_yesno "Make an account for each child?
+
+Each child gets their own login, files and browser. Their accounts are standard: they can't install system software or change system settings."; then
+    children_accounts
+  fi
+  if wz_yesno "Choose which apps the children may use (Parental Controls)?"; then apps_limits; fi
+  if wz_yesno "Also add a Guest account for visitors (wiped at every logout)?"; then guest_flow; fi
+  return 0
+}
+main_menu() {
+  local a
+  a=$(wz_choice "Family Safety: what would you like to do?" \
+    "Set up for children" "Guest account for visitors" "Family filter on/off" "Choose apps for a child" "Close")
+  case $a in
+    "Set up for children") children_flow ;;
+    "Guest account for visitors") guest_flow ;;
+    "Family filter on/off")
+      if filter_is_on; then
+        if wz_yesno "The family filter is ON. Switch it off?"; then filter off >/dev/null 2>&1; fi
+      else
+        if wz_yesno "The family filter is OFF. Switch it on (blocks adult and dangerous websites for everyone)?"; then filter on >/dev/null 2>&1; fi
+      fi ;;
+    "Choose apps for a child") apps_limits ;;
+  esac
+  return 0
+}
+list_standard_users() {
+  local u
+  for u in $(getent passwd | awk -F: '$3>=1000 && $3<60000 {print $1}'); do
+    id -nG "$u" 2>/dev/null | grep -qw wheel || printf '%s ' "$u"
+  done
+}
+status() {
+  if filter_is_on; then echo "Family filter: on"; else echo "Family filter: off"; fi
+  if getent passwd "$G" >/dev/null 2>&1; then echo "Guest account: yes"; else echo "Guest account: no"; fi
+  if cf_have malcontent-control; then echo "Parental Controls app: installed"; else echo "Parental Controls app: not installed"; fi
+  echo "Standard (non-admin) accounts: $(list_standard_users)"
+}
+
+ui_load() { UI_TITLE="Family Safety"; . "$CF_FILES/wz-fallback.sh"; }
+case "${1:-}" in
+  -h|--help|help) usage ;;
+  "") ui_load; main_menu ;;
+  --wizard)
+    ui_load
+    case "${2:-}" in children) children_flow ;; guest) guest_flow ;; *) main_menu ;; esac ;;
+  filter) filter "${2:-status}" ;;
+  add-child) ui_load; children_accounts ;;
+  apps) ui_load; apps_limits ;;
+  guest-setup) shift; guest_setup "$@" ;;
+  guest-remove) shift; guest_remove "$@" ;;
+  status) status ;;
+  *) usage; exit 2 ;;
+esac

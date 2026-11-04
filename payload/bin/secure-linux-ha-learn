@@ -1,0 +1,102 @@
+#!/bin/bash
+# secure-linux-ha-learn: short, plain-English Home Assistant lessons, and a "read this file to me" helper.
+#
+#   secure-linux-ha-learn                       menu: pick a lesson (it waits for you)
+#   secure-linux-ha-learn lesson N              show lesson number N
+#   secure-linux-ha-learn tour                  all the lessons in order, one at a time
+#   secure-linux-ha-learn explain FILE [--speak]
+#                                               read a YAML file out loud in everyday words (any file in your config, or
+#                                               one of ours: sl_battery_alerts, motion_light, secure-defaults ...).
+#                                               --speak also says it aloud, if a speech program is installed.
+#   secure-linux-ha-learn files                 the ready-made files you can ask me to explain
+#   secure-linux-ha-learn glossary [WORD]       what a word means
+#   secure-linux-ha-learn help
+set -u   # no pipefail: "cmd | grep -q" must not fail when grep stops reading early
+SL_ROOT=${SL_ROOT:-/usr/local/lib/secure-linux}
+. "$SL_ROOT/lib/common.sh"
+. "$SL_ROOT/files/homeassistant/ha-lib.sh"
+
+usage() { sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; }
+say() { ha_say "$@"; }
+ask() { local a; printf '%s ' "$1" >&2; IFS= read -r a || a=""; printf '%s' "$a"; }
+L=$HA_FILES/lessons
+S=$HA_FILES/starter
+
+lessons() { ls "$L"/*.txt 2>/dev/null | sort; }
+show_lesson() {   # show_lesson N
+  local f; f=$(lessons | sed -n "${1}p")
+  [ -n "$f" ] || { say "There's no lesson $1."; return 1; }
+  say ""; say "-------------------------------------------------------------------------"
+  cat "$f"; say "-------------------------------------------------------------------------"
+}
+cmd_menu() {
+  local n c i
+  while :; do
+    say ""; say "Home Assistant: learn the basics"; say "================================="
+    i=0; while IFS= read -r f; do i=$((i+1)); say "  $i) $(head -1 "$f")"; done < <(lessons)
+    say "  e) Hear a ready-made automation explained"
+    say "  g) What does a word mean? (glossary)"
+    say "  q) Quit"
+    c=$(ask "Pick a number, or e, g or q:")
+    case $c in
+      q|Q|"") say "See you next time."; return 0 ;;
+      e|E) cmd_files; n=$(ask "Which one? (name, for example sl_battery_alerts)"); [ -n "$n" ] && cmd_explain "$n" ;;
+      g|G) n=$(ask "Which word?"); [ -n "$n" ] && cmd_glossary "$n" ;;
+      *[!0-9]*) say "Please type a number from the list." ;;
+      *) show_lesson "$c" && ask "(Press Enter for the menu)" >/dev/null ;;
+    esac
+  done
+}
+cmd_tour() {
+  local i=0 f
+  while IFS= read -r f; do
+    i=$((i+1)); show_lesson "$i"
+    a=$(ask "(Enter = next lesson, q = stop)"); [ "$a" = q ] && return 0
+  done < <(lessons)
+  say "That's all the lessons. Try: secure-linux-ha-secure --guided"
+}
+find_file() {   # find_file NAME  -> path
+  local n=$1 p
+  [ -f "$n" ] && { echo "$n"; return 0; }
+  for p in "$S/packages/$n" "$S/packages/$n.yaml" "$S/blueprints/automation/secure_linux/$n" "$S/blueprints/automation/secure_linux/$n.yaml" \
+           "$S/dashboards/$n" "$S/dashboards/$n.yaml" "$S/secure-defaults/$n" "$S/secure-defaults/$n.yaml" "$(ha_config_dir)/$n" "$(ha_config_dir)/packages/$n"; do
+    [ -f "$p" ] && { echo "$p"; return 0; }
+  done
+  [ "$n" = secure-defaults ] && { echo "$S/secure-defaults/configuration.yaml"; return 0; }
+  return 1
+}
+cmd_explain() {
+  local f speak=no name="" t
+  for a in "$@"; do case $a in --speak) speak=yes ;; *) name=$a ;; esac; done
+  [ -n "$name" ] || { say "Which file? Try: secure-linux-ha-learn files"; return 2; }
+  f=$(find_file "$name") || { say "I can't find '$name'. See the list: secure-linux-ha-learn files"; return 1; }
+  say "Reading: $f"; say ""
+  t=$(python3 "$HA_FILES/ha_explain.py" "$f") || { say "I couldn't read that file as YAML."; return 1; }
+  say "$t"
+  if [ $speak = yes ]; then
+    if ha_have spd-say; then printf '%s' "$t" | tr -s '\n ' ' ' | spd-say -e -w 2>/dev/null
+    elif ha_have espeak-ng; then printf '%s' "$t" | espeak-ng -s 150 2>/dev/null
+    else say ""; say "(No speech program is installed. sudo dnf install speech-dispatcher espeak-ng and try again.)"; fi
+  fi
+}
+cmd_files() {
+  say "Ready-made files you can ask me to explain (type the name only):"
+  python3 "$HA_ENGINE" starter-list --starter "$S" | sed 's/^/  /'
+  say "  secure-defaults        a safe configuration.yaml, line by line"
+}
+cmd_glossary() {
+  local w=${1:-}
+  if [ -z "$w" ]; then awk -F'\t' '{print $1}' "$HA_FILES/glossary.tsv" | paste -sd, - | fold -s -w 100; return 0; fi
+  awk -F'\t' -v w="$w" 'tolower($1) ~ tolower(w) {printf "%s\n   %s\n\n", $1, $2; f=1} END {if (!f) print "No word like \"" w "\" in the glossary yet."}' "$HA_FILES/glossary.tsv"
+}
+
+case "${1:-menu}" in
+  menu|"") cmd_menu ;;
+  lesson) shift; show_lesson "${1:-1}" ;;
+  tour) cmd_tour ;;
+  explain) shift; cmd_explain "$@" ;;
+  files) cmd_files ;;
+  glossary) shift; cmd_glossary "${1:-}" ;;
+  help|-h|--help) usage ;;
+  *) usage; exit 2 ;;
+esac

@@ -1,0 +1,293 @@
+#!/bin/bash
+# secure-linux-firmware: bring all firmware up to date - safely, step by step, never automatically.
+#   secure-linux-firmware status             what can be updated (LVFS/fwupd, WD SSD, ASUS BIOS)
+#   secure-linux-firmware update [--dry-run] guided update with confirmations (--dry-run: only show what it would do)
+#   secure-linux-firmware check              (root, no questions) one-time notice after setup if updates exist
+# Sources, in this order:
+#   1. fwupd / LVFS            fwupdmgr refresh + get-updates + update (fwupdmgr asks before flashing)
+#   2. Western Digital SSDs    WD Dashboard catalogue (what WD's Windows app uses), when LVFS has nothing;
+#                              flashed with nvme-cli (fw-download + fw-commit "activate at next restart")
+#   3. ASUS BIOS               newest BIOS from ASUS support, verified, put on the EFI partition for EZ Flash;
+#                              you flash it yourself in the BIOS setup (instructions are shown)
+# Runs on the installed system AND standalone from any Linux live system (needs bash, curl, python3, nvme-cli):
+#   sudo bash secure-linux-firmware update
+set -u   # no pipefail: "cmd | grep -q" must not fail when grep stops reading early
+export LC_ALL=C
+SL_ROOT=${SL_ROOT:-/usr/local/lib/secure-linux}
+if [ -f "$SL_ROOT/lib/common.sh" ]; then
+  # shellcheck source=../lib/common.sh
+  . "$SL_ROOT/lib/common.sh"
+else   # standalone (live USB): no alerts, state in /tmp
+  SL_STATE=/tmp/secure-linux; SL_LOGDIR=/tmp/secure-linux
+  sl_alert() { :; }; sl_clear() { :; }; sl_event() { :; }; sl_user() { echo "${SUDO_USER:-}"; }
+fi
+have() { command -v "$1" >/dev/null 2>&1; }
+DRY=""; MODE=${1:-status}; shift || true
+for a in "$@"; do [ "$a" = --dry-run ] && DRY=1; done
+PY=$(command -v python3 || command -v python || true)
+WD_BASE=https://wddashboarddownloads.wdc.com/wdDashboard
+WD_LIST=$WD_BASE/config/devices/lista_devices.xml            # VERIFY: URL and format (community scripts use it)
+ASUS_API="https://www.asus.com/support/api/product.asmx/GetPDBIOS?website=global&pdhashedid=&cpu=&model="   # VERIFY
+WORK=$(mktemp -d); trap 'rm -rf "$WORK"' EXIT
+
+say()  { printf '%s\n' "$*"; }
+warn() { printf '\n  !!! %s\n' "$*"; }
+run()  { if [ -n "$DRY" ]; then say "  [dry-run] would run: $*"; else "$@"; fi; }
+confirm() {   # confirm "question"  (type yes)
+  local a; [ -t 0 ] || return 1
+  read -rp "  $1 Type yes to continue: " a; [ "$a" = yes ]
+}
+
+# ---------------------------------------------------------------- power
+on_ac() { local p; for p in /sys/class/power_supply/*; do case "$(cat "$p/type" 2>/dev/null)" in Mains|USB) [ "$(cat "$p/online" 2>/dev/null)" = 1 ] && return 0 ;; esac; done
+          ls /sys/class/power_supply/BAT* >/dev/null 2>&1 && return 1; return 0; }
+battery() { cat /sys/class/power_supply/BAT*/capacity 2>/dev/null | head -1; }
+power_ok() {
+  local b; b=$(battery)
+  on_ac || { warn "Plug in the charger first. A firmware update must never lose power."; return 1; }
+  [ -z "$b" ] || [ "$b" -gt 50 ] || { warn "Let the battery charge above 50% first (now $b%)."; return 1; }
+}
+
+# ---------------------------------------------------------------- 1. fwupd / LVFS
+lvfs_status() {   # prints "N" devices with updates (0 if none / no fwupd)
+  have fwupdmgr || { echo 0; return; }
+  local out; out=$(timeout 120 fwupdmgr get-updates --json --no-unreported-check </dev/null 2>/dev/null)
+  printf '%s\n' "$out" | grep -c '"Releases"'
+}
+lvfs_update() {
+  have fwupdmgr || { say "  fwupd isn't installed; skipping LVFS."; return 0; }
+  say "== Firmware from LVFS (the Linux Vendor Firmware Service)"
+  run fwupdmgr refresh --force
+  fwupdmgr get-updates --no-unreported-check </dev/null || { say "  Nothing from LVFS."; return 0; }
+  [ -n "$DRY" ] && { say "  [dry-run] would run: fwupdmgr update (it asks before each device)"; return 0; }
+  fwupdmgr update --no-unreported-check    # interactive: asks before flashing and before restarting
+}
+
+# ---------------------------------------------------------------- 2. Western Digital SSD
+nvme_field() { nvme id-ctrl "$1" 2>/dev/null | sed -n "s/^$2 *: *//p" | head -1 | sed 's/ *$//'; }
+wd_drives() {   # lines: /dev/nvmeN|model|firmware
+  local c dev mn fr
+  for c in /sys/class/nvme/nvme*; do
+    [ -e "$c" ] || continue
+    dev=/dev/${c##*/}
+    if have nvme; then mn=$(nvme_field "$dev" mn); fr=$(nvme_field "$dev" fr); fi
+    [ -n "${mn:-}" ] || mn=$(sed 's/ *$//' "$c/model" 2>/dev/null)
+    [ -n "${fr:-}" ] || fr=$(sed 's/ *$//' "$c/firmware_rev" 2>/dev/null)
+    case "$mn" in WD*|WDC*|"WD_BLACK"*|SanDisk*) echo "$dev|$mn|$fr" ;; esac
+    mn=""; fr=""
+  done
+}
+# wd_next MODEL FW -> "version|firmware_url|checksum_or_empty|properties_url" for the next compatible step
+wd_next() {
+  [ -n "$PY" ] || return 1
+  curl -fsSL --max-time 30 -o "$WORK/lista.xml" "$WD_LIST" || return 1
+  grep -qi '<!ENTITY' "$WORK/lista.xml" && return 1      # refuse XML entity tricks (stdlib parser)
+  local props
+  props=$("$PY" - "$WORK/lista.xml" "$1" "$2" "$WD_BASE" <<'PYEOF'
+# Find the device_properties.xml for (model, current firmware). Tolerant of the exact layout (VERIFY):
+# an element whose attributes/children mention both the model and the current firmware, with a child URL.
+import sys, xml.etree.ElementTree as ET
+path, model, fw, base = sys.argv[1:5]
+norm = lambda s: " ".join((s or "").replace("_", " ").split()).lower()
+m, f = norm(model), norm(fw)
+root = ET.parse(path).getroot()
+for el in root.iter():
+    vals = [norm(v) for v in el.attrib.values()] + [norm(c.text) for c in el] + [norm(el.text)]
+    blob = " | ".join(vals)
+    if m and f and m in blob and f in blob:
+        for c in list(el) + [el]:
+            t = (c.text or "").strip()
+            if t.endswith(".xml"):
+                print(t if t.startswith("http") else base.rstrip("/") + "/" + t.lstrip("/"))
+                sys.exit(0)
+sys.exit(1)
+PYEOF
+) || return 1
+  curl -fsSL --max-time 30 -o "$WORK/props.xml" "$props" || return 1
+  grep -qi '<!ENTITY' "$WORK/props.xml" && return 1
+  "$PY" - "$WORK/props.xml" "$2" "$props" <<'PYEOF'
+# device_properties.xml: <fwfile> (file name next to this xml), <dependency> (versions it may be installed on),
+# optional <fwversion>/<version> and a checksum element (sha256/md5/checksum). VERIFY element names.
+import sys, xml.etree.ElementTree as ET
+path, cur, url = sys.argv[1:4]
+root = ET.parse(path).getroot()
+tag = lambda e: e.tag.split("}")[-1].lower()
+fwfile = ver = csum = ""
+deps = []
+for e in root.iter():
+    t, x = tag(e), (e.text or "").strip()
+    if t == "fwfile": fwfile = x
+    elif t in ("fwversion", "version", "firmware_version") and not ver: ver = x
+    elif t == "dependency" and x: deps.append(x)
+    elif t in ("sha256", "checksum", "md5") and x: csum = t + ":" + x
+if not fwfile: sys.exit(1)
+if deps and cur not in deps: sys.exit(2)
+if not ver: ver = url.rstrip("/").split("/")[-2]
+print("%s|%s|%s|%s" % (ver, url.rsplit("/", 1)[0] + "/" + fwfile, csum, url))
+PYEOF
+}
+wd_update_one() {   # wd_update_one DEV MODEL FW
+  local dev=$1 model=$2 fw=$3 info ver url csum frmw slots ro slot file sum
+  info=$(wd_next "$model" "$fw") || { say "  $model ($fw): no newer firmware in WD's catalogue (or it can't be read)."; return 0; }
+  IFS='|' read -r ver url csum _ <<<"$info"
+  [ "$ver" != "$fw" ] || { say "  $model: firmware $fw is current."; return 0; }
+  say "  $model: firmware $fw -> $ver"
+  say "  Source: $url"
+  have nvme || { say "  nvme-cli is needed (sudo dnf install nvme-cli)."; return 1; }
+  frmw=$(nvme_field "$dev" frmw); frmw=$((frmw))                        # e.g. 0x14
+  ro=$(( frmw & 1 )); slots=$(( (frmw >> 1) & 7 ))
+  if [ "$slots" -ge 2 ]; then slot=2; else slot=1; fi
+  [ "$ro" = 1 ] && [ "$slot" = 1 ] && { say "  The drive reports only a read-only slot; can't update it here."; return 1; }
+  warn "Updating SSD firmware. Your files normally stay, but a power cut during the update can make the drive"
+  say  "      unusable. Make a FULL BACKUP first. Some WD drives need several updates in a row: after the restart,"
+  say  "      run this again until it says the firmware is current."
+  power_ok || return 1
+  if [ -z "$DRY" ]; then confirm "Flash $model to $ver now?" || { say "  Skipped."; return 0; }; fi
+  file="$WORK/${url##*/}"
+  if [ -n "$DRY" ]; then
+    say "  [dry-run] would download $url"
+  else
+    curl -fsSL --max-time 600 -o "$file" "$url" || { say "  Download failed."; return 1; }
+    if [ -n "$csum" ]; then
+      case "$csum" in sha256:*) sum=$(sha256sum "$file" | cut -d' ' -f1) ;; md5:*) sum=$(md5sum "$file" | cut -d' ' -f1) ;; *) sum="" ;; esac
+      if [ -n "$sum" ] && [ "${csum#*:}" != "$sum" ]; then warn "Checksum mismatch: not flashing."; return 1; fi
+      [ -n "$sum" ] && say "  Checksum verified (${csum%%:*})."
+    else
+      say "  (WD publishes no checksum for this file; it was downloaded over HTTPS from WD's own server.)"
+    fi
+  fi
+  # action 1 = replace the image in the slot and activate it at the next reset (restart)   VERIFY per drive
+  run nvme fw-download "$dev" --fw="$file" || { say "  fw-download failed; nothing was activated."; return 1; }
+  run nvme fw-commit "$dev" --slot="$slot" --action=1 || { say "  fw-commit failed; the old firmware stays active."; return 1; }
+  say "  Done. RESTART the computer to start the new SSD firmware (then run this again to check for a next step)."
+  NEED_RESTART=1
+}
+wd_status() { local d m f info; while IFS='|' read -r d m f; do info=$(wd_next "$m" "$f" 2>/dev/null) && echo "$m|$f|${info%%|*}"; done < <(wd_drives); }
+
+# ---------------------------------------------------------------- 3. ASUS BIOS
+asus_model() {
+  local b; b=$(cat /sys/class/dmi/id/board_name 2>/dev/null)
+  printf '%s' "$b" | grep -qE '^[A-Z]{1,3}[0-9]{3,4}[A-Z]{0,3}$' && { echo "$b"; return; }
+  cat /sys/class/dmi/id/product_name 2>/dev/null | grep -oE '[A-Z]{1,3}[0-9]{3,4}[A-Z]{1,3}' | head -1
+}
+is_asus() { grep -qi asus /sys/class/dmi/id/sys_vendor 2>/dev/null; }
+bios_now() { cat /sys/class/dmi/id/bios_version 2>/dev/null | grep -oE '[0-9]+$'; }
+asus_latest() {   # -> "number|url|sha256_or_empty|title"
+  local model=$1
+  [ -n "$PY" ] || return 1
+  curl -fsSL --max-time 30 -A "Mozilla/5.0" -o "$WORK/asus.json" "$ASUS_API$model" || return 1
+  "$PY" - "$WORK/asus.json" <<'PYEOF'
+# ASUS support JSON (VERIFY): {"Result":{"Obj":[{"Name":"BIOS","Files":[{"Version":"311","Title":...,
+#   "DownloadUrl":{"Global":"https://...zip"},"SHA256"?:...}]}, {"Name":"BIOS Update (Windows)",...}]}}
+import json, re, sys
+d = json.load(open(sys.argv[1], encoding="utf-8"))
+objs = ((d.get("Result") or {}).get("Obj")) or []
+best = None
+for o in objs:
+    name = (o.get("Name") or "").lower()
+    if "bios" not in name or "windows" in name or "utilit" in name:
+        continue
+    for f in o.get("Files") or []:
+        m = re.search(r"(\d+)\s*$", str(f.get("Version", "")))
+        url = (f.get("DownloadUrl") or {}).get("Global") or ""
+        if not m or not url:
+            continue
+        sha = next((str(v) for k, v in f.items() if k.lower() in ("sha256", "sha-256", "sha256sum", "filehash") and v), "")
+        cand = (int(m.group(1)), url, sha, f.get("Title") or "")
+        if best is None or cand[0] > best[0]:
+            best = cand
+if not best: sys.exit(1)
+print("%d|%s|%s|%s" % best)
+PYEOF
+}
+esp() { findmnt -no TARGET /boot/efi 2>/dev/null || findmnt -no TARGET /efi 2>/dev/null; }
+asus_update() {
+  is_asus || { say "  Not an ASUS computer; skipping the BIOS check."; return 0; }
+  local model cur info num url sha title dest e
+  model=$(asus_model); cur=$(bios_now)
+  [ -n "$model" ] && [ -n "$cur" ] || { say "  Couldn't read the ASUS model or BIOS version."; return 0; }
+  info=$(asus_latest "$model") || { say "  Couldn't ask ASUS for BIOS updates for $model."; return 0; }
+  IFS='|' read -r num url sha title <<<"$info"
+  [ "$num" -gt "$cur" ] || { say "  ASUS BIOS $cur is the newest for $model."; return 0; }
+  say "== ASUS BIOS: version $cur installed, $num available ($title)"
+  say "  Source: $url"
+  e=$(esp); [ -n "$e" ] || { say "  Couldn't find the EFI partition."; return 1; }
+  dest="$e/ASUS-BIOS"
+  if [ -n "$DRY" ]; then say "  [dry-run] would download it, check it, and unpack it to $dest"; return 0; fi
+  curl -fsSL --max-time 900 -A "Mozilla/5.0" -o "$WORK/bios.zip" "$url" || { say "  Download failed."; return 1; }
+  if [ -n "$sha" ]; then
+    [ "$(sha256sum "$WORK/bios.zip" | cut -d' ' -f1 | tr A-F a-f)" = "$(printf '%s' "$sha" | tr A-F a-f)" ] \
+      || { warn "Checksum mismatch: the BIOS file was NOT kept."; return 1; }
+    say "  Checksum verified."
+  else
+    say "  (ASUS lists no checksum for this file; it came over HTTPS from ASUS's own server.)"
+  fi
+  mkdir -p "$dest"; rm -f "$dest"/*
+  "$PY" -c 'import sys, zipfile; zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])' "$WORK/bios.zip" "$dest" \
+    || { say "  Couldn't unpack the BIOS file."; return 1; }
+  local u h; u=$(sl_user 2>/dev/null); h=$(getent passwd "$u" 2>/dev/null | cut -d: -f6)
+  [ -n "$h" ] && [ -d "$h/Downloads" ] && cp "$WORK/bios.zip" "$h/Downloads/ASUS-BIOS-$model-$num.zip" && chown "$u:" "$h/Downloads/ASUS-BIOS-$model-$num.zip"
+  cat <<EOF
+
+  The new BIOS ($num) is ready on the EFI partition, folder ASUS-BIOS:
+$(ls -1 "$dest" | sed 's/^/     /')
+  Nothing has been flashed. To install it yourself (about 5 minutes; keep the charger plugged in):
+    1. Restart. As soon as the screen goes dark, press F2 repeatedly to open the BIOS setup.
+    2. Press F7 for "Advanced Mode" if needed, then Advanced > ASUS EZ Flash 3 Utility.
+    3. Choose "via Storage Device(s)", open the ASUS-BIOS folder and pick the file above. Confirm with Yes.
+    4. Don't switch off or close the lid while it flashes; it restarts by itself when done.
+  If EZ Flash doesn't show the EFI partition (VERIFY on this model): copy the file from the zip in your
+  Downloads folder onto a FAT32 USB stick and pick it from the USB stick in step 3.
+  Disk encryption note: after a BIOS update the computer starts normally and asks your disk password as always.
+EOF
+}
+
+# ---------------------------------------------------------------- commands
+status() {
+  local n; n=$(lvfs_status)
+  say "LVFS (fwupd): $([ "$n" -gt 0 ] && echo "$n device(s) have updates" || echo "nothing to update")"
+  local line any=""
+  while IFS='|' read -r m f v; do any=1; say "WD SSD $m: firmware $f$([ -n "$v" ] && [ "$v" != "$f" ] && echo " -> $v available")"; done < <(wd_status)
+  [ -n "$any" ] || say "WD SSD: none found, or no newer firmware in WD's catalogue"
+  if is_asus; then
+    local info; info=$(asus_latest "$(asus_model)" 2>/dev/null)
+    if [ -n "$info" ] && [ "${info%%|*}" -gt "$(bios_now)" ] 2>/dev/null; then say "ASUS BIOS: $(bios_now) installed, ${info%%|*} available"
+    else say "ASUS BIOS: $(bios_now) (newest, or ASUS couldn't be asked)"; fi
+  fi
+}
+update() {
+  [ -t 0 ] || exec secure-linux-terminal --hold "$(readlink -f "$0")" update "$@"
+  [ "$(id -u)" -eq 0 ] || { say "Your password is needed to update firmware."; exec pkexec "$(readlink -f "$0")" update "$@"; }
+  say ""
+  say "  FIRMWARE UPDATE  $([ -n "$DRY" ] && echo '(dry run: nothing is changed)')"
+  say "  Firmware is the software inside your BIOS, SSD and other parts. Updates fix bugs and security holes."
+  say "  Before you start: charger plugged in, battery above 50%, and a recent backup of your files."
+  power_ok || [ -n "$DRY" ] || exit 1
+  NEED_RESTART=""
+  lvfs_update
+  say ""; say "== Western Digital SSD firmware"
+  local d m f n=0
+  while IFS='|' read -r d m f; do n=$((n + 1)); wd_update_one "$d" "$m" "$f" < /dev/tty; done < <(wd_drives)
+  [ "$n" -gt 0 ] || say "  No WD SSD found."
+  say ""; asus_update
+  [ -n "$NEED_RESTART" ] && say "" && say "  Please restart the computer now to finish the SSD update."
+  sl_clear firmware-updates
+}
+check() {   # non-interactive, once after setup: tell the user if anything can be updated
+  [ "$(id -u)" -eq 0 ] || return 0
+  local found=() n info
+  if is_asus && info=$(asus_latest "$(asus_model)" 2>/dev/null) && [ "${info%%|*}" -gt "$(bios_now)" ] 2>/dev/null; then found+=(BIOS); fi
+  [ -n "$(wd_status | awk -F'|' '$3 != "" && $3 != $2')" ] && found+=(SSD)
+  n=$(lvfs_status); [ "$n" -gt 0 ] && found+=("other parts")
+  [ ${#found[@]} -gt 0 ] || return 0
+  sl_event firmware-after-setup "Firmware updates are available" \
+    "New firmware for: $(IFS=,; echo "${found[*]}" | sed 's/,/, /g'). When the charger is plugged in, open 'Secure Linux Status & Fixes' and choose 'Update firmware (BIOS, SSD)'."
+}
+
+case "$MODE" in
+  -h|--help) sed -n '2,16p' "$0" ;;
+  status) status ;;
+  update) update "$@" ;;
+  check) check ;;
+  *) echo "Unknown command '$MODE' (see --help)" >&2; exit 2 ;;
+esac

@@ -1,0 +1,233 @@
+#!/bin/bash
+# secure-linux-hibernate: hibernate when the laptop lid closes (the memory is saved to the encrypted disk and
+# the laptop switches fully off; opening it asks for your disk password and you continue where you left off).
+#   secure-linux-hibernate                     explain, show the state, and ask what you want
+#   secure-linux-hibernate enable [on-lid|sleep-then-hibernate] [--auto]
+#                                              on-lid: lid closed = hibernate (default)
+#                                              sleep-then-hibernate: sleep first, hibernate after 30 minutes
+#                                              --auto: no questions (used by setup and the health check)
+#   secure-linux-hibernate disable             back to "lid closed = sleep"; removes the swap file
+#   secure-linux-hibernate status | active     (active: exit 0 when everything is in place)
+#   secure-linux-hibernate wanted              print the mode that should be in place: no|on-lid|sleep-then-hibernate
+#   secure-linux-hibernate test                hibernate now (after a confirmation)
+# Fedora only allows hibernation with Secure Boot OFF (kernel lockdown). zram stays the normal swap; the
+# swap file on the disk is only used for hibernation (lower priority).
+# Choice keys: hibernate = no|on-lid|sleep-then-hibernate (explicit choice wins);
+#              secureboot_intent = on|off (asked by the installer). When hibernate is unset:
+#              intent off -> on-lid (full profile); intent on -> no (lid = sleep, no alerts);
+#              intent unset -> on-lid on the full profile (waits, with one alert, until Secure Boot is off).
+set -u   # no pipefail: "cmd | grep -q" must not fail when grep stops reading early
+export LC_ALL=C
+SL_ROOT=${SL_ROOT:-/usr/local/lib/secure-linux}
+# shellcheck source=../lib/common.sh
+. "$SL_ROOT/lib/common.sh"
+have() { command -v "$1" >/dev/null 2>&1; }
+
+SWAPDIR=/swap; SWAPFILE=$SWAPDIR/swapfile
+LOGIND=/etc/systemd/logind.conf.d/90-secure-linux-lid.conf
+SLEEPCONF=/etc/systemd/sleep.conf.d/90-secure-linux-hibernate.conf
+DRACUT=/etc/dracut.conf.d/90-secure-linux-resume.conf
+PDRC=/etc/xdg/powerdevilrc
+
+sb_on() { mokutil --sb-state 2>/dev/null | grep -qi 'SecureBoot enabled' || grep -q '\[integrity\]\|\[confidentiality\]' /sys/kernel/security/lockdown 2>/dev/null; }
+mode_now() { sl_choice_get hibernate no; }
+wanted() {
+  local h i p; h=$(sl_choice_get hibernate); i=$(sl_choice_get secureboot_intent); p=$(sl_profile)
+  [ -e /run/ostree-booted ] && p=atomic
+  if [ -n "$h" ]; then echo "$h"
+  elif [ "$i" = on ] || [ "$p" != full ]; then echo no
+  else echo on-lid; fi
+}
+active() {   # everything in place for hibernation
+  swapon --show=NAME --noheadings 2>/dev/null | grep -qx "$SWAPFILE" || grep -q "^$SWAPFILE " /etc/fstab || return 1
+  grep -q 'resume=' /proc/cmdline 2>/dev/null || grubby --info=DEFAULT 2>/dev/null | grep -q 'resume=' || return 1
+  [ -f "$LOGIND" ] || return 1
+  ! sb_on
+}
+status() {
+  echo "Hibernate when the lid closes: $(mode_now)"
+  if sb_on; then echo "Secure Boot: ON (Fedora blocks hibernation while it is on)"; else echo "Secure Boot: off"; fi
+  if swapon --show=NAME --noheadings 2>/dev/null | grep -qx "$SWAPFILE"; then echo "Swap file for hibernation: $SWAPFILE (in use)"
+  elif [ -f "$SWAPFILE" ]; then echo "Swap file for hibernation: $SWAPFILE (not switched on yet)"
+  else echo "Swap file for hibernation: none"; fi
+  grep -o 'resume[^ ]*' /proc/cmdline 2>/dev/null | sed 's/^/Running with: /'
+  [ -f "$LOGIND" ] && sed -n 's/^HandleLidSwitch=/Lid closed: /p' "$LOGIND" || echo "Lid closed: sleep (Fedora default)"
+  if active; then echo "State: hibernation is ready"; else echo "State: not active"; fi
+}
+
+need_root() { [ "$(id -u)" -eq 0 ] || exec pkexec "$(readlink -f "$0")" "$@"; }
+
+explain_secureboot() {
+  cat <<'EOF'
+
+  Hibernation needs Secure Boot switched OFF.
+
+  Fedora blocks hibernation while Secure Boot is on, because a saved memory image could be tampered with.
+  What changes if you switch Secure Boot off:
+    - Your disk stays fully encrypted; your disk password is asked when the laptop wakes from hibernation.
+    - You lose the protection against someone tampering with the start-up files of a laptop they had in
+      their hands while it was off. For most people at home that's a small risk; when travelling it matters more.
+
+  How to switch it off (ASUS Zenbook):
+    1. Restart. As soon as the screen goes dark, press F2 repeatedly to open the BIOS setup.
+    2. Press F7 for "Advanced Mode" if needed, then go to Security > Secure Boot > Secure Boot Control: Disabled.
+    3. Press F10 to save and restart.
+  Hibernation then switches itself on (the health check does it a few minutes after start-up).
+EOF
+}
+
+enable() {
+  local mode=${1:-on-lid} auto=${2:-} ram_gb size root_uuid offset fsroot
+  case "$mode" in on-lid|sleep-then-hibernate) ;; *) echo "Unknown mode: $mode"; return 2 ;; esac
+  sl_choice_set hibernate "$mode"
+  [ -n "$auto" ] || sl_choice_set secureboot_intent off     # the user asked for it: Secure Boot will be switched off
+  if sb_on; then
+    [ -n "$auto" ] || explain_secureboot
+    sl_alert hibernate-needs-secureboot-off "Hibernate on lid close is waiting" \
+      "Fedora only allows hibernation with Secure Boot off. Turn it off in the BIOS (F2 > Security > Secure Boot > Disabled), then restart; it switches on by itself." \
+      "Open 'Secure Linux Status & Fixes' and choose 'Hibernate settings'."
+    return 3
+  fi
+  fsroot=$(findmnt -no FSTYPE / 2>/dev/null)
+  [ "$fsroot" = btrfs ] || { echo "Hibernation set-up here needs a Btrfs system disk (found: $fsroot)."; return 1; }
+  ram_gb=$(awk '/^MemTotal:/ {printf "%d", $2 / 1024 / 1024 + 1}' /proc/meminfo)
+  size=$((ram_gb + 1))
+  echo ">> Swap file for hibernation (${size} GB, at least the size of the memory)"
+  if ! btrfs subvolume show "$SWAPDIR" >/dev/null 2>&1; then
+    [ -e "$SWAPDIR" ] && { echo "$SWAPDIR exists but isn't a Btrfs subvolume; not touching it."; return 1; }
+    btrfs subvolume create "$SWAPDIR" || return 1     # its own subvolume: snapshots of / don't include it
+  fi
+  if [ ! -f "$SWAPFILE" ]; then
+    btrfs filesystem mkswapfile --size "${size}g" --uuid clear "$SWAPFILE" || return 1   # handles nodatacow + no compression
+  fi
+  # SELinux label (VERIFY: swapfile_t is the type Fedora's policy expects for swap files)
+  if have semanage; then
+    semanage fcontext -l 2>/dev/null | grep -q '^/swap(/.\*)?' || semanage fcontext -a -t swapfile_t '/swap(/.*)?'
+  fi
+  have restorecon && restorecon -RF "$SWAPDIR"
+  # fstab: priority 0, far below zram (Fedora's zram uses 100), so normal swapping still goes to zram
+  grep -q "^$SWAPFILE " /etc/fstab || echo "$SWAPFILE none swap defaults,nofail,pri=0 0 0" >> /etc/fstab
+  swapon --show=NAME --noheadings | grep -qx "$SWAPFILE" || swapon -p 0 "$SWAPFILE"
+
+  echo ">> Resume settings (initramfs + kernel arguments)"
+  # resume= is the Btrfs file system inside the LUKS container; the initramfs unlocks LUKS (asks the
+  # password) before it looks for the hibernation image, so resume works with full-disk encryption.
+  root_uuid=$(findmnt -no UUID /)
+  offset=$(btrfs inspect-internal map-swapfile -r "$SWAPFILE")
+  [ -n "$root_uuid" ] && [ -n "$offset" ] || { echo "Couldn't read the disk UUID or swap offset."; return 1; }
+  mkdir -p "$(dirname "$DRACUT")"
+  printf '# Secure Linux: wake from hibernation\nadd_dracutmodules+=" resume "\n' > "$DRACUT"
+  grubby --update-kernel=ALL --remove-args="resume resume_offset" >/dev/null 2>&1
+  grubby --update-kernel=ALL --args="resume=UUID=$root_uuid resume_offset=$offset" || return 1
+  dracut -f --regenerate-all || return 1
+
+  echo ">> Lid action"
+  mkdir -p "$(dirname "$LOGIND")" "$(dirname "$SLEEPCONF")"
+  if [ "$mode" = on-lid ]; then lid=hibernate; else lid=suspend-then-hibernate; fi
+  cat > "$LOGIND" <<EOF
+# Secure Linux: lid closed -> $lid (choice hibernate=$mode)
+[Login]
+HandleLidSwitch=$lid
+HandleLidSwitchExternalPower=$lid
+HandleLidSwitchDocked=ignore
+EOF
+  cat > "$SLEEPCONF" <<'EOF'
+# Secure Linux: allow hibernation; "sleep then hibernate" switches to hibernation after 30 minutes
+[Sleep]
+AllowHibernation=yes
+AllowSuspendThenHibernate=yes
+HibernateDelaySec=30min
+EOF
+  plasma_lid "$mode"
+  systemctl kill -s HUP systemd-logind >/dev/null 2>&1   # re-read logind.conf.d without logging anyone out
+  echo "Done: closing the lid will $( [ "$mode" = on-lid ] && echo hibernate || echo 'sleep, then hibernate after 30 minutes'). Active from the next restart."
+  sl_clear hibernate-needs-secureboot-off
+  return 0
+}
+
+plasma_lid() {   # Plasma's own power settings decide the lid action on KDE (PowerDevil overrides logind).
+  # VERIFY (Plasma 6 powerdevilrc): groups [AC|Battery|LowBattery][SuspendAndShutdown], LidAction:
+  # 0 nothing, 1 sleep, 2 hibernate; SleepMode: 1 standby, 2 hybrid, 3 sleep-then-hibernate.
+  local mode=$1 lid sleepmode g u
+  case "$mode" in on-lid) lid=2; sleepmode=1 ;; sleep-then-hibernate) lid=1; sleepmode=3 ;; *) lid=1; sleepmode=1 ;; esac
+  for g in AC Battery LowBattery; do
+    ini_set "$PDRC" "$g][SuspendAndShutdown" LidAction "$lid"
+    ini_set "$PDRC" "$g][SuspendAndShutdown" SleepMode "$sleepmode"
+  done
+  u=$(sl_user)
+  if have kwriteconfig6 && [ -n "$u" ]; then
+    for g in AC Battery LowBattery; do
+      sudo -u "$u" kwriteconfig6 --file powerdevilrc --group "$g" --group SuspendAndShutdown --key LidAction "$lid" 2>/dev/null
+      sudo -u "$u" kwriteconfig6 --file powerdevilrc --group "$g" --group SuspendAndShutdown --key SleepMode "$sleepmode" 2>/dev/null
+    done
+    sl_user_run systemctl --user try-restart plasma-powerdevil.service >/dev/null 2>&1
+  fi
+}
+ini_set() {   # ini_set FILE GROUP KEY VALUE   ("AC][SuspendAndShutdown" -> [AC][SuspendAndShutdown])
+  local f=$1 g="[$2]" k=$3 v=$4 tmp
+  mkdir -p "$(dirname "$f")"; [ -f "$f" ] || : > "$f"; tmp=$(mktemp)
+  awk -v g="$g" -v k="$k" -v v="$v" '
+    function flush() { if (ing && !done) { print k "=" v; done=1 } }
+    /^\[.*\]$/ { flush(); ing = ($0 == g); print; next }
+    ing && index($0, k "=") == 1 { if (!done) { print k "=" v; done=1 }; next }
+    { print }
+    END { flush(); if (!done) { print ""; print g; print k "=" v } }' "$f" > "$tmp" && cat "$tmp" > "$f"; rm -f "$tmp"
+}
+
+disable() {
+  sl_choice_set hibernate no
+  sl_choice_set secureboot_intent on
+  sl_clear hibernate-needs-secureboot-off
+  rm -f "$LOGIND" "$SLEEPCONF"
+  plasma_lid no
+  systemctl kill -s HUP systemd-logind >/dev/null 2>&1
+  if grep -q 'resume=' /proc/cmdline 2>/dev/null || grubby --info=ALL 2>/dev/null | grep -q 'resume='; then
+    grubby --update-kernel=ALL --remove-args="resume resume_offset"
+  fi
+  if [ -f "$DRACUT" ]; then rm -f "$DRACUT"; dracut -f --regenerate-all; fi
+  swapon --show=NAME --noheadings 2>/dev/null | grep -qx "$SWAPFILE" && swapoff "$SWAPFILE"
+  sed -i "\#^$SWAPFILE #d" /etc/fstab
+  rm -f "$SWAPFILE"
+  btrfs subvolume show "$SWAPDIR" >/dev/null 2>&1 && btrfs subvolume delete "$SWAPDIR"
+  have semanage && semanage fcontext -d '/swap(/.*)?' 2>/dev/null
+  echo "Done: closing the lid puts the laptop to sleep again; the swap file is removed."
+  if ! sb_on; then
+    echo "You can switch Secure Boot back on now: restart, press F2, Security > Secure Boot > Secure Boot Control: Enabled, F10."
+  fi
+}
+
+ask() { local a; read -rp "  $1 [y/N] " a; [ "$a" = y ] || [ "$a" = Y ]; }
+
+case "${1:-}" in
+  -h|--help) sed -n '2,15p' "$0" ;;
+  status) status ;;
+  active) active ;;
+  wanted) wanted ;;
+  enable)
+    shift; mode=on-lid; auto=""
+    for a in "$@"; do case "$a" in --auto) auto=1 ;; on-lid|sleep-then-hibernate) mode=$a ;; esac; done
+    [ -n "$auto" ] || { [ -t 0 ] || exec secure-linux-terminal --hold "$(readlink -f "$0")" enable "$mode"; }
+    need_root enable "$@"
+    enable "$mode" "$auto" ;;
+  disable) [ -t 0 ] || exec secure-linux-terminal --hold "$(readlink -f "$0")" disable
+           need_root disable; disable ;;
+  test)
+    [ -t 0 ] || exec secure-linux-terminal --hold "$(readlink -f "$0")" test
+    active || { echo "Hibernation isn't set up yet."; status; exit 1; }
+    ask "Save your work. Hibernate now? (Press the power button to wake; your disk password is asked.)" && systemctl hibernate ;;
+  "")
+    [ -t 0 ] || exec secure-linux-terminal --hold "$(readlink -f "$0")"
+    echo; status; echo
+    echo "  1  Lid closed = hibernate (laptop fully off, no battery used)"
+    echo "  2  Lid closed = sleep, then hibernate after 30 minutes"
+    echo "  3  Lid closed = sleep only (switch hibernation off)"
+    echo "  4  Test hibernation now"
+    read -rp "  Choose (Enter = leave as it is): " c
+    case "$c" in
+      1) exec "$(readlink -f "$0")" enable on-lid ;;
+      2) exec "$(readlink -f "$0")" enable sleep-then-hibernate ;;
+      3) exec "$(readlink -f "$0")" disable ;;
+      4) exec "$(readlink -f "$0")" test ;;
+    esac ;;
+  *) echo "Unknown command '$1' (see --help)" >&2; exit 2 ;;
+esac

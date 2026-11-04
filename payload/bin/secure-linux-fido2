@@ -1,0 +1,78 @@
+#!/bin/bash
+# secure-linux-fido2: unlock the disk at start-up with a security key (YubiKey, Nitrokey, Token2, SoloKey...).
+# Optional, an EXTRA way to unlock; your disk password always keeps working.
+#
+#   secure-linux-fido2 status     is a security key set up?
+#   secure-linux-fido2 enroll     add a security key (plug it in first; asks for your disk password, then touch it)
+#   secure-linux-fido2 remove     remove all security keys from the disk (the password keeps working)
+#
+# Note: the Flipper Zero's "U2F" app is NOT a FIDO2 key and can't unlock the disk (it only does old-style
+# two-factor logins for websites and keeps its keys on a removable SD card).
+set -u   # no pipefail: "cmd | grep -q" must not fail when grep stops reading early
+SL_ROOT=${SL_ROOT:-/usr/local/lib/secure-linux}
+. "$SL_ROOT/lib/common.sh"
+. "$SL_ROOT/files/security/lib-security.sh"
+DRACUT_CONF=$SEC_DRACUT_DIR/50-secure-linux-fido2.conf
+
+usage() { sed -n '2,11p' "$(sec_self)" | sed 's/^# \{0,1\}//'; }
+
+cmd_status() {
+  sec_need_root status
+  local dev; dev=$(sec_luks_dev) || { echo "No encrypted disk found."; return 0; }
+  if sec_luks_has "$dev" fido2; then echo "Security key unlock: on"; else echo "Security key unlock: off"; fi
+}
+
+cmd_enroll() {
+  sec_need_terminal enroll
+  sec_need_root enroll
+  local dev name
+  dev=$(sec_luks_dev) || { echo "No encrypted disk found."; sec_pause; return 1; }
+  name=$(sec_luks_name "$dev")
+  [ -n "$name" ] || { echo "Couldn't find the disk in /etc/crypttab; not changing anything."; sec_pause; return 1; }
+  if ! systemd-cryptenroll --fido2-device=list 2>/dev/null | grep -q '/dev/'; then
+    cat <<'EOF'
+No FIDO2 security key found. Plug it in and run this again.
+(A Flipper Zero won't work here: its U2F app isn't a FIDO2 key.)
+EOF
+    sec_pause; return 1
+  fi
+  cat <<'EOF'
+
+  ADD A SECURITY KEY
+  1. Type your CURRENT disk password.
+  2. If your key has a PIN, type the key's PIN.
+  3. Touch the key when it blinks.
+  At start-up you'll then plug in the key, type its PIN (if any) and touch it.
+  Your disk password keeps working. Tip: register a second key as a spare (run this again with it).
+
+EOF
+  if ! systemd-cryptenroll --fido2-device=auto "$dev"; then echo "That didn't work. Nothing was changed."; sec_pause; return 1; fi
+  sec_crypttab_opt add "$name" fido2-device=auto
+  mkdir -p "$SEC_DRACUT_DIR"
+  printf '%s\n' '# Secure Linux: FIDO2 security key unlock in the start-up image (secure-linux-fido2)' \
+    'add_dracutmodules+=" fido2 "' > "$DRACUT_CONF"
+  sec_dracut_regen || echo "Updating the start-up image failed, so the key isn't used yet. Your disk password still works."
+  echo "Done. Next start-up: plug in the key (or just type the password as usual)."
+  sec_pause "Press Enter to close. "
+}
+
+cmd_remove() {
+  sec_need_root remove
+  local dev name
+  dev=$(sec_luks_dev) || { echo "No encrypted disk found."; return 0; }
+  name=$(sec_luks_name "$dev")
+  if sec_luks_has "$dev" fido2; then
+    systemd-cryptenroll --wipe-slot=fido2 "$dev" || { echo "Couldn't remove the security key."; return 1; }
+  fi
+  [ -n "$name" ] && sec_crypttab_opt remove "$name" fido2-device=auto
+  if [ -f "$DRACUT_CONF" ]; then rm -f "$DRACUT_CONF"; sec_dracut_regen; fi
+  echo "Security key unlock is off. Use your disk password at start-up."
+}
+
+case "${1:-}" in
+  -h|--help|help|"") usage ;;
+  status) cmd_status ;;
+  enroll) cmd_enroll ;;
+  remove) cmd_remove ;;
+  *) echo "Unknown command '$1'." >&2; usage; exit 2 ;;
+esac

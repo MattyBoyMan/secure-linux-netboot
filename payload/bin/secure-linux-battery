@@ -1,0 +1,81 @@
+#!/bin/bash
+# secure-linux-battery: look after the battery by not charging it to 100% all the time.
+#   secure-linux-battery status          charge, limit, plugged in or not, battery health
+#   secure-linux-battery limit 80|90|100 stop charging at 80% (best for battery life), 90% or 100%
+#   secure-linux-battery travel          charge to 100% once; goes back to your limit when you unplug or restart
+# Internal (boot unit / udev): apply, save-current, unplugged, ac-changed, supported
+# KDE Plasma's own "Charge limit" (System Settings > Power Management) changes the same setting; if you
+# change it there, that choice is kept across restarts too.
+set -u   # no pipefail: "cmd | grep -q" must not fail when grep stops reading early
+SL_ROOT=${SL_ROOT:-/usr/local/lib/secure-linux}
+. "$SL_ROOT/lib/common.sh"
+. "$SL_ROOT/files/experience/exp-lib.sh"
+
+TRAVEL=$SL_RUN/battery-travel          # on /run: forgotten at restart
+F=$(exp_battery_file) || F=""
+need_battery() { [ -n "$F" ] || { echo "This computer has no battery charge limit setting (that's normal on desktop PCs)."; exit 0; }; }
+current() { cat "$F" 2>/dev/null; }
+write_limit() {   # write_limit N   (root)
+  [ "$(current)" = "$1" ] && return 0
+  echo "$1" > "$F" 2>/dev/null || { echo "Could not set the limit (the firmware refused $1%)." >&2; return 1; }
+}
+
+case "${1:-status}" in
+  supported) [ -n "$F" ] ;;
+  limit)
+    need_battery
+    n=${2:-}; case $n in 80|90|100) ;; *) echo "Use: secure-linux-battery limit 80|90|100"; exit 1 ;; esac
+    exp_elevate "$@"
+    rm -f "$TRAVEL"
+    write_limit "$n" && sl_choice_set battery_limit "$n" || exit 1
+    if [ "$n" = 100 ]; then echo "Charging to 100%. (80% is gentler on the battery if you're usually plugged in.)"
+    else echo "Done: the battery now stops charging at $n%. This keeps it healthy for longer."; fi ;;
+  travel)
+    need_battery
+    exp_elevate "$@"
+    mkdir -p "$SL_RUN"; touch "$TRAVEL"
+    write_limit 100 || exit 1
+    echo "Charging to 100% for your trip. It goes back to $(sl_choice_get battery_limit 100)% when you unplug or restart." ;;
+  unplugged)       # udev: charger removed -> travel mode ends
+    [ -n "$F" ] && [ -f "$TRAVEL" ] || exit 0
+    exp_on_ac && exit 0
+    rm -f "$TRAVEL"; lim=$(sl_choice_get battery_limit ""); [ -n "$lim" ] && write_limit "$lim"; exit 0 ;;
+  ac-changed)      # udev, charger plugged/unplugged
+    [ -n "$F" ] || exit 0
+    exp_on_ac || "$0" unplugged
+    # Only without tuned-ppd (which switches by itself): battery -> power-saver, charger -> balanced.
+    # Never overrides "performance" chosen by the user.
+    if [ ! -f "$SL_R/etc/tuned/ppd.conf" ] && [ "$(sl_choice_get power_battery_saver yes)" = yes ] && command -v powerprofilesctl >/dev/null 2>&1; then
+      cur=$(powerprofilesctl get 2>/dev/null)
+      if exp_on_ac; then [ "$cur" = power-saver ] && [ -f "$SL_RUN/ppd-auto" ] && powerprofilesctl set balanced && rm -f "$SL_RUN/ppd-auto"
+      else [ "$cur" = balanced ] && powerprofilesctl set power-saver && { mkdir -p "$SL_RUN"; touch "$SL_RUN/ppd-auto"; }; fi
+    fi
+    exit 0 ;;
+  apply)           # boot: re-apply the saved limit (asus-wmi forgets it at power-off)
+    [ -n "$F" ] || exit 0
+    rm -f "$TRAVEL"; lim=$(sl_choice_get battery_limit "")
+    [ -n "$lim" ] && write_limit "$lim"; exit 0 ;;
+  save-current)    # shutdown: if the limit was changed elsewhere (Plasma settings), remember it
+    [ -n "$F" ] || exit 0
+    [ -f "$TRAVEL" ] && exit 0
+    cur=$(current); lim=$(sl_choice_get battery_limit "")
+    case $cur in ''|*[!0-9]*) exit 0 ;; esac
+    if [ "$cur" != "$lim" ] && [ "$cur" -ge 20 ] && [ "$cur" -le 100 ] && { [ -n "$lim" ] || [ "$cur" != 100 ]; }; then
+      sl_choice_set battery_limit "$cur"
+    fi
+    exit 0 ;;
+  status)
+    need_battery
+    d=$(dirname "$F")
+    cap=$(cat "$d/capacity" 2>/dev/null); st=$(cat "$d/status" 2>/dev/null)
+    full=$(cat "$d/energy_full" 2>/dev/null || cat "$d/charge_full" 2>/dev/null)
+    design=$(cat "$d/energy_full_design" 2>/dev/null || cat "$d/charge_full_design" 2>/dev/null)
+    echo "Battery: ${cap:-?}% (${st:-unknown}), $(exp_on_ac && echo 'plugged in' || echo 'on battery')"
+    echo "Charge limit: $(current)%$([ -f "$TRAVEL" ] && echo ' (travel mode: back to your limit when you unplug)')"
+    echo "Saved choice: $(sl_choice_get battery_limit 'none (the laptop decides)')"
+    [ -n "$full" ] && [ -n "$design" ] && [ "$design" -gt 0 ] 2>/dev/null && echo "Health: $(( full * 100 / design ))% of its original capacity"
+    exit 0
+    ;;
+  -h|--help|help) sed -n '2,9p' "$0" ;;
+  *) sed -n '2,9p' "$0"; exit 1 ;;
+esac

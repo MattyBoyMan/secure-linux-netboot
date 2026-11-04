@@ -1,0 +1,179 @@
+#!/bin/bash
+# secure-linux-dns: encrypted DNS (the internet's "phone book") on/off, and VPN hand-over.
+#
+#   secure-linux-dns status [--short]   show what is answering name lookups
+#                                       (short: encrypted|family|vpn|paused|off)
+#   secure-linux-dns open [MINUTES]     pause encrypted DNS so a hotel/cafe Wi-Fi login page can load;
+#                                       switches back on by itself after MINUTES (default 15)
+#   secure-linux-dns secure             switch encrypted DNS back on now
+#   secure-linux-dns sync               (automatic) let a connected VPN's DNS win, or go back to encrypted DNS
+#   secure-linux-dns family on|off|status
+#                                       family filter: Cloudflare for Families (1.1.1.3) also blocks adult sites.
+#                                       While it's on, a VPN can't replace it (the VPN still hides your traffic).
+#
+# How it works (details in the security report):
+#   /etc/systemd/resolved.conf.d/10-secure-linux-dns.conf   Cloudflare 1.1.1.2 + Quad9 over TLS, Domains=~.
+#   /run/systemd/resolved.conf.d/50-secure-linux-vpn.conf    "Domains=" (drops the global ~.) while a VPN
+#                                                            interface (nordlynx, CloudflareWARP...) has ~.
+#   /etc/systemd/resolved.conf.d/15-secure-linux-family.conf family filter: replaces the servers with 1.1.1.3
+#   /run/systemd/resolved.conf.d/99-secure-linux-open.conf   pause for login pages (gone after a restart)
+set -u   # no pipefail: "cmd | grep -q" must not fail when grep stops reading early
+SL_ROOT=${SL_ROOT:-/usr/local/lib/secure-linux}
+. "$SL_ROOT/lib/common.sh"
+. "$SL_ROOT/files/security/lib-security.sh"
+
+usage() { sed -n '2,22p' "$(sec_self)" | sed 's/^# \{0,1\}//'; }
+
+# Tell systemd-resolved to re-read its settings. A reload keeps the DNS settings that NetworkManager and the
+# VPN apps put on each connection; if reload isn't supported, restart and put the VPN settings back.
+dns_reload() {
+  if [ "$(systemctl show -p CanReload --value systemd-resolved 2>/dev/null)" = yes ]; then
+    systemctl reload systemd-resolved && return 0
+  fi
+  local saved=() l dns dom
+  while read -r l; do
+    dns=$(resolvectl dns "$l" 2>/dev/null | sed 's/^[^:]*: *//')
+    dom=$(resolvectl domain "$l" 2>/dev/null | sed 's/^[^:]*: *//')
+    [ -n "$dns" ] && saved+=("$l|$dns|$dom")
+  done < <(vpn_links_all)
+  systemctl restart systemd-resolved
+  local s
+  for s in "${saved[@]}"; do
+    IFS='|' read -r l dns dom <<<"$s"
+    # shellcheck disable=SC2086
+    resolvectl dns "$l" $dns; [ -n "$dom" ] && resolvectl domain "$l" $dom
+  done
+  return 0
+}
+
+# Every VPN interface that exists right now
+vpn_links_all() {
+  resolvectl domain 2>/dev/null | sed -n 's/^Link [0-9]* (\([^)]*\)):.*/\1/p' | grep -E "$SEC_VPN_IFACES"
+}
+# VPN interfaces that claim all lookups (routing domain ~.)
+vpn_links_default() {
+  resolvectl domain 2>/dev/null | sed -n 's/^Link [0-9]* (\([^)]*\)):\(.*\)$/\1 \2/p' \
+    | awk '{for(i=2;i<=NF;i++) if($i=="~.") {print $1; break}}' | grep -E "$SEC_VPN_IFACES"
+}
+
+family_on() { [ -f "$SEC_DNS_FAMILY" ]; }
+
+dns_mode() {
+  if [ ! -f "$SEC_DNS_CONF" ]; then echo off
+  elif [ -f "$SEC_DNS_OPEN" ]; then echo paused
+  elif family_on; then echo family
+  elif [ -f "$SEC_DNS_VPN" ]; then echo vpn
+  else echo encrypted; fi
+}
+
+cmd_status() {
+  local m; m=$(dns_mode)
+  [ "${1:-}" = --short ] && { echo "$m"; return 0; }
+  case "$m" in
+    family)    echo "Family filter is ON: lookups go privately to Cloudflare for Families (blocks malware and adult sites), even while a VPN is connected." ;;
+    encrypted) echo "Encrypted DNS is ON: lookups go privately to Cloudflare (blocks known malware sites), with Quad9 as backup." ;;
+    vpn)       echo "Your VPN is answering lookups (its own private DNS and filters apply): $(vpn_links_default | tr '\n' ' ')" ;;
+    paused)    echo "Encrypted DNS is PAUSED for a Wi-Fi login page. It switches back on by itself, or run: secure-linux-dns secure" ;;
+    off)       echo "Encrypted DNS is not set up. Open 'Secure Linux Status' and choose Repair." ;;
+  esac
+}
+
+cmd_open() {
+  sec_need_root open "$@"
+  local min=${1:-15}
+  case "$min" in ''|*[!0-9]*) min=15 ;; esac
+  mkdir -p "$SEC_RESOLVED_RUN"
+  cat > "$SEC_DNS_OPEN" <<'EOF'
+# Written by secure-linux-dns open: plain DNS from the Wi-Fi network so its login page can load.
+# Removed by "secure-linux-dns secure", by the automatic timer, or by restarting the computer.
+[Resolve]
+DNS=
+Domains=
+DNSOverTLS=no
+DNSSEC=no
+EOF
+  dns_reload
+  systemctl stop secure-linux-dns-restore.timer secure-linux-dns-restore.service >/dev/null 2>&1
+  systemctl reset-failed secure-linux-dns-restore.service >/dev/null 2>&1
+  systemd-run --quiet --on-active="${min}min" --unit=secure-linux-dns-restore "$SEC_BIN/secure-linux-dns" secure
+  echo "Encrypted DNS is paused for $min minutes so the Wi-Fi login page can load."
+}
+
+cmd_secure() {
+  sec_need_root secure "$@"
+  rm -f "$SEC_DNS_OPEN"
+  systemctl stop secure-linux-dns-restore.timer >/dev/null 2>&1
+  cmd_sync quiet
+  dns_reload
+  echo "Encrypted DNS is on."
+}
+
+# Decide who answers lookups: a VPN that claims all names (~.), or our encrypted servers.
+cmd_sync() {
+  sec_need_root sync "$@"
+  local vpns l changed=0
+  [ -f "$SEC_DNS_OPEN" ] && return 0          # paused for a login page: leave alone
+  vpns=$(vpn_links_default)
+  if family_on; then
+    # Family filter: the VPN must not answer lookups (its DNS has no adult-site filter). Take its "all names"
+    # route away; lookups then go through the tunnel to Cloudflare for Families, encrypted.
+    for l in $vpns; do
+      resolvectl domain "$l" "" 2>/dev/null
+      resolvectl default-route "$l" false 2>/dev/null
+    done
+    [ -f "$SEC_DNS_VPN" ] && { rm -f "$SEC_DNS_VPN"; changed=1; }
+  elif [ -n "$vpns" ]; then
+    for l in $vpns; do
+      # VPN DNS servers sit inside the tunnel and don't speak DNS-over-TLS; DNSSEC breaks their filters
+      # (NordVPN 5.4.0 bug, fixed in 5.4.1 by doing the same thing).
+      resolvectl dnsovertls "$l" no 2>/dev/null
+      resolvectl dnssec "$l" no 2>/dev/null
+    done
+    if [ ! -f "$SEC_DNS_VPN" ]; then
+      mkdir -p "$SEC_RESOLVED_RUN"
+      printf '%s\n' "# Written by secure-linux-dns sync while a VPN supplies DNS ($(echo $vpns))." \
+        "[Resolve]" "Domains=" > "$SEC_DNS_VPN"
+      changed=1
+    fi
+  elif [ -f "$SEC_DNS_VPN" ]; then
+    rm -f "$SEC_DNS_VPN"; changed=1
+  fi
+  if [ "$changed" = 1 ] && [ "${1:-}" != quiet ]; then dns_reload; fi
+  return 0
+}
+
+cmd_family() {
+  case "${1:-status}" in
+    status) family_on && echo "Family filter: on" || echo "Family filter: off"; return 0 ;;
+    on|off) ;;
+    *) echo "Use: secure-linux-dns family on|off|status" >&2; return 2 ;;
+  esac
+  sec_need_root family "$@"
+  local f; f=$SL_ROOT/files/security/resolved/15-secure-linux-family.conf
+  if [ "$1" = on ]; then
+    mkdir -p "$SEC_RESOLVED_ETC"
+    cmp -s "$f" "$SEC_DNS_FAMILY" || install -m 0644 "$f" "$SEC_DNS_FAMILY"
+    sl_choice_set family_dns yes
+  else
+    rm -f "$SEC_DNS_FAMILY"
+    sl_choice_set family_dns no
+    # give the VPN its DNS back: reconnecting the VPN restores its settings; the next sync does the rest
+  fi
+  cmd_sync quiet
+  dns_reload
+  if [ "$1" = on ]; then
+    echo "Family filter is on: adult and dangerous sites are blocked for everyone on this computer, also with the VPN on."
+  else
+    echo "Family filter is off. (If the VPN is connected, reconnect it so its own DNS is used again.)"
+  fi
+}
+
+case "${1:-}" in
+  -h|--help|help|"") usage ;;
+  family) shift; cmd_family "$@" ;;
+  status) shift; cmd_status "$@" ;;
+  open)   shift; cmd_open "$@" ;;
+  secure) shift; cmd_secure "$@" ;;
+  sync)   shift; cmd_sync "$@" ;;
+  *) echo "Unknown command '$1'." >&2; usage; exit 2 ;;
+esac

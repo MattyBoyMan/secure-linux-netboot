@@ -1,0 +1,105 @@
+#!/bin/bash
+# secure-linux-care: the care calendar - friendly reminders before things run out.
+#   secure-linux-care list                  everything on the calendar, soonest first
+#   secure-linux-care add KEY YYYY-MM-DD    e.g. add nordvpn-renewal 2027-03-18   (KEY: letters, digits, - and _)
+#   secure-linux-care remove KEY
+#   secure-linux-care --notify              (daily user timer) notifications 60, 30 and 7 days before, and on the day
+# Your own dates live in ~/.config/secure-linux/care-dates (KEY=YYYY-MM-DD lines; the welcome wizard writes them).
+# Automatic dates: Fedora end of support (SUPPORT_END in /etc/os-release), "rebuild the USB stick" one year after
+# it was built (build.conf BUILD_DATE, then yearly) and a battery health check every 6 months (laptops).
+set -u   # no pipefail: "cmd | grep -q" must not fail when grep stops reading early
+SL_ROOT=${SL_ROOT:-/usr/local/lib/secure-linux}
+# shellcheck source=../lib/common.sh
+. "$SL_ROOT/lib/common.sh" 2>/dev/null
+R=${SL_TEST_SYSROOT:-}
+CONF=${XDG_CONFIG_HOME:-$HOME/.config}/secure-linux/care-dates
+ST=${XDG_STATE_HOME:-$HOME/.local/state}/secure-linux
+TODAY=$(date +%F); NOW=$(date -d "$TODAY" +%s)
+
+label() {
+  case "$1" in
+    auto-fedora-eol) echo "Fedora $( . "$R/etc/os-release" 2>/dev/null; echo "${VERSION_ID:-}") stops getting security updates (upgrade before then)" ;;
+    auto-usb-rebuild) echo "Rebuild the Secure Linux USB stick (fresh installer with current software)" ;;
+    auto-battery-check) echo "Battery health check (open 'Secure Linux Status & Fixes' and look at Battery health)" ;;
+    *) printf '%s' "$1" | tr '_-' '  ' | sed 's/^./\U&/' ;;
+  esac
+}
+next_yearly() {   # next_yearly START_DATE -> the next anniversary on or after today
+  local d=$1 n=1 c
+  [ -n "$d" ] && date -d "$d" >/dev/null 2>&1 || return 0
+  while :; do
+    c=$(date -d "$d +$n year" +%F)
+    [ "$(date -d "$c" +%s)" -ge "$NOW" ] && break
+    n=$((n + 1))
+  done
+  echo "$c"
+}
+entries() {   # KEY=YYYY-MM-DD lines: automatic ones, then the user's
+  local se bd first next
+  se=$(sed -n 's/^SUPPORT_END=//p' "$R/etc/os-release" 2>/dev/null | tr -d '"')
+  [ -n "$se" ] && echo "auto-fedora-eol=$se"
+  bd=$(sl_build_get BUILD_DATE 2>/dev/null)
+  [ -n "$bd" ] && date -d "$bd" >/dev/null 2>&1 && echo "auto-usb-rebuild=$(next_yearly "$bd")"
+  if ls "$R"/sys/class/power_supply/BAT* >/dev/null 2>&1; then
+    mkdir -p "$ST"; [ -s "$ST/care-battery-from" ] || echo "$TODAY" > "$ST/care-battery-from"
+    first=$(cat "$ST/care-battery-from"); next=$(date -d "$first +6 months" +%F)
+    while [ "$(date -d "$next" +%s)" -lt "$NOW" ]; do next=$(date -d "$next +6 months" +%F); done
+    echo "auto-battery-check=$next"
+  fi
+  [ -f "$CONF" ] && grep -E '^[A-Za-z0-9_-]+=[0-9]{4}-[0-9]{2}-[0-9]{2}$' "$CONF"
+}
+days_to() { echo $(( ( $(date -d "$1" +%s) - NOW ) / 86400 )); }
+
+cmd_list() {
+  local k d n
+  entries | while IFS='=' read -r k d; do echo "$d|$k"; done | sort | while IFS='|' read -r d k; do
+    n=$(days_to "$d")
+    if [ "$n" -lt 0 ]; then printf '  %s  (%d days ago)  %s\n' "$d" $((-n)) "$(label "$k")"
+    else printf '  %s  (in %d days)  %s   [%s]\n' "$d" "$n" "$(label "$k")" "$k"; fi
+  done
+}
+cmd_add() {
+  local k=${1:-} d=${2:-}
+  printf '%s' "$k" | grep -qE '^[A-Za-z0-9_-]+$' || { echo "KEY may only use letters, digits, - and _" >&2; return 2; }
+  case "$k" in auto-*) echo "Names starting with auto- are reserved." >&2; return 2 ;; esac
+  d=$(date -d "$d" +%F 2>/dev/null) || { echo "Not a date: ${2:-} (use YYYY-MM-DD)" >&2; return 2; }
+  mkdir -p "$(dirname "$CONF")"; touch "$CONF"
+  sed -i "/^$k=/d" "$CONF"; echo "$k=$d" >> "$CONF"
+  echo "Added: $(label "$k") on $d"
+}
+cmd_remove() {
+  [ -f "$CONF" ] && grep -q "^${1:-}=" "$CONF" || { echo "Not on the calendar: ${1:-}" >&2; return 1; }
+  sed -i "/^$1=/d" "$CONF"; echo "Removed: $1"
+}
+cmd_notify() {
+  local k d n step key
+  mkdir -p "$ST"; touch "$ST/care-shown"
+  while IFS='=' read -r k d; do
+    n=$(days_to "$d")
+    step=""
+    if [ "$n" -le 0 ] && [ "$n" -ge -3 ]; then step=0
+    elif [ "$n" -le 7 ] && [ "$n" -gt 0 ]; then step=7
+    elif [ "$n" -le 30 ] && [ "$n" -gt 7 ]; then step=30
+    elif [ "$n" -le 60 ] && [ "$n" -gt 30 ]; then step=60
+    fi
+    [ -n "$step" ] || continue
+    case "$k" in auto-battery-check) [ "$step" = 0 ] || continue ;; esac   # a check-up only needs the day itself
+    key="$k|$d|$step"
+    grep -qxF "$key" "$ST/care-shown" && continue
+    if [ "$step" = 0 ]; then
+      notify-send -a "Secure Linux" -i appointment-soon "Today: $(label "$k")" "From your care calendar ($d)."
+    else
+      notify-send -a "Secure Linux" -i appointment-soon "In $n days: $(label "$k")" "Due on $d (care calendar)."
+    fi
+    echo "$key" >> "$ST/care-shown"
+  done < <(entries)
+}
+
+case "${1:-list}" in
+  -h|--help) sed -n '2,11p' "$0" ;;
+  list) cmd_list ;;
+  add) shift; cmd_add "$@" ;;
+  remove) shift; cmd_remove "$@" ;;
+  --notify) [ "$(id -u)" -eq 0 ] && exit 0; cmd_notify ;;
+  *) echo "Unknown command '$1' (see --help)" >&2; exit 2 ;;
+esac

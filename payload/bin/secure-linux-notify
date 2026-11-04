@@ -1,0 +1,85 @@
+#!/bin/bash
+# secure-linux-notify: desktop notifications for the logged-in user (runs at login and every 15 minutes).
+#   - each active alert (/var/lib/secure-linux/alerts.d, and user-alerts/<this user>) is shown at most once
+#     a day while it lasts
+#     (again straight away if its title changes, e.g. "Disk 91% full" -> "Disk 96% full")
+#   - each one-off event (/var/lib/secure-linux/events.d) is shown exactly once per user, ever
+#     (remembered in ~/.local/state/secure-linux/acked), so "Setup finished" never repeats
+#   - clicking "Open Secure Linux Status" on a notification opens the Status & Fixes window
+#   secure-linux-notify [--login]     --login waits a little for the desktop to finish starting
+set -u   # no pipefail: "cmd | grep -q" must not fail when grep stops reading early
+SL_ROOT=${SL_ROOT:-/usr/local/lib/secure-linux}
+# shellcheck source=../lib/common.sh
+. "$SL_ROOT/lib/common.sh" 2>/dev/null || SL_STATE=/var/lib/secure-linux
+
+case "${1:-}" in
+  -h|--help) sed -n '2,9p' "$0"; exit 0 ;;
+  --login) sleep "${SL_NOTIFY_DELAY:-20}" ;;
+esac
+[ "$(id -u)" -eq 0 ] && exit 0          # notifications are for the desktop user, never root
+
+ST=${XDG_STATE_HOME:-$HOME/.local/state}/secure-linux
+mkdir -p "$ST/shown"; touch "$ST/acked"
+if command -v flock >/dev/null 2>&1; then exec 9>"$ST/notify.lock"; flock -n 9 || exit 0; fi
+TODAY=$(date +%F)
+GUI=secure-linux-status-gui
+
+# notify-send in libnotify >= 0.8 has --action and --wait (prints the chosen action's name). VERIFY on F44.
+ACTIONS=""
+if notify-send --help 2>&1 | grep -q -- '--action' && notify-send --help 2>&1 | grep -q -- '--wait'; then ACTIONS=1; fi
+
+send() {   # send TITLE BODY [urgency]
+  local title=$1 body=$2 urg=${3:-normal}
+  if [ -n "$ACTIONS" ]; then
+    (
+      r=$(timeout 900 notify-send -a "Secure Linux" -i security-high -u "$urg" \
+            --action=open="Open Secure Linux Status" --wait "$title" "$body" 2>/dev/null)
+      if [ "$r" = open ] && command -v "$GUI" >/dev/null 2>&1; then
+        if command -v setsid >/dev/null 2>&1; then setsid -f "$GUI" >/dev/null 2>&1; else "$GUI" >/dev/null 2>&1 & fi
+      fi
+    ) &
+  else
+    notify-send -a "Secure Linux" -i security-high -u "$urg" "$title" "$body"
+  fi
+}
+
+# ---------------------------------------------------------------- one-off events: once per user
+for f in "$SL_STATE"/events.d/*; do
+  [ -f "$f" ] || continue
+  id=${f##*/}
+  grep -qxF "$id" "$ST/acked" && continue
+  title=$(sed -n 1p "$f"); msg=$(sed -n 2p "$f")
+  [ -n "$title" ] || continue
+  send "$title" "$msg"
+  echo "$id" >> "$ST/acked"
+done
+
+# ---------------------------------------------------------------- alerts: once a day while active
+due_ids=(); due_titles=(); due_bodies=()
+UALERTS=$SL_STATE/user-alerts/$(id -un)       # alerts from this user's own checks (e.g. backup check)
+for f in "$SL_STATE"/alerts.d/* "$UALERTS"/*; do
+  [ -f "$f" ] || continue
+  id=${f##*/}
+  title=$(sed -n 1p "$f"); msg=$(sed -n 2p "$f"); hint=$(sed -n 3p "$f")
+  [ -n "$title" ] || continue
+  key="$TODAY $(printf '%s' "$title" | md5sum | cut -c1-12)"
+  [ "$(cat "$ST/shown/$id" 2>/dev/null)" = "$key" ] && continue
+  due_ids+=("$id"); due_titles+=("$title")
+  if [ -n "$hint" ] && [ -z "$ACTIONS" ]; then due_bodies+=("$msg"$'\n'"$hint"); else due_bodies+=("$msg"); fi
+  printf '%s\n' "$key" > "$ST/shown/$id"
+done
+if [ ${#due_ids[@]} -gt 3 ]; then          # don't flood the screen: one summary instead
+  list=$(printf '%s\n' "${due_titles[@]}" | sed 's/^/- /')
+  send "${#due_ids[@]} things need your attention" "$list"$'\n'"Open 'Secure Linux Status & Fixes' to sort them out." critical
+else
+  for i in "${!due_ids[@]}"; do send "${due_titles[$i]}" "${due_bodies[$i]}"; done
+fi
+
+# forget alerts that went away, so they show straight away if they come back
+for s in "$ST"/shown/*; do
+  [ -f "$s" ] || continue
+  [ -e "$SL_STATE/alerts.d/${s##*/}" ] || [ -e "$UALERTS/${s##*/}" ] || rm -f "$s"
+done
+
+wait    # keep running while notifications with a button are on screen (max 15 min each)
+exit 0

@@ -1,0 +1,141 @@
+#!/bin/bash
+# secure-linux-diagnose: finds what is wrong with this computer, in plain English, and says how it can be fixed.
+#
+#   secure-linux-diagnose [--quick|--full] [--json] [--only ID] [--root DIR]
+#       --quick   (default) fast look, about 10 seconds, no heavy tests
+#       --full    also the slower checks (network tests, package checks, drive self-tests, firmware lookup)
+#       --json    print a JSON list of problems (id, severity, title, what, why, safe_level, auto_fixable, fix_action,
+#                 fix_args, fix_summary, backup_first, time_estimate, learn_more, needs_input ...) instead of text
+#       --only ID check only one known problem (also tells you when it is NOT present)
+#       --root DIR  check an installed system that is mounted at DIR (for the rescue stick)
+#   secure-linux-diagnose --plan [--json]            ONE ordered plan of fixes to approve once (backup first)
+#   secure-linux-diagnose --autopilot-plan [--json]  the same plus routine upkeep that is due (updates, caches, trim, scrub...)
+#   secure-linux-diagnose --apply-plan --yes [--answer STEP=VALUE]... [--dry-run] [--autopilot]
+#                                                    do the plan you approved (--dry-run only shows what would happen)
+#   secure-linux-diagnose --auto-fix-safe            used by the timer: applies only the SAFE fixes, only if you chose
+#                                                    auto_fix_safe=yes (secure-linux-choice set auto_fix_safe yes)
+#   secure-linux-diagnose --list                     list every problem it knows (id, area, title)
+#
+# Reads only. Safe to run as a normal user (it says "needs administrator rights to check X" instead of failing), from the
+# Secure Linux stick (SystemRescue), a Fedora/Debian live system and the installed system. Exit 0 unless the tool itself fails.
+set -u
+export LC_ALL=C
+SELF=$(readlink -f "$0" 2>/dev/null || echo "$0"); SD_HERE=$(dirname "$SELF")
+SL_ROOT=${SL_ROOT:-/usr/local/lib/secure-linux}
+HLIB=""
+for c in "$SL_ROOT/hw/health" "$SD_HERE/../hw/health"; do [ -r "$c/diagnose-lib.sh" ] && { HLIB=$c; break; }; done
+[ -n "$HLIB" ] || { echo "secure-linux-diagnose: cannot find hw/health/diagnose-lib.sh next to $0." >&2; exit 3; }
+[ -d "$SL_ROOT/hw" ] || SL_ROOT=$(cd "$HLIB/../.." && pwd)
+KBDIR=${SL_DIAG_KB:-$HLIB/kb}
+
+MODE=quick; JSON=0; ONLY=""; ROOTDIR=/; DO_PLAN=0; AUTOPILOT=0; APPLY=0; YES=0; DRY=0; AUTOFIX=0; LIST=0; AUTOTARGET=0
+declare -a ANSWERS=()
+usage() { sed -n '2,/^# Reads only/p' "$SELF" | sed 's/^# \{0,1\}//'; }
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    --quick) MODE=quick ;; --full) MODE=full ;;
+    --json) JSON=1 ;;
+    --only) shift; ONLY=${1:-} ;; --only=*) ONLY=${1#--only=} ;;
+    --root) shift; ROOTDIR=${1:-/} ;; --root=*) ROOTDIR=${1#--root=} ;;
+    --plan) DO_PLAN=1 ;;
+    --autopilot-plan) DO_PLAN=1; AUTOPILOT=1 ;;
+    --autopilot) AUTOPILOT=1 ;;
+    --apply-plan) APPLY=1; DO_PLAN=1 ;;
+    --yes) YES=1 ;; --dry-run|-n) DRY=1 ;;
+    --answer) shift; ANSWERS+=("${1:-}") ;; --answer=*) ANSWERS+=("${1#--answer=}") ;;
+    --auto-fix-safe) AUTOFIX=1; AUTOPILOT=1; DO_PLAN=1 ;;
+    --auto-target) AUTOTARGET=1 ;;
+    --list) LIST=1 ;;
+    *) echo "Unknown option: $1  (try --help)" >&2; exit 3 ;;
+  esac
+  shift
+done
+
+# --- where the system to check is (real machine, a mounted system, or a test fixture)
+if [ -n "${SL_DIAG_FIXTURE:-}" ]; then
+  SD_ROOT=$SL_DIAG_FIXTURE/root
+  export SL_TEST_SYSFS=${SL_TEST_SYSFS:-$SD_ROOT/sys} SL_TEST_PROC=${SL_TEST_PROC:-$SD_ROOT/proc} SL_TEST_DEV=${SL_TEST_DEV:-$SD_ROOT/dev}
+  SD_HAVE_TARGET=1; [ -n "${SL_DIAG_NOTARGET:-}" ] && SD_HAVE_TARGET=0
+else
+  SD_ROOT=${ROOTDIR%/}; [ -n "$SD_ROOT" ] || SD_ROOT=/
+  if [ "$SD_ROOT" != / ] && [ ! -d "$SD_ROOT" ]; then echo "secure-linux-diagnose: $ROOTDIR is not a folder." >&2; exit 3; fi
+  SD_HAVE_TARGET=0; [ "$SD_ROOT" != / ] && SD_HAVE_TARGET=1
+fi
+export SD_ROOT SD_HAVE_TARGET
+# shellcheck source=../hw/health/lib.sh
+. "$HLIB/lib.sh"
+. "$HLIB/repair-lib.sh"
+. "$HLIB/diagnose-lib.sh"; . "$HLIB/diagnose-detect.sh"; . "$HLIB/diagnose-plan.sh"
+[ -r "$HLIB/diagnose-auto.sh" ] && . "$HLIB/diagnose-auto.sh"
+
+SD_MODE=$MODE; SD_AUTOPILOT=$AUTOPILOT
+SD_TMP=$(mktemp -d 2>/dev/null || { mkdir -p "/tmp/sd.$$" && echo "/tmp/sd.$$"; })
+cleanup() { [ -n "${SD_HEALTH_PID:-}" ] && kill "$SD_HEALTH_PID" 2>/dev/null; rm -rf "$SD_TMP"; [ -n "${SD_MOUNTED:-}" ] && umount "$SD_MOUNTED" 2>/dev/null; return 0; }
+trap cleanup EXIT
+
+sd_kb_load "$KBDIR"
+[ "${#KB[@]}" -gt 0 ] || { echo "secure-linux-diagnose: the knowledge base is empty or missing ($KBDIR)." >&2; exit 3; }
+
+if [ "$LIST" = 1 ]; then
+  for ((i = 0; i < ${#KB[@]}; i++)); do IFS=$US read -r -a F <<< "${KB[i]}"; printf '%s\t%s\t%s\n' "${F[0]}" "${F[1]}" "${F[7]}"; done
+  exit 0
+fi
+
+# --- applying a plan: needs the repair libraries, and administrator rights unless it is only a dry run
+if [ "$APPLY" = 1 ] || [ "$AUTOFIX" = 1 ]; then
+  [ "$APPLY" = 1 ] && [ "$YES" != 1 ] && [ "$DRY" != 1 ] && { echo "Applying a plan needs your approval: add --yes (or use --dry-run to only look)." >&2; exit 3; }
+  if [ "$DRY" != 1 ] && ! slh_is_root; then
+    SELF=/usr/local/bin/secure-linux-diagnose; [ -x "$SELF" ] || SELF=$(readlink -f "$0" 2>/dev/null || echo "$0")   # polkit names /usr/local/bin
+    if have pkexec; then exec pkexec "$SELF" "$@"; fi
+    have sudo && exec sudo "$SELF" "$@"
+    echo "This needs administrator rights: run it with sudo." >&2; exit 1
+  fi
+  RP_DRY=$DRY
+  . "$HLIB/repair-boot.sh"; . "$HLIB/repair-disk.sh"; . "$HLIB/repair-misc.sh"
+  RP_WANT_TARGET=$SD_ROOT; [ "$SD_ROOT" = / ] && RP_WANT_TARGET=""
+  for a in "${ANSWERS[@]:-}"; do [ -n "$a" ] && SD_ANSWERS[${a%%=*}]=${a#*=}; done
+  export RP_FIX_PREAPPROVED=1
+fi
+if [ "$AUTOFIX" = 1 ]; then declare -F sd_auto_fix_safe >/dev/null || { echo "auto-fix is not installed." >&2; exit 3; }; sd_auto_fix_safe; exit $?; fi
+
+# --- a rescue/live system with several Linux systems on the drives: find them, ask one simple question if unsure
+for a in "${ANSWERS[@]:-}"; do [ -n "$a" ] && SD_ANSWERS[${a%%=*}]=${a#*=}; done
+if [ "$AUTOTARGET" = 1 ] && [ "$SD_HAVE_TARGET" != 1 ] && [ "$(sd_envclass)" != installed ]; then
+  sd_find_targets
+  if [ "${SD_NTARGETS:-0}" = 1 ]; then sd_use_target "$SD_TARGET_ONE_DEV"
+  elif [ "${SD_NTARGETS:-0}" -gt 1 ] && [ -n "${SD_ANSWERS[which-system]:-}" ]; then sd_use_target "${SD_ANSWERS[which-system]%% *}"; SD_TARGET_CHOICES=""
+  fi
+fi
+
+sd_health_start
+if [ -n "$ONLY" ]; then
+  found=0; for ((i = 0; i < ${#KB[@]}; i++)); do IFS=$US read -r -a F <<< "${KB[i]}"; [ "${F[0]}" = "$ONLY" ] && found=1; done
+  [ "$found" = 1 ] || { echo "secure-linux-diagnose: I do not know a problem called '$ONLY' (try --list)." >&2; exit 3; }
+fi
+sd_collect "$ONLY"
+sd_correlate
+
+if [ "$DO_PLAN" = 1 ]; then
+  sd_plan_build
+  if [ "$APPLY" = 1 ]; then
+    [ "$JSON" = 1 ] && echo "(--json is ignored while applying a plan)" >&2
+    sd_plan_apply; exit $?
+  fi
+  if [ "$JSON" = 1 ]; then sd_plan_json; else sd_plan_text; fi
+  exit 0
+fi
+
+if [ -n "$ONLY" ] && [ "$(sd_sorted | grep -c .)" = 0 ]; then
+  for ((i = 0; i < ${#KB[@]}; i++)); do
+    IFS=$US read -r -a F <<< "${KB[i]}"
+    [ "${F[0]}" = "$ONLY" ] || continue
+    if [ "$JSON" = 1 ]; then
+      printf '[\n  {"id":"%s","severity":"ok","title":"%s","what":"Checked: this problem is not present.","why":"","safe_level":"safe","auto_fixable":false,"fix_action":"","fix_args":[],"fix_summary":"Nothing to do.","backup_first":"","time_estimate":"","learn_more":"%s","area":"%s","needs_input":null,"confidence":"high","manual":"","undo":"","detail":"","also_explains":"","urgent_backup":false,"reboot_needed":false}\n]\n' \
+        "$(sd_je "$ONLY")" "$(sd_je "${F[7]}")" "$(sd_je "${F[18]}")" "$(sd_je "${F[1]}")"
+    else echo "Checked: \"${F[7]}\" is not present on this computer."; fi
+    exit 0
+  done
+fi
+if [ "$JSON" = 1 ]; then sd_emit_json; else sd_emit_text; fi
+exit 0

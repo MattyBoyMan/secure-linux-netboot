@@ -1,0 +1,15 @@
+#!/bin/bash
+# secure-linux-hwtest-marker: note that Wi-Fi did not come back after sleep during the hardware test.
+# Writes /var/lib/secure-linux/mt7921e-resume-fix, which the repair tools look for. Needs root; asks for
+# the password once through pkexec when the hardware test runs it as the logged-in user.
+#   secure-linux-hwtest-marker   write the marker file (takes no arguments)
+set -u   # no pipefail: "cmd | grep -q" must not fail when grep stops reading early
+SL_ROOT=${SL_ROOT:-/usr/local/lib/secure-linux}
+# shellcheck source=../lib/common.sh
+. "$SL_ROOT/lib/common.sh"
+
+case "${1:-}" in -h|--help) sed -n '2,5p' "$0"; exit 0 ;; esac
+SELF=/usr/local/bin/secure-linux-hwtest-marker; [ -x "$SELF" ] || SELF=$(readlink -f "$0")   # polkit names /usr/local/bin
+[ "$(id -u)" -eq 0 ] || exec pkexec "$SELF"
+
+touch "$SL_STATE/mt7921e-resume-fix"

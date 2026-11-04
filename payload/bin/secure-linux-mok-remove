@@ -1,0 +1,142 @@
+#!/bin/bash
+# secure-linux-mok-remove: remove the Ventoy USB-stick key from Secure Boot after installation.
+#
+#   secure-linux-mok-remove [remove]   find Ventoy's key among the extra Secure Boot keys and schedule its removal
+#   secure-linux-mok-remove status     list the extra keys and say whether Ventoy's key is still there
+#
+# Why: to start the installer, Ventoy's key was added to Secure Boot. While it stays, anything signed with that
+# key can start on this laptop. Removing it closes that door. (Your Ventoy stick then only starts with
+# Secure Boot switched off in the BIOS, or after enrolling its key again.)
+set -u   # no pipefail: "cmd | grep -q" must not fail when grep stops reading early
+SL_ROOT=${SL_ROOT:-/usr/local/lib/secure-linux}
+. "$SL_ROOT/lib/common.sh"
+. "$SL_ROOT/files/security/lib-security.sh"
+MEDIA_DIRS=${SL_SEC_MEDIA:-"$SEC_PREFIX/run/media $SEC_PREFIX/media $SEC_PREFIX/mnt"}
+
+usage() { sed -n '2,9p' "$(sec_self)" | sed 's/^# \{0,1\}//'; }
+
+fp() { openssl x509 -inform der -in "$1" -noout -fingerprint -sha1 2>/dev/null | sed 's/.*=//; s/://g' | tr 'A-F' 'a-f'; }
+subj() { openssl x509 -inform der -in "$1" -noout -subject -issuer 2>/dev/null | tr '\n' ' '; }
+
+# Ventoy's certificate on a plugged-in Ventoy stick (VTOYEFI partition), if any
+stick_cer() {
+  local d
+  # shellcheck disable=SC2086
+  for d in $MEDIA_DIRS; do
+    [ -d "$d" ] || continue
+    find "$d" -maxdepth 4 -iname 'ENROLL_THIS_KEY_IN_MOKMANAGER.cer' 2>/dev/null | head -1
+  done | head -1
+}
+
+# Export every enrolled MOK key into $WORK and print the file name of Ventoy's
+find_ventoy_key() {
+  local cer stick_fp f
+  ( cd "$WORK" && mokutil --export >/dev/null 2>&1 )
+  cer=$(stick_cer); stick_fp=""
+  [ -n "$cer" ] && stick_fp=$(fp "$cer")
+  for f in "$WORK"/MOK-*.der; do
+    [ -f "$f" ] || continue
+    if [ -n "$stick_fp" ] && [ "$(fp "$f")" = "$stick_fp" ]; then echo "$f"; return 0; fi
+    if subj "$f" | grep -qi ventoy; then echo "$f"; return 0; fi
+  done
+  # Export didn't work: ask mokutil directly whether the stick's key is enrolled
+  if [ -n "$cer" ] && mokutil --test-key "$cer" 2>&1 | grep -qi 'already enrolled'; then echo "$cer"; return 0; fi
+  return 1
+}
+
+bios_advice() {
+  cat <<'EOF'
+
+  ALSO RECOMMENDED: an ASUS BIOS administrator password
+    1. Restart and keep tapping F2 to open the BIOS (UEFI) setup. Press F7 for "Advanced Mode".
+    2. Security > Administrator Password: set one (write it on the same paper as your disk recovery key).
+    3. Leave "Secure Boot" on (Security / Boot > Secure Boot Control: Enabled).
+    4. Press F10 to save and restart.
+  This stops someone with the laptop from switching Secure Boot off or starting it from their own USB stick.
+  Don't set a "User Password" unless you want to type a second password at every start-up.
+
+EOF
+}
+
+cmd_status() {
+  sec_need_root status
+  command -v mokutil >/dev/null 2>&1 || { echo "mokutil isn't installed."; return 1; }
+  echo "Secure Boot: $(mokutil --sb-state 2>/dev/null | head -1)"
+  echo "Extra keys (MOK) enrolled:"
+  mokutil --list-enrolled 2>/dev/null | grep -E 'Subject:|Issuer:|SHA1 Fingerprint' | sed 's/^ */    /'
+  local pending; pending=$(mokutil --list-delete 2>/dev/null | grep -c 'Subject:')
+  [ "${pending:-0}" -gt 0 ] && echo "A key removal is waiting: restart the computer and confirm it on the blue screen."
+  WORK=$(mktemp -d)
+  if find_ventoy_key >/dev/null; then echo "Ventoy's key: still enrolled."; else echo "Ventoy's key: not found (already removed)."; fi
+  rm -rf "$WORK"
+}
+
+cmd_remove() {
+  sec_need_terminal remove
+  sec_need_root remove
+  command -v mokutil >/dev/null 2>&1 || { echo "mokutil isn't installed. Open 'Secure Linux Status' and choose Repair."; sec_pause; return 1; }
+  sec_sb_applies || { sec_pause; return 0; }
+  WORK=$(mktemp -d); trap 'rm -rf "$WORK"' EXIT
+  if [ -n "$(mokutil --list-delete 2>/dev/null)" ] && mokutil --list-delete 2>/dev/null | grep -qi 'Subject'; then
+    echo "A key removal is already scheduled. Restart the computer and follow the blue screen (see below)."
+  else
+    local key; key=$(find_ventoy_key)
+    if [ -z "$key" ]; then
+      echo "Ventoy's key isn't in the Secure Boot key list: nothing to remove."
+      sl_choice_set mok_removed yes
+      bios_advice; sec_pause "Press Enter to close. "; return 0
+    fi
+    echo "Found Ventoy's key:"
+    subj "$key" | sed 's/^/    /'; echo
+    if [ ! -f "$key" ]; then
+      cat <<'EOF'
+  The key file couldn't be read automatically. You can do it by hand:
+    sudo mokutil --export          (writes MOK-0001.der, MOK-0002.der... in the current folder)
+    openssl x509 -inform der -in MOK-0001.der -noout -subject     (find the one that says Ventoy)
+    sudo mokutil --delete MOK-000N.der
+EOF
+      sec_pause; return 1
+    fi
+    sec_ask "Remove Ventoy's key from Secure Boot?" yes || { echo "Nothing changed."; sec_pause; return 0; }
+    cat <<'EOF'
+
+  You'll now be asked to make up a ONE-TIME password (twice). Use something short and simple,
+  e.g. 1234. You only need it once, on the next restart. Note: on that blue screen the keyboard may
+  be American (QWERTY) layout.
+
+EOF
+    if ! mokutil --delete "$key"; then echo "That didn't work. Nothing was changed."; sec_pause; return 1; fi
+  fi
+  sl_choice_set mok_removed pending
+  cat <<'EOF'
+
+  NEXT RESTART: a BLUE screen appears ("Shim UEFI key management"). It waits only 10 seconds!
+    1. Press any key.
+    2. Choose "Delete MOK".  (Arrow keys and Enter.)
+    3. Choose "Continue", then "Yes".
+    4. Type the one-time password you just made up, press Enter.
+    5. Choose "Reboot".
+  If you miss the blue screen, just run this helper again.
+
+EOF
+  bios_advice
+  if sec_ask "Restart now?" no; then systemctl reboot; fi
+  return 0
+}
+
+# After the restart: confirm the key is really gone (called by steps/25-security.sh too)
+cmd_check() {
+  sec_need_root check
+  [ "$(sl_choice_get mok_removed no)" = pending ] || return 0
+  WORK=$(mktemp -d)
+  if ! find_ventoy_key >/dev/null; then sl_choice_set mok_removed yes; echo "Ventoy's key has been removed."; fi
+  rm -rf "$WORK"
+}
+
+case "${1:-remove}" in
+  -h|--help|help) usage ;;
+  remove) cmd_remove ;;
+  status) cmd_status ;;
+  check)  cmd_check ;;
+  *) echo "Unknown command '$1'." >&2; usage; exit 2 ;;
+esac

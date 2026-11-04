@@ -1,0 +1,797 @@
+#!/bin/bash
+# secure-linux-check: the health check (needs root; runs 10 min after start and every 6 h).
+# Turns problems into plain-English alerts (/var/lib/secure-linux/alerts.d/<id>, removed again when fixed)
+# and writes the results table shown by "Secure Linux Status & Fixes" (/var/lib/secure-linux/checks).
+#   secure-linux-check                    run every check
+#   secure-linux-check --antivirus-scan   weekly virus scan of Downloads + Desktop, then the antivirus check
+#   secure-linux-check --scrub            monthly Btrfs data check, then the disk checks
+#   secure-linux-check --av-ack           "Mark as dealt with": hide the latest antivirus findings
+#   secure-linux-check --clean-snapshots  delete old snapshots now to free space
+#   secure-linux-check --wear             monthly: log battery + SSD wear to /var/lib/secure-linux/wear.csv
+#   secure-linux-check --server           weekly: home server (Immich) version, HTTPS certificate, backup health
+#   secure-linux-check --flatpak-update   daily: update Flatpak apps, remove unused parts, warn about outdated
+#                                         runtimes, back up the LibreWolf profile before a major update
+set -u   # no pipefail: "cmd | grep -q" must not fail when grep stops reading early
+export LC_ALL=C
+SL_ROOT=${SL_ROOT:-/usr/local/lib/secure-linux}
+# shellcheck source=../lib/common.sh
+. "$SL_ROOT/lib/common.sh"
+R=${SL_TEST_SYSROOT:-}      # tests only: fake root for files read from the system (/proc/uptime, /etc/os-release, ...)
+
+case "${1:-}" in
+  -h|--help) sed -n '2,9p' "$0"; exit 0 ;;
+esac
+[ "$(id -u)" -eq 0 ] || exec pkexec "$0" "$@"
+
+mkdir -p "$SL_STATE/alerts.d" "$SL_STATE/events.d" "$SL_STATE/fedora-seen"
+CHECKS=$SL_STATE/checks
+NOW=$(date +%s)
+PROFILE=$(sl_profile); sl_is_atomic && PROFILE=atomic
+RES=$(mktemp); trap 'rm -f "$RES"' EXIT
+RAISED=" "
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+# ---------------------------------------------------------------- result helpers
+# results line: id|status|label|detail|fix     status: ok, warn, bad      fix: a key understood by secure-linux-status --fix
+row() { printf '%s|%s|%s|%s|%s\n' "$1" "$2" "$3" "${4:-}" "${5:-}" | tr -d '\r' >> "$RES"; }
+fix_label() {
+  case "$1" in
+    restart) echo "Restart the computer" ;;      updates) echo "Install updates now" ;;
+    repair) echo "Repair setup" ;;                firmware) echo "Update firmware (BIOS, SSD)" ;;
+    upgrade) echo "Upgrade Fedora" ;;             diag) echo "Create a diagnostics file" ;;
+    av-findings) echo "Show antivirus findings" ;; snapshots-clean) echo "Free space from old snapshots" ;;
+    disk) echo "See what's using disk space" ;;   vpn) echo "Set up VPN" ;;
+    vpn-renew) echo "Renew VPN subscription" ;;   battery) echo "Battery care" ;;
+    recovery-key) echo "Make a disk recovery key" ;; backup) echo "Check backups" ;;
+    hibernate) echo "Hibernate settings" ;;
+    *) echo "$1" ;;
+  esac
+}
+hint() { [ -n "${1:-}" ] && printf "Open 'Secure Linux Status & Fixes' and choose '%s'." "$(fix_label "$1")"; }
+good() { row "$1" ok "$2" "${3:-}" ""; sl_clear "$1"; }                       # good ID LABEL [DETAIL]
+note() { row "$1" "$2" "$3" "${4:-}" "${5:-}"; sl_clear "$1"; }              # note ID STATUS LABEL DETAIL [FIX]  (row only)
+problem() {   # problem ID bad|warn LABEL DETAIL FIX "Alert title" "Alert message"   (row + desktop alert)
+  row "$1" "$2" "$3" "$4" "$5"
+  sl_alert "$1" "$6" "$7" "$(hint "$5")"
+  RAISED="$RAISED$1 "
+}
+clear_stale() {   # clear_stale PREFIX   remove alerts PREFIX* not raised in this run
+  local f id
+  for f in "$SL_STATE/alerts.d/$1"*; do
+    [ -f "$f" ] || continue; id=${f##*/}
+    case "$RAISED" in *" $id "*) ;; *) sl_clear "$id" ;; esac
+  done
+}
+save_results() {   # full run: replace the table; partial run (MERGE=1): replace only the rows we produced
+  local tmp; tmp=$(mktemp)
+  if [ "${MERGE:-0}" = 1 ] && [ -f "$CHECKS" ]; then
+    awk -F'|' 'NR==FNR { n[$1]=$0; order[++k]=$1; next }
+               ($1 in n) { print n[$1]; delete n[$1]; next } { print }
+               END { for (i=1;i<=k;i++) if (order[i] in n) print n[order[i]] }' "$RES" "$CHECKS" > "$tmp"
+  else
+    cat "$RES" > "$tmp"
+  fi
+  mv -f "$tmp" "$CHECKS"; chmod 644 "$CHECKS"
+  date '+%Y-%m-%d %H:%M' > "$SL_STATE/checks.time"; chmod 644 "$SL_STATE/checks.time"
+}
+setup_running() { [ -f "$SL_STATE/progress" ] && ! grep -q '^done' "$SL_STATE/progress"; }
+fs_root() { findmnt -no FSTYPE / 2>/dev/null; }
+disk_use() { df --output=pcent / 2>/dev/null | tail -1 | tr -dc 0-9; }
+
+# ---------------------------------------------------------------- checks
+check_restart() {   # restart needed / updates waiting > 7 days / no restart for > 14 days
+  local need="" why="" since="" rc f="$SL_STATE/restart-needed-since" days ud running newest
+  if [ "$PROFILE" = atomic ]; then
+    rpm-ostree status --json 2>/dev/null | grep -q '"staged" *: *true' && { need=1; why="An update is ready and is applied when you restart."; }
+  elif [ -e "$R/system-update" ] || [ -L "$R/system-update" ]; then
+    need=1; why="Updates are downloaded and install while the computer restarts."
+    since=$(stat -c %Y "$R/system-update" 2>/dev/null)
+  elif [ -f "$R/var/lib/PackageKit/prepared-update" ]; then
+    need=1; why="Updates are downloaded and install while the computer restarts."
+    since=$(stat -c %Y "$R/var/lib/PackageKit/prepared-update" 2>/dev/null)
+  else
+    rc=2
+    have dnf && { timeout 180 dnf -q needs-restarting -r >/dev/null 2>&1; rc=$?; }   # dnf5: 1 = restart needed (VERIFY)
+    if [ "$rc" -eq 1 ]; then
+      need=1; why="Updates were installed; a restart finishes them."
+    elif [ "$rc" -ne 0 ]; then
+      running=$(uname -r)
+      newest=$(rpm -q kernel-core --qf '%{VERSION}-%{RELEASE}.%{ARCH}\n' 2>/dev/null | sort -V | tail -1)
+      [ -n "$newest" ] && [ "$running" != "$newest" ] && { need=1; why="A new system core (kernel) was installed."; }
+    fi
+  fi
+  if [ -n "$need" ]; then
+    if [ -z "$since" ]; then [ -s "$f" ] || echo "$NOW" > "$f"; since=$(cat "$f"); fi
+    days=$(( (NOW - since) / 86400 ))
+    if [ "$days" -ge 7 ]; then
+      sl_clear restart-needed
+      problem updates-waiting bad "No restart needed" "Updates have waited $days days for a restart" restart \
+        "Please restart to finish updates" \
+        "Security updates have been waiting $days days for a restart. Save your work and restart today; it takes a few minutes."
+    else
+      sl_clear updates-waiting
+      problem restart-needed warn "No restart needed" "$why" restart \
+        "Restart to finish updates" "$why Restart when it suits you (save your work first)."
+    fi
+  else
+    rm -f "$f"; sl_clear updates-waiting
+    good restart-needed "No restart needed"
+  fi
+  ud=$(cut -d. -f1 "$R/proc/uptime" 2>/dev/null); ud=$(( ${ud:-0} / 86400 ))
+  if [ -z "$need" ] && [ "$ud" -ge 14 ]; then
+    problem reboot-overdue warn "Restarted in the last 2 weeks" "Running for $ud days without a restart" restart \
+      "Time for a restart" "This computer has been on for $ud days. A restart now and then keeps it fast and finishes updates."
+  else
+    sl_clear reboot-overdue
+  fi
+}
+
+check_updates() {   # automatic updates switched on, and the last run worked
+  local timers=() t off=() failed=() u pk="$R/var/lib/PackageKit/offline-update-competed"
+  case "$PROFILE" in
+    full) timers=(secure-linux-offline-updates.timer) ;;
+    atomic) timers=(rpm-ostreed-automatic.timer) ;;
+    *) timers=(dnf5-automatic.timer) ;;
+  esac
+  timers+=(secure-linux-flatpak-update.timer)
+  for t in "${timers[@]}"; do systemctl is-enabled --quiet "$t" 2>/dev/null || off+=("$t"); done
+  if [ ${#off[@]} -gt 0 ] && ! setup_running; then
+    problem updates-off bad "Automatic updates are switched on" "Not scheduled: ${off[*]}" repair \
+      "Automatic updates are off" "Your computer isn't updating itself. Choose 'Repair setup' to switch updates back on."
+  else
+    good updates-off "Automatic updates are switched on"
+  fi
+  for u in dnf5-automatic.service secure-linux-offline-updates.service rpm-ostreed-automatic.service \
+           secure-linux-flatpak-update.service packagekit-offline-update.service dnf5-offline-transaction.service; do
+    systemctl is-failed --quiet "$u" 2>/dev/null && failed+=("$u")
+  done
+  # PackageKit result of the last install-on-restart (file name really is "competed"; VERIFY)
+  if [ -f "$pk" ] && grep -qi '^Success=false' "$pk" && [ $(( NOW - $(stat -c %Y "$pk") )) -lt 604800 ]; then
+    failed+=("install-on-restart")
+  fi
+  if [ ${#failed[@]} -gt 0 ]; then
+    problem updates-failed bad "The last automatic update worked" "Problem in: ${failed[*]}" updates \
+      "Automatic updates had a problem" \
+      "The last automatic update didn't finish. Choose 'Install updates now' to try again. If it fails again, choose 'Create a diagnostics file' and ask for help."
+  else
+    good updates-failed "The last automatic update worked"
+  fi
+}
+
+check_firewall() {
+  if systemctl is-active --quiet firewalld 2>/dev/null; then
+    good firewall-off "Firewall is on"
+  else
+    problem firewall-off bad "Firewall is on" "The firewall isn't running" repair \
+      "Firewall is off" "Your firewall isn't running. Choose 'Repair setup' to switch it back on."
+  fi
+}
+
+check_services() {
+  local failed
+  failed=$(systemctl --failed --no-legend --plain 2>/dev/null | awk '{print $1}' \
+    | grep -vE '^(dnf5-automatic|secure-linux-offline-updates|rpm-ostreed-automatic|secure-linux-flatpak-update|packagekit-offline-update|dnf5-offline-transaction)\.service$' \
+    | head -5 | tr '\n' ' ' | sed 's/ *$//')
+  if [ -n "$failed" ]; then
+    problem services-failed warn "All background services are running" "Stopped: $failed" restart \
+      "A background service stopped" "Not running: $failed. A restart usually fixes this; if not, choose 'Repair setup'."
+  else
+    good services-failed "All background services are running"
+  fi
+}
+
+check_disk() {
+  local use; use=$(disk_use)
+  [ -n "$use" ] || return 0
+  if [ "$use" -ge 90 ]; then
+    problem disk-full bad "Enough free disk space" "The disk is $use% full" disk \
+      "Disk almost full ($use%)" "Your disk is nearly full, which can stop updates. Choose 'See what's using disk space' to find big files."
+  elif [ "$use" -ge 80 ]; then
+    note disk-full warn "Enough free disk space" "The disk is $use% full" disk
+  else
+    good disk-full "Enough free disk space" "$use% used"
+  fi
+}
+
+check_setup() {
+  local n
+  if setup_running; then
+    note setup-failures warn "Setup finished without problems" "Setup is still running"
+  elif [ -s "$SL_FAILS" ]; then
+    n=$(grep -c . "$SL_FAILS")
+    problem setup-failures warn "Setup finished without problems" "$n item(s) didn't install" repair \
+      "Some things didn't install" "$n part(s) of the setup didn't finish (often a brief internet problem). Choose 'Repair setup' to try again."
+  else
+    good setup-failures "Setup finished without problems"
+  fi
+}
+
+release_age() {   # release_age N -> days since Fedora N came out (known date, else first seen by this check)
+  local v=$1 t=""
+  case "$v" in 45) t=$(date -d 2026-11-03 +%s) ;; esac
+  [ -n "$t" ] || t=$(cat "$SL_STATE/fedora-seen/$v" 2>/dev/null)
+  [ -n "$t" ] || t=$NOW
+  echo $(( (NOW - t) / 86400 ))
+}
+check_fedora() {   # support status; suggest upgrading only from the 4th week after a release
+  local cur latest json v a
+  cur=$( . "$R/etc/os-release" 2>/dev/null; echo "${VERSION_ID:-}")
+  json=$(curl -fsS --max-time 20 https://fedoraproject.org/releases.json 2>/dev/null) || return 0
+  latest=$(printf '%s' "$json" | grep -oE '"version": *"[0-9]+"' | grep -oE '[0-9]+' | sort -n | tail -1)
+  case "$cur$latest" in ''|*[!0-9]*) return 0 ;; esac
+  for v in $(seq $((cur + 1)) "$latest"); do
+    [ -s "$SL_STATE/fedora-seen/$v" ] || echo "$NOW" > "$SL_STATE/fedora-seen/$v"
+  done
+  if [ "$latest" -ge $((cur + 2)) ]; then
+    a=$(release_age $((cur + 2)))     # Fedora N ends 4 weeks after N+2 comes out
+    if [ "$a" -ge 28 ]; then
+      problem fedora-version bad "This Fedora version gets security updates" "Fedora $cur no longer gets security updates" upgrade \
+        "Upgrade Fedora now" "Fedora $cur no longer gets security fixes. Choose 'Upgrade Fedora' (about an hour; your files and apps stay)."
+    else
+      problem fedora-version warn "This Fedora version gets security updates" "Fedora $cur stops getting security fixes in about $((28 - a)) days" upgrade \
+        "Please upgrade Fedora soon" "Fedora $cur stops getting security fixes in about $((28 - a)) days. Choose 'Upgrade Fedora' (about an hour; your files and apps stay)."
+    fi
+  elif [ "$latest" -eq $((cur + 1)) ]; then
+    a=$(release_age "$latest")
+    if [ "$a" -ge 21 ]; then
+      note fedora-version warn "This Fedora version gets security updates" "Yes. Fedora $latest is available when you're ready" upgrade
+      sl_event "fedora-$latest-available" "Fedora $latest is available" \
+        "When it suits you, open 'Secure Linux Status & Fixes' and choose 'Upgrade Fedora'. No rush: Fedora $cur still gets security fixes for a few months."
+    else
+      good fedora-version "This Fedora version gets security updates" "Fedora $cur (Fedora $latest is brand new; the upgrade is offered from its 4th week)"
+    fi
+  else
+    good fedora-version "This Fedora version gets security updates" "Fedora $cur is the latest version"
+  fi
+}
+
+check_smart() {   # NVMe/SATA health: wear >= 80%, critical warning, failed self-assessment, bad sectors
+  have smartctl || return 0
+  local d out cw pu bad realloc any="" details=""
+  while read -r d; do
+    [ -n "$d" ] || continue
+    case "$d" in zram*|loop*|sr*) continue ;; esac
+    any=1
+    out=$(smartctl -H -A "/dev/$d" 2>/dev/null)
+    cw=$(printf '%s\n' "$out" | sed -n 's/^Critical Warning: *//p' | head -1)
+    pu=$(printf '%s\n' "$out" | sed -n 's/^Percentage Used: *\([0-9]*\)%.*/\1/p' | head -1)
+    realloc=$(printf '%s\n' "$out" | awk '$2=="Reallocated_Sector_Ct" || $2=="Current_Pending_Sector" {s+=$10} END {print s+0}')
+    bad=""
+    { [ -n "$cw" ] && [ "$cw" != "0x00" ] && [ "$cw" != "0" ]; } && bad="the disk reports a critical warning ($cw)"
+    printf '%s\n' "$out" | grep -q 'self-assessment test result: FAILED' && bad="the disk's self-test says it is failing"
+    if [ -n "$bad" ]; then
+      problem "disk-health-$d" bad "Disk $d is healthy" "$bad" diag "Back up your files now" \
+        "Your disk ($d): $bad. Copy important files to a USB drive or your backup today, then choose 'Create a diagnostics file' and ask for help."
+    elif [ -n "$pu" ] && [ "$pu" -ge 80 ]; then
+      problem "disk-health-$d" warn "Disk $d is healthy" "The SSD is $pu% worn out" backup "Your SSD is wearing out" \
+        "The SSD ($d) has used $pu% of its expected life. Make sure your backups work and plan to replace it."
+    elif [ "${realloc:-0}" -gt 0 ]; then
+      problem "disk-health-$d" warn "Disk $d is healthy" "$realloc damaged sector(s) found" backup "Your disk has damaged areas" \
+        "The disk ($d) has $realloc damaged sector(s). Make sure your backups work; the disk may fail soon."
+    else
+      details="$details$d${pu:+ ($pu% worn)} "
+    fi
+  done < <(lsblk -dn -o NAME,TYPE,TRAN 2>/dev/null | awk '$2=="disk" && $3!="usb" {print $1}')
+  # problems smartd reported through its hook (lite profile), last 3 days
+  if have journalctl && [ -n "$(journalctl -t secure-linux-smartd --since '-3 days' -o cat 2>/dev/null | head -1)" ]; then
+    problem disk-health-smartd bad "Disk monitor reports no problems" "smartd reported a disk problem" diag "A disk may be failing" \
+      "The disk monitor reported a problem. Back up your files soon, then choose 'Create a diagnostics file' and ask for help."
+  fi
+  clear_stale disk-health-
+  [ -n "$any" ] && [ -n "$details" ] && row disk-health ok "Disks are healthy" "${details% }" ""
+  return 0
+}
+
+check_btrfs() {   # write/read/corruption counters and the last monthly scrub
+  [ "$(fs_root)" = btrfs ] || return 0
+  local errs st
+  errs=$(btrfs device stats / 2>/dev/null | awk '$2 != 0 {print $1"="$2}' | head -3 | tr '\n' ' ')
+  if [ -n "$errs" ]; then
+    problem btrfs-errors bad "The disk reports no read/write errors" "Errors: $errs" diag "Your disk reported errors" \
+      "The system disk reported read or write errors. Back up your files, then choose 'Create a diagnostics file' and ask for help."
+  else
+    good btrfs-errors "The disk reports no read/write errors"
+  fi
+  st=$(btrfs scrub status / 2>/dev/null)
+  if printf '%s\n' "$st" | grep -qiE 'Error summary: *no errors found'; then
+    good scrub-errors "Monthly data check found no damage"
+  elif printf '%s\n' "$st" | grep -qi 'Error summary:'; then
+    problem scrub-errors bad "Monthly data check found no damage" "$(printf '%s\n' "$st" | grep -i 'Error summary:' | sed 's/^ *//')" diag \
+      "The monthly disk check found damage" \
+      "Some stored data failed its integrity check. Back up your files, then choose 'Create a diagnostics file' and ask for help."
+  fi
+}
+
+check_secureboot() {   # alert only if Secure Boot was on before and is off now
+  have mokutil || return 0
+  local sb; sb=$(mokutil --sb-state 2>/dev/null)
+  if printf '%s' "$sb" | grep -qi 'SecureBoot enabled'; then
+    touch "$SL_STATE/secureboot-was-on"
+    good secureboot-off "Secure Boot is on"
+  elif printf '%s' "$sb" | grep -qi 'SecureBoot disabled'; then
+    if [ -f "$SL_STATE/secureboot-was-on" ]; then
+      problem secureboot-off bad "Secure Boot is on" "Secure Boot was switched off" diag "Secure Boot is off" \
+        "Secure Boot was on before and is now off. If you didn't switch it off in the BIOS, ask for help (choose 'Create a diagnostics file')."
+    else
+      note secureboot-off warn "Secure Boot is on" "This computer runs without Secure Boot"
+    fi
+  fi
+}
+
+check_firmware() {   # fwupd: firmware (BIOS, SSD, ...) updates available
+  have fwupdmgr || return 0
+  local out rc n
+  out=$(timeout 120 fwupdmgr get-updates --json --no-unreported-check --no-metadata-check </dev/null 2>/dev/null); rc=$?
+  if [ $rc -ne 0 ] && [ $rc -ne 2 ] && [ -z "$out" ]; then
+    out=$(timeout 120 fwupdmgr get-updates --json </dev/null 2>/dev/null); rc=$?
+  fi
+  # exit 2 = nothing to do (no updates / no supported devices)
+  n=$(printf '%s\n' "$out" | grep -c '"Releases"')
+  if [ $rc -eq 0 ] && [ "$n" -gt 0 ]; then
+    problem firmware-updates warn "Firmware is up to date" "$n device(s) have a firmware update" firmware \
+      "Firmware update available" "A firmware update (for example for the BIOS or SSD) is ready. Plug in the charger, then choose 'Install firmware update'."
+  elif [ $rc -eq 0 ] || [ $rc -eq 2 ]; then
+    good firmware-updates "Firmware is up to date"
+  fi
+}
+
+battery_pct() {   # battery capacity now vs new, in % (upower, else /sys); empty if no battery
+  local b info full design d
+  if have upower && b=$(upower -e 2>/dev/null | grep -m1 'battery_'); then
+    info=$(upower -i "$b" 2>/dev/null)
+    # values look like "45.2 Wh" (or "45,2 Wh" in some languages)
+    full=$(printf '%s\n' "$info" | awk -F: '/energy-full:/ {v=$2; gsub(/,/,".",v); gsub(/[^0-9.]/,"",v); print v; exit}')
+    design=$(printf '%s\n' "$info" | awk -F: '/energy-full-design:/ {v=$2; gsub(/,/,".",v); gsub(/[^0-9.]/,"",v); print v; exit}')
+  fi
+  if [ -z "${full:-}" ] || [ -z "${design:-}" ]; then
+    for d in "$R"/sys/class/power_supply/BAT*; do
+      [ -d "$d" ] || continue
+      full=$(cat "$d/energy_full" 2>/dev/null || cat "$d/charge_full" 2>/dev/null)
+      design=$(cat "$d/energy_full_design" 2>/dev/null || cat "$d/charge_full_design" 2>/dev/null)
+      break
+    done
+  fi
+  awk -v f="${full:-0}" -v d="${design:-0}" 'BEGIN { if (d > 0 && f > 0) printf "%d", f * 100 / d }'
+}
+
+WEAR=$SL_STATE/wear.csv
+spark() {   # spark N...   tiny text chart, 0-100 scale
+  local v out="" c
+  for v in "$@"; do
+    case "$v" in ''|*[!0-9]*) continue ;; esac
+    c=$(( v * 7 / 100 )); [ "$c" -gt 7 ] && c=7; [ "$c" -lt 0 ] && c=0
+    out="$out$(printf '%s' '▁▂▃▄▅▆▇█' | cut -c$((c * 3 + 1))-$((c * 3 + 3)))"
+  done
+  printf '%s' "$out"
+}
+wear_trend() {   # wear_trend COLUMN  -> the last 12 values of a wear.csv column as a sparkline
+  [ -f "$WEAR" ] || return 0
+  # shellcheck disable=SC2046
+  spark $(tail -n 12 "$WEAR" | awk -F, -v c="$1" 'NR > 0 && $1 != "date" {print $c}')
+}
+
+check_battery() {   # battery wear: a one-off notice below 80% of new (it can't be fixed), always in the table
+  local pct t; pct=$(battery_pct)
+  [ -n "$pct" ] || return 0
+  t=$(wear_trend 2); t=${t:+  trend: $t}
+  if [ "$pct" -lt 80 ]; then
+    note battery-wear warn "Battery health" "The battery holds $pct% of its original charge$t" battery
+    sl_event battery-wear-80 "Your battery is wearing out" \
+      "It now holds $pct% of its original charge, which is normal for an older battery. Tip: open 'Secure Linux Status & Fixes' and choose 'Battery care' so it lasts longer."
+  else
+    good battery-wear "Battery health" "Holds $pct% of its original charge$t"
+  fi
+}
+
+wear_log() {   # monthly: date,battery %,NVMe % used,TB written  -> wear.csv (one line per month)
+  local month bat used tbw j d
+  month=$(date +%Y-%m)
+  [ -f "$WEAR" ] || echo "date,battery_pct,nvme_used_pct,nvme_tb_written" > "$WEAR"
+  grep -q "^$month" "$WEAR" && return 0
+  bat=$(battery_pct)
+  d=$(lsblk -dn -o NAME,TYPE 2>/dev/null | awk '$2=="disk" && $1 ~ /^nvme/ {print $1; exit}')
+  if [ -n "$d" ] && have smartctl; then
+    j=$(smartctl -j -A "/dev/$d" 2>/dev/null)
+    used=$(printf '%s\n' "$j" | grep -oE '"percentage_used": *[0-9]+' | grep -oE '[0-9]+$' | head -1)
+    tbw=$(printf '%s\n' "$j" | grep -oE '"data_units_written": *[0-9]+' | grep -oE '[0-9]+$' | head -1)
+    [ -n "$tbw" ] && tbw=$(awk -v u="$tbw" 'BEGIN { printf "%.2f", u * 512000 / 1e12 }')   # 1 unit = 512,000 bytes
+  fi
+  echo "$(date +%F),${bat:-},${used:-},${tbw:-}" >> "$WEAR"; chmod 644 "$WEAR"
+}
+check_wear() {   # alerts from the wear log (battery < 80% is a one-off notice; NVMe >= 80% is a disk alert)
+  local last used t
+  [ -f "$WEAR" ] || return 0
+  last=$(tail -n 1 "$WEAR"); used=$(printf '%s' "$last" | cut -d, -f3)
+  t=$(wear_trend 3)
+  if [ -n "$used" ] && [ "$used" -ge 80 ] 2>/dev/null; then
+    problem wear-nvme warn "SSD wear" "$used% of its rated life used${t:+  trend: $t}" backup "Your SSD is getting old" \
+      "The SSD has used $used% of its rated life. Make sure your backups work and plan to replace it in the next year or so."
+  elif [ -n "$used" ]; then
+    good wear-nvme "SSD wear" "$used% of its rated life used, $(printf '%s' "$last" | cut -d, -f4) TB written${t:+  trend: $t}"
+  fi
+}
+
+check_hibernate() {   # hibernate on lid close (rule: `secure-linux-hibernate wanted`, from choices hibernate + secureboot_intent)
+  local want sb
+  have secure-linux-hibernate || return 0
+  want=$(secure-linux-hibernate wanted 2>/dev/null)
+  if [ "$want" = no ] || [ "$PROFILE" = atomic ]; then
+    sl_clear hibernate-needs-secureboot-off
+    if [ "$(sl_choice_get secureboot_intent)" = on ]; then
+      row hibernate ok "Lid closed" "Sleep (Secure Boot on, by your choice)" hibernate
+    else
+      row hibernate ok "Lid closed" "Sleep" hibernate
+    fi
+    return 0
+  fi
+  if secure-linux-hibernate active >/dev/null 2>&1; then
+    sl_clear hibernate-needs-secureboot-off
+    good hibernate "Hibernate when the lid closes" "On ($want)"
+    return 0
+  fi
+  sb=$(mokutil --sb-state 2>/dev/null)
+  if printf '%s' "$sb" | grep -qi 'SecureBoot enabled'; then
+    problem hibernate-needs-secureboot-off warn "Hibernate when the lid closes" "Waiting: Secure Boot is on" hibernate \
+      "Hibernate on lid close is waiting" \
+      "Fedora only allows hibernation with Secure Boot off. Turn it off in the BIOS (F2 > Security > Secure Boot > Disabled), then restart; it switches on by itself."
+  elif ! setup_running; then
+    # Secure Boot is off now: switch hibernation on by itself (swap file, resume settings, lid action)
+    secure-linux-hibernate enable "$want" --auto >> "$SL_LOGDIR/hibernate.log" 2>&1
+    if secure-linux-hibernate active >/dev/null 2>&1; then
+      sl_clear hibernate-needs-secureboot-off
+      good hibernate "Hibernate when the lid closes" "On ($want); works from the next restart"
+    else
+      note hibernate warn "Hibernate when the lid closes" "Couldn't switch it on (see $SL_LOGDIR/hibernate.log)" repair
+    fi
+  fi
+}
+
+check_wifi_resume() {   # MT7922 Wi-Fi reload-after-sleep workaround (flag written by the hardware test)
+  if [ -f "$SL_STATE/mt7921e-resume-fix" ]; then
+    note wifi-resume ok "Wi-Fi after sleep" "Wi-Fi resume fix is on (the hardware test found it was needed)"
+  elif lsmod 2>/dev/null | grep -q '^mt7921e'; then
+    good wifi-resume "Wi-Fi after sleep"
+  fi
+}
+
+# ---------------------------------------------------------------- home server watchdog (weekly)
+server_url() { local u; u=$(sl_choice_get immich_url); [ -n "$u" ] || u=$(sl_build_get IMMICH_URL); printf '%s' "${u%/}"; }
+check_server() {
+  local url ver latest j host port end days health rel breaking
+  url=$(server_url)
+  [ -n "$url" ] || return 0
+  # Immich: GET /api/server/version -> {"major":1,"minor":132,"patch":3}  (VERIFY for current Immich)
+  j=$(curl -fsS --max-time 15 "$url/api/server/version" 2>/dev/null)
+  ver=$(printf '%s' "$j" | tr -d ' \n' | sed -n 's/.*"major":\([0-9]*\).*"minor":\([0-9]*\).*"patch":\([0-9]*\).*/\1.\2.\3/p')
+  if [ -z "$ver" ]; then
+    note server-update warn "Home server (Immich) is up to date" "Couldn't reach $url (normal when you're away from home)"
+  else
+    rel=$(curl -fsS --max-time 30 "https://api.github.com/repos/immich-app/immich/releases?per_page=30" 2>/dev/null)
+    latest=$(printf '%s' "$rel" | grep -oE '"tag_name": *"v[0-9.]+"' | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
+    if [ -n "$latest" ] && [ "$ver" != "$latest" ] && [ "$(printf '%s\n%s\n' "$ver" "$latest" | sort -V | tail -1)" = "$latest" ]; then
+      breaking=""
+      have python3 && breaking=$(printf '%s' "$rel" | python3 -c '
+import json, re, sys
+cur = tuple(int(x) for x in sys.argv[1].split("."))
+out = []
+for r in json.load(sys.stdin):
+    m = re.match(r"v?(\d+)\.(\d+)\.(\d+)", r.get("tag_name", ""))
+    if m and tuple(map(int, m.groups())) > cur and re.search(r"breaking", (r.get("name") or "") + (r.get("body") or ""), re.I):
+        out.append(r["tag_name"])
+print(" ".join(out))' "$ver" 2>/dev/null)
+      if [ -n "$breaking" ]; then
+        problem server-update warn "Home server (Immich) is up to date" "Immich $ver; $latest is out (breaking changes in: $breaking)" "" \
+          "Immich update needs care" "Your home server runs Immich $ver; $latest is out and includes breaking changes ($breaking). Read the release notes before updating the server."
+      else
+        problem server-update warn "Home server (Immich) is up to date" "Immich $ver; $latest is out" "" \
+          "Immich update available" "Your home server runs Immich $ver; $latest is out. Update it on the server when convenient."
+      fi
+    else
+      good server-update "Home server (Immich) is up to date" "Immich $ver"
+    fi
+  fi
+  # HTTPS certificate
+  case "$url" in
+    https://*)
+      host=${url#https://}; host=${host%%/*}; port=443
+      case "$host" in *:*) port=${host##*:}; host=${host%:*} ;; esac
+      end=$(echo | timeout 20 openssl s_client -servername "$host" -connect "$host:$port" 2>/dev/null | openssl x509 -noout -enddate 2>/dev/null | cut -d= -f2)
+      if [ -n "$end" ] && days=$(( ($(date -d "$end" +%s) - NOW) / 86400 )); then
+        if [ "$days" -lt 21 ]; then
+          problem server-cert warn "Home server certificate is valid" "Expires in $days day(s)" "" "Home server certificate expires soon" \
+            "The HTTPS certificate of $host expires in $days day(s). Renew it on the server (it normally renews itself; check the server's renewal job)."
+        else
+          good server-cert "Home server certificate is valid" "$days days left"
+        fi
+      fi ;;
+  esac
+  # Backup health file written by the server kit (choice server_health_url). Accepted formats:
+  #   key=value lines with last_backup=<date or epoch> and/or status=ok|error ; or any text: words like
+  #   error / fail / stale mean trouble.
+  local hu; hu=$(sl_choice_get server_health_url)
+  [ -n "$hu" ] || return 0
+  health=$(curl -fsS --max-time 15 "$hu" 2>/dev/null) || { note server-backup warn "Home server backups are working" "Couldn't read $hu"; return 0; }
+  local lb lbs st
+  lb=$(printf '%s\n' "$health" | sed -n 's/^last_backup=//p' | head -1)
+  st=$(printf '%s\n' "$health" | sed -n 's/^status=//p' | head -1)
+  lbs=""; [ -n "$lb" ] && { case "$lb" in *[!0-9]*) lbs=$(date -d "$lb" +%s 2>/dev/null) ;; *) lbs=$lb ;; esac; }
+  if { [ -n "$st" ] && [ "$st" != ok ]; } || { [ -z "$st" ] && printf '%s' "$health" | grep -qiE 'error|fail|stale'; }; then
+    problem server-backup bad "Home server backups are working" "$(printf '%s\n' "$health" | head -1 | cut -c1-120)" "" \
+      "Home server backup problem" "The home server reports a backup problem: $(printf '%s\n' "$health" | head -1 | cut -c1-120)"
+  elif [ -n "$lbs" ] && [ $(( (NOW - lbs) / 86400 )) -gt 8 ]; then
+    problem server-backup warn "Home server backups are working" "Last backup $(( (NOW - lbs) / 86400 )) days ago" "" \
+      "Home server backups stopped" "The home server's last backup was $(( (NOW - lbs) / 86400 )) days ago. Check the server."
+  else
+    good server-backup "Home server backups are working"
+  fi
+}
+
+# ---------------------------------------------------------------- Flatpak updates + tidy-up (daily service)
+LW=io.gitlab.librewolf-community
+librewolf_backup() {   # before a LibreWolf major update: copy the profile (keep 3)
+  local cur new home prof dest u
+  flatpak info --system "$LW" >/dev/null 2>&1 || return 0
+  cur=$(flatpak info --system "$LW" 2>/dev/null | sed -n 's/^ *Version: *//p' | head -1)
+  new=$(flatpak remote-info --system flathub "$LW" 2>/dev/null | sed -n 's/^ *Version: *//p' | head -1)
+  [ -n "$cur" ] && [ -n "$new" ] && [ "${cur%%.*}" != "${new%%.*}" ] || return 0
+  u=$(sl_user); home=$(sl_user_home); prof="$home/.var/app/$LW/.librewolf"
+  [ -d "$prof" ] || return 0
+  dest="$home/.local/share/secure-linux/librewolf-backups"
+  mkdir -p "$dest"
+  echo "LibreWolf $cur -> $new: backing up the profile first"
+  tar -C "$home/.var/app/$LW" -czf "$dest/librewolf-$(date +%Y%m%d)-v${cur%%.*}.tar.gz" .librewolf \
+    && ls -1t "$dest"/librewolf-*.tar.gz | tail -n +4 | while read -r old; do rm -f "$old"; done
+  chown -R "$u:" "$home/.local/share/secure-linux" 2>/dev/null; chmod 700 "$dest"
+}
+flatpak_update() {
+  local out rc eol
+  librewolf_backup
+  out=$(flatpak update --system -y --noninteractive 2>&1); rc=$?
+  printf '%s\n' "$out"
+  flatpak uninstall --system -y --noninteractive --unused
+  # end-of-life runtimes: flatpak prints e.g. "Info: org.gnome.Platform//44 is end-of-life, with reason: ..." (VERIFY wording)
+  eol=$(printf '%s\n' "$out" | grep -i 'end-of-life' | grep -oE '[A-Za-z0-9_.-]+(//|/[a-z0-9_]+/)[A-Za-z0-9_.-]+' | sort -u)
+  [ -n "$eol" ] && printf '%s\n' "$eol" >> "$SL_STATE/flatpak-eol"
+  check_flatpak_eol
+  return $rc
+}
+check_flatpak_eol() {   # still installed end-of-life runtimes (remembered from update output)
+  local f=$SL_STATE/flatpak-eol still="" r installed
+  [ -s "$f" ] || { sl_clear flatpak-eol; return 0; }
+  installed=$(flatpak list --system --runtime --columns=application,branch 2>/dev/null | awk '{print $1"//"$2}')
+  while read -r r; do
+    [ -n "$r" ] || continue
+    printf '%s\n' "$installed" | grep -qxF "$(printf '%s' "$r" | sed -E 's#/[a-z0-9_]+/#//#')" && still="$still $r"
+  done < <(sort -u "$f")
+  if [ -n "$still" ]; then
+    problem flatpak-eol warn "Apps use supported building blocks" "Outdated:$still" updates "Some apps use outdated parts" \
+      "Some apps still use parts that no longer get security fixes ($still). Updates usually fix this; if it stays for weeks, an app may be abandoned."
+  else
+    : > "$f"; good flatpak-eol "Apps use supported building blocks"
+  fi
+}
+
+check_snapshots() {   # snapshots on, and not filling the disk
+  [ "$PROFILE" != atomic ] && [ "$(fs_root)" = btrfs ] || return 0
+  if ! have snapper || ! snapper -c root get-config >/dev/null 2>&1; then
+    setup_running || note snapshot-space warn "System snapshots are on" "Snapshots aren't set up" repair
+    return 0
+  fi
+  local n use
+  n=$(snapper -c root list 2>/dev/null | awk -F'[|│]' 'NR > 2 && $1 + 0 > 0' | wc -l | tr -d ' ')
+  use=$(disk_use)
+  if [ "${use:-0}" -ge 85 ] && [ "${n:-0}" -gt 10 ]; then
+    problem snapshot-space warn "Snapshots aren't filling the disk" "$n snapshots kept; the disk is $use% full" snapshots-clean \
+      "Free up space from old snapshots" "The disk is $use% full and $n undo-snapshots are kept. Choose 'Free space from old snapshots' (the newest ones stay)."
+  else
+    good snapshot-space "System snapshots are on" "$n snapshots kept (undo points for updates)"
+  fi
+}
+
+check_protection() {   # status rows only (other areas raise their own alerts for these)
+  if lsblk -rno TYPE 2>/dev/null | grep -qx crypt; then
+    good encryption "Disk encryption is on"
+    if [ "$(sl_choice_get recovery_key_done no)" = yes ]; then good recovery-key "Recovery key saved"
+    else note recovery-key warn "Recovery key saved" "Not yet: without it a forgotten password means losing your files" recovery-key; fi
+  else
+    note encryption warn "Disk encryption is on" "This drive isn't encrypted"
+  fi
+  local dns vpn zone zl
+  if have secure-linux-dns; then
+    dns=$(secure-linux-dns status --short 2>/dev/null)
+    case "$dns" in
+      encrypted) good dns "Encrypted DNS is on" ;;
+      family) good dns "Encrypted DNS is on" "With the family filter" ;;
+      vpn) good dns "Encrypted DNS is on" "Handled by the VPN" ;;
+      paused) note dns warn "Encrypted DNS is on" "Paused for a hotel / cafe Wi-Fi login" hotspot ;;
+      *) note dns warn "Encrypted DNS is on" "Website look-ups aren't encrypted right now" repair ;;
+    esac
+  elif resolvectl status 2>/dev/null | grep -q '+DNSOverTLS'; then good dns "Encrypted DNS is on"
+  else note dns warn "Encrypted DNS is on" "Website look-ups aren't encrypted right now (normal during hotel Wi-Fi login)" repair; fi
+  if have secure-linux-vpn; then
+    vpn=$(secure-linux-vpn status --short 2>/dev/null)
+    if [ "$vpn" = both ]; then
+      problem vpn-both bad "Only one VPN is on" "NordVPN and Cloudflare WARP are both on" vpn "Two VPNs are on at once" \
+        "NordVPN and Cloudflare WARP are both switched on, which breaks the internet connection. Choose 'Set up VPN' to pick one."
+    else
+      sl_clear vpn-both
+      [ -n "$vpn" ] && row vpn-now ok "VPN right now" "$vpn" vpn
+    fi
+  fi
+  if have secure-linux-zone; then
+    zone=$(secure-linux-zone status --short 2>/dev/null)
+    case "$zone" in
+      home) zl="Home network" ;; away) zl="Away from home (extra protection on)" ;; offline) zl="Offline" ;; *) zl="" ;;
+    esac
+    [ -n "$zl" ] && row zone ok "Network" "$zl"
+  fi
+  if [ "$(getenforce 2>/dev/null)" = Enforcing ]; then
+    good selinux-off "SELinux protection is on"
+  elif have getenforce; then
+    problem selinux-off bad "SELinux protection is on" "SELinux is $(getenforce 2>/dev/null)" repair \
+      "SELinux protection is off" "A core security layer (SELinux) is off. Choose 'Repair setup' to switch it back on."
+  fi
+  if [ -n "$(sl_choice_get backup_target)" ]; then good backups "Backups are set up" "$(sl_choice_get backup_target)"
+  else note backups warn "Backups are set up" "No backup chosen yet" backup; fi
+}
+
+check_vpn() {   # respects the user's choice vpn_mode (unset = not chosen yet, off = no VPN alerts)
+  local mode acct exp e d i
+  mode=$(sl_choice_get vpn_mode)
+  case "$mode" in
+    "")
+      for i in vpn-not-running vpn-login vpn-expiry; do sl_clear "$i"; done
+      if setup_running; then return 0; fi
+      problem vpn-setup warn "VPN is set up" "You haven't chosen how to use a VPN yet" vpn "Set up your VPN" \
+        "Choose how this computer uses a VPN (it hides what you do online from Wi-Fi owners). Choose 'Set up VPN'."
+      return 0 ;;
+    off)
+      for i in vpn-setup vpn-not-running vpn-login vpn-expiry; do sl_clear "$i"; done
+      row vpn-setup ok "VPN" "Switched off (your choice)" vpn
+      return 0 ;;
+  esac
+  good vpn-setup "VPN is set up" "Mode: $mode"
+  if ! have nordvpn; then
+    for i in vpn-not-running vpn-login vpn-expiry; do sl_clear "$i"; done
+    return 0
+  fi
+  if systemctl is-active --quiet nordvpnd 2>/dev/null; then
+    good vpn-not-running "VPN service is running"
+  else
+    problem vpn-not-running bad "VPN service is running" "The NordVPN service isn't running" restart \
+      "VPN service isn't running" "Restart the computer. If this keeps happening, choose 'Repair setup'."
+    sl_clear vpn-login; sl_clear vpn-expiry
+    return 0
+  fi
+  acct=$(timeout 20 nordvpn account </dev/null 2>/dev/null | tr -d '\r')
+  [ -n "$acct" ] || return 0
+  if printf '%s' "$acct" | grep -qi 'not logged in'; then
+    sl_clear vpn-expiry
+    if [ "$mode" = private ]; then
+      problem vpn-login warn "Signed in to NordVPN" "Not signed in" vpn "Sign in to your VPN" \
+        "NordVPN isn't signed in, so the VPN can't protect you. Choose 'Set up VPN' to sign in."
+    else
+      sl_clear vpn-login
+    fi
+    return 0
+  fi
+  good vpn-login "Signed in to NordVPN"
+  # e.g. "VPN Service: Active (Expires on Mar 18th, 2027)"  (VERIFY wording of `nordvpn account`)
+  exp=$(printf '%s\n' "$acct" | sed -n 's/.*[Ee]xpires on \([A-Za-z]\{3,\}\) \([0-9]\{1,2\}\)[a-z]*, \([0-9]\{4\}\).*/\1 \2 \3/p' | head -1)
+  if [ -n "$exp" ] && e=$(date -d "$exp" +%s 2>/dev/null); then
+    d=$(( (e - NOW) / 86400 ))
+    if [ "$d" -lt 0 ]; then
+      problem vpn-expiry bad "VPN subscription is active" "It ended on $exp" vpn-renew "Your VPN subscription has ended" \
+        "Your NordVPN subscription ended on $exp, so the VPN can't connect. Renew it, or choose another VPN option in 'Set up VPN'."
+    elif [ "$d" -lt 14 ]; then
+      problem vpn-expiry warn "VPN subscription is active" "It ends in $d day(s) ($exp)" vpn-renew "Your VPN subscription ends soon" \
+        "Your NordVPN subscription ends in $d day(s), on $exp. If it doesn't renew automatically, renew it before then."
+    else
+      good vpn-expiry "VPN subscription is active" "Until $exp"
+    fi
+  elif printf '%s\n' "$acct" | grep -qiE 'VPN Service: *(Inactive|Expired)'; then
+    problem vpn-expiry bad "VPN subscription is active" "The subscription isn't active" vpn-renew "Your VPN subscription has ended" \
+      "Your NordVPN subscription isn't active, so the VPN can't connect. Renew it, or choose another VPN option in 'Set up VPN'."
+  fi
+}
+
+AV_DIR=$SL_LOGDIR/clamscan
+check_antivirus() {   # alert only on the latest weekly scan's FOUND lines, until marked as dealt with
+  have clamscan || return 0
+  local latest n
+  if systemctl is-active --quiet clamav-freshclam 2>/dev/null; then good antivirus-updates "Antivirus signatures are updating"
+  else note antivirus-updates warn "Antivirus signatures are updating" "The signature updater isn't running" repair; fi
+  latest=$(ls -1 "$AV_DIR"/*.log 2>/dev/null | sort | tail -1)
+  if [ -z "$latest" ]; then
+    note antivirus-found ok "Weekly virus scan found nothing" "The first scan runs within a week"
+    return 0
+  fi
+  n=$(grep -c 'FOUND$' "$latest")
+  if [ "${n:-0}" -gt 0 ] && [ "$(cat "$SL_STATE/antivirus-acked" 2>/dev/null)" != "${latest##*/}" ]; then
+    problem antivirus-found bad "Weekly virus scan found nothing" "$n suspicious file(s) in the scan of $(basename "$latest" .log)" av-findings \
+      "Antivirus found $n suspicious file(s)" "Nothing was deleted. Choose 'Show antivirus findings' to see them."
+  elif [ "${n:-0}" -gt 0 ]; then
+    good antivirus-found "Weekly virus scan found nothing" "Findings of $(basename "$latest" .log) marked as dealt with"
+  else
+    good antivirus-found "Weekly virus scan found nothing" "Last scan: $(basename "$latest" .log)"
+  fi
+}
+
+antivirus_scan() {
+  have clamscan || { echo "ClamAV isn't installed; nothing to scan with."; return 0; }
+  local u home t d dirs=() log rc old
+  u=$(sl_user); home=$(sl_user_home)
+  for t in DOWNLOAD DESKTOP; do
+    d=$(sudo -u "$u" xdg-user-dir "$t" 2>/dev/null)
+    [ -n "$d" ] && [ "$d" != "$home" ] && [ -d "$d" ] && dirs+=("$d")
+  done
+  [ ${#dirs[@]} -gt 0 ] || for t in Downloads Desktop; do [ -d "$home/$t" ] && dirs+=("$home/$t"); done
+  [ ${#dirs[@]} -gt 0 ] || { echo "No Downloads or Desktop folder to scan."; return 0; }
+  mkdir -p "$AV_DIR"; chmod 0755 "$AV_DIR"
+  log="$AV_DIR/$(date +%F).log"; rm -f "$log"
+  echo "Scanning ${dirs[*]} ..."
+  nice -n 19 clamscan -r -i --log="$log" "${dirs[@]}" >/dev/null 2>&1; rc=$?   # 0 clean, 1 found, 2 error
+  [ -f "$log" ] || echo "Scan didn't produce a log (exit $rc)" > "$log"
+  chmod 0644 "$log"
+  [ $rc -eq 2 ] && echo "ClamAV reported an error (see $log)"
+  ls -1 "$AV_DIR"/*.log 2>/dev/null | sort | head -n -12 | while read -r old; do rm -f "$old"; done
+  return 0
+}
+
+# ---------------------------------------------------------------- main
+case "${1:-}" in
+  --antivirus-scan)
+    antivirus_scan; MERGE=1; check_antivirus; save_results; exit 0 ;;
+  --scrub)
+    if [ "$(fs_root)" = btrfs ]; then
+      echo "Checking all data on the disk (Btrfs scrub)..."
+      ionice -c3 btrfs scrub start -B -d / || true
+    fi
+    MERGE=1; check_btrfs; save_results; exit 0 ;;
+  --av-ack)
+    latest=$(ls -1 "$AV_DIR"/*.log 2>/dev/null | sort | tail -1)
+    [ -n "$latest" ] && echo "${latest##*/}" > "$SL_STATE/antivirus-acked"
+    sl_clear antivirus-found
+    MERGE=1; check_antivirus; save_results; exit 0 ;;
+  --clean-snapshots)
+    if have snapper; then
+      echo "Deleting old snapshots (the newest ones stay)..."
+      snapper -c root cleanup number; snapper -c root cleanup timeline
+    fi
+    MERGE=1; check_snapshots; check_disk; save_results; exit 0 ;;
+  --wear)
+    wear_log; MERGE=1; check_wear; check_battery; save_results; exit 0 ;;
+  --server)
+    MERGE=1; check_server; save_results; exit 0 ;;
+  --flatpak-update)
+    flatpak_update; rc=$?; MERGE=1; save_results; exit $rc ;;
+  "") ;;
+  *) echo "Unknown option: $1 (see --help)" >&2; exit 2 ;;
+esac
+
+if have flock; then exec 9>"$SL_STATE/check.lock"; flock -w 600 9 || exit 0; fi
+check_restart
+check_updates
+check_firewall
+check_protection
+check_vpn
+check_antivirus
+check_setup
+check_disk
+check_snapshots
+check_smart
+check_btrfs
+check_secureboot
+check_firmware
+check_battery
+check_wear
+check_hibernate
+check_wifi_resume
+check_flatpak_eol
+check_services
+check_fedora
+save_results
+# one-off events older than 90 days are no longer needed (users keep their own "seen" list)
+find "$SL_STATE/events.d" -type f -mtime +90 -delete 2>/dev/null
+exit 0

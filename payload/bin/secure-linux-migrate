@@ -1,0 +1,289 @@
+#!/bin/bash
+# secure-linux-migrate: bring your passwords, bookmarks, photos, files and apps over from Windows.
+#   secure-linux-migrate                       pick a topic from a list (same pages as the welcome wizard)
+#   secure-linux-migrate page NAME             one topic: passwords bookmarks photos onedrive office study
+#                                              apps-you-used games printer display streaming meetings
+#                                              accessibility extras devices hibernate care before emergency
+#                                              family tips help
+#   secure-linux-migrate bookmarks [FOLDER]    turn Chrome/Edge bookmarks from the Windows backup into
+#                                              ~/Documents/Bookmarks from Windows.html (import it in LibreWolf)
+#   secure-linux-migrate wait-csv [SECONDS [SINCE_FILE]]  wait for a passwords CSV (newer than SINCE_FILE)
+#                                              to arrive in ~/Downloads, print its path
+#   secure-linux-migrate shred FILE            securely delete an exported passwords file
+#   secure-linux-migrate immich [--dry-run] PATH...   upload a Google Takeout to Immich (immich-go)
+#   secure-linux-migrate onedrive [setup|copy|check]  copy all of OneDrive to ~/OneDrive-Archive (rclone)
+#   secure-linux-migrate vault SOURCE NAME     copy an Obsidian/Joplin-markdown vault to ~/Vaults/NAME + Syncthing
+#   secure-linux-migrate conda-envs [FOLDER]   recreate Anaconda environments from exported .yml files
+#   secure-linux-migrate webapp-open URL      open a website in its own app-style window (Teams, Zoom, Microsoft 365 entries)
+#   secure-linux-migrate devices               what is ready for USB drives, iPhones, monitors and Bluetooth audio
+#   secure-linux-migrate find-backup           print where the Windows backup is (USB drive or home)
+#   secure-linux-migrate install KEY=VALUE...  (root) save a choice and install what it needs, e.g. office=onlyoffice
+#   secure-linux-migrate choice KEY VALUE      (root) save a comfort choice (when secure-linux-choice is missing)
+set -uo pipefail
+SL_ROOT=${SL_ROOT:-/usr/local/lib/secure-linux}
+. "$SL_ROOT/lib/common.sh"
+. "$SL_ROOT/files/comfort/comfort-lib.sh"
+SELF=$(readlink -f "$0")
+usage() { sed -n '2,24p' "$SELF" | sed 's/^# \{0,1\}//'; }
+
+PAGES="passwords bookmarks photos onedrive office study apps-you-used games printer display streaming meetings accessibility
+extras devices hibernate care before emergency family tips help"
+page_file() { local f; for f in "$SL_ROOT"/wizard.d/[0-9][0-9]-"$1".sh; do [ -f "$f" ] && { echo "$f"; return 0; }; done; return 1; }
+
+run_page() {   # run one wizard.d page with the fallback wz_* helpers
+  local f; f=$(page_file "$1") || { echo "Unknown topic: $1" >&2; return 1; }
+  . "$CF_FILES/wz-fallback.sh"
+  rm -f "$_WZ_CF"                      # scripted-answer counter starts again for each page
+  WZ_PAGE=$1 WZ_FORCE=${WZ_FORCE:-1}
+  # shellcheck disable=SC1090
+  . "$f"
+  UI_TITLE="$(page_title)"
+  page_run
+}
+
+menu() {
+  . "$CF_FILES/wz-fallback.sh"
+  local opts=() p f t a
+  for p in $PAGES; do f=$(page_file "$p") || continue; t=$(. "$f"; page_title); opts+=("$t"); done
+  a=$(wz_choice "What would you like help with?" "${opts[@]}")
+  [ -n "$a" ] || return 0
+  for p in $PAGES; do f=$(page_file "$p") || continue; t=$(. "$f"; page_title); [ "$t" = "$a" ] && { run_page "$p"; return; }; done
+}
+
+# ---------------------------------------------------------------- bookmarks
+cmd_bookmarks() {
+  local src=${1:-} docs out
+  [ -n "$src" ] || src=$(cf_find_backup) || { echo "Windows backup not found. Plug in the backup drive, or give the folder: secure-linux-migrate bookmarks /path/to/ZenbookBackup-..." >&2; return 1; }
+  [ -d "$src/browsers" ] && src=$src/browsers
+  docs=$(xdg-user-dir DOCUMENTS 2>/dev/null); [ -n "$docs" ] && [ "$docs" != "$HOME" ] || docs=$HOME/Documents
+  mkdir -p "$docs"; out="$docs/Bookmarks from Windows.html"
+  # Chrome/Edge "Bookmarks" (JSON) and Firefox "places.sqlite" all go into one HTML file
+  python3 "$CF_FILES/bookmarks2html.py" "$out" --search "$src" || return 1
+  echo "$out"
+}
+
+# ---------------------------------------------------------------- passwords
+cmd_wait_csv() {
+  local dl; dl=$(xdg-user-dir DOWNLOAD 2>/dev/null); [ -n "$dl" ] && [ "$dl" != "$HOME" ] || dl=$HOME/Downloads
+  mkdir -p "$dl"
+  cf_wait_for_file "$dl" '*.csv' "${1:-900}" "${2:-}"
+}
+cmd_shred() {
+  local f=${1:-}
+  [ -f "$f" ] || { echo "No such file: $f" >&2; return 1; }
+  case $f in *.csv|*.CSV) ;; *) echo "Only .csv exports are shredded by this command." >&2; return 1 ;; esac
+  cf_shred "$f" && echo "Deleted $f"
+}
+
+# ---------------------------------------------------------------- Google Takeout -> Immich
+cmd_immich() {
+  local dry="" keyfile=${XDG_RUNTIME_DIR:-/tmp}/secure-linux-immich-key key url rc
+  [ "${1:-}" = --dry-run ] && { dry=1; shift; }
+  [ $# -ge 1 ] || { echo "Give the Takeout folder or zip files." >&2; return 1; }
+  cf_have immich-go || { echo "immich-go isn't installed yet (setup installs it on the full profile). Try again after setup finishes." >&2; return 1; }
+  key=${IMMICH_GO_UPLOAD_API_KEY:-}
+  [ -z "$key" ] && [ -f "$keyfile" ] && key=$(cat "$keyfile")
+  [ -n "$key" ] || { echo "No Immich API key given." >&2; return 1; }
+  url=$(cf_immich_url)
+  echo "Uploading to $url"
+  [ -n "$dry" ] && echo "TEST RUN: nothing is uploaded; this only shows what would happen."
+  # VERIFY on a real machine: immich-go option names (--server, --api-key, --dry-run, --pause-immich-jobs,
+  # --on-errors). The key is passed as an option (immich-go has no documented way to read it from a file);
+  # it is visible to other programs for the length of the upload, so the wizard tells the user to delete
+  # the key in Immich afterwards. --pause-immich-jobs=false: pausing server jobs needs an admin key.
+  immich-go upload from-google-photos ${dry:+--dry-run} --server="$url" --api-key="$key"     --pause-immich-jobs=false --on-errors=continue "$@"
+  rc=$?
+  [ -z "$dry" ] && rm -f "$keyfile"
+  echo
+  if [ $rc -eq 0 ] && [ -n "$dry" ]; then echo "Test run finished: nothing was uploaded."
+  elif [ $rc -eq 0 ]; then
+    echo "Finished. Open Immich ($url) to see your photos. Big libraries keep processing on the server for a while."
+    echo "Last step: in Immich, Account Settings > API Keys, delete the key you made for this upload."
+  else echo "immich-go stopped with an error ($rc). You can run it again: already-uploaded photos are skipped."; fi
+  return $rc
+}
+
+# ---------------------------------------------------------------- OneDrive -> ~/OneDrive-Archive
+cmd_onedrive() {
+  local what=${1:-all} dest=$HOME/OneDrive-Archive
+  cf_have rclone || { echo "rclone isn't installed yet. Run: sudo dnf install rclone" >&2; return 1; }
+  if [ "$what" = setup ] || [ "$what" = all ]; then
+    if ! rclone listremotes 2>/dev/null | grep -qx 'onedrive:'; then
+      echo "Step 1: connect to OneDrive. A Microsoft sign-in page opens in your browser."
+      echo "Sign in, then click Accept. Come back to this window afterwards."
+      echo
+      # Non-interactive create: rclone opens the browser for Microsoft's sign-in and picks your personal
+      # OneDrive. If that fails, fall back to the guided questions.
+      rclone config create onedrive onedrive || {
+        echo; echo "Let's do it step by step instead: answer n (new remote), name: onedrive, storage: onedrive,"
+        echo "then press Enter for the defaults and choose your OneDrive when asked."
+        rclone config; }
+    fi
+    rclone listremotes 2>/dev/null | grep -qx 'onedrive:' || { echo "OneDrive isn't connected; nothing copied."; return 1; }
+  fi
+  if [ "$what" = copy ] || [ "$what" = all ]; then
+    mkdir -p "$dest"
+    echo; echo "Step 2: copying everything from OneDrive to $dest (it can take hours; you can keep working)."
+    rclone copy onedrive: "$dest" --progress --transfers 4 || { echo "The copy stopped. Run it again: it continues where it left off."; return 1; }
+  fi
+  if [ "$what" = check ] || [ "$what" = all ]; then
+    echo; echo "Step 3: checking that every file arrived."
+    if rclone check onedrive: "$dest" --one-way; then
+      echo; echo "All files are here: $dest"
+      echo "Nothing was deleted from OneDrive. When you're happy, you can cancel the subscription."
+    else
+      echo; echo "Some files differ or are missing (listed above). Run the copy again, then check again."
+      return 1
+    fi
+  fi
+}
+
+# ---------------------------------------------------------------- notes vault -> ~/Vaults/NAME (+ Syncthing)
+syncthing_add_folder() {   # syncthing_add_folder ID LABEL PATH   (best effort, via the local REST API)
+  local cfg key addr
+  for cfg in "$HOME/.local/state/syncthing/config.xml" "$HOME/.config/syncthing/config.xml"; do [ -f "$cfg" ] && break; done
+  [ -f "$cfg" ] || return 1
+  key=$(sed -n 's:.*<apikey>\(.*\)</apikey>.*:\1:p' "$cfg" | head -1)
+  addr=$(sed -n '/<gui/,/<\/gui>/s:.*<address>\(.*\)</address>.*:\1:p' "$cfg" | head -1)
+  [ -n "$key" ] && [ -n "$addr" ] || return 1
+  curl -fsS --max-time 10 -H "X-API-Key: $key" "http://$addr/rest/config/folders/$1" >/dev/null 2>&1 && return 0
+  curl -fsS --max-time 10 -X POST -H "X-API-Key: $key" -H 'Content-Type: application/json' \
+    -d "$(python3 -c 'import json,sys; print(json.dumps({"id":sys.argv[1],"label":sys.argv[2],"path":sys.argv[3],"type":"sendreceive"}))' "$1" "$2" "$3")" \
+    "http://$addr/rest/config/folders" >/dev/null 2>&1
+}
+cmd_vault() {
+  local src=${1:-} name=${2:-} dest id
+  [ -d "$src" ] || { echo "Folder not found: $src" >&2; return 1; }
+  name=$(printf '%s' "${name:-$(basename "$src")}" | tr -cd 'A-Za-z0-9 ._-')
+  name=${name#"${name%%[!. ]*}"}                 # no leading dots/spaces: ".." must never leave ~/Vaults
+  name=${name:-Notes}
+  dest=$HOME/Vaults/$name
+  mkdir -p "$dest"
+  cp -a --no-clobber "$src"/. "$dest"/ 2>/dev/null || cp -an "$src"/. "$dest"/
+  id="vault-$(printf '%s' "$name" | tr 'A-Z ' 'a-z-' | tr -cd 'a-z0-9-')"
+  if syncthing_add_folder "$id" "$name (notes)" "$dest"; then echo "SYNCTHING: added"; else echo "SYNCTHING: manual"; fi
+  echo "$dest"
+}
+
+# ---------------------------------------------------------------- Anaconda environments
+# Windows exports contain Windows-only packages and exact Windows build strings that don't exist on Linux.
+# We make a Linux-friendly copy: no "prefix:", no build strings, no Windows-only packages.
+clean_env_yaml() {   # clean_env_yaml IN OUT
+  python3 - "$1" "$2" <<'EOF'
+import re, sys
+win_only = re.compile(r"^(vc|vs20\d\d_runtime|vs20\d\d_win-64|ucrt|m2-.*|m2w64-.*|msys2-.*|pywin32.*|pywinpty|wincertstore|win_inet_pton|winpty|menuinst|intel-openmp|console_shortcut|powershell_shortcut)$", re.I)
+out = []
+pip_indent = None            # inside "- pip:" the entries are pip's (name==version): keep them exactly
+with open(sys.argv[1], encoding="utf-8-sig") as fh:
+    for line in fh:
+        if line.startswith("prefix:"):
+            continue
+        indent = len(line) - len(line.lstrip(" "))
+        if pip_indent is not None:
+            if line.strip() and indent > pip_indent:
+                out.append(line)
+                continue
+            pip_indent = None
+        if re.match(r"^\s*-\s+pip:\s*$", line):
+            pip_indent = indent
+            out.append(line)
+            continue
+        m = re.match(r"^(\s*-\s+)([A-Za-z0-9_.\-]+)(=[^=\s#]+)?(=[^\s#]+)?\s*$", line.rstrip("\n"))
+        if m and ":" not in line:
+            if win_only.match(m.group(2)):
+                continue
+            line = m.group(1) + m.group(2) + (m.group(3) or "") + "\n"   # keep name=version, drop =build
+        out.append(line)
+with open(sys.argv[2], "w", encoding="utf-8", newline="\n") as fh:
+    fh.writelines(out)
+EOF
+}
+cmd_conda_envs() {
+  local src=${1:-} f name tmp n=0 ok=0
+  cf_have conda || { echo "conda isn't installed. Choose 'Anaconda environments' in Bring My Stuff from Windows > Study tools, or run: sudo dnf install conda" >&2; return 1; }
+  [ -n "$src" ] || src=$(cf_find_backup) || { echo "Windows backup not found: give the folder with the .yml files." >&2; return 1; }
+  tmp=$(mktemp -d)
+  while IFS= read -r f; do
+    grep -q '^dependencies:' "$f" 2>/dev/null || continue
+    n=$((n + 1))
+    name=$(sed -n 's/^name: *//p' "$f" | head -1 | tr -cd 'A-Za-z0-9._-')
+    [ -n "$name" ] && [ "$name" != base ] || name=$(basename "${f%.*}" | tr -cd 'A-Za-z0-9._-')
+    [ "$name" = base ] && name=base-from-windows
+    if conda env list 2>/dev/null | awk '{print $1}' | grep -qx "$name"; then echo "Already here: $name"; ok=$((ok + 1)); continue; fi
+    clean_env_yaml "$f" "$tmp/$name.yml"
+    echo; echo "=== Creating environment '$name' from $(basename "$f")"
+    if conda env create -n "$name" -f "$tmp/$name.yml"; then ok=$((ok + 1))
+    else echo "Couldn't recreate '$name' exactly. Tip: on Windows, export with: conda env export --from-history > $name.yml"; fi
+  done < <(find "$src" -maxdepth 4 \( -iname '*.yml' -o -iname '*.yaml' \) 2>/dev/null | sort)
+  rm -rf "$tmp"
+  [ $n -gt 0 ] || { echo "No exported environments (.yml) found in $src."; return 1; }
+  echo; echo "$ok of $n environment(s) ready. Use one with: conda activate NAME"
+}
+
+# ---------------------------------------------------------------- devices summary (setup installs these by itself)
+cmd_devices() {
+  local ok=0
+  have_pkg() { rpm -q "$1" >/dev/null 2>&1; }
+  echo "USB drives from friends (exFAT, NTFS) and zip/7z/rar files:"
+  if have_pkg exfatprogs && have_pkg 7zip; then echo "  ready: plug a drive in and it appears in the file manager."
+  else echo "  not fully installed yet (setup adds exfatprogs and 7zip)."; ok=1; fi
+  echo "iPhone photos and files:"
+  if have_pkg usbmuxd && have_pkg ifuse; then
+    echo "  ready: plug in the iPhone, tap Trust on it, then open it in the file manager."
+  else echo "  not installed yet (usbmuxd and ifuse)."; ok=1; fi
+  echo "Brightness of an external monitor:"
+  if have_pkg ddcutil; then
+    echo "  ready: use the brightness slider, or type: ddcutil setvcp 10 60   (brightness 60). Check which monitors it sees: ddcutil detect"
+  else echo "  not installed yet (ddcutil)."; ok=1; fi
+  echo "Bluetooth headphones (LDAC, AAC):"
+  if have_pkg libldac; then
+    echo "  ready: connect them, then pick the best codec in System Settings > Audio > the device's Profile."
+  else echo "  codec libraries not installed yet."; ok=1; fi
+  return $ok
+}
+
+# ---------------------------------------------------------------- root: choices + installs
+root_choice() {   # choice KEY VALUE
+  [ "$(id -u)" -eq 0 ] || exec pkexec "$SELF" choice "$@"
+  cf_key_allowed "${1:-}" "${2:-}" || { echo "Not a comfort choice: ${1:-}=${2:-}" >&2; return 2; }
+  sl_choice_set "$1" "$2"
+}
+root_install() {  # install KEY=VALUE...
+  [ "$(id -u)" -eq 0 ] || exec pkexec "$SELF" install "$@"
+  local kv k v rc=0
+  for kv in "$@"; do
+    k=${kv%%=*}; v=${kv#*=}
+    cf_key_allowed "$k" "$v" || { echo "Not a comfort choice: $kv" >&2; rc=2; continue; }
+    sl_choice_set "$k" "$v"
+  done
+  SL_PROFILE=$(sl_profile); export SL_PROFILE
+  # reuse the steps' install functions
+  CF45_LIB_ONLY=1; . "$SL_ROOT/steps/45-migration.sh"
+  CF75_LIB_ONLY=1; . "$SL_ROOT/steps/75-comfort.sh"
+  for kv in "$@"; do
+    k=${kv%%=*}; v=${kv#*=}
+    cf_key_allowed "$k" "$v" || continue
+    _cf45_apply "$k" "$v" || rc=1
+    _cf75_apply "$k" "$v" || rc=1
+  done
+  return $rc
+}
+
+case "${1:-}" in
+  -h|--help|help) usage ;;
+  "") menu ;;
+  page) [ -n "${2:-}" ] || { usage; exit 2; }; run_page "$2" ;;
+  bookmarks) shift; cmd_bookmarks "$@" ;;
+  wait-csv) shift; cmd_wait_csv "$@" ;;
+  shred) shift; cmd_shred "$@" ;;
+  immich) shift; cmd_immich "$@" ;;
+  onedrive) shift; cmd_onedrive "$@" ;;
+  vault) shift; cmd_vault "$@" ;;
+  conda-envs) shift; cmd_conda_envs "$@" ;;
+  webapp-open) cf_webapp_open "${2:-}" ;;
+  devices) shift; cmd_devices "$@" ;;
+  find-backup) cf_find_backup ;;
+  install) shift; root_install "$@" ;;
+  choice) shift; root_choice "$@" ;;
+  *) usage; exit 2 ;;
+esac

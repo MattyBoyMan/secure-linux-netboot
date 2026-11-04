@@ -1,0 +1,270 @@
+#!/bin/bash
+# secure-linux-fleet-join: let the household's main computer (the "fleet laptop", the Zenbook) look
+# after this PC over the home network. Run it any time (the welcome wizard offers it too):
+#   secure-linux-fleet-join        asks before every change; saying no leaves everything as it is
+# What joining means: the main computer can log in here with its own key (passwords stay off for
+# remote logins), check this PC's health, and install its updates. Screen help (RustDesk) is a
+# separate question and only ever talks to YOUR fleet server, never to RustDesk's public servers.
+# Nothing here uses the internet except the optional RustDesk app download; pairing is LAN-only.
+# Test hooks (never set on a real machine): SL_TEST_PREFIX (fake root for /etc, /usr, /var),
+# SL_FLEET_HOME (primary user's home), SL_FLEET_YES=1 (answer yes to yes/no questions),
+# SL_FLEET_RD_API (RustDesk release info address), SL_FLEET_SERVER_JSON (fleet.json override).
+set -u   # no pipefail: "cmd | grep -q" must not fail when grep stops reading early
+SL_ROOT=${SL_ROOT:-/usr/local/lib/secure-linux}
+. "$SL_ROOT/lib/common.sh"
+. "$SL_ROOT/lib/fleet-pair.sh"
+P=${SL_TEST_PREFIX:-}
+# Re-run as administrator through the dedicated polkit action org.securelinux.fleet-join (named for this
+# helper, like secure-linux-update-now), so the password box says what is being asked - never a generic prompt.
+SELF=/usr/local/bin/secure-linux-fleet-join; [ -x "$SELF" ] || SELF=$(readlink -f "$0")   # polkit names /usr/local/bin
+if [ -z "$P" ] && [ "$(id -u)" -ne 0 ]; then exec pkexec "$SELF" "$@"; fi
+
+FLEET_USER=$(sl_user); [ -n "$FLEET_USER" ] || FLEET_USER=${SUDO_USER:-}
+FLEET_HOME=${SL_FLEET_HOME:-}
+[ -n "$FLEET_HOME" ] || FLEET_HOME=$(getent passwd "$FLEET_USER" 2>/dev/null | cut -d: -f6)
+[ -n "$FLEET_HOME" ] || FLEET_HOME=$HOME
+DROPIN=$P/etc/ssh/sshd_config.d/40-secure-linux-fleet.conf
+RD_CONF=$P/root/.config/rustdesk/RustDesk2.toml   # the RustDesk background service runs as root
+
+say() { printf '%s\n' "$*"; }
+confirm() {       # confirm "question"   (SL_FLEET_YES=1 answers yes, for tests)
+  [ "${SL_FLEET_YES:-}" = 1 ] && return 0
+  local a; read -rp "$1 [y/N] " a; case $a in y*|Y*) return 0 ;; *) return 1 ;; esac
+}
+ask() {           # ask "question"   prints the typed answer
+  local a; read -rp "$1 " a; printf '%s' "$a"
+}
+
+if [ -z "$FLEET_USER" ]; then
+  say "I couldn't work out this PC's main user. Run me from a normal login, or set the user first:"
+  say "  echo YOURNAME | sudo tee /etc/secure-linux/user"
+  exit 1
+fi
+
+# ---------------------------------------------------------------- already enrolled?
+if [ "$(sl_choice_get fleet_enrolled no)" = yes ]; then
+  say "This PC is already enrolled in your home fleet (joined $(sl_choice_get fleet_date 'on an earlier date'))."
+  if confirm "Do you want to re-pair it (a new key from the fleet laptop)? Saying no leaves everything as it is."; then
+    say "OK, re-pairing. The old fleet key is replaced, everything else stays."
+  else
+    say "Leaving things as they are. Nothing was changed."
+    exit 0
+  fi
+fi
+
+# ---------------------------------------------------------------- what joining means
+cat <<'EOF'
+Join your home fleet
+
+The fleet laptop (the main computer) will be able to, over your HOME network only:
+  - check this PC is healthy (updates, disk space, backups),
+  - install this PC's updates when you ask it to,
+  - open this PC's Cockpit page (https://<this-pc>:9090) if it has one.
+
+Remote logins use the fleet laptop's own key; logging in with a password is switched OFF for remote
+logins. Nothing is sent to any company: no cloud, no outside server, no internet needed.
+
+EOF
+confirm "Join your home fleet now?" || { say "No problem. Nothing was changed. You can join any time: secure-linux-fleet-join"; exit 0; }
+
+# ---------------------------------------------------------------- step 1: SSH + fail2ban
+if ! rpm -q openssh-server >/dev/null 2>&1 || ! rpm -q fail2ban >/dev/null 2>&1; then
+  say ""
+  say "Step 1: this PC needs two small programs: the remote-login door (openssh-server) and the"
+  say "guard that locks out password guessers (fail2ban). They are Fedora's own packages."
+  if confirm "Install them now?"; then
+    sl_dnf_install openssh-server fail2ban || { say "The install didn't work. Nothing else was changed."; exit 1; }
+  else
+    say "Can't join without them. Nothing was changed."; exit 0
+  fi
+fi
+sl_enable sshd.service fail2ban.service
+
+# ---------------------------------------------------------------- step 2: pairing (fetch the key)
+say ""
+say "Step 2: pairing. On the FLEET LAPTOP, run:  secure-linux-fleet pair"
+say "It shows an address (like 10.0.30.5:47631) and six everyday words. Keep that window open."
+say ""
+say "Two ways to get the fleet laptop's key here:"
+say "  1. Over the home network (easiest: type the address it shows)"
+say "  2. With a USB stick (copy the file id_ed25519.pub from the fleet laptop)"
+METHOD=$(ask "Type 1 or 2:")
+
+KEYTMP=$(mktemp); SERVERJSON=""
+case $METHOD in
+  1)
+    ADDR=$(ask "Type the address from the fleet laptop (e.g. 10.0.30.5:47631):")
+    HOST=${ADDR%:*}; PORT=${ADDR##*:}
+    if [ "$HOST" = "$ADDR" ] || ! fp_is_lan_addr "$HOST" || ! printf '%s' "$PORT" | grep -qE '^[0-9]{2,5}$'; then
+      say "That doesn't look like a home-network address (something like 10.0.30.5:47631 or zenbook.local:47631)."
+      say "Nothing was changed. Run secure-linux-fleet-join again when you have it."; rm -f "$KEYTMP"; exit 1
+    fi
+    if ! fp_fetch "http://$ADDR/id_ed25519.pub" > "$KEYTMP" || [ ! -s "$KEYTMP" ]; then
+      say "Couldn't reach the fleet laptop at $ADDR. Is its pairing window still open, and are both PCs"
+      say "on the same home network? Nothing was changed."; rm -f "$KEYTMP"; exit 1
+    fi
+    # Optional extra: if the fleet laptop runs the fleet server (screen help), it says so here
+    SERVERJSON=${SL_FLEET_SERVER_JSON:-}
+    [ -n "$SERVERJSON" ] || { fp_fetch "http://$ADDR/fleet.json" > "$KEYTMP.fleet.json" 2>/dev/null && [ -s "$KEYTMP.fleet.json" ] && SERVERJSON=$KEYTMP.fleet.json; }
+    ;;
+  2)
+    USBKEY=""
+    for f in "$P/run/media/$FLEET_USER"/*/id_ed25519.pub "$P/run/media/$FLEET_USER"/*/*/id_ed25519.pub "$P/media/$FLEET_USER"/*/id_ed25519.pub; do
+      [ -f "$f" ] && { USBKEY=$f; break; }
+    done
+    if [ -z "$USBKEY" ]; then
+      USBKEY=$(ask "I couldn't spot id_ed25519.pub on a USB stick. Type its full path:")
+    fi
+    if [ -z "$USBKEY" ] || [ ! -f "$USBKEY" ]; then
+      say "No key file found. Nothing was changed."; rm -f "$KEYTMP"; exit 1
+    fi
+    cp "$USBKEY" "$KEYTMP"
+    say "Tip: the fleet laptop can also show the six words with:  secure-linux-fleet pair --words-only"
+    ;;
+  *)
+    say "That's not 1 or 2. Nothing was changed."; rm -f "$KEYTMP"; exit 1 ;;
+esac
+
+# ---------------------------------------------------------------- step 3: check the key before trusting it
+if ! fp_valid_pubkey "$KEYTMP"; then
+  say "That file isn't a valid fleet key (it should be one line starting with ssh-ed25519)."
+  say "Nothing was changed."; rm -f "$KEYTMP" "$KEYTMP.fleet.json"; exit 1
+fi
+WORDS=$(fp_words_for_pubkey "$KEYTMP")
+say ""
+say "Check now, on the fleet laptop's screen. These six words must match what it shows:"
+say ""
+say "      $WORDS"
+say ""
+say "  (fingerprint: $(fp_fingerprint "$KEYTMP"))"
+say ""
+if ! confirm "Do the six words match EXACTLY what the fleet laptop shows?"; then
+  say "Then I won't trust that key: a mismatch can mean someone else is pretending to be the fleet laptop."
+  say "Nothing was changed. Try again, and if the words never match, ask whoever set up the fleet laptop."
+  rm -f "$KEYTMP" "$KEYTMP.fleet.json"; exit 1
+fi
+
+# ---------------------------------------------------------------- step 4: install the key (fail safe order)
+SSH_DIR=$FLEET_HOME/.ssh
+mkdir -p "$SSH_DIR"; chmod 700 "$SSH_DIR"
+AUTH=$SSH_DIR/authorized_keys
+touch "$AUTH"
+# Replace any previous fleet key; keep every other key exactly as it is
+grep -v 'secure-linux-fleet' "$AUTH" > "$AUTH.new" 2>/dev/null || true
+KEYLINE=$(awk '{print $1" "$2}' "$KEYTMP")
+case $KEYLINE in *secure-linux-fleet*) ;; *) KEYLINE="$KEYLINE secure-linux-fleet" ;; esac
+printf '%s\n' "$KEYLINE" >> "$AUTH.new"
+cat "$AUTH.new" > "$AUTH"; rm -f "$AUTH.new"
+chmod 600 "$AUTH"; chown -R "$FLEET_USER:$FLEET_USER" "$SSH_DIR"
+say "The fleet laptop's key is installed for $FLEET_USER. Password logins for remote access are switched off now."
+
+# Keys only for remote logins (drop-in; removed again if sshd rejects it)
+printf '# secure-linux-fleet: remote logins use the fleet laptop key only (no passwords)\nPasswordAuthentication no\nKbdInteractiveAuthentication no\n' | sl_write_file "$DROPIN" 0600
+if command -v sshd >/dev/null 2>&1 && ! sshd -t 2>/dev/null; then
+  say "The SSH settings check failed; I removed my change so remote login keeps working as before."
+  rm -f "$DROPIN"; try systemctl reload-or-restart sshd.service
+else
+  try systemctl reload-or-restart sshd.service
+fi
+
+# SSH only in the firewall's home zone (never in the public/away zone) - same pattern as 20-network.sh
+fw() { if firewall-cmd --state >/dev/null 2>&1; then firewall-cmd --permanent "$@"; else firewall-offline-cmd "$@"; fi }
+if command -v firewall-cmd >/dev/null 2>&1; then
+  fw --zone=home --query-service=ssh >/dev/null 2>&1 || try fw --zone=home --add-service=ssh
+  firewall-cmd --state >/dev/null 2>&1 && try firewall-cmd --reload
+else
+  say "Note: firewalld isn't installed, so I couldn't limit remote logins to the home network zone."
+fi
+
+# ---------------------------------------------------------------- step 5: Cockpit version check (advice only, never a failure)
+if rpm -q cockpit >/dev/null 2>&1; then
+  CKV=$(rpm -q --qf '%{VERSION}' cockpit 2>/dev/null | cut -d. -f1)
+  case $CKV in ''|*[!0-9]*) ;; *)
+    if [ "$CKV" -lt 360 ]; then
+      say ""
+      say "Heads-up: Cockpit on this PC is version $CKV, which is older than 360. Versions before 360 have"
+      say "a known security problem (CVE-2026-4631). Please update it soon:  sudo dnf upgrade cockpit"
+    fi ;;
+  esac
+fi
+
+# ---------------------------------------------------------------- step 6: optional screen help (RustDesk to YOUR server only)
+RD_SERVER="" RD_KEY=""
+if [ -n "$SERVERJSON" ] && [ -f "$SERVERJSON" ]; then
+  RD_SERVER=$(sed -n 's/.*"rendezvous"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$SERVERJSON" | head -1)
+  RD_KEY=$(sed -n 's/.*"key"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$SERVERJSON" | head -1)
+fi
+if [ -n "$RD_SERVER" ] && [ -n "$RD_KEY" ]; then
+  say ""
+  say "Optional: screen help. The fleet laptop can SEE and DRIVE this PC's screen to help you, using the"
+  say "RustDesk program pointed at YOUR fleet server ($RD_SERVER). It never uses RustDesk's public"
+  say "servers - screen traffic stays between this PC and the fleet laptop."
+  say ""
+  say "Honest notes: on Xfce (X11) desktops this works even while you're away from the PC. On KDE/"
+  say "Wayland (Fedora's full desktop) YOU must be at this PC and click Allow each time - that's a"
+  say "Wayland safety rule, not a setting we can (or should) bypass. This needs the internet once,"
+  say "to download the RustDesk app."
+  if confirm "Install screen help (RustDesk) now?"; then
+    if [ "${SL_FLEET_SERVER_UP:-}" != 1 ] && ! fp_tcp_open "$RD_SERVER" 21116 3; then
+      say "The fleet server at $RD_SERVER isn't answering right now, so I'll skip screen help."
+      say "Everything else is done. You can add screen help later by running me again."
+    else
+      _rd_install() {
+        local api=${SL_FLEET_RD_API:-https://api.github.com/repos/rustdesk/rustdesk/releases/latest}
+        local dir name url digest want got
+        dir=$(mktemp -d)
+        curl -fsSL --max-time 60 -o "$dir/release.json" "$api" 2>/dev/null || { rm -rf "$dir"; return 1; }
+        python3 - "$dir/release.json" > "$dir/asset" <<'PY'
+import json, re, sys
+rel = json.load(open(sys.argv[1]))
+for a in rel.get("assets", []):
+    n = a.get("name", "")
+    if re.fullmatch(r"rustdesk-[0-9][^/]*-0\.x86_64\.rpm", n):
+        print("%s|%s|%s" % (n, a.get("browser_download_url", ""), (a.get("digest") or "")))
+        break
+PY
+        [ -s "$dir/asset" ] || { rm -rf "$dir"; return 1; }
+        sed -i 's/\r$//' "$dir/asset"   # (Windows Python prints CR+LF)
+        IFS='|' read -r name url digest < "$dir/asset"
+        case $url in https://github.com/*) ;; *) echo "Unexpected download address for $name; not used."; rm -rf "$dir"; return 1 ;; esac
+        curl -fsSL --max-time 300 -o "$dir/$name" "$url" 2>/dev/null || { rm -rf "$dir"; return 1; }
+        if [ -n "$digest" ]; then
+          want=${digest#sha256:}; got=$(sha256sum "$dir/$name" | cut -d' ' -f1)
+          [ "$want" = "$got" ] || { echo "$name: checksum does not match; not installed."; rm -rf "$dir"; return 1; }
+          echo "$name: checksum OK"
+        fi
+        try dnf -y install "$dir/$name"; local rc=$?
+        rm -rf "$dir"; return $rc
+      }
+      if [ "$(sl_arch)" = x86_64 ] && _rd_install; then
+        # Point the background service at YOUR fleet server only (never the public relays)
+        printf 'rendezvous_server = %s\n\n[options]\ncustom-rendezvous-server = %s\nrelay-server = %s\nkey = %s\napi-server = \n' \
+          "'$RD_SERVER'" "'$RD_SERVER'" "'$RD_SERVER'" "'$RD_KEY'" | sl_write_file "$RD_CONF" 0600
+        sl_enable rustdesk.service
+        sl_choice_set fleet_screen yes
+        say "Screen help is on. The first time the fleet laptop connects, open RustDesk once here and set a"
+        say "permanent password (or approve the connection on this PC's screen)."
+      else
+        say "Couldn't install RustDesk (no internet, no version for this computer, or a checksum mismatch)."
+        say "Everything else is done; screen help can be added later by running me again."
+      fi
+    fi
+  else
+    sl_choice_set fleet_screen no
+    say "No screen help. You can add it later: secure-linux-fleet-join"
+  fi
+else
+  say ""
+  say "Note: the fleet laptop didn't mention a fleet server, so screen help isn't offered. Remote checks"
+  say "and updates work without it. (On the fleet laptop, linux/server/setup-fleet-server.sh sets one up.)"
+fi
+
+# ---------------------------------------------------------------- done: remember it
+sl_choice_set fleet yes
+sl_choice_set fleet_enrolled yes
+sl_choice_set fleet_method "$( [ "$METHOD" = 1 ] && echo network || echo usb )"
+sl_choice_set fleet_date "$(date +%F)"
+rm -f "$KEYTMP" "$KEYTMP.fleet.json"
+say ""
+say "Done: this PC is part of your home fleet. On the fleet laptop, run:  secure-linux-fleet status"
+exit 0

@@ -1,0 +1,123 @@
+#!/bin/bash
+# secure-linux-emergency-kit: a printable page that says WHERE your recovery codes are kept.
+#   secure-linux-emergency-kit              make "Emergency Kit.html" in your Documents folder and open it
+#   secure-linux-emergency-kit --open       the same (used by the welcome wizard)
+#   secure-linux-emergency-kit --out FILE   write the page to FILE and print its path (nothing is opened)
+# It holds NO secrets: the blanks are for you to fill in by hand with a pen after printing (Ctrl+P). It lists
+# what to keep (Bitwarden master password hint, disk recovery key, Ente Auth recovery phrase ...), a checklist
+# for two-step login, how to set up Bitwarden Emergency Access, and where to check for data breaches.
+# The only details filled in for you are this computer's name, model and serial number, and today's date.
+set -uo pipefail
+SL_ROOT=${SL_ROOT:-/usr/local/lib/secure-linux}
+. "$SL_ROOT/lib/common.sh"
+. "$SL_ROOT/files/comfort/comfort-lib.sh"
+SELF=$(readlink -f "$0")
+usage() { sed -n '2,9p' "$SELF" | sed 's/^# \{0,1\}//'; }
+
+esc() { printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' -e 's/"/\&quot;/g'; }
+dmi() {   # dmi FIELD -> value from the firmware tables (the serial number may be readable by root only)
+  local sys=${SL_TEST_SYSFS:-/sys} v
+  v=$(cat "$sys/class/dmi/id/$1" 2>/dev/null | tr -d '\n')
+  case $v in ""|"To Be Filled By O.E.M."|"Default string"|"None"|"Not Specified"|"System Serial Number") v="" ;; esac
+  printf '%s' "$v"
+}
+nice_date() { date -d "$(cf_today)" '+%-d/%-m/%Y' 2>/dev/null || cf_today; }
+
+make_page() {   # make_page FILE
+  local out=$1 host model serial who today
+  host=$(esc "$(hostname 2>/dev/null)"); model=$(esc "$(dmi product_name) $(dmi sys_vendor)"); serial=$(dmi product_serial)
+  who=$(esc "$(sl_build_get SL_FULLNAME "$(sl_user)")"); today=$(esc "$(nice_date)")
+  if [ -n "$serial" ]; then serial=$(esc "$serial")
+  else serial='<span class="blank"></span> <small>(on the sticker under the laptop, or run: <code>sudo dmidecode -s system-serial-number</code>)</small>'; fi
+  mkdir -p "$(dirname "$out")"
+  cat > "$out" <<EOF
+<!doctype html>
+<html lang="en-AU"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Emergency Kit</title>
+<style>
+@page{size:A4;margin:14mm}
+body{font:14px/1.5 "Noto Sans",system-ui,sans-serif;color:#111;background:#fff;max-width:190mm;margin:0 auto;padding:16px}
+h1{font-size:26px;margin:0}h2{font-size:17px;margin:20px 0 6px;padding:4px 8px;background:#e8eefc;border-radius:6px}
+p.sub{margin:2px 0 12px;color:#444}table{border-collapse:collapse;width:100%}
+td,th{border-bottom:1px solid #ccc;padding:7px 6px;vertical-align:top;text-align:left}th{background:#f3f3f3}
+.blank{display:inline-block;min-width:240px;border-bottom:1px solid #000;height:1.1em}
+.box{display:inline-block;width:14px;height:14px;border:1.5px solid #000;border-radius:3px;vertical-align:middle;margin-right:6px}
+.warn{border:2px solid #b00;padding:8px 10px;border-radius:6px;margin:10px 0}
+small{color:#444}code{background:#f0f0f0;padding:0 4px;border-radius:3px}
+@media print{.noprint{display:none}h2{break-after:avoid}tr{break-inside:avoid}}
+</style></head><body>
+<h1>Emergency Kit</h1>
+<p class="sub">$who &middot; made on $today &middot; <span class="noprint">print this page with <b>Ctrl+P</b>, fill in the blanks with a pen, and keep it somewhere safe (with your passport, or in a fire-proof box).</span></p>
+<div class="warn"><b>Never type secrets into the computer for this page.</b> It only says WHERE things are kept. Don't photograph it and don't store it on this laptop's disk once printed. If you lose it, anyone who finds it still needs the things it points to, but treat it like a spare key.</div>
+
+<h2>This computer</h2>
+<table>
+<tr><td width="35%">Name</td><td>$host</td></tr>
+<tr><td>Model</td><td>$model</td></tr>
+<tr><td>Serial number (for the police and insurance)</td><td>$serial</td></tr>
+<tr><td>Purchased from / receipt kept at</td><td><span class="blank"></span></td></tr>
+</table>
+
+<h2>1. Where my recovery items are kept</h2>
+<table>
+<tr><th>What</th><th>Where it is (write the place, not the secret)</th></tr>
+<tr><td><b>Bitwarden master password</b> (cannot be reset by Bitwarden)<br><small>Write only a hint that only you understand, or "in my head".</small></td><td><span class="blank"></span></td></tr>
+<tr><td><b>Bitwarden recovery code</b> (Settings &gt; Security &gt; Two-step login &gt; View recovery code)</td><td><span class="blank"></span></td></tr>
+<tr><td><b>Disk recovery key</b> (made by the setup; "Recovery key" in the app menu)<br><small>Needed if the disk password is forgotten or the computer's start-up files change.</small></td><td><span class="blank"></span></td></tr>
+<tr><td><b>Disk password</b> (typed when the laptop starts)</td><td>In my head &nbsp; <span class="box"></span> or kept at: <span class="blank" style="min-width:120px"></span></td></tr>
+<tr><td><b>Ente Auth recovery phrase</b> (Ente Auth &gt; Settings &gt; Account &gt; Recovery key)<br><small>Without it, losing the phone loses your 2-step codes.</small></td><td><span class="blank"></span></td></tr>
+<tr><td><b>Backup passphrase</b> (Pika Backup / server backup)</td><td><span class="blank"></span></td></tr>
+<tr><td><b>Phone unlock PIN / SIM PIN and PUK</b></td><td><span class="blank"></span></td></tr>
+<tr><td><b>Email account recovery</b> (the address and phone number used to get back into your main email)</td><td><span class="blank"></span></td></tr>
+<tr><td><b>Microsoft and Google account recovery</b> (kept up to date? <span class="box"></span> yes)</td><td><span class="blank"></span></td></tr>
+<tr><td><b>Router / Wi-Fi password</b> and the home server's admin login</td><td><span class="blank"></span></td></tr>
+<tr><td><b>Spare USB stick with the Secure Linux installer</b></td><td><span class="blank"></span></td></tr>
+</table>
+
+<h2>2. Two-step login checklist</h2>
+<p>Two-step login means a thief with your password still can't get in. Use an app (Ente Auth) or a hardware key, not text messages if you can avoid it. Tick each one when it's done, and save the recovery codes each site shows you.</p>
+<table>
+<tr><td><span class="box"></span>Email (Gmail / Outlook / Tuta): <small>this is the master key to all your other accounts: do it first</small></td></tr>
+<tr><td><span class="box"></span>Bitwarden</td></tr>
+<tr><td><span class="box"></span>Google account <small>(g.co/2sv)</small> and Microsoft account <small>(account.microsoft.com/security)</small></td></tr>
+<tr><td><span class="box"></span>Apple ID, if you have one</td></tr>
+<tr><td><span class="box"></span>Banking and myGov <small>(use the bank's own app code or myGov Code Generator)</small></td></tr>
+<tr><td><span class="box"></span>Steam <small>(Steam Guard through the Steam mobile app)</small>, Epic Games, Discord</td></tr>
+<tr><td><span class="box"></span>NordVPN, Cloudflare, GitHub, domain registrar</td></tr>
+<tr><td><span class="box"></span>Social media: Facebook / Instagram, TikTok, X, Reddit</td></tr>
+<tr><td><span class="box"></span>Amazon, eBay, PayPal, and any shop that keeps your card</td></tr>
+<tr><td><span class="box"></span>Recovery codes for all of the above printed or written on this sheet's back, and the Ente Auth recovery phrase stored (section 1)</td></tr>
+</table>
+
+<h2>3. Let someone you trust get in if something happens to you</h2>
+<p><b>Bitwarden Emergency Access</b> (Bitwarden web vault &gt; Settings &gt; Emergency access &gt; Add emergency contact; setting it up needs Bitwarden Premium (a small yearly fee), and your contact only needs a free account). You choose the waiting time (for example 7 days): if they ask for access and you don't say no within that time, they can view your vault.</p>
+<table>
+<tr><td width="35%">My emergency contact</td><td><span class="blank"></span></td></tr>
+<tr><td>Waiting time I chose</td><td><span class="blank" style="min-width:80px"></span> days &nbsp; Set up on: <span class="blank" style="min-width:100px"></span></td></tr>
+<tr><td>Who knows where this sheet is</td><td><span class="blank"></span></td></tr>
+</table>
+
+<h2>4. Check whether your details have leaked</h2>
+<p>Once a year (or when a company says it was hacked), type your email addresses into <b>haveibeenpwned.com</b> (free, run by a security researcher; it shows which breaches included you). Bitwarden Premium can do the same checks on your saved passwords ("Reports"). If you are listed: change that site's password (and any other site where you used it), and turn on two-step login there. In Australia, report a serious breach of your identity details to <b>IDCARE</b> (idcare.org, 1800 595 160) for free help.</p>
+<table>
+<tr><td width="35%">Last checked on</td><td><span class="blank" style="min-width:120px"></span> &nbsp; Next check: <span class="blank" style="min-width:120px"></span></td></tr>
+</table>
+
+<h2>5. If the laptop is lost or stolen</h2>
+<p>Your files are encrypted, so a thief can't read them. From another device: change your Bitwarden master password, then your email password; sign the laptop out of Signal, NordVPN and Ente Auth; make a police report with the serial number above. Restore onto a new computer with the Secure Linux USB stick and your backup.</p>
+</body></html>
+EOF
+}
+
+case "${1:-}" in
+  -h|--help|help) usage ;;
+  --out) [ -n "${2:-}" ] || { usage; exit 2; }; make_page "$2" && echo "$2" ;;
+  ""|--open)
+    docs=$(xdg-user-dir DOCUMENTS 2>/dev/null); [ -n "$docs" ] && [ "$docs" != "$HOME" ] || docs=$HOME/Documents
+    f="$docs/Emergency Kit.html"
+    make_page "$f" || { echo "Couldn't write $f" >&2; exit 1; }
+    echo "$f"
+    cf_open "$f" ;;
+  *) usage; exit 2 ;;
+esac
+exit 0

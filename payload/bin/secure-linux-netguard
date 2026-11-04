@@ -1,0 +1,413 @@
+#!/bin/bash
+# secure-linux-netguard: the app firewall (OpenSnitch) made simple.
+#
+#   secure-linux-netguard status [--short]   is it on? (short: on|paused|down|off|not-installed)
+#   secure-linux-netguard pause [MINUTES]     let everything through for a while (default 15) to rule it out
+#                                             when something doesn't work; switches back on by itself
+#   secure-linux-netguard resume              switch protection back on now
+#   secure-linux-netguard why DOMAIN          is DOMAIN blocked, and by which list?
+#   secure-linux-netguard allow DOMAIN [--for APP-PATH] [--once MINUTES | --always]
+#                                             let DOMAIN through although a block list has it
+#   secure-linux-netguard unallow DOMAIN      remove that exception again
+#   secure-linux-netguard exceptions          list your exceptions
+#   secure-linux-netguard update-lists        download the newest block lists now (also runs every week)
+#
+# Automatic parts (run by systemd): "watch" (notifications with Allow buttons when a list blocks something),
+# "summary" (weekly "blocked N connections" message), "check" (health check, ends pauses and expired exceptions),
+# "ui-settings" (pop-up defaults for the OpenSnitch window, written once).
+#
+# How it works: OpenSnitch asks once per NEW app (pop-up; Secure Linux's own apps and system services are
+# pre-approved). Known malware, phishing, tracker and telemetry addresses are blocked for every app by lists
+# that update weekly. If OpenSnitch ever stops, the internet keeps working (it "fails open").
+set -u   # no pipefail: "cmd | grep -q" must not fail when grep stops reading early
+SL_ROOT=${SL_ROOT:-/usr/local/lib/secure-linux}
+. "$SL_ROOT/lib/common.sh"
+. "$SL_ROOT/files/security/lib-security.sh"
+
+OSF=$SL_ROOT/files/security/opensnitch
+RULES=$SEC_PREFIX/etc/opensnitchd/rules
+LISTS=$SEC_PREFIX/etc/opensnitchd/secure-linux-lists
+NGSTATE=$SEC_PREFIX$SL_STATE/netguard
+PAUSE_RULE=$RULES/000-0-secure-linux-pause.json
+EXC_PREFIX=001-secure-linux-exception-
+PY=${SL_SEC_PYTHON:-python3}
+
+usage() { sed -n '2,24p' "$(sec_self)" | sed 's/^# \{0,1\}//'; }
+installed() { [ -d "$SEC_PREFIX/etc/opensnitchd" ] && { command -v opensnitchd >/dev/null 2>&1 || rpm -q opensnitch >/dev/null 2>&1; }; }
+unit() { local u; for u in opensnitch.service opensnitchd.service; do systemctl cat "$u" >/dev/null 2>&1 && { echo "$u"; return; }; done; echo opensnitch.service; }
+now() { date +%s; }
+valid_domain() { printf '%s' "$1" | grep -E '^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$' >/dev/null; }
+json_str() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
+stamp() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+list_label() { case "$1" in threats) echo "malware/phishing";; trackers) echo "tracker";; telemetry) echo "telemetry";; *) echo "$1";; esac; }
+
+# ---------------------------------------------------------------- status
+paused() { [ -f "$PAUSE_RULE" ]; }
+cmd_status() {
+  local s
+  if ! installed; then s=not-installed
+  elif [ "$(sl_choice_get opensnitch yes)" = no ] && ! systemctl -q is-enabled "$(unit)" 2>/dev/null; then s=off
+  elif ! systemctl -q is-active "$(unit)" 2>/dev/null; then s=down
+  elif paused; then s=paused
+  else s=on; fi
+  [ "${1:-}" = --short ] && { echo "$s"; return 0; }
+  case "$s" in
+    on) if [ "$(sl_profile)" = lite ]; then echo "Network protection is ON: known dangerous sites, trackers and telemetry are blocked (this older computer is never asked questions)."
+        else echo "Network protection is ON: new apps are asked about once; known dangerous sites, trackers and telemetry are blocked."; fi ;;
+    paused) echo "Network protection is PAUSED until $(date -d "@$(sed -n 's/.*until=\([0-9]*\).*/\1/p' "$PAUSE_RULE")" '+%H:%M' 2>/dev/null). Resume now: secure-linux-netguard resume" ;;
+    down) echo "Network protection isn't running (your internet still works). Open 'Secure Linux Status' and choose Repair." ;;
+    off) echo "Network protection (OpenSnitch) is switched off." ;;
+    not-installed) echo "Network protection (OpenSnitch) isn't installed." ;;
+  esac
+  local f n
+  for f in threats trackers telemetry; do
+    n=$(cat "$LISTS/$f"/*.* 2>/dev/null | grep -cv '^#')
+    printf '  %-10s list: %s entries\n' "$f" "${n:-0}"
+  done
+  [ -f "$NGSTATE/lists.updated" ] && echo "  Lists updated: $(date -d "@$(cat "$NGSTATE/lists.updated")" '+%d %b %Y' 2>/dev/null)"
+  n=$(ls "$RULES"/"$EXC_PREFIX"*.json 2>/dev/null | wc -l)
+  [ "$n" -gt 0 ] && echo "  Your exceptions: $n (see: secure-linux-netguard exceptions)"
+  return 0
+}
+
+# ---------------------------------------------------------------- pause / resume
+cmd_pause() {
+  sec_need_root pause "$@"
+  local min=${1:-15}; case "$min" in ''|*[!0-9]*) min=15 ;; esac
+  installed || { echo "Network protection isn't installed: nothing to pause."; return 0; }
+  mkdir -p "$RULES"
+  cat > "$PAUSE_RULE" <<EOF
+{
+  "created": "$(stamp)", "updated": "$(stamp)",
+  "name": "000-0-secure-linux-pause",
+  "description": "Secure Linux: everything allowed while paused (until=$(( $(now) + min*60 )))",
+  "enabled": true, "precedence": true, "nolog": true,
+  "action": "allow", "duration": "always",
+  "operator": {"type": "simple", "operand": "true", "sensitive": false, "data": "", "list": []}
+}
+EOF
+  systemctl stop secure-linux-netguard-resume.timer >/dev/null 2>&1
+  systemd-run --quiet --on-active="${min}min" --unit=secure-linux-netguard-resume "$SEC_BIN/secure-linux-netguard" resume
+  echo "Network protection is paused for $min minutes. Everything is allowed until then."
+}
+cmd_resume() {
+  sec_need_root resume
+  rm -f "$PAUSE_RULE"
+  systemctl stop secure-linux-netguard-resume.timer >/dev/null 2>&1
+  echo "Network protection is on again."
+}
+
+# ---------------------------------------------------------------- exceptions
+exc_file() {   # exc_file DOMAIN [APP]
+  local id; id=$1
+  [ -n "${2:-}" ] && id="$1-$(printf '%s' "$2" | md5sum | cut -c1-8)"
+  printf '%s/%s%s.json' "$RULES" "$EXC_PREFIX" "$id"
+}
+cmd_allow() {
+  local domain="" app="" once="" a
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --for) app=${2:-}; shift ;;
+      --once) once=${2:-15}; shift ;;
+      --always) once="" ;;
+      *) domain=$1 ;;
+    esac
+    shift
+  done
+  domain=$(printf '%s' "$domain" | tr '[:upper:]' '[:lower:]')
+  valid_domain "$domain" || { echo "Please give a web address like example.com"; return 2; }
+  case "$once" in ''|*[!0-9]*) [ -n "$once" ] && once=15 ;; esac
+  case "$app" in *'"'*|*'\'*) echo "Unusual program path; not used."; app="" ;; esac
+  sec_need_root allow "$domain" ${app:+--for "$app"} ${once:+--once "$once"}
+  local f until="" desc op name
+  f=$(exc_file "$domain" "$app"); name=$(basename "$f" .json)
+  [ -n "$once" ] && until=$(( $(now) + once*60 ))
+  desc="Secure Linux exception domain=$domain app=${app:--} until=${until:-never}"
+  if [ -n "$app" ]; then
+    local l; l="[{\"type\": \"simple\", \"operand\": \"dest.host\", \"sensitive\": false, \"data\": \"$domain\", \"list\": []}, {\"type\": \"simple\", \"operand\": \"process.path\", \"sensitive\": false, \"data\": \"$(json_str "$app")\", \"list\": []}]"
+    op="{\"type\": \"list\", \"operand\": \"list\", \"sensitive\": false, \"data\": \"$(json_str "$l")\", \"list\": $l}"
+  else
+    op="{\"type\": \"simple\", \"operand\": \"dest.host\", \"sensitive\": false, \"data\": \"$domain\", \"list\": []}"
+  fi
+  mkdir -p "$RULES"
+  printf '{\n  "created": "%s", "updated": "%s",\n  "name": "%s",\n  "description": "%s",\n  "enabled": true, "precedence": true, "nolog": false,\n  "action": "allow", "duration": "always",\n  "operator": %s\n}\n' \
+    "$(stamp)" "$(stamp)" "$name" "$(json_str "$desc")" "$op" > "$f"
+  chmod 644 "$f"
+  if [ -n "$once" ]; then
+    systemd-run --quiet --on-active="${once}min" --unit="secure-linux-netguard-unallow-$(printf '%s' "$name" | md5sum | cut -c1-8)" \
+      "$SEC_BIN/secure-linux-netguard" unallow "$domain" ${app:+--for "$app"} >/dev/null 2>&1
+    echo "$domain is allowed for $once minutes${app:+ (only for $app)}."
+  else
+    echo "$domain is always allowed${app:+ for $app}. Undo with: secure-linux-netguard unallow $domain"
+  fi
+}
+cmd_unallow() {
+  local domain="" app=""
+  while [ $# -gt 0 ]; do case "$1" in --for) app=${2:-}; shift ;; *) domain=$1 ;; esac; shift; done
+  domain=$(printf '%s' "$domain" | tr '[:upper:]' '[:lower:]')
+  valid_domain "$domain" || { echo "Please give a web address like example.com"; return 2; }
+  sec_need_root unallow "$domain" ${app:+--for "$app"}
+  local f n=0
+  if [ -n "$app" ]; then rm -f "$(exc_file "$domain" "$app")" && n=1
+  else
+    for f in "$RULES/$EXC_PREFIX$domain.json" "$RULES/$EXC_PREFIX$domain"-????????.json; do [ -f "$f" ] && rm -f "$f" && n=$((n+1)); done
+  fi
+  echo "$domain: exception removed (block lists apply again)."
+}
+cmd_exceptions() {
+  local f d any=0 dom app until
+  for f in "$RULES/$EXC_PREFIX"*.json; do
+    [ -f "$f" ] || continue; any=1
+    d=$(sed -n 's/.*"description": "\(Secure Linux exception[^"]*\)".*/\1/p' "$f")
+    dom=$(printf '%s' "$d" | sed -n 's/.*domain=\([^ ]*\).*/\1/p'); app=$(printf '%s' "$d" | sed -n 's/.*app=\([^ ]*\).*/\1/p')
+    until=$(printf '%s' "$d" | sed -n 's/.*until=\([^ ]*\).*/\1/p')
+    printf '  %-40s %s %s\n' "$dom" "$([ "$app" != - ] && echo "for $app")" \
+      "$([ "$until" != never ] && echo "(until $(date -d "@$until" '+%d %b %H:%M' 2>/dev/null))" || echo "(always)")"
+  done
+  [ $any = 0 ] && echo "No exceptions: all block lists apply."
+  return 0
+}
+
+# ---------------------------------------------------------------- why
+cmd_why() {
+  local d=${1:-} f l hit=0 never
+  d=$(printf '%s' "$d" | tr '[:upper:]' '[:lower:]' | sed 's#^[a-z]*://##; s#/.*##')
+  valid_domain "$d" || { echo "Please give a web address like example.com"; return 2; }
+  if paused; then echo "Protection is paused right now: nothing is blocked."; fi
+  for f in "$RULES/$EXC_PREFIX$d.json" "$RULES/$EXC_PREFIX$d"-????????.json; do
+    [ -f "$f" ] && { echo "$d has an exception (you allowed it): $(sed -n 's/.*"description": "\([^"]*\)".*/\1/p' "$f")"; hit=2; }
+  done
+  local p=$d
+  for l in threats trackers; do
+    p=$d
+    while [ "${p#*.}" != "$p" ]; do   # the name itself, then its parent names (a.b.example.com, b.example.com, example.com)
+      if cat "$LISTS/$l"/*.* 2>/dev/null | grep -Fx "0.0.0.0 $p" >/dev/null; then
+        if [ "$p" = "$d" ]; then echo "$d is on the $(list_label "$l") list ($l)."
+        else echo "$d belongs to $p, which is on the $(list_label "$l") list ($l)."; fi
+        hit=${hit/0/1}; break
+      fi
+      p=${p#*.}
+    done
+  done
+  while IFS= read -r l; do
+    case "$l" in ''|'#'*) continue ;; esac
+    if [[ "$d" =~ $l ]]; then echo "$d matches the telemetry list (pattern $l)."; hit=${hit/0/1}; break; fi
+  done < <(cat "$LISTS/telemetry"/*.* 2>/dev/null)
+  never=$(grep -v '^#' "$OSF/never-block.txt" 2>/dev/null | while read -r n; do [ -n "$n" ] && { [ "$d" = "$n" ] || [[ "$d" == *".$n" ]]; } && echo "$n"; done | head -1)
+  [ -n "$never" ] && echo "$d belongs to $never, which Secure Linux never blocks with its lists."
+  case "$hit" in
+    0) echo "$d is not on Secure Linux's block lists. If it still doesn't load, it may be blocked by the encrypted DNS malware filter (Cloudflare) or the family filter, or an app rule you made in Network Monitor." ;;
+    1) echo "To let it through anyway: secure-linux-netguard allow $d   (or --once 15 for 15 minutes)" ;;
+  esac
+  return 0
+}
+
+# ---------------------------------------------------------------- block lists
+# Convert a downloaded list to OpenSnitch's hosts format ("0.0.0.0 host"), minus the never-block domains.
+convert_list() {   # convert_list FORMAT IN OUT
+  awk -v fmt="$1" -v nb="$OSF/never-block.txt" '
+    BEGIN { while ((getline l < nb) > 0) { if (l !~ /^#/ && l != "") never[tolower(l)] = 1 } }
+    function blocked_ok(h,   p) {
+      if (h !~ /^[a-z0-9_.-]+\.[a-z0-9-]+$/) return 0
+      if (h == "localhost" || h == "localhost.localdomain" || h == "broadcasthost" || h == "local") return 0
+      p = h
+      while (1) { if (p in never) return 0; if (index(p, ".") == 0) break; p = substr(p, index(p, ".") + 1) }
+      return 1
+    }
+    { sub(/\r$/, ""); sub(/#.*/, "") }
+    fmt == "hosts" && ($1 == "0.0.0.0" || $1 == "127.0.0.1") && NF >= 2 { h = tolower($2); if (blocked_ok(h) && !(h in seen)) { seen[h]; print "0.0.0.0 " h } next }
+    fmt == "domains" && NF >= 1 { h = tolower($1); if (blocked_ok(h) && !(h in seen)) { seen[h]; print "0.0.0.0 " h; if (h !~ /^www\./) print "0.0.0.0 www." h } }
+  ' "$2" > "$3"
+}
+cmd_update_lists() {
+  sec_need_root update-lists
+  local name url fmt min why tmp n old ok=0 bad=0 dir
+  mkdir -p "$NGSTATE/lastgood" "$LISTS"
+  while IFS='|' read -r name url fmt min why; do
+    case "$name" in ''|'#'*) continue ;; esac
+    dir=$LISTS/$name; mkdir -p "$dir"
+    tmp=$(mktemp -d)
+    if curl -fsSL --proto '=https' --max-time 300 --max-filesize 200000000 -o "$tmp/raw" "$url" 2>/dev/null && [ -s "$tmp/raw" ]; then
+      convert_list "$fmt" "$tmp/raw" "$tmp/list"
+      n=$(wc -l < "$tmp/list" | tr -d ' ')
+      old=$(grep -vc '^#' "$dir/$name.txt" 2>/dev/null); old=${old:-0}
+      if [ "${n:-0}" -ge "${min:-1}" ] && [ "$n" -le 3000000 ] && [ "$old" -le 1000 -o "$n" -ge $((old / 2)) ]; then
+        { echo "# Secure Linux block list '$name' from $url ($(date -u +%F)); $n entries"; cat "$tmp/list"; } > "$dir/.$name.new"
+        chmod 644 "$dir/.$name.new"
+        cp -p "$dir/.$name.new" "$NGSTATE/lastgood/$name.txt"      # the last list that passed the checks
+        mv -f "$dir/.$name.new" "$dir/$name.txt"     # atomic swap: OpenSnitch never sees a half-written list
+        echo "$name: $n entries"; ok=$((ok+1))
+      else
+        echo "$name: download looked wrong ($n entries, expected at least $min and not far below the $old before); keeping the previous list"; bad=$((bad+1))
+      fi
+    else
+      echo "$name: download failed; keeping the previous list"; bad=$((bad+1))
+    fi
+    rm -rf "$tmp"
+    # never leave a list empty when an older good copy exists
+    if [ ! -s "$dir/$name.txt" ] && [ -s "$NGSTATE/lastgood/$name.txt" ]; then cp -p "$NGSTATE/lastgood/$name.txt" "$dir/$name.txt"; fi
+  done < "$OSF/sources.conf"
+  [ "$ok" -gt 0 ] && now > "$NGSTATE/lists.updated"
+  [ "$bad" -eq 0 ]
+}
+
+# ---------------------------------------------------------------- OpenSnitch window (pop-up) settings
+# Written into the user's ~/.config/opensnitch/settings.conf (Qt INI) once, while the window isn't running (it
+# rewrites the file when it exits). Keys verified in opensnitch ui/opensnitch/config.py and dialogs/prompt:
+#   [global] default_target=0   pop-up proposes "from this executable" (a per-APP decision)
+#            default_duration=8 "forever" pre-selected (index 0 once ... 7 until restart, 8+ always);
+#                               choice netguard_prompt_duration=restart uses 7 (asked again after a restart)
+#            default_action=1   allow (what the pop-up does when nobody answers: never "deny")
+#            default_timeout=60 seconds before the pop-up answers by itself (clicking it stops the countdown).
+#                               NOTE (verified in opensnitch ui dialogs/prompt/dialog.py): on a timeout the UI
+#                               creates the rule with the duration currently pre-selected, so with "forever"
+#                               pre-selected an ignored pop-up becomes an always-allow rule for that app, not a
+#                               one-off allow. choice netguard_prompt_duration=restart makes both clicks and
+#                               timeouts last only until the next restart. The daemon's own fallback (no window
+#                               answers within 120 s) IS allow-once (DefaultAction allow, DefaultDuration once).
+#            disable_popups=false
+#   [notifications] enabled=true, type=0 (desktop notifications)
+#   [database] type=1 (file), file=~/.local/share/opensnitch/opensnitch.sqlite3, purge_oldest=true, max_days=8
+UI_SETTINGS_VERSION=1
+ini_set() {   # ini_set FILE SECTION KEY VALUE
+  local f=$1 sec=$2 key=$3 val=$4 tmp
+  [ -f "$f" ] || printf '[%s]
+' "$sec" > "$f"
+  grep -q "^\[$sec\]" "$f" || printf '
+[%s]
+' "$sec" >> "$f"
+  tmp=$(mktemp)
+  awk -v sec="[$sec]" -v key="$key" -v val="$val" '
+    /^\[/ { if (insec && !done) { print key "=" val; done=1 } insec = ($0 == sec) }
+    insec && index($0, key "=") == 1 { if (!done) print key "=" val; done=1; next }
+    { print }
+    END { if (insec && !done) print key "=" val }' "$f" > "$tmp"
+  cat "$tmp" > "$f"; rm -f "$tmp"
+}
+cmd_ui_settings() {
+  sec_need_root ui-settings
+  local u home dir f mark dur=8
+  u=$(sl_user); [ -n "$u" ] || return 0
+  home=$SEC_PREFIX$(sl_user_home); [ -n "$home" ] || return 0
+  dir=$home/.config/opensnitch; f=$dir/settings.conf; mark=$dir/.secure-linux-settings
+  [ "$(cat "$mark" 2>/dev/null)" = "$UI_SETTINGS_VERSION" ] && return 0
+  if pgrep -u "$u" -f opensnitch-ui >/dev/null 2>&1; then echo "OpenSnitch window is open; settings will be written later."; return 0; fi
+  [ "$(sl_choice_get netguard_prompt_duration always)" = restart ] && dur=7
+  mkdir -p "$dir" "$home/.local/share/opensnitch"
+  ini_set "$f" global default_target 0
+  ini_set "$f" global default_duration "$dur"
+  ini_set "$f" global default_action 1
+  ini_set "$f" global default_timeout 60
+  ini_set "$f" global disable_popups false
+  ini_set "$f" notifications enabled true
+  ini_set "$f" notifications type 0
+  ini_set "$f" database type 1
+  ini_set "$f" database file "$(sl_user_home)/.local/share/opensnitch/opensnitch.sqlite3"
+  ini_set "$f" database purge_oldest true
+  ini_set "$f" database max_days 8
+  echo "$UI_SETTINGS_VERSION" > "$mark"
+  chown -R "$u": "$dir" "$home/.local/share/opensnitch" 2>/dev/null
+  return 0
+}
+
+# ---------------------------------------------------------------- automatic jobs
+cmd_check() {   # health check (timer every 30 min, and when OpenSnitch fails)
+  sec_need_root check
+  local f d until
+  # expired pause / exceptions (e.g. after a restart, when their timers are gone)
+  if paused; then
+    until=$(sed -n 's/.*until=\([0-9]*\).*/\1/p' "$PAUSE_RULE")
+    [ -n "$until" ] && [ "$(now)" -ge "$until" ] && rm -f "$PAUSE_RULE"
+  fi
+  for f in "$RULES/$EXC_PREFIX"*.json; do
+    [ -f "$f" ] || continue
+    until=$(sed -n 's/.*until=\([0-9][0-9]*\).*/\1/p' "$f")
+    [ -n "$until" ] && [ "$(now)" -ge "$until" ] && rm -f "$f"
+  done
+  if ! installed || [ "$(sl_choice_get opensnitch yes)" = no ]; then sl_clear opensnitch-down; return 0; fi
+  command -v opensnitch-ui >/dev/null 2>&1 && cmd_ui_settings >/dev/null
+  systemctl -q is-enabled "$(unit)" 2>/dev/null || { sl_clear opensnitch-down; return 0; }
+  if ! systemctl -q is-active "$(unit)" 2>/dev/null; then
+    systemctl restart "$(unit)" >/dev/null 2>&1
+    sleep 5
+  fi
+  if systemctl -q is-active "$(unit)" 2>/dev/null; then sl_clear opensnitch-down
+  else
+    sl_alert opensnitch-down "Network protection stopped" \
+      "The app firewall (OpenSnitch) isn't running. Your internet still works, but new apps aren't checked and dangerous sites aren't blocked." \
+      "Open 'Secure Linux Status' and choose Repair, or restart the computer."
+  fi
+  if [ -f "$NGSTATE/lists.updated" ] && [ $(( $(now) - $(cat "$NGSTATE/lists.updated") )) -gt $((30*86400)) ]; then
+    sl_alert netguard-lists-old "Block lists are out of date" "The lists of dangerous sites haven't updated for a month. Is the computer often offline?" "Run: secure-linux-netguard update-lists"
+  else sl_clear netguard-lists-old; fi
+  return 0
+}
+
+cmd_summary() {   # weekly "blocked N" message
+  sec_need_root summary
+  installed || return 0
+  local json db home
+  home=$(sl_user_home 2>/dev/null)
+  db=${SL_SEC_NETGUARD_DB:-$SEC_PREFIX$home/.local/share/opensnitch/opensnitch.sqlite3}
+  if [ -f "$db" ]; then json=$("$PY" "$OSF/events.py" summary --db "$db")
+  else json=$(journalctl -q -o cat _COMM=opensnitchd --since "-7d" 2>/dev/null | "$PY" "$OSF/events.py" summary --journal); fi
+  local count top
+  count=$(printf '%s' "$json" | "$PY" -c 'import json,sys; print(json.load(sys.stdin)["count"])' 2>/dev/null)
+  top=$(printf '%s' "$json" | "$PY" -c 'import json,sys; print(", ".join(h for h,n in json.load(sys.stdin)["top"]))' 2>/dev/null)
+  [ "${count:-0}" -gt 0 ] || { echo "Nothing blocked this week."; return 0; }
+  sl_event "netguard-week-$(date +%G-%V)" "Network protection: your week" \
+    "Blocked $count connections to trackers and dangerous sites this week.${top:+ Most often: $top.} Nothing for you to do."
+  echo "Blocked $count; top: $top"
+}
+
+# Live notifier: a system service reads OpenSnitch's block events and shows a notification with buttons.
+notify_user() {   # notify_user LIST HOST APP
+  local list=$1 host=$2 app=$3 label title body choice warn=""
+  label=$(list_label "$list")
+  title="Blocked $host"
+  [ "$list" = threats ] && warn=" WARNING: this site is known for malware or phishing. Only allow it if you are sure."
+  body="On the $label list${app:+, for $(basename "$app")}.$warn"
+  choice=$(sl_user_run notify-send -a "Secure Linux" -i security-high --expire-time=60000 --wait \
+             --action=once="Allow once" --action=always="Always allow" --action=keep="Keep blocked" \
+             "$title" "$body" 2>/dev/null | tail -1)
+  case "$choice" in
+    once)   "$SEC_BIN/secure-linux-netguard" allow "$host" ${app:+--for "$app"} --once 15 >/dev/null ;;
+    always) "$SEC_BIN/secure-linux-netguard" allow "$host" ${app:+--for "$app"} --always >/dev/null ;;
+  esac
+  return 0
+}
+cmd_watch() {
+  sec_need_root watch
+  mkdir -p "$NGSTATE"
+  local seen=$NGSTATE/notified list host app last t
+  touch "$seen"
+  journalctl -f -n 0 -q -o cat _COMM=opensnitchd 2>/dev/null | "$PY" -u "$OSF/events.py" parse | {
+  while IFS='|' read -r list host app; do
+    app=${app%$'\r'}; [ -n "$host" ] || continue
+    [ "$(sl_choice_get netguard_notify yes)" = no ] && continue
+    t=$(now)
+    last=$(awk -v h="$host" '$1==h {print $2}' "$seen" | tail -1)
+    [ -n "$last" ] && [ $((t - last)) -lt 3600 ] && continue        # once per address per hour
+    { grep -v "^$host " "$seen"; echo "$host $t"; } | tail -500 > "$seen.new"; mv -f "$seen.new" "$seen"
+    notify_user "$list" "$host" "$app" &
+  done
+  wait   # only reached when the log ends (never in normal use; lets the tests wait for the notifications)
+  }
+}
+
+case "${1:-}" in
+  -h|--help|help|"") usage ;;
+  status) shift; cmd_status "$@" ;;
+  pause) shift; cmd_pause "$@" ;;
+  resume) cmd_resume ;;
+  why) shift; cmd_why "$@" ;;
+  allow) shift; cmd_allow "$@" ;;
+  unallow) shift; cmd_unallow "$@" ;;
+  exceptions) cmd_exceptions ;;
+  update-lists) cmd_update_lists ;;
+  check) cmd_check ;;
+  summary) cmd_summary ;;
+  watch) cmd_watch ;;
+  ui-settings) cmd_ui_settings ;;
+  *) echo "Unknown command '$1'." >&2; usage; exit 2 ;;
+esac

@@ -1,0 +1,269 @@
+#!/bin/bash
+# secure-linux-hwtest: a friendly hardware check - speakers, microphone, camera, brightness and volume keys,
+# Wi-Fi band, then the quick check of every other part (drive wear, memory, temperatures, battery, USB, security chip...
+# through secure-linux-health), and (if you agree) one sleep/wake cycle. Results are saved for secure-linux-diag in
+# /var/lib/secure-linux/hwtest.txt (or ~/.local/state/secure-linux/hwtest.txt). At the end it offers the full check
+# (about 10 minutes). Without secure-linux-health it still does the friendly tests and says so.
+#   secure-linux-hwtest          run the check (dialogs)
+#   secure-linux-hwtest --show   show the last results
+set -u   # no pipefail: "cmd | grep -q" must not fail when grep stops reading early
+SL_ROOT=${SL_ROOT:-/usr/local/lib/secure-linux}
+. "$SL_ROOT/lib/common.sh"
+. "$SL_ROOT/files/experience/exp-lib.sh"
+UI_TITLE="Hardware check"; UI_ICON=preferences-desktop-peripherals
+
+OUT=$SL_STATE/hwtest.txt
+[ -w "$OUT" ] || [ -w "$SL_STATE" ] || OUT=$HOME/.local/state/secure-linux/hwtest.txt
+case "${1:-}" in
+  -h|--help) sed -n '2,10p' "$0"; exit 0 ;;
+  --show) cat "$OUT" 2>/dev/null || echo "No hardware check has been run yet."; exit 0 ;;
+esac
+have() { command -v "$1" >/dev/null 2>&1; }
+TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
+RESULTS=()
+res() { RESULTS+=("$(printf '%-11s %-8s %s' "$1:" "$2" "${3:-}")"); echo "RESULT $1: $2 ${3:-}"; }
+tips=()
+
+test_sound() {
+  local snd=/usr/share/sounds/freedesktop/stereo/complete.oga played=0
+  ui_info sound_intro "First, the speakers. Turn the volume up a little, then click OK: we'll play a short sound."
+  if [ -f "$snd" ] && have pw-play; then pw-play "$snd" 2>/dev/null && played=1
+  elif [ -f "$snd" ] && have paplay; then paplay "$snd" 2>/dev/null && played=1
+  elif have speaker-test; then timeout 3 speaker-test -t sine -f 660 -l 1 >/dev/null 2>&1; played=1; fi
+  [ -n "${SL_WIZARD_ANSWERS:-}" ] && played=1
+  [ $played = 1 ] || { res Sound fail "could not play a sound (no audio device?)"; return; }
+  case $(ui_ask sound "Did you hear the sound?" "Yes" "No") in
+    yes) res Sound ok ;;
+    no) res Sound fail "user did not hear it"; tips+=("Sound: check the volume isn't muted (speaker icon by the clock). If still silent, open Secure Linux Status > Diagnose.") ;;
+    *) res Sound skipped ;;
+  esac
+}
+
+test_mic() {
+  have arecord || { res Microphone skipped "arecord missing"; return; }
+  [ "$(ui_ask mic_intro "Now the microphone. Click \"Start\" and then say something for 3 seconds." "Start" "Skip")" = yes ] || { res Microphone skipped; return; }
+  arecord -q -d 3 -f S16_LE -r 16000 -c 1 -t raw "$TMP/mic.raw" 2>/dev/null
+  local level
+  level=$(python3 -c '
+import sys, array
+a = array.array("h"); data = open(sys.argv[1], "rb").read()
+a.frombytes(data[: len(data) // 2 * 2])
+print(int(100 * max((abs(x) for x in a), default=0) / 32768))' "$TMP/mic.raw" 2>/dev/null)
+  level=${level:-0}
+  if [ "$level" -ge 3 ]; then res Microphone ok "peak level $level%"
+  else res Microphone fail "peak level $level% (too quiet)"; tips+=("Microphone: check System Settings > Sound > Input. Easy Effects can boost a quiet laptop mic."); fi
+}
+
+test_camera() {
+  local dev; dev=$(ls /dev/video* 2>/dev/null | head -1)
+  [ -n "$dev" ] || [ -n "${SL_WIZARD_ANSWERS:-}" ] || { res Camera fail "no camera found"; tips+=("Camera: some laptops have a camera switch or a key with a camera symbol (F10 on many ASUS models)."); return; }
+  if have ffmpeg && [ -n "$dev" ]; then
+    ui_info camera_intro "Now the camera. Look at the screen and click OK; we'll take one picture (it isn't saved anywhere)."
+    if ffmpeg -loglevel error -f v4l2 -i "$dev" -frames:v 1 -y "$TMP/cam.jpg" 2>/dev/null; then
+      xdg-open "$TMP/cam.jpg" >/dev/null 2>&1 &
+    fi
+  fi
+  case $(ui_ask camera "Could you see yourself in the picture?" "Yes" "No") in
+    yes) res Camera ok "$dev" ;;
+    no) res Camera fail "$dev"; tips+=("Camera: check the camera key/switch, then try the Camera app.") ;;
+    *) res Camera skipped ;;
+  esac
+  sleep 1
+}
+
+test_keys() {
+  local bl before after vb va
+  bl=$(ls -d "$SL_SYS"/class/backlight/* 2>/dev/null | head -1)
+  if [ -n "$bl" ]; then
+    before=$(cat "$bl/brightness" 2>/dev/null)
+    ui_info keys_brightness "Press the key that makes the screen DIMMER (it has a small sun symbol, usually on the top row) once or twice, then click OK."
+    after=$(cat "$bl/brightness" 2>/dev/null)
+    if [ -n "${SL_WIZARD_ANSWERS:-}" ]; then res Brightness ok "(test)"
+    elif [ "$before" != "$after" ]; then res Brightness ok "key changed $before -> $after"
+    else
+      case $(ui_ask brightness "Did the screen get dimmer?" "Yes" "No") in
+        yes) res Brightness ok "(said yes)" ;; no) res Brightness fail; tips+=("Brightness keys: try them with the Fn key held down. ASUS laptops can swap this in the BIOS (\"Fn lock\").") ;; *) res Brightness skipped ;;
+      esac
+    fi
+  fi
+  if have wpctl; then
+    vb=$(wpctl get-volume @DEFAULT_AUDIO_SINK@ 2>/dev/null)
+    ui_info keys_volume "Now press the VOLUME UP key (speaker symbol) once, then click OK."
+    va=$(wpctl get-volume @DEFAULT_AUDIO_SINK@ 2>/dev/null)
+    if [ -n "${SL_WIZARD_ANSWERS:-}" ]; then res Volume ok "(test)"
+    elif [ "$vb" != "$va" ]; then res Volume ok "key works"
+    else res Volume fail "volume didn't change"; tips+=("Volume keys: try them with the Fn key held down."); fi
+  fi
+}
+
+test_wifi() {
+  have iw || { res Wi-Fi skipped "iw missing"; return; }
+  local dev freq ch band reg
+  dev=$(iw dev 2>/dev/null | awk '/Interface/{print $2; exit}')
+  [ -n "$dev" ] || { res Wi-Fi fail "no Wi-Fi adapter found"; return; }
+  freq=$(iw dev "$dev" link 2>/dev/null | awk '/freq:/{print int($2); exit}')
+  [ -n "$freq" ] || freq=$(iw dev "$dev" info 2>/dev/null | sed -n 's/.*channel \([0-9]*\) (\([0-9]*\) MHz.*/\2/p' | head -1)
+  ch=$(iw dev "$dev" info 2>/dev/null | sed -n 's/.*channel \([0-9]*\).*/\1/p' | head -1)
+  reg=$(iw reg get 2>/dev/null | awk '/country/{print $2; exit}' | tr -d :)
+  if [ -z "$freq" ]; then res Wi-Fi skipped "not connected"; return; fi
+  if [ "$freq" -ge 5925 ]; then band="6 GHz (Wi-Fi 6E, fastest)"
+  elif [ "$freq" -ge 4900 ]; then band="5 GHz (fast)"
+  else band="2.4 GHz (longest range, slowest)"; tips+=("Wi-Fi: you're on 2.4 GHz. If your router also has 5 GHz, connecting to it is usually much faster."); fi
+  res Wi-Fi ok "$band, channel ${ch:-?}, $freq MHz, country ${reg:-?}"
+  ui_info wifi_info "Wi-Fi: connected on $band."
+}
+
+# ---------------------------------------------------------------- the rest of the computer: secure-linux-health
+# SL_HEALTH_BIN overrides where secure-linux-health is (used by the tests; a path that does not exist = "not installed").
+HEALTH_BIN=""; H_WARN=0; H_FAIL=0; H_OK=0; H_RAN=0; HEALTH_SECTIONS=""; HEALTH_ATTN=""; HEALTH_NOTE=""
+find_health() {
+  if [ -n "${SL_HEALTH_BIN:-}" ]; then [ -x "$SL_HEALTH_BIN" ] && HEALTH_BIN=$SL_HEALTH_BIN
+  elif have secure-linux-health; then HEALTH_BIN=$(command -v secure-linux-health)
+  elif [ -x "$SL_ROOT/bin/secure-linux-health" ]; then HEALTH_BIN=$SL_ROOT/bin/secure-linux-health; fi
+  return 0
+}
+# health_run TITLE ARGS...   runs it, adds its lines to the report and its WARN/FAIL items to the summary; returns 1 if it could not run
+health_run() {
+  local title=$1 f="$TMP/health-$H_RAN.txt" rc s w fl ok; shift
+  if have timeout; then timeout 900 "$HEALTH_BIN" "$@" > "$f" 2> "$TMP/health.err"; rc=$?
+  else "$HEALTH_BIN" "$@" > "$f" 2> "$TMP/health.err"; rc=$?; fi
+  s=$(grep -m1 '^Summary:' "$f" 2>/dev/null)
+  if [ "$rc" -gt 2 ] || [ -z "$s" ]; then return 1; fi
+  ok=$(printf '%s' "$s" | sed -n 's/^Summary: \([0-9][0-9]*\) OK.*/\1/p')
+  w=$(printf '%s' "$s" | sed -n 's/.*, \([0-9][0-9]*\) need a look.*/\1/p')
+  fl=$(printf '%s' "$s" | sed -n 's/.*, \([0-9][0-9]*\) failing.*/\1/p')
+  H_OK=$((H_OK + ${ok:-0})); H_WARN=$((H_WARN + ${w:-0})); H_FAIL=$((H_FAIL + ${fl:-0})); H_RAN=$((H_RAN + 1))
+  HEALTH_SECTIONS="$HEALTH_SECTIONS
+$title
+$(sed -n '/^\[/,$p' "$f" | sed 's/^/  /')
+"
+  HEALTH_ATTN="$HEALTH_ATTN$(sed -n '/^NEEDS ATTENTION/,/^$/p' "$f" | sed '1d; /^$/d; s/^ \* //')
+"
+  return 0
+}
+
+test_health() {
+  find_health
+  if [ -z "$HEALTH_BIN" ]; then
+    res Health skipped "the detailed check (secure-linux-health) is not installed here"
+    HEALTH_NOTE="Note: the detailed check of the drive, memory, temperatures and battery was not done (it is not installed here)."
+    tips+=("Drive, memory, temperature and battery checks were skipped because the Secure Linux health tool is not installed on this computer. Re-running the Secure Linux setup (or its update) adds it.")
+    return
+  fi
+  local hargs=(--quick --no-save --no-interactive) text="Now the rest of the computer: drive wear, memory errors, temperatures and fans, battery, USB ports, CD/DVD drive, Bluetooth, the security chip (TPM), card reader, fingerprint reader, graphics and video, Ethernet, firmware updates. This takes about a minute and changes nothing."
+  if [ "$(id -u)" != 0 ] && have pkexec; then
+    case $(ui_ask health_admin "$text
+
+Drive wear and memory details can only be read with your password. Allow that?" "Yes, ask for my password" "No, check without it") in
+      yes) hargs+=(--elevate) ;;
+    esac
+  else ui_info health_intro "$text"; fi
+  if health_run "Hardware health (quick check)" "${hargs[@]}"; then
+    res Health "$([ $((H_WARN + H_FAIL)) = 0 ] && echo ok || echo look)" "$H_OK fine, $H_WARN need a look, $H_FAIL failing (quick check)"
+  else
+    res Health skipped "the detailed check could not run ($(head -n 1 "$TMP/health.err" 2>/dev/null | cut -c1-80))"
+    HEALTH_NOTE="Note: the detailed check of the drive, memory, temperatures and battery did not run. To try it yourself, open a terminal and type secure-linux-health."
+    tips+=("The detailed hardware check did not run. Try it yourself later: open a terminal and type secure-linux-health, or send a Secure Linux diagnostics file (Secure Linux Status > Diagnose).")
+  fi
+}
+
+test_health_screen() {   # the "do you see / feel it" tests of the health tool: touchpad and mouse events, dead-pixel colours
+  [ -n "$HEALTH_BIN" ] || return 0
+  case $(ui_ask health_screen "Optional: test the touchpad, mouse and screen?
+
+We'll ask you to move the pointer and click, then show full-screen colours so you can spot dead or stuck pixels. About a minute." "Test them" "Skip") in
+    yes) ;; *) res Touchpad skipped; return ;;
+  esac
+  if health_run "Touchpad, mouse and screen colours" --part pointer,display --interactive --no-save; then
+    res Touchpad ok "touchpad, mouse and screen colour tests done (see the report)"
+  else res Touchpad skipped "could not run"; fi
+}
+
+test_health_full() {   # offered at the very end, after the results are saved
+  [ -n "$HEALTH_BIN" ] || return 0
+  case $(ui_ask health_full "Want to check everything thoroughly?
+
+The full hardware check tests the drive, memory, processor under load, sound, camera, keys, screen and more. It takes about 10 minutes, and you will be asked to listen and look at a few things." "Run the full hardware check (about 10 minutes)" "Not now") in
+    yes) echo "RESULT Full-check: started"
+         "$HEALTH_BIN" --full --gui; local frc=$?
+         echo "RESULT Full-check: finished (exit $frc)"
+         { echo; echo "Full hardware check run $(date '+%Y-%m-%d %H:%M'): its report is in the window it showed and in $SL_STATE/health/latest.txt"; } >> "$OUT" 2>/dev/null ;;
+  esac
+}
+
+wifi_resume_failed() {
+  local f=$SL_STATE/mt7921e-resume-fix
+  have iw && iw dev 2>/dev/null | grep -q Interface || return 0   # no Wi-Fi adapter: nothing to fix
+  touch "$f" 2>/dev/null || secure-linux-hwtest-marker 2>/dev/null || true   # the helper asks for the password once (pkexec)
+}
+
+test_suspend() {
+  case $(ui_ask suspend "Last one (optional): test sleep and wake?
+
+The screen goes dark for a moment. Wait 10 seconds, then press the power button briefly to wake the laptop. Save any open work first." "Test sleep" "Skip") in
+    yes) ;; *) res Sleep skipped; return ;;
+  esac
+  local t0 t1 i
+  t0=$(date +%s)
+  systemctl suspend 2>/dev/null || { res Sleep fail "could not start sleep"; return; }
+  for i in $(seq 1 120); do sleep 1; t1=$(date +%s); [ $((t1 - t0)) -gt $((i + 5)) ] && break; done
+  sleep 5   # give Wi-Fi time to reconnect
+  local net w
+  for w in 1 2 3 4 5; do   # up to ~20 more seconds for the network to come back
+    net=$(nmcli -t -f STATE general 2>/dev/null)
+    case $net in connected*) break ;; esac
+    sleep 4
+  done
+  # Wi-Fi did not come back after sleep: leave a flag for the repair tools (known MT7921e/MT7922 resume problem)
+  case $net in connected*) ;; *) wifi_resume_failed ;; esac
+  case $(ui_ask suspend_ok "Welcome back! Did the laptop wake up properly (screen, keyboard and touchpad working)?" "Yes" "No") in
+    yes) res Sleep ok "network after wake: ${net:-unknown}"
+         case $net in connected*) ;; *) tips+=("Wi-Fi didn't reconnect after sleep. If this keeps happening, see 'Wi-Fi drops' in the guide's Troubleshooting chapter.") ;; esac ;;
+    no) res Sleep fail "network after wake: ${net:-unknown}"; tips+=("Sleep: if the laptop doesn't wake properly, see 'Sleep problems' in the guide's Troubleshooting chapter.") ;;
+    *) res Sleep skipped ;;
+  esac
+}
+
+ui_info intro "This takes about 2 minutes. You can skip any test.
+
+We'll check the speakers, microphone, camera, keys and Wi-Fi."
+test_sound; test_mic; test_camera; test_keys; test_wifi; test_health; test_health_screen; test_suspend
+
+{
+  echo "Secure Linux hardware check - $(date '+%Y-%m-%d %H:%M') - user $USER"
+  echo "Computer: $(cat "$SL_SYS/class/dmi/id/sys_vendor" 2>/dev/null) $(cat "$SL_SYS/class/dmi/id/product_name" 2>/dev/null), BIOS $(cat "$SL_SYS/class/dmi/id/bios_version" 2>/dev/null)"
+  echo "Kernel: $(uname -r)   SSD firmware: $(cat "$SL_SYS"/class/nvme/nvme0/firmware_rev 2>/dev/null | tr -d ' ')"
+  printf '%s\n' "${RESULTS[@]}"
+  [ -n "$HEALTH_SECTIONS" ] && printf '%s\n' "$HEALTH_SECTIONS"
+  [ ${#tips[@]} -gt 0 ] && { echo "Tips:"; printf '  - %s\n' "${tips[@]}"; }
+} > "$TMP/report" 2>/dev/null
+mkdir -p "$(dirname "$OUT")"; cat "$TMP/report" > "$OUT" 2>/dev/null || { OUT=$HOME/.local/state/secure-linux/hwtest.txt; mkdir -p "$(dirname "$OUT")"; cat "$TMP/report" > "$OUT"; }
+
+fails=$(printf '%s\n' "${RESULTS[@]}" | grep -c ' fail ' || true)
+summary=$(printf '%s\n' "${RESULTS[@]}")
+looks=$((fails + H_WARN + H_FAIL))
+if [ "$looks" = 0 ]; then
+  msg="Everything we tested works.
+
+$summary"
+  [ -n "$HEALTH_NOTE" ] && msg="$msg
+
+$HEALTH_NOTE"
+else
+  msg="Done. $looks thing(s) need a look:
+
+$summary"
+  [ -n "${HEALTH_ATTN//[[:space:]]/}" ] && msg="$msg
+
+$HEALTH_ATTN"
+  [ ${#tips[@]} -gt 0 ] && msg="$msg
+
+$(printf -- '- %s\n' "${tips[@]}")"
+  msg="$msg
+
+These results are saved, so 'Secure Linux Status > Diagnose' can include them if you ask for help."
+fi
+echo "SUMMARY: $msg"
+ui_info done "$msg"
+test_health_full
+exit 0

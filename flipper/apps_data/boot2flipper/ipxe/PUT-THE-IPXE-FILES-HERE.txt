@@ -1,0 +1,14 @@
+PUT THE IPXE BOOT FILES HERE
+============================
+
+This folder must hold two files, downloaded from https://boot.ipxe.org :
+
+  ipxe.efi    (for UEFI computers - almost every PC since about 2012)
+  ipxe.lkrn   (for legacy BIOS computers)
+
+So this folder then contains:
+  apps_data/boot2flipper/ipxe/ipxe.efi
+  apps_data/boot2flipper/ipxe/ipxe.lkrn
+
+They are not included in this repository because they are programs built
+by the iPXE project; getting them from boot.ipxe.org is the official way.

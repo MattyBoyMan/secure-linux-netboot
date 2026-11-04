@@ -1,0 +1,11 @@
+Filetype: Boot2Flipper Config
+Version: 1
+DHCP: true
+IP_Address: 192.168.1.10
+Subnet_Mask: 255.255.255.0
+Gateway: 192.168.1.1
+DNS: 8.8.8.8
+Chainload_URL: https://raw.githubusercontent.com/MattyBoyMan/secure-linux-netboot/main/menu.ipxe
+Network_Interface: auto
+Partition_Scheme: 1
+Chainload_Enabled: true

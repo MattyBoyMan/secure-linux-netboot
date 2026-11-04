@@ -1,0 +1,7 @@
+REM Flipper Zero BadUSB: installs all updates on this computer (it asks for the login password on screen).
+REM Copy to the Flipper SD card under /badusb/ (qFlipper does this). Only use on your own computers.
+DELAY 1000
+CTRL-ALT t
+DELAY 2000
+STRING secure-linux-update-now
+ENTER

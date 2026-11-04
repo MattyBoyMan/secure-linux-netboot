@@ -1,0 +1,7 @@
+REM Flipper Zero BadUSB: opens the Secure Linux Toolbox (look after this computer, rescue files, check hardware).
+REM Copy to the Flipper SD card under /badusb/ (qFlipper does this). Only use on your own computers.
+DELAY 1000
+CTRL-ALT t
+DELAY 2000
+STRING secure-linux-toolbox
+ENTER

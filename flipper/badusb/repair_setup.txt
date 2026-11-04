@@ -1,0 +1,8 @@
+REM Flipper Zero BadUSB: re-checks and repairs the setup on a computer installed with Secure Linux
+REM (from the USB stick or over the internet - the installed system is the same).
+REM Copy to the Flipper SD card under /badusb/ (qFlipper does this). Only use on your own computers.
+DELAY 1000
+CTRL-ALT t
+DELAY 2000
+STRING sudo /usr/local/lib/secure-linux/setup.sh --repair
+ENTER

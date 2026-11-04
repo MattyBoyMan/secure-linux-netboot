@@ -1,0 +1,105 @@
+#!ipxe
+# ============================================================================
+#  The Complete Secure Linux Package - netboot menu (no USB stick needed)
+#  https://github.com/MattyBoyMan/secure-linux-netboot
+#
+#  This file is public and generic. It downloads Linux from Fedora's and
+#  Debian's official servers, and the installer files from the repository
+#  above. The installer always asks which system suits the computer, which
+#  drive to erase, and for every name and password: nothing personal is in
+#  these files, and nothing is changed without you confirming it first.
+# ============================================================================
+
+# The installer files (the public repository)
+set base https://raw.githubusercontent.com/MattyBoyMan/secure-linux-netboot/main
+
+# Fedora 44, straight from Fedora (download.fedoraproject.org redirects to a
+# nearby mirror; the redirect target varies from place to place, which is fine)
+set mirror https://download.fedoraproject.org/pub/fedora/linux/releases/44
+set repo ${mirror}/Everything/x86_64/os
+
+# Debian's installer, straight from Debian
+set deb https://deb.debian.org/debian/dists
+
+:start
+echo
+echo  The installer downloads Linux, so this computer needs the internet:
+echo  a network cable, or a phone connected by USB with USB tethering on.
+echo
+dhcp && goto menu
+echo
+echo  No internet connection yet. Check the cable clicks in at both ends,
+echo  or connect the phone by USB and turn on USB tethering.
+prompt Press a key to try again, or turn the computer off to stop here. || goto end
+goto start
+
+:menu
+menu The Complete Secure Linux Package - set up this computer
+item --gap -- ------------------------------------------------------------
+item fedora     Install Secure Linux (recommended for almost every PC)
+item debian     Lighter Debian - for old or small PCs (under 2 GB memory)
+item debian32   Very old 32-bit PCs - Debian 12 (32-bit)
+item --gap -- ------------------------------------------------------------
+item rescue     Fix or rescue a computer (netboot.xyz tools)
+item netbootxyz More systems and tools (the full netboot.xyz menu)
+item --gap -- ------------------------------------------------------------
+item shell      iPXE shell (experts)
+item reboot     Reboot
+item --gap -- ------------------------------------------------------------
+item --gap -- The installer asks which system fits this computer best, and
+item --gap -- confirms everything before anything is erased.
+choose --timeout 10000 --default fedora picked || goto end
+goto ${picked}
+
+:fedora
+echo
+echo  Loading the Fedora installer from Fedora's mirrors (about 100 MB)...
+kernel ${repo}/images/pxeboot/vmlinuz ip=dhcp inst.repo=${repo} inst.ks=${base}/fedora-netboot.ks
+initrd ${repo}/images/pxeboot/initrd.img
+# Fedora's own shim makes this work on PCs with Secure Boot left on
+# (a safe no-op on PCs without it)
+shim ${repo}/EFI/BOOT/BOOTX64.EFI
+boot || goto failed
+
+:debian
+echo
+echo  Loading the Debian installer from deb.debian.org ...
+# Secure Boot must be OFF for this one: the Debian installer kernel is not
+# loaded through a shim here. Turn it back on after the install if you like.
+kernel ${deb}/trixie/main/installer-amd64/current/images/netboot/debian-installer/amd64/linux preseed/url=${base}/debian/preseed-netboot-lite.cfg netcfg/choose_interface=auto
+initrd ${deb}/trixie/main/installer-amd64/current/images/netboot/debian-installer/amd64/initrd.gz
+boot || goto failed
+
+:debian32
+echo
+echo  Loading the 32-bit Debian installer from deb.debian.org ...
+kernel ${deb}/bookworm/main/installer-i386/current/images/netboot/debian-installer/i386/linux preseed/url=${base}/debian/preseed-netboot-i386.cfg netcfg/choose_interface=auto
+initrd ${deb}/bookworm/main/installer-i386/current/images/netboot/debian-installer/i386/initrd.gz
+boot || goto failed
+
+:rescue
+:netbootxyz
+echo
+echo  Loading the netboot.xyz menu (all the rescue tools come from them)...
+chain --autofree https://boot.netboot.xyz || goto failed
+
+:shell
+echo
+echo  Type 'exit' to leave the shell, or 'reboot' to restart.
+shell
+goto end
+
+:reboot
+reboot
+
+:failed
+echo
+echo  That did not work (no internet, or the server did not answer).
+echo  Nothing has been changed on this computer.
+prompt Press a key to go back to the menu. || goto end
+goto menu
+
+:end
+echo
+echo  Cancelled - nothing was changed on this computer.
+exit

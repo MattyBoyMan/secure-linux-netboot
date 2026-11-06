@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Install System & App Updates
+GenericName=Review and install updates
+Comment=Explicitly check for and install updates with graphical progress; no restart is triggered
+Exec=/usr/local/bin/secure-linux-update-gui
+Icon=system-software-update
+Terminal=false
+Categories=System;Settings;
+Keywords=updates;upgrade;system;apps;security;software;
+StartupNotify=true

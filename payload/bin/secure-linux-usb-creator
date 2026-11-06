@@ -1,0 +1,1960 @@
+#!/usr/bin/env python3
+# secure-linux-usb-creator: Save a finished Linux USB and make fully verified installer clones.
+"""Linux USB Installer Creator - Turn any blank USB into a Linux installer.
+
+A beginner-facing, whole-USB master/cloning tool. Real runs require Linux block
+devices. --mock-devices is a test-only mode whose listed paths must be regular
+files; it can never write a physical device.
+"""
+
+import argparse
+import datetime
+import errno
+try:
+    import fcntl
+except ImportError:  # Windows is supported only for regular-file mock tests.
+    fcntl = None
+import gzip
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import stat
+import struct
+import subprocess
+import sys
+import tempfile
+import time
+import uuid
+
+_KIT_ROOT = Path(__file__).resolve().parent.parent
+_LIB = _KIT_ROOT / "lib"
+if str(_LIB) not in sys.path:
+    sys.path.insert(0, str(_LIB))
+from release_manifest import (  # noqa: E402
+    ReleaseError,
+    canonical_path,
+    capture_master_release,
+    master_problems,
+    validate_master_release_block,
+)
+
+APP = "Linux USB Installer Creator - Turn any blank USB into a Linux installer"
+VERSION = "1.0.0"
+SCHEMA = 1
+DEFAULT_CHUNK = 4 * 1024 * 1024
+COPY_BLOCK = 1024 * 1024
+PORTABLE_FORMAT = "ventoy-verified-file-tree-v1"
+# Ventoy normally reserves a 32 MiB EFI partition plus alignment and metadata.
+# Keep a conservative allowance, then add filesystem allocation and 10% headroom.
+PORTABLE_VENTOY_OVERHEAD = 64 * 1024 * 1024
+PORTABLE_MIN_FILESYSTEM_OVERHEAD = 16 * 1024 * 1024
+PORTABLE_MIN_SAFETY_MARGIN = 256 * 1024 * 1024
+PORTABLE_BOOT_ASSETS = (
+    "EFI/BOOT/BOOTX64.EFI",
+    "EFI/BOOT/BOOTIA32.EFI",
+    "ENROLL_THIS_KEY_IN_MOKMANAGER.cer",
+)
+HASH_RE = re.compile(r"^[0-9a-f]{64}$")
+ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+DEFAULT_CURRENT_RELEASE = _KIT_ROOT / "release.json"
+_REPOSITORY_ROOT = _KIT_ROOT.parent if canonical_path(_KIT_ROOT.parent).is_file() else None
+
+
+class CreatorError(Exception):
+    """A safe, expected refusal."""
+
+
+class VerificationError(CreatorError):
+    """A checksum or full-content mismatch."""
+
+
+class Progress:
+    """Real byte progress with a five-sample moving-average ETA."""
+
+    def __init__(self, label, total, done=0):
+        self.label = label
+        self.total = total
+        self.done = done
+        self.last_done = done
+        self.last_time = time.monotonic()
+        self.rates = []
+        self.last_print = 0.0
+        self.interval = float(os.environ.get("SL_USBC_PROGRESS_INTERVAL", "1"))
+        self.render(force=True)
+
+    def advance(self, amount):
+        self.done += amount
+        now = time.monotonic()
+        elapsed = now - self.last_time
+        moved = self.done - self.last_done
+        if elapsed > 0 and moved > 0:
+            self.rates.append(moved / elapsed)
+            self.rates = self.rates[-5:]
+            self.last_time = now
+            self.last_done = self.done
+        if now - self.last_print >= self.interval or self.done == self.total:
+            self.render(force=True)
+
+    def render(self, force=False):
+        now = time.monotonic()
+        if not force and now - self.last_print < self.interval:
+            return
+        self.last_print = now
+        percent = min(100, self.done * 100 // self.total) if self.total else 100
+        eta = "ETA: calculating"
+        if len(self.rates) >= 2:
+            average = sum(self.rates) / len(self.rates)
+            if average > 0:
+                seconds = max(0, round((self.total - self.done) / average))
+                if seconds < 60:
+                    eta = f"ETA: {seconds} seconds"
+                elif seconds < 3600:
+                    eta = f"ETA: {seconds // 60} min {seconds % 60} sec"
+                else:
+                    eta = f"ETA: about {seconds / 3600:.1f} hours"
+        if self.total:
+            text = f"{self.label}: {percent}% ({self.done}/{self.total} bytes), {eta}"
+        else:
+            text = f"{self.label}: {self.done} bytes; total unknown (indeterminate)"
+        print(text, flush=True)
+
+    def finish(self):
+        self.done = self.total
+        self.render(force=True)
+
+
+def say(text=""):
+    print(text, flush=True)
+
+
+def utc_now():
+    return datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+
+def sha256_bytes(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def json_data(value):
+    return (json.dumps(value, indent=2, sort_keys=True) + "\n").encode("utf-8")
+
+
+def fsync_directory(path):
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except OSError:
+        # Windows cannot fsync a directory. File fsync + atomic replace remains.
+        pass
+
+
+def atomic_replace(source, destination):
+    """Publish staged data despite brief Windows scanner locks, never unsafe failures."""
+    deadline = time.monotonic() + 5.0
+    while True:
+        try:
+            os.replace(source, destination)
+            return
+        except PermissionError:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(0.05)
+
+
+def atomic_write(path, data, mode=0o600):
+    path = os.path.abspath(path)
+    parent = os.path.dirname(path)
+    os.makedirs(parent, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=".tmp-", dir=parent)
+    try:
+        if hasattr(os, "fchmod"):
+            os.fchmod(fd, mode)
+        else:
+            os.chmod(temporary, mode)
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        atomic_replace(temporary, path)
+        fsync_directory(parent)
+    except BaseException:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise
+
+
+def parse_size(text):
+    match = re.fullmatch(r"([0-9]+)([KMG]?)i?B?", text.strip(), re.I)
+    if not match:
+        raise argparse.ArgumentTypeError("use bytes or a K/M/G suffix, for example 4M")
+    value = int(match.group(1))
+    value *= {"": 1, "K": 1024, "M": 1024**2, "G": 1024**3}[match.group(2).upper()]
+    if value < 4096 or value % 512:
+        raise argparse.ArgumentTypeError("chunk size must be at least 4096 and a multiple of 512")
+    return value
+
+
+def human(number):
+    number = int(number)
+    for unit in ("bytes", "KiB", "MiB", "GiB", "TiB"):
+        if number < 1024 or unit == "TiB":
+            return f"{number:.1f} {unit}" if unit != "bytes" else f"{number} bytes"
+        number /= 1024
+    return f"{number} bytes"
+
+
+def as_bool(value):
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    return str(value).strip().lower() in ("1", "true", "yes", "y")
+
+
+def mountpoints(device):
+    points = []
+    for key in ("mountpoint", "mountpoints"):
+        value = device.get(key)
+        if isinstance(value, str) and value and value != "-":
+            points.append(value)
+        elif isinstance(value, list):
+            points.extend(point for point in value if point and point != "-")
+    for child in device.get("children") or []:
+        points.extend(mountpoints(child))
+    return list(dict.fromkeys(points))
+
+
+def identity(device):
+    serial = str(device.get("serial") or "").strip()
+    wwn = str(device.get("wwn") or "").strip()
+    if serial:
+        return "serial:" + serial
+    if wwn:
+        return "wwn:" + wwn
+    return ""
+
+
+def identity_label(device):
+    return str(device.get("serial") or device.get("wwn") or "").strip()
+
+
+def canonical(device):
+    result = dict(device)
+    result["path"] = os.path.abspath(device.get("path") or ("/dev/" + device.get("name", "")))
+    result["model"] = str(device.get("model") or "unknown").strip() or "unknown"
+    result["serial"] = str(device.get("serial") or "").strip()
+    result["wwn"] = str(device.get("wwn") or "").strip()
+    result["size"] = int(device.get("size") or 0)
+    result["ro"] = as_bool(device.get("ro"))
+    result["rm"] = as_bool(device.get("rm"))
+    result["hotplug"] = as_bool(device.get("hotplug"))
+    result["tran"] = str(device.get("tran") or "").strip()
+    result["type"] = str(device.get("type") or "disk")
+    result["mountpoints"] = mountpoints(device)
+    if "health" in device:
+        result["health"] = device.get("health")
+    elif "smart_passed" in device:
+        result["health"] = device.get("smart_passed")
+    else:
+        result["health"] = None
+    if "free_bytes" in device and device.get("free_bytes") is not None:
+        result["free_bytes"] = int(device["free_bytes"])
+    else:
+        total = 0
+        seen = set()
+        for point in result["mountpoints"]:
+            try:
+                real = os.path.realpath(point)
+                if real not in seen:
+                    total += shutil.disk_usage(point).free
+                    seen.add(real)
+            except OSError:
+                pass
+        result["free_bytes"] = total
+    return result
+
+
+class Devices:
+    def __init__(self, mock_path=None):
+        self.mock_path = os.path.abspath(mock_path) if mock_path else None
+
+    @property
+    def mock(self):
+        return bool(self.mock_path)
+
+    def scan(self, probe_smart=True):
+        if self.mock:
+            try:
+                with open(self.mock_path, encoding="utf-8") as handle:
+                    payload = json.load(handle)
+                rows = payload.get("devices", payload.get("blockdevices", []))
+                return [canonical(row) for row in rows if row.get("type", "disk") == "disk"]
+            except (OSError, ValueError, TypeError) as exc:
+                raise CreatorError(f"cannot read mock device list {self.mock_path}: {exc}") from exc
+        columns = "NAME,PATH,TYPE,LABEL,TRAN,RM,HOTPLUG,RO,MODEL,SERIAL,WWN,SIZE,MOUNTPOINT,MOUNTPOINTS"
+        command = ["lsblk", "-J", "-b", "-o", columns]
+        try:
+            result = subprocess.run(command, text=True, capture_output=True, timeout=20)
+            if result.returncode:
+                command[-1] = columns.replace(",MOUNTPOINTS", "")
+                result = subprocess.run(command, text=True, capture_output=True, timeout=20)
+            if result.returncode:
+                raise CreatorError(f"lsblk could not list drives: {result.stderr.strip()}")
+            rows = json.loads(result.stdout).get("blockdevices", [])
+        except FileNotFoundError as exc:
+            raise CreatorError("lsblk is required on a real Linux run; no drive was changed") from exc
+        except (subprocess.TimeoutExpired, ValueError) as exc:
+            raise CreatorError(f"drive enumeration failed safely: {exc}") from exc
+        devices = []
+        for row in rows:
+            name = str(row.get("name") or "")
+            if row.get("type") != "disk" or re.match(r"^(loop|ram|zram|sr)", name):
+                continue
+            item = canonical(row)
+            # HOTPLUG alone can describe an internal enterprise drive. This app
+            # offers only USB/removable media, never a fixed internal disk.
+            if item["tran"] != "usb" and not item["rm"]:
+                continue
+            if probe_smart:
+                item["health"] = self.smart_health(item["path"])
+            devices.append(item)
+        return devices
+
+    @staticmethod
+    def smart_health(path):
+        try:
+            result = subprocess.run(["smartctl", "-H", "-j", path], text=True, capture_output=True, timeout=25)
+            payload = json.loads(result.stdout)
+            passed = payload.get("smart_status", {}).get("passed")
+            return passed if isinstance(passed, bool) else None
+        except (FileNotFoundError, subprocess.TimeoutExpired, ValueError, OSError):
+            return None
+
+    def find_path(self, path):
+        wanted = os.path.realpath(os.path.abspath(path))
+        matches = [d for d in self.scan(probe_smart=False) if os.path.realpath(d["path"]) == wanted]
+        if len(matches) != 1:
+            raise CreatorError(f"{path} is not exactly one enumerated whole drive")
+        return matches[0]
+
+
+def show_devices(devices):
+    if not devices:
+        say("No USB or removable whole drives were found. Internal fixed disks are not offered.")
+        return
+    say("Whole drives (free space is informational; cloning erases the whole target):")
+    for index, device in enumerate(devices, 1):
+        health = "healthy" if device["health"] is True else "UNHEALTHY" if device["health"] is False else "SMART unavailable"
+        mounts = ", ".join(device["mountpoints"]) if device["mountpoints"] else "none"
+        say(
+            f"  {index}) {device['path']} | {device['model']} | serial {device['serial'] or 'unknown'} | "
+            f"WWN {device['wwn'] or 'unknown'} | {device['size']} bytes | "
+            f"mounted-filesystem free space {device['free_bytes']} bytes | read-only {device['ro']} | "
+            f"health {health} | mounted at {mounts}"
+        )
+
+
+def choose_device(devices, supplied, purpose, non_interactive):
+    if supplied:
+        matches = [d for d in devices if os.path.realpath(d["path"]) == os.path.realpath(os.path.abspath(supplied))]
+        if len(matches) != 1:
+            raise CreatorError(f"selected {purpose} is not exactly one listed whole drive; refusing an ambiguous choice")
+        return matches[0]
+    if non_interactive:
+        raise CreatorError(f"non-interactive mode requires an explicit --{purpose} path")
+    show_devices(devices)
+    answer = input(f"Choose the {purpose} by number or exact whole-drive path (Q to stop): ").strip()
+    if answer.lower() == "q":
+        raise CreatorError("stopped before any drive was changed")
+    if answer.isdigit() and 1 <= int(answer) <= len(devices):
+        return devices[int(answer) - 1]
+    matches = [d for d in devices if d["path"] == answer]
+    if len(matches) != 1:
+        raise CreatorError("that selection is not exactly one listed drive; nothing was changed")
+    return matches[0]
+
+
+def require_unambiguous(devices, selected):
+    ident = identity(selected)
+    if not ident:
+        raise CreatorError("this drive has no serial or WWN, so it cannot be identified safely after replugging")
+    if sum(identity(d) == ident for d in devices) != 1:
+        raise CreatorError(f"more than one drive reports identity {identity_label(selected)}; refusing an ambiguous target")
+    return ident
+
+
+def mock_regular_file(device):
+    try:
+        info = os.stat(device["path"])
+    except OSError as exc:
+        raise CreatorError(f"mock drive file is unavailable: {device['path']}") from exc
+    if not stat.S_ISREG(info.st_mode):
+        raise CreatorError("mock mode only accepts regular files; physical devices are always refused")
+    # Large-capacity tests may explicitly declare virtual mock capacity so they
+    # do not allocate 32/64 GB on the host. Real block devices never use this path.
+    virtual_mock_capacity = device.get("mock_virtual_capacity") is True
+    if info.st_size != device["size"] and not virtual_mock_capacity:
+        raise CreatorError(
+            f"mock drive capacity changed or is ambiguous: list says {device['size']}, file has {info.st_size}"
+        )
+
+
+def open_device(device, write, mock):
+    path = device["path"]
+    if mock:
+        mock_regular_file(device)
+    else:
+        info = os.stat(path)
+        if not stat.S_ISBLK(info.st_mode):
+            raise CreatorError(f"real mode only accepts Linux whole-block devices, not {path}")
+    flags = os.O_RDWR if write else os.O_RDONLY
+    flags |= getattr(os, "O_BINARY", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError as exc:
+        raise CreatorError(f"cannot open {path} safely: {exc.strerror}") from exc
+    try:
+        if fcntl is not None:
+            fcntl.flock(fd, fcntl.LOCK_EX if write else fcntl.LOCK_SH)
+        elif not mock:
+            raise CreatorError("real block-device cloning requires Linux/Unix file locking")
+        if not mock and sys.platform.startswith("linux"):
+            # BLKGETSIZE64 and BLKROGET recheck the opened kernel object, not only lsblk text.
+            size = struct.unpack("Q", fcntl.ioctl(fd, 0x80081272, b"\0" * 8))[0]
+            if size != device["size"]:
+                raise CreatorError("opened drive capacity differs from the selected drive; possible replug")
+            if write:
+                read_only = struct.unpack("I", fcntl.ioctl(fd, 0x125E, b"\0" * 4))[0]
+                if read_only:
+                    raise CreatorError("the opened drive is hardware/kernel read-only")
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def read_up_to(fd, length):
+    parts = []
+    remaining = length
+    while remaining:
+        data = os.read(fd, remaining)
+        if not data:
+            break
+        parts.append(data)
+        remaining -= len(data)
+    return b"".join(parts)
+
+
+def write_all(fd, data):
+    view = memoryview(data)
+    while view:
+        count = os.write(fd, view)
+        if count <= 0:
+            raise OSError(errno.EIO, "short drive write")
+        view = view[count:]
+
+
+def hash_fd(fd, total, label):
+    os.lseek(fd, 0, os.SEEK_SET)
+    progress = Progress(label, total)
+    digest = hashlib.sha256()
+    left = total
+    while left:
+        data = os.read(fd, min(COPY_BLOCK, left))
+        if not data:
+            raise VerificationError(f"{label} ended early; the drive may have been unplugged")
+        digest.update(data)
+        left -= len(data)
+        progress.advance(len(data))
+    progress.finish()
+    return digest.hexdigest()
+
+
+def hash_file(path, expected_size=None):
+    digest = hashlib.sha256()
+    count = 0
+    with open(path, "rb") as handle:
+        while True:
+            data = handle.read(COPY_BLOCK)
+            if not data:
+                break
+            digest.update(data)
+            count += len(data)
+    if expected_size is not None and count != expected_size:
+        raise VerificationError(f"file size changed while hashing: {path}")
+    return count, digest.hexdigest()
+
+
+def safe_payload_path(value):
+    if not isinstance(value, str) or not value or "\x00" in value or "\\" in value:
+        raise VerificationError("portable manifest contains an unsafe file path")
+    path = Path(value)
+    if path.is_absolute() or path.as_posix() != value or any(part in ("", ".", "..") for part in path.parts):
+        raise VerificationError(f"portable manifest contains an unsafe file path: {value!r}")
+    return value
+
+
+def source_file_entries(root):
+    """Return a complete regular-file inventory; never silently omit symlinks."""
+    entries = []
+    for base, directories, files in os.walk(root, followlinks=False):
+        directories.sort()
+        files.sort()
+        for name in directories:
+            path = Path(base) / name
+            if path.is_symlink():
+                raise CreatorError(f"finished USB contains a symbolic-link directory, not a regular file tree: {path}")
+        for name in files:
+            path = Path(base) / name
+            if path.is_symlink() or not path.is_file():
+                raise CreatorError(f"finished USB payload must contain regular files only: {path}")
+            relative = safe_payload_path(path.relative_to(root).as_posix())
+            entries.append((relative, path, path.stat().st_size))
+    if not entries:
+        raise CreatorError("finished USB source folder contains no files to preserve")
+    return entries
+
+
+def capture_portable_payload(source_root, staging, source_release):
+    """Snapshot all D:/finished-USB files and prove a stable, complete second pass."""
+    root = Path(source_root).expanduser().resolve()
+    release = Path(source_release).expanduser().resolve()
+    if not root.is_dir():
+        raise CreatorError(f"finished USB source folder is unavailable: {root}")
+    try:
+        release_relative = safe_payload_path(release.relative_to(root).as_posix())
+    except ValueError as exc:
+        raise CreatorError("--source-release must be inside --source-root so the current release is preserved") from exc
+    entries = source_file_entries(root)
+    by_name = {name: (path, size) for name, path, size in entries}
+    if release_relative not in by_name:
+        raise CreatorError("the finished USB release record is missing from the portable source file tree")
+    payload = Path(staging) / "payload"
+    payload.mkdir()
+    copied = []
+    total = sum(size for _, _, size in entries)
+    progress = Progress("Saving every finished USB file for portable copies", total)
+    for relative, source, expected_size in entries:
+        destination = payload / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        digest = hashlib.sha256()
+        count = 0
+        with open(source, "rb") as incoming, open(destination, "xb") as outgoing:
+            while True:
+                data = incoming.read(COPY_BLOCK)
+                if not data:
+                    break
+                outgoing.write(data)
+                digest.update(data)
+                count += len(data)
+                progress.advance(len(data))
+            outgoing.flush()
+            os.fsync(outgoing.fileno())
+        if count != expected_size:
+            raise VerificationError(f"source file changed size during capture: {relative}")
+        copied.append({"path": relative, "size": count, "sha256": digest.hexdigest()})
+    progress.finish()
+    # Re-read every source file after the complete pass. A matching receipt alone
+    # is never accepted when the source changed midway through the snapshot.
+    for entry, (_, source, _) in zip(copied, entries):
+        _, stable_hash = hash_file(source, entry["size"])
+        if stable_hash != entry["sha256"]:
+            raise VerificationError(f"source file changed during capture: {entry['path']}")
+        _, saved_hash = hash_file(payload / entry["path"], entry["size"])
+        if saved_hash != entry["sha256"]:
+            raise VerificationError(f"saved portable payload failed read-back: {entry['path']}")
+    return {
+        "format": PORTABLE_FORMAT,
+        "source_root_at_capture": str(root),
+        "source_release_path": release_relative,
+        "source_release_sha256": copied[[e["path"] for e in copied].index(release_relative)]["sha256"],
+        "file_count": len(copied),
+        "payload_bytes": total,
+        "files": copied,
+    }
+
+
+def master_paths(store, master_id=None):
+    store = os.path.abspath(store)
+    if master_id is None:
+        try:
+            with open(os.path.join(store, "current"), encoding="ascii") as handle:
+                master_id = handle.read().strip()
+        except OSError as exc:
+            raise CreatorError("no saved master is selected; create one first") from exc
+    if not ID_RE.fullmatch(master_id):
+        raise CreatorError("invalid master identifier")
+    root = os.path.join(store, "generations", master_id)
+    return store, master_id, root, os.path.join(root, "manifest.json")
+
+
+def check_read_only(path):
+    if os.stat(path).st_mode & 0o222:
+        raise VerificationError(f"master payload is not read-only: {path}")
+
+
+def validate_portable_manifest(portable):
+    if not isinstance(portable, dict) or portable.get("format") != PORTABLE_FORMAT:
+        raise VerificationError("master has no supported portable file manifest; recreate it with --source-root")
+    files = portable.get("files")
+    if not isinstance(files, list) or not files:
+        raise VerificationError("portable file manifest is empty")
+    seen = set()
+    total = 0
+    release_hash = None
+    for entry in files:
+        if not isinstance(entry, dict):
+            raise VerificationError("portable file manifest contains an invalid entry")
+        relative = safe_payload_path(entry.get("path"))
+        if relative in seen:
+            raise VerificationError(f"portable file manifest contains a duplicate path: {relative}")
+        seen.add(relative)
+        size = entry.get("size")
+        if not isinstance(size, int) or size < 0 or not HASH_RE.fullmatch(entry.get("sha256", "")):
+            raise VerificationError(f"portable file manifest has an invalid size or hash: {relative}")
+        total += size
+        if relative == portable.get("source_release_path"):
+            release_hash = entry["sha256"]
+    if portable.get("file_count") != len(files) or portable.get("payload_bytes") != total:
+        raise VerificationError("portable file manifest totals do not match its file entries")
+    if not release_hash or portable.get("source_release_sha256") != release_hash:
+        raise VerificationError("portable file manifest does not preserve the current release record")
+    if "ventoy/ventoy.json" not in seen:
+        raise VerificationError("portable source is missing ventoy/ventoy.json")
+    if not any(name.lower().startswith("iso/") and name.lower().endswith(".iso") for name in seen):
+        raise VerificationError("portable source has no bootable ISO under ISO/")
+
+
+def validate_manifest(manifest):
+    if manifest.get("schema_version") != SCHEMA or manifest.get("application") != APP:
+        raise VerificationError("unsupported or wrong-application master manifest")
+    image = manifest.get("image", {})
+    source = manifest.get("source", {})
+    if not HASH_RE.fullmatch(image.get("raw_sha256", "")):
+        raise VerificationError("manifest has no valid full-image SHA-256")
+    if image.get("compression") != "gzip-independent-chunks-v1":
+        raise VerificationError("unsupported master compression")
+    raw_size = image.get("raw_size_bytes")
+    chunk_size = image.get("chunk_size_bytes")
+    if not isinstance(raw_size, int) or raw_size <= 0 or not isinstance(chunk_size, int) or chunk_size < 4096:
+        raise VerificationError("manifest has invalid sizes")
+    if source.get("capacity_bytes") != raw_size or not source.get("identity"):
+        raise VerificationError("manifest lacks source identity or matching capacity")
+    chunks = image.get("chunks")
+    if not isinstance(chunks, list) or not chunks:
+        raise VerificationError("manifest has no content chunks")
+    offset = 0
+    for chunk in chunks:
+        if chunk.get("raw_offset") != offset or not isinstance(chunk.get("raw_size"), int) or chunk["raw_size"] <= 0:
+            raise VerificationError("manifest chunk offsets are not contiguous")
+        if not HASH_RE.fullmatch(chunk.get("raw_sha256", "")) or not HASH_RE.fullmatch(chunk.get("compressed_sha256", "")):
+            raise VerificationError("manifest contains an invalid chunk hash")
+        if not re.fullmatch(r"chunk-[0-9]{6}\.raw\.gz", chunk.get("file", "")):
+            raise VerificationError("manifest contains an unsafe chunk filename")
+        if not isinstance(chunk.get("compressed_size"), int) or chunk["compressed_size"] <= 0:
+            raise VerificationError("manifest contains an invalid compressed size")
+        if chunk["raw_size"] > chunk_size:
+            raise VerificationError("manifest chunk exceeds the agreed block size")
+        offset += chunk["raw_size"]
+    if offset != raw_size or image.get("chunk_count") != len(chunks):
+        raise VerificationError("manifest chunk total does not equal source capacity")
+    release = manifest.get("release")
+    if not isinstance(release, dict):
+        raise VerificationError("master has no kit release linkage; recreate it from a current finished USB")
+    try:
+        validate_master_release_block(release)
+    except ReleaseError as exc:
+        raise VerificationError(str(exc)) from exc
+    if "portable" in manifest:
+        validate_portable_manifest(manifest["portable"])
+        if manifest["portable"]["source_release_sha256"] != release["source_release_sha256"]:
+            raise VerificationError("portable file manifest's current release differs from the verified master release")
+
+
+def read_manifest(store, master_id=None):
+    store, master_id, root, path = master_paths(store, master_id)
+    try:
+        check_read_only(root)
+        check_read_only(path)
+        sidecar_path = os.path.join(root, "manifest.sha256")
+        check_read_only(sidecar_path)
+        with open(path, "rb") as handle:
+            raw = handle.read()
+        with open(sidecar_path, encoding="ascii") as handle:
+            sidecar = handle.read().split()[0]
+    except (OSError, IndexError) as exc:
+        raise VerificationError("master manifest or its immutable checksum cannot be read") from exc
+    if sha256_bytes(raw) != sidecar:
+        raise VerificationError("master manifest does not match its immutable SHA-256 sidecar")
+    try:
+        manifest = json.loads(raw)
+    except ValueError as exc:
+        raise VerificationError("master manifest is not valid JSON") from exc
+    validate_manifest(manifest)
+    if manifest.get("master_id") != master_id:
+        raise VerificationError("master identifier does not match its manifest")
+    return store, master_id, root, manifest
+
+
+def decompress_chunk(path, expected_size):
+    """Yield decompressed bytes incrementally; never expand a whole USB in RAM."""
+    with gzip.open(path, "rb") as source:
+        remaining = expected_size
+        while remaining:
+            data = source.read(min(COPY_BLOCK, remaining))
+            if not data:
+                raise VerificationError(f"compressed chunk ended early: {os.path.basename(path)}")
+            remaining -= len(data)
+            yield data
+        if source.read(1):
+            raise VerificationError(f"compressed chunk has unexpected extra content: {os.path.basename(path)}")
+
+
+def verify_master_payload(root, manifest, show_progress=True):
+    total = manifest["image"]["raw_size_bytes"]
+    progress = Progress("Checking every byte of saved master", total) if show_progress else None
+    whole = hashlib.sha256()
+    for entry in manifest["image"]["chunks"]:
+        path = os.path.join(root, entry["file"])
+        check_read_only(path)
+        if os.stat(path).st_size != entry["compressed_size"]:
+            raise VerificationError(f"compressed master chunk size differs from manifest: {entry['file']}")
+        compressed = hashlib.sha256()
+        with open(path, "rb") as handle:
+            while True:
+                data = handle.read(COPY_BLOCK)
+                if not data:
+                    break
+                compressed.update(data)
+        if compressed.hexdigest() != entry["compressed_sha256"]:
+            raise VerificationError(f"compressed master chunk failed SHA-256: {entry['file']}")
+        raw = hashlib.sha256()
+        count = 0
+        try:
+            for data in decompress_chunk(path, entry["raw_size"]):
+                raw.update(data)
+                whole.update(data)
+                count += len(data)
+                if progress:
+                    progress.advance(len(data))
+        except (OSError, EOFError) as exc:
+            raise VerificationError(f"cannot decompress master chunk {entry['file']}: {exc}") from exc
+        if count != entry["raw_size"] or raw.hexdigest() != entry["raw_sha256"]:
+            raise VerificationError(f"decompressed master content failed SHA-256: {entry['file']}")
+    if whole.hexdigest() != manifest["image"]["raw_sha256"]:
+        raise VerificationError("full decompressed master SHA-256 does not match its manifest")
+    if progress:
+        progress.finish()
+    portable = manifest.get("portable")
+    if portable:
+        payload = Path(root) / "payload"
+        expected = {entry["path"]: entry for entry in portable["files"]}
+        actual = set()
+        for base, directories, files in os.walk(payload):
+            for name in directories:
+                if (Path(base) / name).is_symlink():
+                    raise VerificationError("saved portable payload contains a symbolic-link directory")
+            for name in files:
+                path = Path(base) / name
+                if path.is_symlink() or not path.is_file():
+                    raise VerificationError("saved portable payload contains a non-regular file")
+                relative = path.relative_to(payload).as_posix()
+                actual.add(relative)
+                entry = expected.get(relative)
+                if entry is None:
+                    raise VerificationError(f"unexpected file in saved portable payload: {relative}")
+                check_read_only(path)
+                size, digest = hash_file(path, entry["size"])
+                if size != entry["size"] or digest != entry["sha256"]:
+                    raise VerificationError(f"saved portable file failed SHA-256: {relative}")
+        missing = sorted(set(expected) - actual)
+        if missing:
+            raise VerificationError(f"saved portable payload is missing files, starting with: {missing[0]}")
+
+
+def load_master(store, master_id=None, payload=True, show_progress=True, current_release=None):
+    store, master_id, root, manifest = read_manifest(store, master_id)
+    current = Path(current_release).expanduser().resolve() if current_release else DEFAULT_CURRENT_RELEASE
+    check_root = _REPOSITORY_ROOT if current == DEFAULT_CURRENT_RELEASE else None
+    try:
+        # A source edit invalidates old masters even before somebody restamps.
+        capture_master_release(current, current, check_root)
+    except ReleaseError as exc:
+        raise VerificationError(f"current kit is not release-coherent: {exc}") from exc
+    stale = master_problems(manifest, current)
+    if stale:
+        raise VerificationError("saved master is not current: " + "; ".join(stale))
+    if payload:
+        verify_master_payload(root, manifest, show_progress)
+    return store, master_id, root, manifest
+
+
+def restore_guide(manifest):
+    source = manifest["source"]
+    return f"""{APP}
+
+SAVED MASTER {manifest['master_id']}
+Kit release: {manifest['release']['release_id']}
+Source: {source.get('model', 'unknown')} / {source.get('identity')}
+Exact source capacity: {source['capacity_bytes']} bytes
+
+The manifest, its SHA-256 sidecar and every independently compressed chunk are
+read-only. The current pointer is updated only after a complete new master passes
+all checks. Older generations are retained so an interrupted update cannot harm
+the last usable master.
+
+CREATE A CLONE (erases the explicitly selected destination):
+  secure-linux-usb-creator clone --store /path/to/master-store
+
+AFTER POWER LOSS OR UNPLUG:
+Reconnect the same target and run the same clone command again. Each already
+written chunk is read and hashed; only the first mismatching chunk onward is
+written again. A receipt offset is never trusted as proof. Use --restart to
+discard a partial copy and restart at byte zero. A new typed ERASE confirmation
+is always required. The target is invalid until VERIFIED CLONE is printed.
+
+VERIFY WITHOUT WRITING:
+  secure-linux-usb-creator verify --store /path/to/master-store --target /dev/CHANGE-ME
+
+Verification decompresses and reads every source byte and every target byte.
+Only a final full-content match is a verified clone. If verification fails, try
+another USB port or a healthy blank drive, then rerun clone. Do not boot a target
+reported as INCOMPLETE or NOT VERIFIED. The saved master is opened read-only.
+"""
+
+
+def mock_hook(name, mock):
+    return os.environ.get(name) if mock else None
+
+
+def create_master(args):
+    source_release = getattr(args, "source_release", None)
+    if not source_release and not args.non_interactive:
+        source_release = input("Finished USB's linux-setup/linux/release.json path: ").strip()
+    if not source_release:
+        raise CreatorError("--source-release is required: select release.json from the mounted finished USB")
+    current_release = Path(getattr(args, "current_release", None) or DEFAULT_CURRENT_RELEASE).expanduser().resolve()
+    source_release = Path(source_release).expanduser().resolve()
+    # Explicit alternate records are used by isolated fixtures and installed
+    # tools; only the default checkout record has a canonical tree to rehash.
+    check_root = _REPOSITORY_ROOT if current_release == DEFAULT_CURRENT_RELEASE else None
+    try:
+        release_link = capture_master_release(current_release, source_release, check_root)
+    except ReleaseError as exc:
+        raise CreatorError(f"finished USB release check failed: {exc}") from exc
+
+    devices = Devices(args.mock_devices)
+    rows = devices.scan()
+    source = choose_device(rows, args.source, "source", args.non_interactive)
+    source_id = require_unambiguous(rows, source)
+    if source["size"] <= 0:
+        raise CreatorError("source capacity is zero or unknown")
+    if source["mountpoints"]:
+        raise CreatorError("source or its partitions are mounted; unmount them before capture so the raw snapshot is filesystem-consistent")
+    if devices.mock:
+        mock_regular_file(source)
+    store = os.path.abspath(args.store)
+    if args.source_root:
+        source_root = Path(args.source_root).expanduser().resolve()
+        try:
+            Path(store).resolve().relative_to(source_root)
+        except ValueError:
+            pass
+        else:
+            raise CreatorError("--store must be outside --source-root; otherwise the master would recursively copy itself")
+    os.makedirs(store, exist_ok=True)
+    required = source["size"] + source["size"] // 100 + 64 * 1024 * 1024
+    free = shutil.disk_usage(store).free
+    if free < required:
+        raise CreatorError(
+            f"master storage has {free} bytes free; {required} bytes are required as a safe worst-case allowance"
+        )
+    master_id = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%S") + "-" + uuid.uuid4().hex[:12]
+    generations = os.path.join(store, "generations")
+    os.makedirs(generations, exist_ok=True)
+    # Hard power loss cannot run finally. Remove only our unpublished staging
+    # directories on the next create; immutable published generations stay intact.
+    for stale in os.listdir(generations):
+        stale_path = os.path.join(generations, stale)
+        if stale.startswith(".building-") and os.path.isdir(stale_path):
+            shutil.rmtree(stale_path)
+    staging = os.path.join(generations, ".building-" + master_id)
+    final = os.path.join(generations, master_id)
+    os.mkdir(staging, mode=0o700)
+    published = False
+    fd = None
+    try:
+        fd = open_device(source, False, devices.mock)
+        chunks = []
+        whole = hashlib.sha256()
+        offset = 0
+        progress = Progress("Reading finished USB and saving compressed master", source["size"])
+        for index in range((source["size"] + args.chunk_size - 1) // args.chunk_size):
+            wanted = min(args.chunk_size, source["size"] - offset)
+            data = read_up_to(fd, wanted)
+            if len(data) != wanted:
+                raise CreatorError("source ended before its recorded capacity; no master was published")
+            compressed = gzip.compress(data, compresslevel=6, mtime=0)
+            name = f"chunk-{index:06d}.raw.gz"
+            path = os.path.join(staging, name)
+            with open(path, "xb") as output:
+                output.write(compressed)
+                output.flush()
+                os.fsync(output.fileno())
+            entry = {
+                "file": name,
+                "raw_offset": offset,
+                "raw_size": len(data),
+                "raw_sha256": sha256_bytes(data),
+                "compressed_size": len(compressed),
+                "compressed_sha256": sha256_bytes(compressed),
+            }
+            chunks.append(entry)
+            whole.update(data)
+            offset += len(data)
+            progress.advance(len(data))
+            fail_after = mock_hook("SL_USBC_MOCK_EXIT_AFTER_MASTER_CHUNKS", devices.mock)
+            if fail_after and index + 1 == int(fail_after):
+                os._exit(85)
+        progress.finish()
+        mutation = mock_hook("SL_USBC_MOCK_MUTATE_SOURCE_AFTER_CAPTURE", devices.mock)
+        if mutation:
+            with open(source["path"], "r+b") as changed:
+                changed.seek(0)
+                changed.write(mutation.encode("ascii"))
+                changed.flush()
+                os.fsync(changed.fileno())
+        os.close(fd)
+        fd = None
+        # A second complete source pass rejects a stick that changed during capture.
+        refreshed = devices.find_path(source["path"])
+        if identity(refreshed) != source_id or refreshed["size"] != source["size"]:
+            raise CreatorError("source identity or capacity changed during capture; no master was published")
+        if refreshed["mountpoints"]:
+            raise CreatorError("source became mounted during capture; no master was published")
+        fd = open_device(refreshed, False, devices.mock)
+        source_again = hash_fd(fd, source["size"], "Rechecking entire source for a stable snapshot")
+        if source_again != whole.hexdigest():
+            raise VerificationError("source content changed during capture; the previous saved master is untouched")
+        os.close(fd)
+        fd = None
+        # The mounted release record is part of the source contract too. Recheck
+        # it after both complete raw passes so a mid-capture relabel cannot publish.
+        try:
+            release_recheck = capture_master_release(current_release, source_release, check_root)
+        except ReleaseError as exc:
+            raise VerificationError(f"release record changed or became stale during capture: {exc}") from exc
+        if release_recheck != release_link:
+            raise VerificationError("source release record changed during capture; no master was published")
+        portable = capture_portable_payload(args.source_root, staging, source_release) if args.source_root else None
+        if portable:
+            validate_portable_manifest(portable)
+        manifest = {
+            "schema_version": SCHEMA,
+            "application": APP,
+            "tool_version": VERSION,
+            "master_id": master_id,
+            "created_at": utc_now(),
+            "release": release_link,
+            "source": {
+                "path_at_capture": source["path"],
+                "model": source["model"],
+                "serial": source["serial"],
+                "wwn": source["wwn"],
+                "identity": source_id,
+                "capacity_bytes": source["size"],
+                "transport": source["tran"],
+                "removable": source["rm"] or source["hotplug"],
+            },
+            "image": {
+                "raw_size_bytes": source["size"],
+                "raw_sha256": whole.hexdigest(),
+                "compression": "gzip-independent-chunks-v1",
+                "chunk_size_bytes": args.chunk_size,
+                "chunk_count": len(chunks),
+                "chunks": chunks,
+            },
+        }
+        if portable:
+            manifest["portable"] = portable
+            validate_manifest(manifest)
+        manifest_raw = json_data(manifest)
+        atomic_write(os.path.join(staging, "manifest.json"), manifest_raw, 0o400)
+        atomic_write(os.path.join(staging, "manifest.sha256"), (sha256_bytes(manifest_raw) + "  manifest.json\n").encode(), 0o400)
+        atomic_write(os.path.join(staging, "RESTORE-AND-RETRY.txt"), restore_guide(manifest).encode(), 0o400)
+        # Validate the actual compressed bytes before making this generation current.
+        for entry in chunks:
+            path = os.path.join(staging, entry["file"])
+            raw = hashlib.sha256()
+            count = 0
+            for data in decompress_chunk(path, entry["raw_size"]):
+                raw.update(data)
+                count += len(data)
+            if count != entry["raw_size"] or raw.hexdigest() != entry["raw_sha256"]:
+                raise VerificationError("new master failed compressed read-back; it was not published")
+            if sha256_bytes(open(path, "rb").read()) != entry["compressed_sha256"]:
+                raise VerificationError("new compressed chunk changed during capture")
+        fsync_directory(staging)
+        # The master is a whole-device copy and may contain private files or keys.
+        # Owner-only permissions protect it while keeping every payload read-only.
+        for base, directories, files in os.walk(staging):
+            for name in files:
+                os.chmod(os.path.join(base, name), 0o400)
+            for name in directories:
+                os.chmod(os.path.join(base, name), 0o500)
+        atomic_replace(staging, final)
+        os.chmod(final, 0o500)
+        fsync_directory(generations)
+        atomic_write(os.path.join(store, "current"), (master_id + "\n").encode(), 0o600)
+        published = True
+        say("")
+        say(f"SAVED MASTER VERIFIED: {master_id}")
+        say(f"Kit release: {release_link['release_id']}")
+        say(f"Source: {source['model']}, {source_id}, {source['size']} bytes")
+        say(f"Full raw SHA-256: {whole.hexdigest()}")
+        say("The master is read-only and owner-only (folder 0500, files 0400) because it may contain private data.")
+        say("Future clones stream-decompress it and never write to it.")
+        return 0
+    finally:
+        if fd is not None:
+            os.close(fd)
+        if not published and os.path.isdir(staging):
+            for name in os.listdir(staging):
+                try:
+                    os.chmod(os.path.join(staging, name), 0o600)
+                except OSError:
+                    pass
+            shutil.rmtree(staging, ignore_errors=True)
+
+
+def state_location(args, master_id, target_id, mode="exact-clone"):
+    root = os.path.abspath(args.state_dir) if args.state_dir else os.path.join(os.path.abspath(args.store), "clone-state")
+    name = sha256_bytes((mode + "\0" + master_id + "\0" + target_id).encode())[:32] + ".json"
+    return root, os.path.join(root, name)
+
+
+def read_state(path):
+    try:
+        with open(path, encoding="utf-8") as handle:
+            return json.load(handle)
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError):
+        return None
+
+
+def save_state(path, state):
+    state = dict(state)
+    state["updated_at"] = utc_now()
+    atomic_write(path, json_data(state), 0o600)
+
+
+def refusal_reason(devices, target, manifest):
+    if identity(target) == manifest["source"]["identity"]:
+        return "the destination is the original source USB; overwriting the finished source is forbidden"
+    if target["size"] < manifest["image"]["raw_size_bytes"]:
+        return f"destination capacity {target['size']} is smaller than master {manifest['image']['raw_size_bytes']}"
+    if target["ro"]:
+        return "destination is read-only"
+    if target["health"] is False:
+        return "destination reports failed SMART health"
+    if target["mountpoints"]:
+        return "destination or its partitions are mounted; unmount them safely before cloning"
+    return None
+
+
+def print_target(target, reason=None):
+    health = "healthy" if target["health"] is True else "UNHEALTHY" if target["health"] is False else "unknown (SMART unavailable)"
+    say(f"Target: {target['path']}")
+    say(f"  Model: {target['model']}; serial: {target['serial'] or 'unknown'}; WWN: {target['wwn'] or 'unknown'}")
+    say(f"  Capacity: {target['size']} bytes; mounted-filesystem free space: {target['free_bytes']} bytes")
+    say(f"  Read-only: {target['ro']}; health: {health}")
+    if reason:
+        say(f"  REFUSED: {reason}")
+
+
+def matching_prefix(fd, root, manifest):
+    matched = 0
+    for entry in manifest["image"]["chunks"]:
+        os.lseek(fd, entry["raw_offset"], os.SEEK_SET)
+        data = read_up_to(fd, entry["raw_size"])
+        if len(data) != entry["raw_size"] or sha256_bytes(data) != entry["raw_sha256"]:
+            break
+        matched += 1
+    return matched
+
+
+def invalidate_target(fd, raw_size):
+    length = min(4096, raw_size)
+    marker = b"SECURE-LINUX-INCOMPLETE-USB\0"
+    data = (marker + bytes(length))[:length]
+    os.lseek(fd, 0, os.SEEK_SET)
+    write_all(fd, data)
+    os.fsync(fd)
+
+
+def verify_open_clone(fd, root, manifest):
+    progress = Progress("Full post-write read-back verification", manifest["image"]["raw_size_bytes"])
+    whole = hashlib.sha256()
+    for entry in manifest["image"]["chunks"]:
+        os.lseek(fd, entry["raw_offset"], os.SEEK_SET)
+        target_hash = hashlib.sha256()
+        target_count = 0
+        for expected in decompress_chunk(os.path.join(root, entry["file"]), entry["raw_size"]):
+            actual = read_up_to(fd, len(expected))
+            if actual != expected:
+                raise VerificationError(f"full-content mismatch in {entry['file']}; target is not a verified clone")
+            target_hash.update(actual)
+            whole.update(actual)
+            target_count += len(actual)
+            progress.advance(len(actual))
+        if target_count != entry["raw_size"] or target_hash.hexdigest() != entry["raw_sha256"]:
+            raise VerificationError(f"target chunk SHA-256 mismatch in {entry['file']}")
+    if whole.hexdigest() != manifest["image"]["raw_sha256"]:
+        raise VerificationError("target full-image SHA-256 differs from the master")
+    progress.finish()
+    return whole.hexdigest()
+
+
+def retry_guidance():
+    say("CLONE INCOMPLETE / NOT VERIFIED. Do not boot or rely on this target.")
+    say("Reconnect the same drive and rerun clone to hash and resume its valid prefix.")
+    say("Use --restart for a clean restart, or choose another healthy blank USB.")
+    say("The read-only saved master has not been changed. Every retry needs a new typed ERASE confirmation.")
+
+
+def clone_master(args):
+    store, master_id, root, manifest = load_master(args.store, args.master_id, payload=True, current_release=args.current_release)
+    devices = Devices(args.mock_devices)
+    rows = devices.scan()
+    target = choose_device(rows, args.target, "target", args.non_interactive)
+    target_id = require_unambiguous(rows, target)
+    reason = refusal_reason(devices, target, manifest)
+    print_target(target, reason)
+    if reason:
+        if target["size"] < manifest["image"]["raw_size_bytes"]:
+            say("")
+            say("CAPACITY CHECK — CLONE REFUSED")
+            say(f"The saved whole-device master is exactly {manifest['image']['raw_size_bytes']} bytes.")
+            say(f"The selected target is {target['size']} bytes. A smaller target cannot hold this master.")
+            say("For example, a 32 GB target cannot exactly clone a 64 GB whole-device master.")
+        raise CreatorError(reason)
+    if target["health"] is None:
+        say("SMART health is unavailable on this USB bridge; capacity, identity and read-only checks still apply.")
+    phrase = "ERASE " + identity_label(target)
+    say("")
+    say("CAPACITY CHECK — READ THIS BEFORE ERASING")
+    say(f"The saved whole-device master is exactly {manifest['image']['raw_size_bytes']} bytes.")
+    say(f"The selected target is {target['size']} bytes. A smaller target cannot hold this master.")
+    say("For example, a 32 GB target cannot exactly clone a 64 GB whole-device master.")
+    if target["size"] > manifest["image"]["raw_size_bytes"]:
+        say("This target is larger: only the master-sized beginning is overwritten and verified.")
+        say("The remaining space is not erased or checked and may retain old data; it is not part of the verified clone.")
+    else:
+        say("The target capacity exactly matches the master, so the whole target is overwritten and verified.")
+    say("WARNING: cloning permanently erases ALL existing data in the master-sized part of this exact whole drive.")
+    say("This is not a secure erase. There is no confirmation timeout. Nothing is written until the exact phrase is entered.")
+    if args.non_interactive:
+        confirmation = args.confirm
+    else:
+        confirmation = args.confirm if args.confirm is not None else input(f"Type {phrase} to erase {target['path']}: ")
+    if confirmation != phrase:
+        raise CreatorError(f"typed confirmation did not match {phrase!r}; target was not opened for writing")
+    # Re-enumerate after human/non-interactive confirmation to catch a replug.
+    refreshed = devices.find_path(target["path"])
+    if identity(refreshed) != target_id or refreshed["size"] != target["size"] or refreshed["model"] != target["model"]:
+        raise CreatorError("target identity changed after selection; possible replug, so nothing was written")
+    reason = refusal_reason(devices, refreshed, manifest)
+    if reason:
+        raise CreatorError("target became unsafe after confirmation: " + reason)
+    state_root, state_path = state_location(args, master_id, target_id)
+    previous = read_state(state_path)
+    base_state = {
+        "schema_version": 1,
+        "application": APP,
+        "master_id": master_id,
+        "master_raw_sha256": manifest["image"]["raw_sha256"],
+        "target": {
+            "identity": target_id,
+            "serial": target["serial"],
+            "wwn": target["wwn"],
+            "model": target["model"],
+            "capacity_bytes": target["size"],
+            "path_at_start": target["path"],
+        },
+        "status": "invalid",
+        "verified": False,
+        "phase": "writing",
+        "next_chunk": 0,
+        "message": "INCOMPLETE / NOT VERIFIED",
+    }
+    # This durable invalid record exists BEFORE the first destructive write.
+    save_state(state_path, base_state)
+    fd = None
+    completed = False
+    try:
+        fd = open_device(refreshed, True, devices.mock)
+        latest = devices.find_path(target["path"])
+        if identity(latest) != target_id or latest["size"] != target["size"]:
+            raise CreatorError("target changed while it was being opened; no clone is considered valid")
+        can_resume = not args.restart and (
+            args.resume or (previous and previous.get("master_id") == master_id and previous.get("target", {}).get("identity") == target_id)
+        )
+        start = matching_prefix(fd, root, manifest) if can_resume else 0
+        if start == len(manifest["image"]["chunks"]):
+            say("Every existing target chunk matches; no rewrite is needed, but full verification will still run.")
+        elif start:
+            say(f"Resume: {start} complete chunks re-hashed and retained; restarting at the first mismatch.")
+        else:
+            say("Starting at byte zero. An incomplete marker is fsynced before image data.")
+            invalidate_target(fd, manifest["image"]["raw_size_bytes"])
+        progress = Progress("Writing exact USB image", manifest["image"]["raw_size_bytes"],
+                            sum(c["raw_size"] for c in manifest["image"]["chunks"][:start]))
+        for index, entry in enumerate(manifest["image"]["chunks"][start:], start):
+            os.lseek(fd, entry["raw_offset"], os.SEEK_SET)
+            raw = hashlib.sha256()
+            count = 0
+            try:
+                for data in decompress_chunk(os.path.join(root, entry["file"]), entry["raw_size"]):
+                    write_all(fd, data)
+                    raw.update(data)
+                    count += len(data)
+                    progress.advance(len(data))
+            except (OSError, EOFError) as exc:
+                raise CreatorError(f"write or decompression stopped: {exc}") from exc
+            if count != entry["raw_size"] or raw.hexdigest() != entry["raw_sha256"]:
+                raise VerificationError("a master chunk changed while cloning")
+            os.fsync(fd)
+            current = dict(base_state)
+            current["next_chunk"] = index + 1
+            save_state(state_path, current)
+            fail_after = mock_hook("SL_USBC_MOCK_EXIT_AFTER_CLONE_CHUNKS", devices.mock)
+            if fail_after and index + 1 == int(fail_after):
+                os._exit(86)
+        progress.finish()
+        os.fsync(fd)
+        verified_hash = verify_open_clone(fd, root, manifest)
+        completed = True
+        final_state = dict(base_state)
+        final_state.update({
+            "status": "verified",
+            "verified": True,
+            "phase": "complete",
+            "next_chunk": len(manifest["image"]["chunks"]),
+            "message": "VERIFIED CLONE",
+            "verified_raw_sha256": verified_hash,
+            "verified_at": utc_now(),
+        })
+        save_state(state_path, final_state)
+        say("")
+        say("VERIFIED CLONE: every target byte in the master extent matches the saved master.")
+        say("The clone is complete and distinct from an interrupted/partial target.")
+        if target["size"] > manifest["image"]["raw_size_bytes"]:
+            say("Capacity limitation: the larger target's remaining space was not erased or verified and may retain old data.")
+        say("Use your operating system's safe-eject action before unplugging it.")
+        return 0
+    except BaseException:
+        if not completed:
+            try:
+                failed = dict(base_state)
+                failed["phase"] = "interrupted"
+                save_state(state_path, failed)
+            except Exception:
+                pass
+        raise
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
+def portable_measurements(manifest):
+    portable = manifest.get("portable")
+    if portable is None:
+        raise VerificationError("this saved master has no portable file manifest; recreate it with --source-root")
+    validate_portable_manifest(portable)
+    allocated = sum(max(4096, ((entry["size"] + 4095) // 4096) * 4096) for entry in portable["files"])
+    filesystem = max(
+        PORTABLE_MIN_FILESYSTEM_OVERHEAD,
+        portable["file_count"] * 4096 + allocated // 100,
+    )
+    subtotal = allocated + PORTABLE_VENTOY_OVERHEAD + filesystem
+    safety = max(PORTABLE_MIN_SAFETY_MARGIN, subtotal // 10)
+    return {
+        "source_used_bytes": portable["payload_bytes"],
+        "allocated_payload_bytes": allocated,
+        "ventoy_partition_overhead_bytes": PORTABLE_VENTOY_OVERHEAD,
+        "filesystem_overhead_bytes": filesystem,
+        "safety_margin_bytes": safety,
+        "exact_clone_minimum_bytes": manifest["image"]["raw_size_bytes"],
+        "portable_copy_minimum_bytes": subtotal + safety,
+        "required_destination_bytes": subtotal + safety,
+        "portable_file_count": portable["file_count"],
+    }
+
+
+def usb_guidance():
+    say("USB guidance: choose a reputable, genuine USB 3.x flash drive from a trustworthy seller.")
+    say("64 GB or 128 GB is recommended for headroom; the calculated minimum above is the actual requirement.")
+    say("Choose a USB-A model when the computer needs USB-A, or use a suitable adapter for another port.")
+
+
+def measure_command(args):
+    _, _, _, manifest = load_master(
+        args.store, args.master_id, payload=True, show_progress=not args.json, current_release=args.current_release
+    )
+    result = portable_measurements(manifest)
+    target = None
+    if args.target:
+        devices = Devices(args.mock_devices)
+        rows = devices.scan(probe_smart=False)
+        target = choose_device(rows, args.target, "target", True)
+        require_unambiguous(rows, target)
+        if devices.mock:
+            mock_regular_file(target)
+        result["target_capacity_bytes"] = target["size"]
+        result["exact_clone_fits"] = target["size"] >= result["exact_clone_minimum_bytes"]
+        result["portable_copy_fits"] = target["size"] >= result["portable_copy_minimum_bytes"]
+    if args.json:
+        say(json.dumps(result, indent=2, sort_keys=True))
+        return 0
+    say("MEASURED USB CAPACITY — based on the verified saved file manifest")
+    say(f"Source used bytes (actual finished tools/files): {result['source_used_bytes']} ({human(result['source_used_bytes'])})")
+    say(f"Filesystem-allocation allowance: {result['allocated_payload_bytes']} bytes")
+    say(f"Ventoy/partition overhead: {result['ventoy_partition_overhead_bytes']} bytes")
+    say(f"Additional filesystem overhead: {result['filesystem_overhead_bytes']} bytes")
+    say(f"Safety margin: {result['safety_margin_bytes']} bytes")
+    say(f"Required destination bytes for Portable tools copy: {result['required_destination_bytes']} ({human(result['required_destination_bytes'])})")
+    say(f"Exact-clone minimum: {result['exact_clone_minimum_bytes']} bytes (the entire source medium)")
+    say(f"Portable-copy minimum: {result['portable_copy_minimum_bytes']} bytes")
+    if target:
+        say(f"Selected target capacity: {target['size']} bytes")
+        say(f"Exact whole-device clone fits: {'yes' if result['exact_clone_fits'] else 'no'}")
+        say(f"Portable tools copy fits: {'yes' if result['portable_copy_fits'] else 'no'}")
+    usb_guidance()
+    return 0
+
+
+def validate_ventoy_installer(value, mock):
+    path = Path(value).expanduser().resolve() if value else None
+    if path is None:
+        raise CreatorError("--ventoy-installer is required; select the genuine Ventoy2Disk.sh from the official package")
+    if path.is_symlink() or not path.is_file():
+        raise CreatorError("Ventoy installer must be a regular file from the official extracted package")
+    if not mock and path.name != "Ventoy2Disk.sh":
+        raise CreatorError("real portable copies require the genuine Ventoy2Disk.sh; no substitute boot writer is allowed")
+    package = path.parent
+    required = ["ventoy/ventoy.disk.img.xz", "tool/ENROLL_THIS_KEY_IN_MOKMANAGER.cer"]
+    hashes = {}
+    for relative in required:
+        asset = package / relative
+        if asset.is_symlink() or not asset.is_file() or asset.stat().st_size <= 0:
+            raise CreatorError(f"Ventoy package is missing required genuine installer asset: {relative}")
+        hashes[relative] = hash_file(asset)[1]
+    tools = list((package / "tool").glob("*/Ventoy2Disk")) if (package / "tool").is_dir() else []
+    if not tools or any(tool.is_symlink() or not tool.is_file() or tool.stat().st_size <= 0 for tool in tools):
+        raise CreatorError("Ventoy package has no usable platform installer under tool/*/Ventoy2Disk")
+    for tool in tools:
+        hashes[tool.relative_to(package).as_posix()] = hash_file(tool)[1]
+    hashes[path.name] = hash_file(path)[1]
+    if mock:
+        command = [sys.executable, str(path), "-i"] if path.suffix == ".py" else [str(path), "-i"]
+    else:
+        command = ["/bin/sh", str(path), "-i", "-s"]
+    return path, command, hashes
+
+
+def portable_refusal_reason(target, manifest, minimum):
+    if identity(target) == manifest["source"]["identity"]:
+        return "the destination is the original source USB; overwriting the finished source is forbidden"
+    if target["size"] < minimum:
+        return (
+            f"destination capacity {target['size']} is smaller than the calculated portable-copy minimum "
+            f"{minimum}; actual content and safety overhead do not fit"
+        )
+    if target["ro"]:
+        return "destination is read-only"
+    if target["health"] is False:
+        return "destination reports failed SMART health"
+    if target["mountpoints"]:
+        return "destination or its partitions are mounted; unmount them safely before a portable copy"
+    return None
+
+
+def verify_boot_assets(efi_root):
+    hashes = {}
+    for relative in PORTABLE_BOOT_ASSETS:
+        path = Path(efi_root) / relative
+        if path.is_symlink() or not path.is_file() or path.stat().st_size <= 0:
+            raise VerificationError(f"required Ventoy boot asset is missing or empty: {relative}")
+        hashes[relative] = hash_file(path)[1]
+    return hashes
+
+
+def child_partitions(device):
+    for child in device.get("children") or []:
+        yield child
+        yield from child_partitions(child)
+
+
+def mount_ventoy_partitions(devices, target, state_root):
+    if devices.mock:
+        data = os.environ.get("SL_USBC_MOCK_VENTOY_DATA_ROOT")
+        efi = os.environ.get("SL_USBC_MOCK_VENTOY_EFI_ROOT")
+        if not data or not efi or not Path(data).is_dir() or not Path(efi).is_dir():
+            raise CreatorError("interrupted mock layout is unavailable; use --restart to recreate the Ventoy layout")
+        return Path(data), Path(efi), []
+    refreshed = devices.find_path(target["path"])
+    found = {}
+    for child in child_partitions(refreshed):
+        label = str(child.get("label") or "").upper()
+        if label in ("VENTOY", "VTOYEFI"):
+            found[label] = child
+    if set(found) != {"VENTOY", "VTOYEFI"}:
+        raise CreatorError("Ventoy finished without both Ventoy and VTOYEFI partitions; use --restart after checking the drive")
+    roots = {}
+    mounted = []
+    for label in ("VENTOY", "VTOYEFI"):
+        child = found[label]
+        points = mountpoints(child)
+        if points:
+            roots[label] = Path(points[0])
+            continue
+        source = child.get("path") or ("/dev/" + str(child.get("name") or ""))
+        mount_root = tempfile.mkdtemp(prefix="ventoy-" + label.lower() + "-", dir=state_root)
+        result = subprocess.run(["mount", "--", source, mount_root])
+        if result.returncode:
+            os.rmdir(mount_root)
+            raise CreatorError(f"could not mount the new {label} partition; target remains invalid")
+        roots[label] = Path(mount_root)
+        mounted.append((source, Path(mount_root)))
+    return roots["VENTOY"], roots["VTOYEFI"], mounted
+
+
+def unmount_ventoy_partitions(mounted):
+    for _, mount_root in reversed(mounted):
+        result = subprocess.run(["umount", "--", str(mount_root)])
+        if result.returncode:
+            say(f"WARNING: could not unmount {mount_root}; unmount it before unplugging the USB.")
+        else:
+            try:
+                os.rmdir(mount_root)
+            except OSError:
+                pass
+
+
+def ensure_payload_destination(data_root, relative):
+    current = Path(data_root)
+    parts = Path(relative).parts
+    for part in parts[:-1]:
+        current = current / part
+        if current.is_symlink():
+            raise VerificationError(f"destination contains an unsafe symbolic link: {current}")
+        current.mkdir(exist_ok=True)
+    destination = current / parts[-1]
+    if destination.is_symlink():
+        raise VerificationError(f"refusing to follow a destination symbolic link: {relative}")
+    return destination
+
+
+def verify_portable_files(data_root, portable):
+    progress = Progress("Full post-copy per-file SHA-256 verification", portable["payload_bytes"])
+    tree = hashlib.sha256()
+    for entry in portable["files"]:
+        path = Path(data_root) / entry["path"]
+        if path.is_symlink() or not path.is_file():
+            raise VerificationError(f"copied file is missing or not regular: {entry['path']}")
+        size, digest = hash_file(path, entry["size"])
+        if size != entry["size"] or digest != entry["sha256"]:
+            raise VerificationError(f"copied file SHA-256 mismatch: {entry['path']}")
+        tree.update(entry["path"].encode("utf-8") + b"\0" + digest.encode("ascii") + b"\n")
+        progress.advance(size)
+    progress.finish()
+    release = next(entry for entry in portable["files"] if entry["path"] == portable["source_release_path"])
+    if release["sha256"] != portable["source_release_sha256"]:
+        raise VerificationError("copied current release manifest does not match the verified source master")
+    return tree.hexdigest()
+
+
+def portable_retry_guidance():
+    say("PORTABLE COPY INCOMPLETE / NOT VERIFIED. Do not boot or rely on this target.")
+    say("Reconnect the same drive and rerun portable --resume to retain hash-matching files.")
+    say("If Ventoy or its partitions failed, rerun portable --restart for a clean Ventoy installation.")
+    say("The read-only saved master has not been changed. Every retry needs a new typed ERASE confirmation.")
+
+
+def portable_copy(args):
+    store, master_id, root, manifest = load_master(
+        args.store, args.master_id, payload=True, current_release=args.current_release
+    )
+    portable = manifest["portable"]
+    measurements = portable_measurements(manifest)
+    _, installer_command, installer_hashes = validate_ventoy_installer(args.ventoy_installer, bool(args.mock_devices))
+    devices = Devices(args.mock_devices)
+    rows = devices.scan()
+    target = choose_device(rows, args.target, "target", args.non_interactive)
+    target_id = require_unambiguous(rows, target)
+    minimum = measurements["portable_copy_minimum_bytes"]
+    reason = portable_refusal_reason(target, manifest, minimum)
+    print_target(target, reason)
+    if reason:
+        say(f"Actual source payload is {measurements['source_used_bytes']} bytes; calculated minimum is {minimum} bytes.")
+        say("A drive labelled 32 GB is accepted only when its enumerated byte capacity meets this calculated minimum.")
+        raise CreatorError(reason)
+    if target["health"] is None:
+        say("SMART health is unavailable on this USB bridge; capacity, identity and read-only checks still apply.")
+    _, state_path = state_location(args, master_id, target_id, mode="portable-tools-copy")
+    previous = read_state(state_path)
+    matching_receipt = previous and previous.get("mode") == "portable-tools-copy" and previous.get("master_id") == master_id
+    if args.resume and not matching_receipt:
+        raise CreatorError("no matching interrupted portable copy exists; use --restart to create a new Ventoy layout")
+    can_resume = not args.restart and bool(matching_receipt)
+    phrase = "ERASE " + identity_label(target)
+    say("")
+    say("PORTABLE TOOLS COPY — a separate option from exact whole-device clone")
+    say("This creates a functionally equivalent bootable Ventoy USB; it is not a byte-for-byte exact clone.")
+    say(f"Verified source used bytes: {measurements['source_used_bytes']}")
+    say(f"Ventoy/partition overhead: {measurements['ventoy_partition_overhead_bytes']} bytes")
+    say(f"Safety margin: {measurements['safety_margin_bytes']} bytes")
+    say(f"Required destination bytes: {minimum}; selected target: {target['size']} bytes")
+    say(f"Exact whole-device clone would still require {measurements['exact_clone_minimum_bytes']} bytes.")
+    if target["size"] > minimum:
+        say("The target is larger than required; space beyond the copied payload is not content-verified and may retain residual old data.")
+    say("WARNING: Ventoy installation permanently erases and repartitions ALL existing data on this exact whole drive.")
+    say("This is not a secure erase. There is no confirmation timeout. Nothing is written until the exact phrase is entered.")
+    usb_guidance()
+    if args.non_interactive:
+        confirmation = args.confirm
+    else:
+        confirmation = args.confirm if args.confirm is not None else input(f"Type {phrase} to erase {target['path']}: ")
+    if confirmation != phrase:
+        raise CreatorError(f"typed confirmation did not match {phrase!r}; target was not opened for writing")
+    refreshed = devices.find_path(target["path"])
+    if identity(refreshed) != target_id or refreshed["size"] != target["size"] or refreshed["model"] != target["model"]:
+        raise CreatorError("target identity changed after selection; possible replug, so nothing was written")
+    reason = portable_refusal_reason(refreshed, manifest, minimum)
+    if reason:
+        raise CreatorError("target became unsafe after confirmation: " + reason)
+    state_root = os.path.dirname(state_path)
+    os.makedirs(state_root, exist_ok=True)
+    base_state = {
+        "schema_version": 1,
+        "application": APP,
+        "mode": "portable-tools-copy",
+        "master_id": master_id,
+        "master_raw_sha256": manifest["image"]["raw_sha256"],
+        "portable_tree_sha256": sha256_bytes(json_data(portable["files"])),
+        "target": {
+            "identity": target_id,
+            "serial": target["serial"],
+            "wwn": target["wwn"],
+            "model": target["model"],
+            "capacity_bytes": target["size"],
+            "path_at_start": target["path"],
+        },
+        "source_used_bytes": measurements["source_used_bytes"],
+        "required_destination_bytes": minimum,
+        "ventoy_installer_sha256": installer_hashes,
+        "status": "invalid",
+        "verified": False,
+        "phase": "ventoy-install" if not can_resume else "copying",
+        "next_file": 0,
+        "message": "INCOMPLETE / NOT VERIFIED",
+    }
+    # The durable invalid receipt is saved before Ventoy can make its first write.
+    save_state(state_path, base_state)
+    fd = None
+    mounted = []
+    completed = False
+    try:
+        fd = open_device(refreshed, True, devices.mock)
+        if can_resume:
+            say("Resume: retaining the existing Ventoy layout and re-hashing every already copied file.")
+        else:
+            say("Starting genuine Ventoy installation; no substitute boot-sector writer is used.")
+            result = subprocess.run(installer_command + [refreshed["path"]])
+            if result.returncode:
+                raise CreatorError(
+                    f"Ventoy installer failed with exit status {result.returncode}; target is INCOMPLETE / NOT VERIFIED"
+                )
+        os.close(fd)
+        fd = None
+        latest = devices.find_path(target["path"])
+        if identity(latest) != target_id or latest["size"] != target["size"]:
+            raise CreatorError("target identity or capacity changed during Ventoy installation")
+        data_root, efi_root, mounted = mount_ventoy_partitions(devices, latest, state_root)
+        boot_hashes = verify_boot_assets(efi_root)
+        current = dict(base_state)
+        current["phase"] = "copying"
+        current["boot_asset_sha256"] = boot_hashes
+        save_state(state_path, current)
+        progress = Progress("Copying verified tools, release and offline content", portable["payload_bytes"])
+        for index, entry in enumerate(portable["files"]):
+            source = Path(root) / "payload" / entry["path"]
+            destination = ensure_payload_destination(data_root, entry["path"])
+            retained = False
+            if can_resume and destination.is_file():
+                try:
+                    size, digest = hash_file(destination, entry["size"])
+                    retained = size == entry["size"] and digest == entry["sha256"]
+                except VerificationError:
+                    retained = False
+            if retained:
+                say(f"Verified existing file {index + 1}/{len(portable['files'])}: {entry['path']}")
+            else:
+                temporary_fd, temporary = tempfile.mkstemp(prefix=".secure-linux-copy-", dir=destination.parent)
+                try:
+                    digest = hashlib.sha256()
+                    count = 0
+                    with open(source, "rb") as incoming, os.fdopen(temporary_fd, "wb") as outgoing:
+                        while True:
+                            data = incoming.read(COPY_BLOCK)
+                            if not data:
+                                break
+                            outgoing.write(data)
+                            digest.update(data)
+                            count += len(data)
+                        outgoing.flush()
+                        os.fsync(outgoing.fileno())
+                    if count != entry["size"] or digest.hexdigest() != entry["sha256"]:
+                        raise VerificationError(f"master file changed while copying: {entry['path']}")
+                    atomic_replace(temporary, destination)
+                    fsync_directory(destination.parent)
+                except BaseException:
+                    try:
+                        os.close(temporary_fd)
+                    except OSError:
+                        pass
+                    try:
+                        os.unlink(temporary)
+                    except OSError:
+                        pass
+                    raise
+            progress.advance(entry["size"])
+            current = dict(base_state)
+            current.update({"phase": "copying", "next_file": index + 1, "boot_asset_sha256": boot_hashes})
+            save_state(state_path, current)
+            fail_after = mock_hook("SL_USBC_MOCK_EXIT_AFTER_PORTABLE_FILES", devices.mock)
+            if fail_after and index + 1 == int(fail_after):
+                os._exit(87)
+        progress.finish()
+        corrupt = mock_hook("SL_USBC_MOCK_CORRUPT_PORTABLE_FILE", devices.mock)
+        if corrupt:
+            with open(Path(data_root) / corrupt, "r+b") as changed:
+                original = changed.read(1)
+                changed.seek(0)
+                changed.write(bytes([original[0] ^ 1]))
+                changed.flush()
+                os.fsync(changed.fileno())
+        tree_hash = verify_portable_files(data_root, portable)
+        if verify_boot_assets(efi_root) != boot_hashes:
+            raise VerificationError("Ventoy boot assets changed during portable file copying")
+        if hasattr(os, "sync"):
+            os.sync()
+        final_state = dict(base_state)
+        final_state.update({
+            "status": "verified",
+            "verified": True,
+            "phase": "complete",
+            "next_file": len(portable["files"]),
+            "message": "VERIFIED PORTABLE TOOLS COPY",
+            "verified_file_count": len(portable["files"]),
+            "verified_tree_sha256": tree_hash,
+            "boot_asset_sha256": boot_hashes,
+            "verified_at": utc_now(),
+        })
+        save_state(state_path, final_state)
+        completed = True
+        say("")
+        say(f"VERIFIED PORTABLE TOOLS COPY: all {len(portable['files'])} file hashes and every required Ventoy boot asset passed.")
+        say("The current release manifest, finished tools/files and offline content were copied from the verified saved master.")
+        say("This is functionally equivalent Ventoy content, not a byte-for-byte exact clone.")
+        if target["size"] > minimum:
+            say("Residual-data warning: the larger target's unwritten sectors were not erased or verified and may retain old data.")
+        say("Use your operating system's safe-eject action before unplugging it.")
+        return 0
+    except BaseException:
+        if not completed:
+            try:
+                failed = dict(base_state)
+                failed.update({"phase": "interrupted", "status": "invalid", "verified": False})
+                save_state(state_path, failed)
+            except Exception:
+                pass
+        raise
+    finally:
+        if fd is not None:
+            os.close(fd)
+        unmount_ventoy_partitions(mounted)
+
+
+def verify_target(args):
+    store, master_id, root, manifest = load_master(args.store, args.master_id, payload=True, current_release=args.current_release)
+    devices = Devices(args.mock_devices)
+    rows = devices.scan()
+    target = choose_device(rows, args.target, "target", True)
+    target_id = require_unambiguous(rows, target)
+    if devices.mock:
+        mock_regular_file(target)
+    if target["size"] < manifest["image"]["raw_size_bytes"]:
+        raise VerificationError("target is smaller than the master and cannot be a complete clone")
+    _, state_path = state_location(args, master_id, target_id)
+    fd = None
+    try:
+        fd = open_device(target, False, devices.mock)
+        digest = verify_open_clone(fd, root, manifest)
+        state = read_state(state_path) or {
+            "schema_version": 1,
+            "application": APP,
+            "master_id": master_id,
+            "target": {"identity": target_id, "capacity_bytes": target["size"], "path_at_start": target["path"]},
+        }
+        state.update({"status": "verified", "verified": True, "phase": "complete", "message": "VERIFIED CLONE",
+                      "master_raw_sha256": manifest["image"]["raw_sha256"], "verified_raw_sha256": digest,
+                      "verified_at": utc_now()})
+        save_state(state_path, state)
+        if args.json:
+            say(json.dumps({"status": "verified", "verified": True, "raw_sha256": digest}, sort_keys=True))
+        else:
+            say("VERIFIED CLONE: full content verification passed; this is not merely a sampled check.")
+        return 0
+    except BaseException:
+        state = read_state(state_path) or {"schema_version": 1, "application": APP, "master_id": master_id,
+                                           "target": {"identity": target_id}}
+        state.update({"status": "invalid", "verified": False, "phase": "verification-failed",
+                      "message": "INCOMPLETE / NOT VERIFIED"})
+        try:
+            save_state(state_path, state)
+        except Exception:
+            pass
+        raise
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
+def target_status(args):
+    _, master_id, _, manifest = load_master(
+        args.store, args.master_id, payload=False, current_release=args.current_release
+    )
+    devices = Devices(args.mock_devices)
+    target = choose_device(devices.scan(), args.target, "target", True)
+    target_id = require_unambiguous(devices.scan(probe_smart=False), target)
+    _, path = state_location(args, master_id, target_id)
+    state = read_state(path)
+    if not state:
+        raise CreatorError("no clone receipt exists for this master and target; treat the target as NOT VERIFIED")
+    if args.json:
+        say(json.dumps(state, indent=2, sort_keys=True))
+    else:
+        say(f"Recorded state: {state.get('message', 'INCOMPLETE / NOT VERIFIED')}")
+        say(f"Master: {master_id}; target: {target_id}; next chunk: {state.get('next_chunk', 0)}")
+        if state.get("verified") is True:
+            say("This is a verification receipt, not a substitute for a fresh verify after another write or replug.")
+        else:
+            say("INCOMPLETE / NOT VERIFIED: rerun clone to resume, or use --restart. Do not boot this target.")
+    return 0 if state.get("verified") is True else 2
+
+
+def interactive(args):
+    say(APP)
+    say("Save one finished Linux USB, then choose exact whole-device clone or Portable tools copy.")
+    say("Nothing is erased until you explicitly select a whole drive and type its ERASE phrase.")
+    usb_guidance()
+    while True:
+        say("\n1) List USB drives  2) Save/update master  3) Exact whole-device clone")
+        say("4) Portable tools copy  5) Measure/minimum size  6) Verify exact clone  7) Clone status  Q) Quit")
+        choice = input("Choose: ").strip().lower()
+        if choice == "q":
+            return 0
+        if choice not in ("1", "2", "3", "4", "5", "6", "7"):
+            say("Please choose 1, 2, 3, 4, 5, 6, 7 or Q.")
+            continue
+        try:
+            if choice == "1":
+                show_devices(Devices().scan())
+                continue
+            if choice in ("2", "3", "4", "6") and hasattr(os, "geteuid") and os.geteuid() != 0:
+                raise CreatorError("raw USB access needs administrator rights; restart this app with sudo")
+            args.store = input("Master storage folder: ").strip()
+            args.master_id = None
+            args.state_dir = None
+            args.mock_devices = None
+            args.non_interactive = False
+            args.confirm = None
+            args.json = False
+            args.current_release = None
+            args.source_release = None
+            args.source_root = None
+            if choice == "2":
+                args.source = input("Exact source whole-drive path: ").strip()
+                args.source_root = input("Finished USB file-tree root for Portable tools copy (for example D:\\): ").strip()
+                args.chunk_size = DEFAULT_CHUNK
+                return create_master(args)
+            if choice == "5":
+                args.target = input("Optional exact target path for a fit check (blank to skip): ").strip() or None
+                return measure_command(args)
+            args.target = input("Exact target whole-drive path: ").strip()
+            if choice == "3":
+                args.resume = False
+                args.restart = False
+                return clone_master(args)
+            if choice == "4":
+                args.ventoy_installer = input("Official Ventoy2Disk.sh path: ").strip()
+                args.resume = False
+                args.restart = False
+                return portable_copy(args)
+            if choice == "6":
+                return verify_target(args)
+            return target_status(args)
+        except CreatorError as exc:
+            say(f"Stopped safely: {exc}")
+
+
+def add_mock(parser):
+    parser.add_argument("--mock-devices", help="test-only JSON drive list; every listed path must be a regular file")
+
+
+def add_current_release(parser):
+    parser.add_argument(
+        "--current-release",
+        help="current kit's installed release.json (default: the copy beside this tool)",
+    )
+
+
+def add_store(parser):
+    parser.add_argument("--store", required=True, help="master store containing current and immutable generations")
+    parser.add_argument("--master-id", help="use a retained generation instead of current")
+    parser.add_argument("--state-dir", help="clone receipts (default: STORE/clone-state)")
+    add_current_release(parser)
+    add_mock(parser)
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(prog="secure-linux-usb-creator", description=APP)
+    parser.add_argument("--version", action="version", version=VERSION)
+    sub = parser.add_subparsers(dest="command")
+    listing = sub.add_parser("list", help="list removable whole drives, identity, capacity, free space and health")
+    add_mock(listing)
+    listing.add_argument("--json", action="store_true")
+    create = sub.add_parser("create", help="create or update a verified compressed master generation")
+    create.add_argument("--store", required=True)
+    create.add_argument("--source", help="explicit finished source whole-drive path")
+    create.add_argument(
+        "--source-release",
+        help="required release.json from the mounted finished USB (normally linux-setup/linux/release.json)",
+    )
+    create.add_argument(
+        "--source-root",
+        help="finished USB file-tree root (for example D:\\); captures every file for Portable tools copy",
+    )
+    create.add_argument("--chunk-size", type=parse_size, default=DEFAULT_CHUNK)
+    create.add_argument("--non-interactive", action="store_true")
+    add_current_release(create)
+    add_mock(create)
+    clone = sub.add_parser("clone", help="exact whole-device clone with full verification and safe resume")
+    add_store(clone)
+    clone.add_argument("--target", help="explicit destination whole-drive path")
+    clone.add_argument("--confirm", help="exact typed phrase: ERASE SERIAL-OR-WWN")
+    mode = clone.add_mutually_exclusive_group()
+    mode.add_argument("--resume", action="store_true", help="re-hash and retain a matching prefix")
+    mode.add_argument("--restart", action="store_true", help="discard any partial target and restart at byte zero")
+    clone.add_argument("--non-interactive", action="store_true")
+    portable = sub.add_parser(
+        "portable",
+        help="Portable tools copy: install genuine Ventoy, copy and hash-verify every saved file (not an exact clone)",
+    )
+    add_store(portable)
+    portable.add_argument("--target", help="explicit destination whole-drive path")
+    portable.add_argument("--ventoy-installer", required=True, help="official Ventoy2Disk.sh from its genuine extracted package")
+    portable.add_argument("--confirm", help="exact typed phrase: ERASE SERIAL-OR-WWN")
+    portable_mode = portable.add_mutually_exclusive_group()
+    portable_mode.add_argument("--resume", action="store_true", help="retain existing Ventoy and hash-matching copied files")
+    portable_mode.add_argument("--restart", action="store_true", help="reinstall Ventoy and restart the complete file copy")
+    portable.add_argument("--non-interactive", action="store_true")
+    measure = sub.add_parser("measure", help="report source used bytes and exact/portable minimum destination sizes")
+    add_store(measure)
+    measure.add_argument("--target", help="optional target for a read-only fit check")
+    measure.add_argument("--json", action="store_true")
+    verify = sub.add_parser("verify", help="read-only full-content verification of an exact-clone target")
+    add_store(verify)
+    verify.add_argument("--target", required=True)
+    verify.add_argument("--json", action="store_true")
+    status_parser = sub.add_parser("status", help="show the durable verified/incomplete receipt")
+    add_store(status_parser)
+    status_parser.add_argument("--target", required=True)
+    status_parser.add_argument("--json", action="store_true")
+    return parser
+
+
+def main(argv=None):
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    try:
+        if args.command is None:
+            return interactive(args)
+        if args.command == "list":
+            rows = Devices(args.mock_devices).scan()
+            if args.json:
+                say(json.dumps({"devices": rows}, indent=2, sort_keys=True))
+            else:
+                show_devices(rows)
+            return 0
+        if (args.command in ("create", "clone", "portable", "verify") and not args.mock_devices
+                and hasattr(os, "geteuid") and os.geteuid() != 0):
+            raise CreatorError("administrator rights are required for raw USB access; rerun with sudo, or use the app launcher")
+        if args.command == "create":
+            return create_master(args)
+        if args.command == "clone":
+            try:
+                return clone_master(args)
+            except KeyboardInterrupt:
+                raise
+            except Exception:
+                retry_guidance()
+                raise
+        if args.command == "portable":
+            try:
+                return portable_copy(args)
+            except KeyboardInterrupt:
+                raise
+            except Exception:
+                portable_retry_guidance()
+                raise
+        if args.command == "measure":
+            return measure_command(args)
+        if args.command == "verify":
+            return verify_target(args)
+        if args.command == "status":
+            return target_status(args)
+        parser.error("unknown command")
+    except VerificationError as exc:
+        say(f"VERIFICATION FAILED: {exc}")
+        return 2
+    except CreatorError as exc:
+        say(f"REFUSED / STOPPED SAFELY: {exc}")
+        return 1
+    except EOFError:
+        say("Input ended. Cancelled safely; no new write was started.")
+        return 1
+    except KeyboardInterrupt:
+        say("Interrupted. Any target remains INCOMPLETE / NOT VERIFIED; rerun the same copy command to resume safely.")
+        return 130
+    except OSError as exc:
+        say(f"STOPPED SAFELY: operating-system error: {exc}")
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

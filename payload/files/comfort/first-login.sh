@@ -69,14 +69,14 @@ do_scale() {
 # KWin reads kcminputrc [Libinput][Defaults][Touchpad] for every touchpad, then per-device groups
 # [Libinput][vendor][product][name] (decimal ids). We write both so it works even if the device
 # group already exists. ClickMethod 2 = "clickfinger": click with two fingers = right click.
-touchpad_devices() {   # prints "vendor_dec product_dec name" for each touchpad the kernel knows
+touchpad_devices() {   # prints "vendor_hex product_hex name" for each touchpad the kernel knows
   local devs=${CF_TEST_INPUT_DEVICES:-/proc/bus/input/devices}
   [ -r "$devs" ] || return 0
   awk '
     /^I:/ { v=""; p=""; for (i=1;i<=NF;i++) { if ($i ~ /^Vendor=/) v=substr($i,8); if ($i ~ /^Product=/) p=substr($i,9) } }
     /^N: Name=/ { n=$0; sub(/^N: Name="/,"",n); sub(/"$/,"",n) }
-    /^$/ { if (n ~ /[Tt]ouchpad/) printf "%d %d %s\n", strtonum("0x" v), strtonum("0x" p), n; n="" }
-    END { if (n ~ /[Tt]ouchpad/) printf "%d %d %s\n", strtonum("0x" v), strtonum("0x" p), n }' "$devs" 2>/dev/null
+    /^$/ { if (n ~ /[Tt]ouchpad/) printf "%s %s %s\n", v, p, n; n="" }
+    END { if (n ~ /[Tt]ouchpad/) printf "%s %s %s\n", v, p, n }' "$devs" 2>/dev/null
 }
 tp_write() {   # tp_write "Group/path"
   cf_kconf kcminputrc "$1" TapToClick true
@@ -88,9 +88,11 @@ do_touchpad() {
   [ "$DESK" = kde ] || return 0
   cf_have kwriteconfig6 || cf_have kwriteconfig5 || return 1
   tp_write "Libinput/Defaults/Touchpad"
-  local v p n
+  local v p n vd pd
   while read -r v p n; do
-    [ -n "$n" ] && tp_write "Libinput/$v/$p/$n"
+    vd=$(printf '%d' "0x$v" 2>/dev/null) || continue
+    pd=$(printf '%d' "0x$p" 2>/dev/null) || continue
+    [ -n "$n" ] && tp_write "Libinput/$vd/$pd/$n"
   done < <(touchpad_devices)
   cf_kde_notify 3 0
   return 0

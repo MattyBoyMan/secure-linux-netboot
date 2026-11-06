@@ -25,6 +25,22 @@ _a_pkgs() {   # install the packages that exist in this Debian and are missing; 
   [ ${#want[@]} -gt 0 ] && sl_pkg_install --no-recommends "${want[@]}"
   return 0
 }
+
+# extra_apps comes from the optional old-app scan. Only a reviewed "extra" TSV row can produce an apt
+# package name; an unknown id is refused, and a blank Debian mapping means honestly unavailable.
+_a_extra_apps() {
+  local db=${SL_APP_EQUIVALENTS:-$SL_ROOT/setup-data/app-equivalents.tsv} id pkg
+  [ -r "$db" ] || { echo "Note: app-equivalents.tsv is missing; no scanned extras installed."; return 0; }
+  for id in $1; do
+    pkg=$(awk -F '\t' -v id="$id" '$2 == id && $9 == "extra" { print $8; found=1; exit } END { if (!found) exit 2 }' "$db") || {
+      echo "Refusing unknown extra_apps package id: $id" >&2; continue; }
+    if [ -z "$pkg" ]; then
+      echo "Note: $id has no Debian package in the reviewed mapping; skipped."
+    else
+      _a_pkgs "$pkg"
+    fi
+  done
+}
 _a_ram=$(sl_ram_mb); _a_ram=${_a_ram:-0}
 
 # Create the user's Syncthing settings without starting anything (works offline), then make them
@@ -131,6 +147,10 @@ case "$(sl_choice_get disk_usage)" in
 esac
 case "$(sl_choice_get disk_utility)" in
   gnome-disks) _a_pkgs gnome-disk-utility ;;   # format/wipe USB sticks and check drive health on Xfce
+esac
+case "$(sl_choice_get extra_apps)" in
+  ""|none) ;;                                  # unset / skipped: no scanned extras
+  *) _a_extra_apps "$(sl_choice_get extra_apps)" ;;
 esac
 unset _a_ram _a_browser _a_desktop _a_user _a_net
 return 0

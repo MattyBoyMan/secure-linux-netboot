@@ -48,7 +48,8 @@ item reboot     Reboot
 item --gap -- ------------------------------------------------------------
 item --gap -- The installer asks which system fits this computer best, and
 item --gap -- confirms everything before anything is erased.
-choose --timeout 10000 --default fedora picked || goto end
+# Fedora is highlighted, but NOTHING starts until you press Enter. There is no countdown.
+choose --default fedora picked || goto end
 goto ${picked}
 
 :fedora

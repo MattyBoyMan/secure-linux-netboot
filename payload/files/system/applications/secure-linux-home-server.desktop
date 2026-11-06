@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Home & Server Helper
+GenericName=Home Assistant, home servers and Docker
+Comment=Guided help for Home Assistant, an existing home server, external unRAID and safer rootless Docker
+Exec=/usr/local/bin/secure-linux-home-server-gui
+Icon=network-server
+Terminal=false
+Categories=System;Settings;Network;
+Keywords=Home Assistant;home server;Docker;rootless;unRAID;SSH;containers;

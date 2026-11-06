@@ -1,0 +1,20 @@
+@define-color sl_window #f7f8f5;
+@define-color sl_surface #f7f8f5;
+@define-color sl_sidebar #e2e6df;
+@define-color sl_text #111512;
+@define-color sl_muted #29322c;
+@define-color sl_border #39423c;
+@define-color sl_accent #005f55;
+@define-color sl_accent_hover #004a43;
+@define-color sl_accent_soft #d1e9e1;
+@define-color sl_on_accent #f7fffc;
+@define-color sl_success #075e32;
+@define-color sl_success_soft #d7ecdc;
+@define-color sl_warning #694000;
+@define-color sl_warning_soft #f3e2be;
+@define-color sl_danger #8b171d;
+@define-color sl_danger_soft #f3d8d7;
+@define-color sl_focus #005f55;
+
+.sl-task-card, .sl-status-card, .sl-review { border-width: 2px; }
+.sl-muted, .sl-caption { color: @sl_muted; }

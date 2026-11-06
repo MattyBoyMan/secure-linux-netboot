@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Customise My Apps & Desktop
+GenericName=Display, accessibility and comfort choices
+Comment=Change display, accessibility, meetings, devices and other guided app and desktop choices
+Exec=/usr/local/bin/secure-linux-migrate
+Icon=preferences-desktop
+Terminal=false
+Categories=Settings;Utility;
+Keywords=customise;customize;display;accessibility;apps;desktop;settings;
+StartupNotify=true

@@ -14,10 +14,25 @@ WHAT YOU NEED
     connected by USB with USB tethering on (the computer downloads Linux
     itself; the installer's own Wi-Fi question can take over after that)
 
+EASIEST WAY: USE THE PREP SCRIPT
+  Windows: right-click prepare-flipper.ps1 and choose Run with PowerShell.
+  Linux/macOS: run  bash prepare-flipper.sh  from this folder.
+  The script lists removable drives with labels and sizes, asks you to pick the
+  SD card by number, and confirms the exact writes before touching the card.
+  It then copies apps_data and badusb, downloads and checks the iPXE files,
+  and installs the released Boot2Flipper app if one exists. If there is no app
+  release yet, it shows the one manual GitHub step; run the script again after
+  that step and it finishes the card automatically. No drive is guessed silently.
+  The manual steps below are the alternative if you prefer them.
+
 1. INSTALL THE APP
    Get boot2flipper.fap from this repository's "flipper-fap" release
    (it is built automatically from the Boot2Flipper source, once a month,
    by a GitHub Action - see .github/workflows/build-flipper-fap.yml).
+   Use exactly boot2flipper.fap from that tag, not an unrelated latest release.
+   The release records both source commit IDs and the file's SHA-256. Building
+   against current RogueMaster source does not guarantee compatibility with
+   every RogueMaster release; test the app with your exact firmware version.
    Copy the .fap to the SD card under  apps/USB/  (qFlipper or the
    Flipper mobile app does this), then find "Boot to Flipper" in the
    Flipper's app menu under USB.
@@ -52,8 +67,8 @@ WHAT YOU NEED
          most others ......... Esc or F12
          Intel Mac ........... hold Option
    - Pick the boot device called "FLIPPER Boot2Flipper" (or similar).
-   - The menu appears. Press Enter for the recommended install
-     (or wait 10 seconds - it starts by itself).
+   - The menu appears with the recommended install highlighted. Press Enter
+     to start it. The menu waits forever: nothing starts by itself.
    The first load from the Flipper is SLOW: it is a tiny computer sending
    the loader over USB, so give it 1-2 minutes. After that, everything
    comes over the internet at full speed.

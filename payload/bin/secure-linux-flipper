@@ -1,0 +1,28 @@
+#!/usr/bin/env python3
+"""Secure Linux Flipper Companion: graphical by default, advanced CLI on request."""
+from pathlib import Path
+import sys
+
+HERE = Path(__file__).resolve().parent
+LIB = HERE.parent / "lib" / "flipper-companion"
+sys.path.insert(0, str(LIB))
+
+
+def run(argv: list[str]) -> int:
+    if not argv or argv[0] in {"gui", "--gui"}:
+        try:
+            from flipper_companion_gui import main as gui_main
+        except (ImportError, ValueError) as exc:
+            if isinstance(exc, ValueError) or (exc.name and (exc.name == "gi" or exc.name.startswith("gi."))):
+                print("The graphical companion needs GTK4/Libadwaita: python3-gobject, gtk4 and libadwaita on Fedora; python3-gi, gir1.2-gtk-4.0 and gir1.2-adw-1 on Debian.", file=sys.stderr)
+                print("Advanced CLI fallback: secure-linux-flipper --help", file=sys.stderr)
+                return 2
+            raise
+        return gui_main()
+
+    from flipper_companion_cli import main as cli_main
+    return cli_main(argv)
+
+
+if __name__ == "__main__":
+    raise SystemExit(run(sys.argv[1:]))

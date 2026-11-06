@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Secure Linux USB Fixer
+GenericName=USB repair and recovery
+Comment=Diagnose, image, recover, repair or reformat a USB drive with explicit confirmation
+Exec=/usr/local/bin/secure-linux-usb-fixer-gui
+Icon=drive-removable-media
+Terminal=false
+Categories=System;Utility;
+Keywords=USB;repair;recovery;PhotoRec;TestDisk;format;
+StartupNotify=true

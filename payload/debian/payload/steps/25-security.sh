@@ -9,6 +9,32 @@ sl_step "AppArmor (limits what a hacked program can touch)"
 sl_pkg_install --no-recommends apparmor
 sl_enable apparmor.service
 
+# ---------------------------------------------------------------- USB device control + security event log
+sl_step "USB device control and security event logging"
+sl_enable secure-linux-security-audit.timer
+if [ "$(sl_choice_get usbguard yes)" = no ]; then
+  echo "USBGuard is switched off by your saved choice; the security report keeps that choice visible."
+  systemctl -q is-enabled usbguard.service 2>/dev/null && try systemctl disable --now usbguard.service
+else
+  sl_pkg_install --no-recommends usbguard
+  sl_install_file "$SECF/usbguard-daemon.conf" "$R/etc/usbguard/usbguard-daemon.conf" 0600
+  # Preserve devices already attached (including the install keyboard and disk); block only newly inserted ones.
+  if [ ! -s "$R/etc/usbguard/rules.conf" ]; then
+    _s_usb_rules=$(mktemp)
+    if usbguard generate-policy > "$_s_usb_rules" 2>/dev/null && [ -s "$_s_usb_rules" ]; then
+      install -D -m 0600 "$_s_usb_rules" "$R/etc/usbguard/rules.conf"
+    else
+      echo "FAILED: couldn't create USBGuard's initial allowed-device list; not enabling a blank block-everything policy" | tee -a "$SL_FAILS" >&2
+    fi
+    rm -f "$_s_usb_rules"
+    unset _s_usb_rules
+  fi
+  [ -s "$R/etc/usbguard/rules.conf" ] && sl_enable usbguard.service
+fi
+sl_pkg_install --no-recommends auditd
+sl_install_file "$SECF/secure-linux.rules" "$R/etc/audit/rules.d/secure-linux.rules" 0600
+sl_enable auditd.service
+
 # ---------------------------------------------------------------- SSH (older PCs: reachable from the home network only)
 if [ "$(sl_choice_get ssh_server yes)" = yes ]; then
   sl_step "Remote login protection (SSH, fail2ban)"

@@ -1,0 +1,28 @@
+{
+  "assets": {
+    "netboot/flipper/README-FLIPPER.txt": "446c1ce28701c7080e97b7a1b5e9a1171028bd78ada4f4467575b7324cce7a38",
+    "netboot/flipper/apps_data/boot2flipper/config.b2f": "4bcd7e38fd1308be400d434dc10f6a9f88243ce69c1b806a5b69d349339ac3fd",
+    "netboot/flipper/apps_data/boot2flipper/ipxe/PUT-THE-IPXE-FILES-HERE.txt": "cfa830fa8a680b94ddad9ecb04c03a64e45cc8ae09cf7d64aa055be8dbfa8844",
+    "netboot/flipper/badusb/README.txt": "5ee08833b0e551357f617046e4e6d3feb39ca9e316670d8055f2954135368ac8",
+    "netboot/flipper/badusb/flipper_companion.txt": "8bf317e40c6f513025d1e2aa6505289ca816f2a9df4586890adf895a3246a343",
+    "netboot/flipper/badusb/health_check.txt": "5a6cf86a449199633f8729b59ebf8d7b8d06c5b6637cea25691629293e3e632e",
+    "netboot/flipper/badusb/install_updates.txt": "0c8b2c2727812307279a055c5dbd713ff89869b6ee2451a9305811fcad1b391a",
+    "netboot/flipper/badusb/open_toolbox.txt": "ee8afc2732bddf5b43d92f5009516d6869153be6eaea94c1385a4b7aab4ff1b5",
+    "netboot/flipper/badusb/repair_setup.txt": "ed4f917015550ae62fcfabdf8cc73608c639216947cbb8ba738a9d8628a546cd",
+    "netboot/flipper/badusb/status_window.txt": "aedb15fecc39550919d943dfae5ed2f7b92a7047e2ffada56b25fcc6b074d231",
+    "netboot/flipper/badusb/usb_creator.txt": "50b79fb2a0983d0f220238add9a560b5dd673a1fe3691cd8c23013b9bc069db1",
+    "netboot/flipper/badusb/usb_fixer.txt": "40ff65d2b4e0248c2759ee5c10d463354312ca656adfad706a19faa37fd20ad4",
+    "netboot/flipper/prepare-flipper.ps1": "adbe7624a202bf842eaeb6a8e2f5774232be96a97e4c958874bd6f5137c5c2a4",
+    "netboot/flipper/prepare-flipper.sh": "d2272b7650f51a46548f27fb9b6c26bc662f4677c09f02f914bbaa94cd91d8e7",
+    "netboot/github-workflows/build-flipper-fap.yml": "c811cd8a17b08c749e9cbcc900e55803934eadc7be990857d1f9341769c4e080"
+  },
+  "companion_version": "1.1.0",
+  "kit_version": "secure-linux-2026.11.06-f51e5fcefb47f0a3",
+  "kit_version_basis": "release.json",
+  "refresh_instructions": "After reviewed payload changes, run: secure-linux-release stamp; regenerate affected USB/netboot/master outputs; then run: secure-linux-release check",
+  "refreshed_at": "2026-11-06T14:36:01.180867+00:00",
+  "release_id": "secure-linux-2026.11.06-f51e5fcefb47f0a3",
+  "release_manifest_sha256": "a824245858092688a632bc13cc22eac8e55ecd1845ff32f911b13a02f6c5917a",
+  "schema_version": 1,
+  "source_sha256": "f51e5fcefb47f0a3c29f5d2a8b5894ceb0017300cf6cb3b55194a48229e6fdc2"
+}

@@ -1,2 +1,3 @@
 secure-linux-dns-sync.path
 secure-linux-dns-sync.service
+secure-linux-security-audit.timer

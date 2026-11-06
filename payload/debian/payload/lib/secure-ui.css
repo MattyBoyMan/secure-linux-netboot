@@ -1,0 +1,63 @@
+/* GTK4/Libadwaita production tokens. Canonical values: secure-ui-tokens.json. */
+@define-color sl_window #f4f5f2;
+@define-color sl_surface #fcfdfb;
+@define-color sl_sidebar #e8ebe6;
+@define-color sl_text #202724;
+@define-color sl_muted #59635e;
+@define-color sl_border #d3dad4;
+@define-color sl_accent #087d70;
+@define-color sl_accent_hover #06675d;
+@define-color sl_accent_soft #dcf0ea;
+@define-color sl_on_accent #f7fffc;
+@define-color sl_success #25734e;
+@define-color sl_success_soft #e0f1e5;
+@define-color sl_warning #8a5a14;
+@define-color sl_warning_soft #f6ead4;
+@define-color sl_danger #a23b3f;
+@define-color sl_danger_soft #f6e4e3;
+@define-color sl_focus #087d70;
+
+window.secure-linux, .secure-linux {
+  font-family: Cantarell, "Adwaita Sans", sans-serif;
+  color: @sl_text;
+  background-color: @sl_window;
+}
+.sl-sidebar { background-color: @sl_sidebar; }
+.sl-surface, .sl-task-card, .sl-status-card, .sl-review {
+  color: @sl_text;
+  background-color: @sl_surface;
+  border: 1px solid @sl_border;
+  border-radius: 16px;
+}
+.sl-task-card, .sl-status-card { padding: 20px; }
+.sl-task-card { transition: opacity 160ms ease-out, transform 160ms ease-out; }
+.sl-task-card:hover { transform: translateY(-2px); }
+.sl-title { font-size: 30px; font-weight: 700; letter-spacing: -0.02em; }
+.sl-section-title { font-size: 22px; font-weight: 650; letter-spacing: -0.01em; }
+.sl-card-title { font-size: 17px; font-weight: 650; }
+.sl-body { font-size: 16px; line-height: 1.55; }
+.sl-muted { color: @sl_muted; }
+.sl-caption { color: @sl_muted; font-size: 13px; }
+.sl-pill { border-radius: 999px; padding: 6px 10px; font-size: 13px; font-weight: 650; }
+.sl-privacy { color: @sl_text; background-color: @sl_sidebar; border: 1px solid @sl_border; }
+.sl-status-on { color: @sl_success; background-color: @sl_success_soft; }
+.sl-status-off { color: @sl_danger; background-color: @sl_danger_soft; }
+.sl-status-info { color: @sl_text; background-color: @sl_sidebar; }
+button, button text, checkbutton, switch, .sl-nav-button, .sl-task-button { min-height: 44px; }
+button { border-radius: 10px; padding: 8px 14px; }
+button.suggested-action {
+  color: @sl_on_accent;
+  background-color: @sl_accent;
+  border-color: @sl_accent;
+}
+button.suggested-action:hover { background-color: @sl_accent_hover; }
+button:focus-visible, .sl-nav-button:focus-visible, switch:focus-visible {
+  outline: 3px solid @sl_focus;
+  outline-offset: 3px;
+}
+.sl-nav-button { border-radius: 10px; padding: 10px 12px; }
+.sl-nav-button.checked { background-color: @sl_surface; color: @sl_text; }
+.sl-review-text { padding: 16px; }
+.sl-dialog-actions { padding-top: 16px; }
+.sl-high-contrast .sl-task-card, .sl-high-contrast .sl-status-card,
+.sl-high-contrast .sl-review { border-width: 2px; }

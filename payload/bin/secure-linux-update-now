@@ -2,7 +2,7 @@
 # secure-linux-update-now: install all updates now (needs root; asks for the password once through
 # pkexec when started by the logged-in user). Used by the Status window's "Install updates now" action.
 # Safe to run any time: the system's own update tools decide what needs doing.
-#   secure-linux-update-now      install updates (dnf, or rpm-ostree on the atomic setup, plus Flatpak apps)
+#   secure-linux-update-now      install updates (apt, dnf, or rpm-ostree on the atomic setup, plus Flatpak apps)
 set -u   # no pipefail: "cmd | grep -q" must not fail when grep stops reading early
 export LC_ALL=C
 SL_ROOT=${SL_ROOT:-/usr/local/lib/secure-linux}
@@ -17,7 +17,11 @@ SELF=/usr/local/bin/secure-linux-update-now; [ -x "$SELF" ] || SELF=$(readlink -
 PROFILE=$(sl_profile); sl_is_atomic && PROFILE=atomic
 rc=0
 echo "Installing updates. This can take a while; what happens is shown here."
-if [ "$PROFILE" = atomic ]; then
+if declare -F sl_distro >/dev/null; then
+  # Debian's common library defines sl_distro. Keep the same update and cleanup
+  # route as the GUI's former inline command, but behind this helper's action.
+  { apt-get update && apt-get -y full-upgrade && apt-get -y autoremove; } || rc=1
+elif [ "$PROFILE" = atomic ]; then
   rpm-ostree upgrade || rc=1
 else
   dnf -y upgrade --refresh || rc=1

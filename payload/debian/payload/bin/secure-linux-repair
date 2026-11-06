@@ -41,23 +41,40 @@ RP_BIN_DIR=$HERE
 ORIG_ARGS=("$@")
 usage() { sed -n '2,/^# ext4 as the installer/p' "$SELF" | sed 's/^# \{0,1\}//'; }
 ACTIONS="diagnose health data boot fs snapshot kernel gpu packages network windows password malware clone factory wipe"
+# The same one-purpose repairs as the shared Fedora tool. secure-linux-ready uses only actions whose KB row
+# says safe + automatic (network/audio); the ordinary 16-item repair menu and its --list output stay unchanged.
+FIXES=""; declare -F rp_fix_ids >/dev/null && FIXES=$(rp_fix_ids | tr '\n' ' ') && FIXES=${FIXES% }
+FIX_ARGS=()
+for _f in "$HLIB"/fix-*.sh ${SL_REPAIR_FIXDIR:+"$SL_REPAIR_FIXDIR"/fix-*.sh}; do [ -r "$_f" ] && . "$_f"; done
+# Keep the detector arrays global: loading them later inside rp_fix_engine would make every fix a no-op.
+. "$HLIB/diagnose-lib.sh"; . "$HLIB/diagnose-detect.sh"
 
-ACTION=""; AUTO=0; LIST=0
+ACTION=""; AUTO=0; LIST=0; RP_APPROVED=0; RP_FIX_PREAPPROVED=""
 while [ $# -gt 0 ]; do
   case "$1" in
     -h|--help) usage; exit 0 ;;
     --dry-run|-n) RP_DRY=1 ;;
+    --approved) RP_APPROVED=1; RP_FIX_PREAPPROVED=1 ;;
     --auto-diagnose) AUTO=1 ;;
     --action) shift; ACTION=${1:-} ;;
     --action=*) ACTION=${1#--action=} ;;
     --target) shift; RP_WANT_TARGET=${1:-} ;;
     --list) LIST=1 ;;
+    --) shift; FIX_ARGS=("$@"); break ;;
     *) echo "Unknown option: $1  (try --help)" >&2; exit 3 ;;
   esac
   shift
 done
 if [ "$LIST" = 1 ]; then for a in $ACTIONS; do printf '%-10s %s\n' "$a" "$(rp_action_label "$a")"; done; exit 0; fi
-if [ -n "$ACTION" ] && ! printf ' %s ' "$ACTIONS" | grep -q " $ACTION "; then echo "Unknown action '$ACTION'. Actions: $ACTIONS" >&2; exit 3; fi
+IS_FIX=0
+if [ -n "$ACTION" ]; then
+  case " $FIXES " in *" $ACTION "*) IS_FIX=1 ;; *) declare -F "fx_${ACTION#fix-}" >/dev/null 2>&1 && IS_FIX=1 ;; esac
+  if [ "$IS_FIX" = 0 ] && ! printf ' %s ' "$ACTIONS" | grep -q " $ACTION "; then echo "Unknown action '$ACTION'. Actions: $ACTIONS" >&2; exit 3; fi
+  if [ "$IS_FIX" = 1 ] && [ "$RP_APPROVED" != 1 ] && [ "${RP_DRY:-0}" != 1 ]; then
+    echo "The action '$ACTION' needs approval first. Nothing was changed." >&2; exit 4
+  fi
+fi
+export RP_APPROVED RP_FIX_PREAPPROVED
 
 # real changes need administrator rights; a dry run and a look around do not
 if [ "$RP_DRY" != 1 ] && ! slh_is_root; then
@@ -78,6 +95,7 @@ banner() {
   echo "=================================================================="
 }
 run_action() {
+  if [ "$IS_FIX" = 1 ]; then rp_fix_run "$ACTION" ${FIX_ARGS[@]+"${FIX_ARGS[@]}"}; return $?; fi
   case "$1" in
     diagnose) act_diagnose ;; health) act_health ;; data) act_data ;; boot) act_boot ;; fs) act_fs ;; snapshot) act_snapshot ;;
     kernel) act_kernel ;; gpu) act_gpu ;; packages) act_packages ;; network) act_network ;; windows) act_windows ;;
@@ -98,7 +116,7 @@ menu() {
 
 banner
 if [ "$AUTO" = 1 ]; then act_diagnose; exit 0; fi
-if [ -n "$ACTION" ]; then run_action "$ACTION"; exit 0; fi
+if [ -n "$ACTION" ]; then run_action "$ACTION"; exit $?; fi
 while true; do
   c=$(menu)
   [ -n "$c" ] || { echo "Goodbye. Nothing else was changed."; break; }

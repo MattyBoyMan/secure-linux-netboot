@@ -40,6 +40,13 @@ for _sys_f in "$SL_ROOT"/bin/secure-linux-*; do
   _sys_put "$_sys_f" "/usr/local/bin/${_sys_f##*/}" 0755
 done
 
+# Flipper Zero Backup & Files: the executable resolves its modules beside /usr/local/bin.
+# Install the complete standard-library-only app now, before networking or package installation.
+_sys_put "$SL_ROOT/lib/release_manifest.py" /usr/local/lib/release_manifest.py 0644
+while IFS= read -r _sys_f; do
+  _sys_put "$_sys_f" "/usr/local/lib/flipper-companion/${_sys_f#"$SL_ROOT/lib/flipper-companion"/}" 0644
+done < <(find "$SL_ROOT/lib/flipper-companion" -type f ! -path '*/__pycache__/*' ! -name '*.pyc' ! -name '*.pyo' | sort)
+
 # --- per-area files
 for _sys_area in "$SL_ROOT"/files/*/; do
   [ -d "$_sys_area" ] || continue
@@ -63,8 +70,9 @@ done
 
 # SELinux labels for the new files (harmless if SELinux is off)
 if [ -z "$_sys_d" ] && command -v restorecon >/dev/null 2>&1; then
-  restorecon -R /usr/local/bin /etc/systemd/system /etc/systemd/user "$_sys_apps" \
-    /etc/xdg/autostart /etc/polkit-1/rules.d /usr/share/polkit-1/actions "$SL_STATE" "$SL_LOGDIR" >/dev/null 2>&1
+  restorecon -R /usr/local/bin /usr/local/lib/flipper-companion /usr/local/lib/release_manifest.py \
+    /etc/systemd/system /etc/systemd/user "$_sys_apps" /etc/xdg/autostart \
+    /etc/polkit-1/rules.d /usr/share/polkit-1/actions "$SL_STATE" "$SL_LOGDIR" >/dev/null 2>&1
 fi
 
 # --- enable units

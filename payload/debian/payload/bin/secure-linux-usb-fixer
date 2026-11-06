@@ -1,0 +1,947 @@
+#!/bin/bash
+# Secure Linux USB Fixer: diagnose, image, recover, repair or reformat a USB disk.
+# Default: a plain-English guided menu. Every action also has a non-interactive form.
+# Recovery uses a verified raw image. Repairs touch only a disposable copy of that image.
+# Reformatting is the only action that writes to the selected USB whole disk.
+set -uo pipefail
+export LC_ALL=C
+
+SELF=$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")
+HERE=$(dirname "$SELF")
+VERSION=1.0.0
+ACTION=guide
+NONINTERACTIVE=0
+DRY_RUN=0
+DEVICE=""
+IMAGE=""
+OUT_DIR=""
+FILESYSTEM=""
+LABEL="SECURE-USB"
+PARTITION=""
+RECOVERY_TOOL=""
+CONFIRM_TARGET=""
+CONFIRM_ERASE=""
+CONFIRM_REPAIR=""
+SKIP_IMAGE=0
+
+RC_SAFETY=1
+RC_OPERATION=2
+RC_USAGE=3
+
+say() { printf '%s\n' "$*"; }
+warn() { printf 'WARNING: %s\n' "$*" >&2; }
+have() {
+  # Test-only capability injection; production always uses the real command lookup.
+  if [ "${SL_USBFIXER_TEST_MODE:-0}" = 1 ]; then
+    case " ${SL_USBFIXER_TEST_MISSING:-} " in *" $1 "*) return 1 ;; esac
+  fi
+  command -v "$1" >/dev/null 2>&1
+}
+trim() { awk '{$1=$1; print}' <<< "${1:-}"; }
+valid_uint() { [[ "${1:-}" =~ ^[0-9]+$ ]]; }
+human() {
+  awk -v b="${1:-0}" 'BEGIN {
+    if (b >= 1099511627776) printf "%.2f TiB", b / 1099511627776;
+    else if (b >= 1073741824) printf "%.2f GiB", b / 1073741824;
+    else if (b >= 1048576) printf "%.2f MiB", b / 1048576;
+    else if (b >= 1024) printf "%.2f KiB", b / 1024;
+    else printf "%d bytes", b;
+  }'
+}
+
+usage() {
+  cat <<'EOF'
+Secure Linux USB Fixer - look first, save an image, then choose what happens
+
+  secure-linux-usb-fixer
+      Open the beginner-friendly guided menu. No question has a timeout.
+  secure-linux-usb-fixer capabilities
+      Show which recovery, repair and formatting features this system can use.
+  secure-linux-usb-fixer diagnose --device /dev/sdX
+      Show whole-disk identity, capacity, partitions, filesystems and read-only
+      SMART health where the USB bridge supports it. Unmounted supported
+      filesystems get a read-only check. Nothing is repaired.
+  secure-linux-usb-fixer image --device /dev/sdX --output-dir /safe/place
+      Unmount the USB disk, read every byte into a raw .img on another disk,
+      then compare fresh SHA-256 hashes of source and image. Only a verified
+      image receives .sha256 and .usbfixer-image metadata files.
+  secure-linux-usb-fixer recover --image /safe/disk.img --output-dir /safe/out \
+      --recovery-tool photorec|testdisk [--non-interactive]
+      PhotoRec reads the verified image and writes recovered files to OUT_DIR.
+      TestDisk receives a disposable copy, never the verified image. Install
+      the testdisk package for either tool. PhotoRec cannot guarantee recovery.
+  secure-linux-usb-fixer repair --device /dev/sdX --image /safe/disk.img \
+      --partition 1 --output-dir /safe/out --confirm-repair 'REPAIR PARTITION 1' \
+      [--non-interactive]
+      Verify that the image matches this exact disk, make a disposable copy,
+      and repair the selected partition on that copy only. The original USB
+      disk and verified image are not changed. Supported: ext2/3/4, FAT,
+      exFAT, NTFS (basic ntfsfix only) and XFS. No automatic restore occurs.
+  secure-linux-usb-fixer format --device /dev/sdX --filesystem fat32 \
+      --image /safe/disk.img --label SECURE-USB \
+      --confirm-target 'TARGET /dev/sdX SERIAL' --confirm-erase 'ERASE /dev/sdX' \
+      [--non-interactive]
+      Make one GPT partition and a new filesystem. Instead of --image, an
+      explicit --skip-image is allowed when another backup already exists.
+      Two exact, different confirmations are always required.
+
+Filesystems: fat32, exfat, ntfs, ext4, ext3, ext2, xfs and btrfs, when their
+real formatters are installed. FAT32 works on disks larger than 32 GiB (up to
+2 TiB here for compatibility), but ONE FILE MUST BE NO LARGER THAN
+4 GiB MINUS 1 BYTE (4,294,967,295 bytes). exFAT is suitable for large files
+and exchange between Windows, macOS and Linux. NTFS is best for Windows;
+macOS may need extra software to write it. ext4 is best for Linux.
+
+Other options:
+  --dry-run             Print a safety preview and exit without reading disks.
+  --non-interactive     Never ask a question; every required option is mandatory.
+  --label NAME          New filesystem label (default: SECURE-USB).
+  --help                Show this help. --version shows the version.
+
+Safety: only removable or USB-transport WHOLE DISKS are accepted; partitions,
+fixed disks and the disk containing / are refused. Identity and capacity are
+shown and rechecked before writes. Formatting is not a secure erase. EOF,
+wrong answers, interruption and verification failure never mean yes or success.
+EOF
+}
+
+need_option_value() {
+  [ "$#" -ge 2 ] && [ -n "${2:-}" ] || { say "Option $1 needs a value. Try --help." >&2; exit "$RC_USAGE"; }
+}
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    --version) say "secure-linux-usb-fixer $VERSION"; exit 0 ;;
+    --dry-run|-n) DRY_RUN=1 ;;
+    --non-interactive) NONINTERACTIVE=1 ;;
+    --device) need_option_value "$@"; DEVICE=$2; shift ;;
+    --device=*) DEVICE=${1#*=} ;;
+    --image) need_option_value "$@"; IMAGE=$2; shift ;;
+    --image=*) IMAGE=${1#*=} ;;
+    --output-dir) need_option_value "$@"; OUT_DIR=$2; shift ;;
+    --output-dir=*) OUT_DIR=${1#*=} ;;
+    --filesystem) need_option_value "$@"; FILESYSTEM=$2; shift ;;
+    --filesystem=*) FILESYSTEM=${1#*=} ;;
+    --label) need_option_value "$@"; LABEL=$2; shift ;;
+    --label=*) LABEL=${1#*=} ;;
+    --partition) need_option_value "$@"; PARTITION=$2; shift ;;
+    --partition=*) PARTITION=${1#*=} ;;
+    --recovery-tool) need_option_value "$@"; RECOVERY_TOOL=$2; shift ;;
+    --recovery-tool=*) RECOVERY_TOOL=${1#*=} ;;
+    --confirm-target) need_option_value "$@"; CONFIRM_TARGET=$2; shift ;;
+    --confirm-target=*) CONFIRM_TARGET=${1#*=} ;;
+    --confirm-erase) need_option_value "$@"; CONFIRM_ERASE=$2; shift ;;
+    --confirm-erase=*) CONFIRM_ERASE=${1#*=} ;;
+    --confirm-repair) need_option_value "$@"; CONFIRM_REPAIR=$2; shift ;;
+    --confirm-repair=*) CONFIRM_REPAIR=${1#*=} ;;
+    --skip-image) SKIP_IMAGE=1 ;;
+    diagnose|image|recover|repair|format|capabilities|guide)
+      [ "$ACTION" = guide ] || { say "Only one action may be chosen." >&2; exit "$RC_USAGE"; }
+      ACTION=$1 ;;
+    *) say "Unknown option or action: $1 (try --help)" >&2; exit "$RC_USAGE" ;;
+  esac
+  shift
+done
+
+if [ "$DRY_RUN" = 1 ]; then
+  say "DRY RUN: no disk will be read, unmounted, repaired, formatted or written."
+  say "Requested action: $ACTION"
+  [ -n "$DEVICE" ] && say "Requested whole disk: $DEVICE (identity would still be checked in a real run)."
+  [ -n "$FILESYSTEM" ] && say "Requested filesystem: $FILESYSTEM"
+  say "A real recovery or repair is image-first. A format needs two exact confirmations."
+  exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# Progress and interruption. The shared helper is used unchanged when present.
+PROGRESS_API=0
+PROGRESS_LIB=${SL_USBFIXER_PROGRESS_LIB:-}
+[ -n "$PROGRESS_LIB" ] || PROGRESS_LIB="$HERE/../lib/sl-progress.sh"
+if [ -r "$PROGRESS_LIB" ]; then
+  # shellcheck source=/dev/null
+  . "$PROGRESS_LIB"
+  if declare -F sl_progress_start >/dev/null && declare -F sl_progress_update >/dev/null && \
+     declare -F sl_progress_done >/dev/null && declare -F sl_progress_spinner_start >/dev/null && \
+     declare -F sl_progress_spinner_stop >/dev/null; then PROGRESS_API=1; fi
+fi
+FALLBACK_STARTED=0
+progress_start() {
+  if [ "$PROGRESS_API" = 1 ]; then sl_progress_start "$1" "$2";
+  else FALLBACK_STARTED=$(date +%s); FALLBACK_TOTAL=$1; FALLBACK_LABEL=$2; say "$2: 0% (ETA: working it out...)"; fi
+}
+progress_update() {
+  local done=$1 pct elapsed rate eta
+  valid_uint "$done" || done=0
+  if [ "$PROGRESS_API" = 1 ]; then sl_progress_update "$done"; return; fi
+  [ "${FALLBACK_TOTAL:-0}" -gt 0 ] || return 0
+  [ "$done" -le "$FALLBACK_TOTAL" ] || done=$FALLBACK_TOTAL
+  pct=$((done * 100 / FALLBACK_TOTAL)); elapsed=$(( $(date +%s) - FALLBACK_STARTED )); eta="working it out..."
+  if [ "$done" -gt 0 ] && [ "$elapsed" -gt 0 ]; then
+    rate=$((done / elapsed)); [ "$rate" -gt 0 ] || rate=1
+    eta="$(( (FALLBACK_TOTAL - done) / rate )) seconds remaining"
+  fi
+  printf '%s: %d%% (ETA: %s)\n' "$FALLBACK_LABEL" "$pct" "$eta"
+}
+progress_done() {
+  if [ "$PROGRESS_API" = 1 ]; then sl_progress_done; else say "${FALLBACK_LABEL:-Work}: 100% (copy finished; verification is separate)"; fi
+}
+spinner_start() {
+  if [ "$PROGRESS_API" = 1 ]; then sl_progress_spinner_start "$1";
+  else say "$1... Time remaining cannot be estimated honestly."; fi
+}
+spinner_stop() {
+  if [ "$PROGRESS_API" = 1 ]; then sl_progress_spinner_stop "$1"; else say "$1"; fi
+}
+
+ACTIVE_OPERATION=none
+CHILD_PID=""
+LOOP_NODE=""
+cleanup() {
+  if [ -n "$LOOP_NODE" ]; then losetup -d "$LOOP_NODE" >/dev/null 2>&1 || true; LOOP_NODE=""; fi
+}
+interrupted() {
+  local code=$1
+  trap - INT TERM HUP
+  [ -n "$CHILD_PID" ] && kill "$CHILD_PID" >/dev/null 2>&1 || true
+  [ -n "$CHILD_PID" ] && wait "$CHILD_PID" >/dev/null 2>&1 || true
+  CHILD_PID=""
+  if [ "$PROGRESS_API" = 1 ] && [ -n "${_SLP_SPINNER_PID:-}" ]; then sl_progress_spinner_stop "Stopped before completion" >&2; fi
+  say "" >&2
+  say "STOPPED: $ACTIVE_OPERATION did not finish." >&2
+  say "The operation is incomplete or unverified and is NOT marked successful." >&2
+  say "Do not rely on a .part file, a partly recovered folder, or a partly formatted disk." >&2
+  exit "$code"
+}
+trap cleanup EXIT
+trap 'interrupted 130' INT
+trap 'interrupted 143' TERM
+trap 'interrupted 129' HUP
+
+run_command() {
+  "$@" &
+  CHILD_PID=$!
+  wait "$CHILD_PID"
+  local rc=$?
+  CHILD_PID=""
+  return "$rc"
+}
+run_indeterminate() {
+  local label=$1 rc
+  shift
+  spinner_start "$label"
+  run_command "$@"
+  rc=$?
+  if [ "$rc" -eq 0 ]; then spinner_stop "$label: finished"; else spinner_stop "$label: did not finish"; fi
+  return "$rc"
+}
+current_uid() { if [ -n "${SL_USBFIXER_TEST_UID:-}" ]; then printf '%s\n' "$SL_USBFIXER_TEST_UID"; else id -u; fi; }
+require_admin() {
+  [ "$(current_uid)" = 0 ] || { say "This action needs administrator rights for whole-disk access. Run with sudo. Nothing was changed." >&2; return "$RC_SAFETY"; }
+}
+test_device_root() { printf '%s' "${SL_USBFIXER_DEVICE_ROOT:-}"; }
+read_device() { printf '%s%s' "$(test_device_root)" "$1"; }
+valid_device_name() { [[ "${1:-}" =~ ^/dev/[A-Za-z0-9._/-]+$ ]]; }
+
+# ---------------------------------------------------------------------------
+# Whole-disk inventory and identity. No user-supplied /dev path is trusted.
+declare -a ELIGIBLE_DISKS=()
+D_MODEL=""; D_SERIAL=""; D_WWN=""; D_VENDOR=""; D_TRAN=""; D_RM=""; D_BYTES=0; D_ID=""
+is_system_disk() {
+  local root current parent n
+  root=$(findmnt -rn -o SOURCE / 2>/dev/null) || return 2
+  case "$root" in /dev/*) ;; *) return 2 ;; esac
+  current=$root
+  for n in 1 2 3 4 5 6 7 8 9 10; do
+    [ "$current" = "$1" ] && return 0
+    parent=$(lsblk -no PKNAME "$current" 2>/dev/null | sed -n '1p') || return 2
+    parent=$(trim "$parent")
+    [ -n "$parent" ] || return 1
+    case "$parent" in /dev/*) current=$parent ;; *) current=/dev/$parent ;; esac
+  done
+  return 2
+}
+find_eligible_disks() {
+  local name type tran rm system_rc
+  ELIGIBLE_DISKS=()
+  # Query blank-able fields separately: raw lsblk columns collapse when TRAN is empty.
+  while read -r name type; do
+    [ "$type" = disk ] || continue
+    tran=$(node_field "$name" TRAN); rm=$(node_field "$name" RM)
+    { [ "$tran" = usb ] || [ "$rm" = 1 ]; } || continue
+    case "$name" in /dev/loop*|/dev/zram*|/dev/sr*|/dev/dm-*|/dev/md*) continue ;; esac
+    is_system_disk "$name"; system_rc=$?
+    [ "$system_rc" -eq 0 ] && continue
+    if [ "$system_rc" -eq 2 ]; then
+      say "SAFETY STOP: could not prove whether $name contains the running system. No disk will be offered." >&2
+      return "$RC_SAFETY"
+    fi
+    ELIGIBLE_DISKS+=("$name")
+  done < <(lsblk -dpno NAME,TYPE 2>/dev/null)
+}
+device_in_inventory() {
+  local d
+  for d in "${ELIGIBLE_DISKS[@]:-}"; do [ "$d" = "$1" ] && return 0; done
+  return 1
+}
+node_field() { trim "$(lsblk -no "$2" "$1" 2>/dev/null | sed -n '1p')"; }
+load_identity() {
+  D_MODEL=$(node_field "$DEVICE" MODEL)
+  D_SERIAL=$(node_field "$DEVICE" SERIAL)
+  D_WWN=$(node_field "$DEVICE" WWN)
+  D_VENDOR=$(node_field "$DEVICE" VENDOR)
+  D_TRAN=$(node_field "$DEVICE" TRAN)
+  D_RM=$(node_field "$DEVICE" RM)
+  D_BYTES=$(trim "$(lsblk -bdno SIZE "$DEVICE" 2>/dev/null | sed -n '1p')")
+  valid_uint "$D_BYTES" && [ "$D_BYTES" -gt 0 ] || { say "The whole-disk capacity could not be measured. Stop." >&2; return "$RC_SAFETY"; }
+  if [ -n "$D_SERIAL" ]; then D_ID=$D_SERIAL; elif [ -n "$D_WWN" ]; then D_ID=$D_WWN; else D_ID=UNKNOWN-ID; fi
+}
+show_identity() {
+  say ""
+  say "SELECTED WHOLE DISK (not just a partition): $DEVICE"
+  say "  Model:    ${D_VENDOR:-unknown vendor} ${D_MODEL:-unknown model}"
+  say "  Serial:   ${D_SERIAL:-not reported}"
+  say "  WWN:      ${D_WWN:-not reported}"
+  say "  Capacity: $(human "$D_BYTES") ($D_BYTES bytes)"
+  say "  USB link: transport ${D_TRAN:-unknown}; removable flag ${D_RM:-unknown}"
+  say "  Partitions, filesystems and mount points:"
+  lsblk -rpo NAME,TYPE,SIZE,FSTYPE,LABEL,MOUNTPOINT "$DEVICE" 2>/dev/null | sed 's/^/    /'
+}
+assert_same_disk() {
+  local model=$D_MODEL serial=$D_SERIAL wwn=$D_WWN vendor=$D_VENDOR tran=$D_TRAN rm=$D_RM bytes=$D_BYTES
+  load_identity || return "$RC_SAFETY"
+  if [ "$model" != "$D_MODEL" ] || [ "$serial" != "$D_SERIAL" ] || [ "$wwn" != "$D_WWN" ] || \
+     [ "$vendor" != "$D_VENDOR" ] || [ "$tran" != "$D_TRAN" ] || [ "$rm" != "$D_RM" ] || [ "$bytes" != "$D_BYTES" ]; then
+    say "SAFETY STOP: the disk identity or capacity changed. It may be a different disk. Nothing further was written." >&2
+    return "$RC_SAFETY"
+  fi
+  if [ "${SL_USBFIXER_TEST_MODE:-0}" != 1 ] && [ ! -b "$(read_device "$DEVICE")" ]; then
+    say "SAFETY STOP: $DEVICE is no longer a block device." >&2; return "$RC_SAFETY"
+  fi
+}
+resolve_device() {
+  valid_device_name "$DEVICE" || { say "Choose a whole-disk name such as /dev/sdb, not a partition or an arbitrary path." >&2; return "$RC_USAGE"; }
+  find_eligible_disks
+  device_in_inventory "$DEVICE" || { say "SAFETY STOP: $DEVICE is not a listed removable/USB whole disk, or it contains the running system." >&2; return "$RC_SAFETY"; }
+  [ "$(node_field "$DEVICE" TYPE)" = disk ] || { say "SAFETY STOP: only a whole disk is accepted, never a partition." >&2; return "$RC_SAFETY"; }
+  load_identity || return "$RC_SAFETY"
+  if [ "${SL_USBFIXER_TEST_MODE:-0}" != 1 ] && [ ! -b "$(read_device "$DEVICE")" ]; then
+    say "SAFETY STOP: $DEVICE is not a real block device." >&2; return "$RC_SAFETY"
+  fi
+  show_identity
+}
+select_device() {
+  local i answer
+  find_eligible_disks
+  [ "${#ELIGIBLE_DISKS[@]}" -gt 0 ] || { say "No safe USB whole disk was found. Fixed disks and the running system disk are never offered." >&2; return "$RC_SAFETY"; }
+  say "USB whole disks found:"
+  for ((i = 0; i < ${#ELIGIBLE_DISKS[@]}; i++)); do
+    say "  $((i + 1))) ${ELIGIBLE_DISKS[i]}  $(human "$(trim "$(lsblk -bdno SIZE "${ELIGIBLE_DISKS[i]}" 2>/dev/null)")")  $(node_field "${ELIGIBLE_DISKS[i]}" MODEL)  serial $(node_field "${ELIGIBLE_DISKS[i]}" SERIAL)"
+  done
+  say "The running system disk and ordinary fixed disks are excluded."
+  read -rp "Choose a disk number, or Q to stop: " answer || { say "No answer received. Nothing was changed." >&2; return "$RC_SAFETY"; }
+  case "$answer" in q|Q) return "$RC_SAFETY" ;; esac
+  valid_uint "$answer" && [ "$answer" -ge 1 ] && [ "$answer" -le "${#ELIGIBLE_DISKS[@]}" ] || { say "That was not a listed disk number. Nothing was changed." >&2; return "$RC_SAFETY"; }
+  DEVICE=${ELIGIBLE_DISKS[$((answer - 1))]}
+}
+prepare_selected_device() {
+  if [ -z "$DEVICE" ]; then
+    [ "$NONINTERACTIVE" = 0 ] || { say "--device is required in non-interactive mode." >&2; return "$RC_USAGE"; }
+    select_device || return "$RC_SAFETY"
+  fi
+  resolve_device
+}
+list_partitions() { lsblk -rpo NAME,TYPE "$DEVICE" 2>/dev/null | awk '$2 == "part" {print $1}'; }
+partition_name() {
+  case "${1##*/}" in nvme*|mmcblk*|loop*|md*|dm-*) printf '%sp%s' "$1" "$2" ;; *) printf '%s%s' "$1" "$2" ;; esac
+}
+mountpoints_for_target() { lsblk -rpo MOUNTPOINT "$DEVICE" 2>/dev/null | awk 'NF && $1 != "-" {print}'; }
+unmount_target() {
+  local mp failed=0
+  while IFS= read -r mp; do
+    [ -n "$mp" ] || continue
+    say "Unmounting $mp so the disk is not changing underneath us."
+    run_command umount -- "$mp" || failed=1
+  done < <(mountpoints_for_target)
+  [ "$failed" = 0 ] || { say "A mount point could not be unmounted. Stop before any disk write." >&2; return "$RC_SAFETY"; }
+  if [ -n "$(mountpoints_for_target)" ]; then say "The USB disk is still mounted. Stop." >&2; return "$RC_SAFETY"; fi
+}
+path_within() {
+  local path=$1 parent=$2
+  [ "$path" = "$parent" ] && return 0
+  if [ "$parent" = / ]; then [[ "$path" = /* ]]; else [[ "$path" = "$parent/"* ]]; fi
+}
+prepare_output_dir() {
+  local mp
+  [ -n "$OUT_DIR" ] || { say "--output-dir is required. Choose a different disk with enough free space." >&2; return "$RC_USAGE"; }
+  mkdir -p -- "$OUT_DIR" || { say "Could not create the output folder." >&2; return "$RC_SAFETY"; }
+  OUT_DIR=$(readlink -f "$OUT_DIR" 2>/dev/null) || { say "Could not resolve the output folder." >&2; return "$RC_SAFETY"; }
+  [ -d "$OUT_DIR" ] && [ -w "$OUT_DIR" ] || { say "The output folder is not writable." >&2; return "$RC_SAFETY"; }
+  if [ -n "$DEVICE" ]; then
+    while IFS= read -r mp; do
+      [ -n "$mp" ] || continue
+      if path_within "$OUT_DIR" "$mp"; then say "SAFETY STOP: the output folder is on the USB disk being read or erased. Use another physical disk." >&2; return "$RC_SAFETY"; fi
+    done < <(mountpoints_for_target)
+  fi
+}
+free_bytes() { df -P -B1 "$OUT_DIR" 2>/dev/null | awk 'END {print $4}'; }
+require_free_space() {
+  local need=$1 free
+  free=$(free_bytes)
+  valid_uint "$free" || { say "Free space at $OUT_DIR could not be measured." >&2; return "$RC_SAFETY"; }
+  say "Destination free space: $(human "$free"). Required: $(human "$need")."
+  [ "$free" -ge "$need" ] || { say "Not enough free space. No image or repaired copy was started." >&2; return "$RC_SAFETY"; }
+}
+stamp() { if [ -n "${SL_USBFIXER_STAMP:-}" ]; then printf '%s' "$SL_USBFIXER_STAMP"; else date +%Y-%m-%d-%H%M%S; fi; }
+
+# ---------------------------------------------------------------------------
+# Read-only diagnosis.
+DIAG_ISSUES=0
+check_filesystem_readonly() {
+  local part=$1 fs=$2 mode=${3:-diagnose} tool="" rc target
+  local -a args=()
+  # Loop nodes refer to our scratch file, not to the selected source-device root.
+  case "$part" in /dev/loop*) target=$part ;; *) target=$(read_device "$part") ;; esac
+  case "$fs" in
+    ext2|ext3|ext4) tool=e2fsck; args=(-f -n) ;;
+    vfat|fat16|fat32) tool=fsck.fat; args=(-n) ;;
+    exfat) tool=fsck.exfat; args=(-n) ;;
+    ntfs) tool=ntfsfix; args=(-n) ;;
+    xfs) tool=xfs_repair; args=(-n) ;;
+    btrfs) tool=btrfs; args=(check --readonly) ;;
+    *) [ "$mode" = diagnose ] && say "    $part: no read-only checker is supported for filesystem '${fs:-unknown}'."; return 3 ;;
+  esac
+  have "$tool" || { [ "$mode" = diagnose ] && say "    $part: $fs check unavailable because $tool is not installed."; return 3; }
+  run_indeterminate "Read-only $fs check on $part" "$tool" "${args[@]}" "$target"
+  rc=$?
+  if [ "$mode" = diagnose ]; then
+    if [ "$rc" -eq 0 ]; then say "    $part: read-only $fs check passed."
+    else say "    $part: the $fs checker reports a problem or could not complete (status $rc). No repair was attempted."; DIAG_ISSUES=$((DIAG_ISSUES + 1)); fi
+    [ "$fs" = ntfs ] && say "    NTFS note: ntfsfix -n is limited; Windows chkdsk is the fuller check."
+  fi
+  return "$rc"
+}
+diagnose_smart() {
+  local out rc
+  if ! have smartctl; then
+    say "SMART health: unavailable (smartctl from smartmontools is not installed). This is unknown, not a pass."
+    return 0
+  fi
+  spinner_start "Reading SMART health (read-only)"
+  out=$(smartctl -H -A "$(read_device "$DEVICE")" 2>&1); rc=$?
+  spinner_stop "SMART read finished"
+  say "SMART health (read-only query; USB bridges often do not expose it):"
+  if printf '%s' "$out" | grep -Eiq 'overall-health.*(PASSED|OK)|NVMe.*(PASSED|OK)|SMART Health Status: OK'; then
+    say "  SMART reports PASSED. This is useful evidence, not a guarantee against failure."
+  elif printf '%s' "$out" | grep -Eiq 'overall-health.*FAILED|SMART Health Status: FAILED|FAILING_NOW|Reliability.*degraded'; then
+    say "  SMART reports FAILURE or failing attributes. Image important data now; do not repair the only copy."
+    DIAG_ISSUES=$((DIAG_ISSUES + 1))
+  else
+    say "  SMART data is unavailable or unsupported by this USB bridge (status $rc). Health remains UNKNOWN."
+  fi
+  printf '%s\n' "$out" | sed -n '1,24{s/^/    /;p;}'
+}
+diagnose_action() {
+  local part fs mp
+  ACTIVE_OPERATION="Read-only diagnosis"
+  say "Diagnosis only: no repair, format or self-test command will be run."
+  diagnose_smart
+  say "Filesystem review:"
+  while IFS= read -r part; do
+    [ -n "$part" ] || continue
+    fs=$(node_field "$part" FSTYPE); mp=$(node_field "$part" MOUNTPOINT)
+    say "  $part: filesystem ${fs:-unknown}; mount point ${mp:-none}"
+    if [ -z "$fs" ]; then say "    No recognizable filesystem. PhotoRec may help after imaging; formatting erases data."
+    elif [ -n "$mp" ]; then say "    Mounted: filesystem check skipped because a live check would not be reliable."
+    else check_filesystem_readonly "$part" "$fs" diagnose || true; fi
+  done < <(list_partitions)
+  if [ "$DIAG_ISSUES" -eq 0 ]; then say "Diagnosis finished. No repair was made."
+  else say "Diagnosis found $DIAG_ISSUES item(s) needing attention. No repair was made."; fi
+  ACTIVE_OPERATION=none
+  [ "$DIAG_ISSUES" -eq 0 ] && return 0 || return "$RC_OPERATION"
+}
+
+# ---------------------------------------------------------------------------
+# Raw imaging and verification. Metadata is written only after all checks pass.
+HASH_RESULT=""
+hash_file() {
+  local out rc
+  spinner_start "Hashing $1 (read-only; no honest ETA)"
+  out=$(sha256sum -- "$1" 2>/dev/null); rc=$?
+  if [ "$rc" -eq 0 ]; then spinner_stop "Hash read finished"; else spinner_stop "Hash read failed"; fi
+  [ "$rc" -eq 0 ] || return "$RC_OPERATION"
+  HASH_RESULT=$(awk 'NR == 1 {print $1}' <<< "$out")
+  [[ "$HASH_RESULT" =~ ^[0-9a-f]{64}$ ]] || return "$RC_OPERATION"
+}
+VI_BYTES=0; VI_HASH=""; VI_DEVICE=""; VI_SERIAL=""; VI_WWN=""; VI_MODEL=""
+verify_image_file() {
+  local image=$1 meta actual sidecar key value fmt="" hash="" size="" dev="" serial="" wwn="" model=""
+  [ -f "$image" ] || { say "The raw image does not exist or is not a regular file: $image" >&2; return "$RC_SAFETY"; }
+  meta="$image.usbfixer-image"
+  [ -f "$meta" ] && [ -f "$image.sha256" ] || { say "This is not a verified Secure Linux USB Fixer image: checksum or metadata is missing. Create an image first." >&2; return "$RC_SAFETY"; }
+  while IFS='=' read -r key value; do
+    case "$key" in
+      format) fmt=$value ;; bytes) size=$value ;; sha256) hash=$value ;; device) dev=$value ;;
+      serial) serial=$value ;; wwn) wwn=$value ;; model) model=$value ;;
+    esac
+  done < "$meta"
+  [ "$fmt" = secure-linux-usbfixer-raw-v1 ] && valid_uint "$size" && [ "$size" -gt 0 ] && [[ "$hash" =~ ^[0-9a-f]{64}$ ]] || { say "Image metadata is invalid or incomplete." >&2; return "$RC_SAFETY"; }
+  actual=$(stat -c %s -- "$image" 2>/dev/null)
+  [ "$actual" = "$size" ] || { say "Image size does not match its verified metadata. It is incomplete or changed." >&2; return "$RC_OPERATION"; }
+  sidecar=$(awk 'NR == 1 {print $1}' "$image.sha256")
+  [ "$sidecar" = "$hash" ] || { say "The image checksum file and metadata disagree." >&2; return "$RC_OPERATION"; }
+  hash_file "$image" || { say "The image could not be read for verification." >&2; return "$RC_OPERATION"; }
+  [ "$HASH_RESULT" = "$hash" ] || { say "SAFETY STOP: the image checksum does not match. It may be corrupt or incomplete." >&2; return "$RC_OPERATION"; }
+  VI_BYTES=$size; VI_HASH=$hash; VI_DEVICE=$dev; VI_SERIAL=$serial; VI_WWN=$wwn; VI_MODEL=$model
+  say "Verified raw image: $image ($(human "$VI_BYTES")); SHA-256 $VI_HASH"
+}
+verify_image_for_device() {
+  verify_image_file "$1" || return "$RC_OPERATION"
+  [ "$VI_DEVICE" = "$DEVICE" ] && [ "$VI_SERIAL" = "$D_SERIAL" ] && [ "$VI_WWN" = "$D_WWN" ] && [ "$VI_MODEL" = "$D_MODEL" ] && [ "$VI_BYTES" = "$D_BYTES" ] || {
+    say "SAFETY STOP: this verified image belongs to a different disk identity or capacity." >&2; return "$RC_SAFETY"; }
+  hash_file "$(read_device "$DEVICE")" || { say "The source disk could not be read back for comparison." >&2; return "$RC_OPERATION"; }
+  [ "$HASH_RESULT" = "$VI_HASH" ] || { say "SAFETY STOP: the current USB disk no longer matches the image. Stop instead of overwriting changed data." >&2; return "$RC_OPERATION"; }
+  say "The image matches a fresh read of this exact USB disk."
+}
+progress_position() {
+  local log=$1 value
+  value=$(tr '\r' '\n' < "$log" 2>/dev/null | awk '/^[0-9]+ bytes/ {v=$1} END {print v}')
+  valid_uint "$value" || value=0
+  printf '%s' "$value"
+}
+create_image() {
+  local base part image meta log pid rc done actual need source_hash image_hash
+  for tool in dd sha256sum stat df sync umount; do have "$tool" || { say "Required imaging tool '$tool' is missing. Nothing was imaged." >&2; return "$RC_SAFETY"; }; done
+  prepare_output_dir || return "$RC_SAFETY"
+  need=$((D_BYTES + 16777216))
+  require_free_space "$need" || return "$RC_SAFETY"
+  unmount_target || return "$RC_SAFETY"
+  assert_same_disk || return "$RC_SAFETY"
+  base=Secure-Linux-USB-${DEVICE##*/}-$(stamp)-$$
+  image="$OUT_DIR/$base.img"; part="$image.part"; meta="$image.usbfixer-image"; log="$OUT_DIR/.$base.dd.log"
+  [ ! -e "$part" ] && [ ! -L "$part" ] && [ ! -e "$image" ] || { say "A destination file already exists. Refusing to overwrite it." >&2; return "$RC_SAFETY"; }
+  : > "$log" || return "$RC_OPERATION"
+  ACTIVE_OPERATION="Whole-disk imaging of $DEVICE"
+  say "Reading every byte of $DEVICE. The source is opened read-only; only $part is written."
+  say "The .part file is incomplete until both hashes match and verified metadata appears."
+  progress_start "$D_BYTES" "Copying $DEVICE to a raw image"
+  dd if="$(read_device "$DEVICE")" of="$part" bs=4M iflag=fullblock status=progress conv=fsync >"$log" 2>&1 &
+  pid=$!; CHILD_PID=$pid
+  # jobs -pr excludes completed/zombie children; kill -0 alone can remain true
+  # for an unreaped failed child on some shells and would stall progress forever.
+  while jobs -pr 2>/dev/null | grep -qx "$pid"; do
+    done=$(progress_position "$log"); progress_update "$done"
+    sleep "${SL_USBFIXER_POLL_SECONDS:-1}"
+  done
+  wait "$pid"; rc=$?; CHILD_PID=""
+  done=$(progress_position "$log")
+  if [ "$rc" -eq 0 ] && [ "$done" -eq "$D_BYTES" ]; then progress_update "$done"; progress_done
+  else
+    say "" ; say "IMAGING DID NOT FINISH. The .part file is NOT a verified backup."
+    sed -n '1,12p' "$log" >&2
+    ACTIVE_OPERATION=none; return "$RC_OPERATION"
+  fi
+  actual=$(stat -c %s -- "$part" 2>/dev/null)
+  if [ "$actual" != "$D_BYTES" ]; then say "IMAGING FAILED: expected $D_BYTES bytes but saved ${actual:-unknown}. The .part file is not verified." >&2; ACTIVE_OPERATION=none; return "$RC_OPERATION"; fi
+  hash_file "$(read_device "$DEVICE")" || { ACTIVE_OPERATION=none; return "$RC_OPERATION"; }; source_hash=$HASH_RESULT
+  hash_file "$part" || { ACTIVE_OPERATION=none; return "$RC_OPERATION"; }; image_hash=$HASH_RESULT
+  if [ -z "$source_hash" ] || [ "$source_hash" != "$image_hash" ]; then
+    say "IMAGE VERIFICATION FAILED: fresh source and image SHA-256 hashes differ. The .part file is not marked good." >&2
+    ACTIVE_OPERATION=none; return "$RC_OPERATION"
+  fi
+  mv -- "$part" "$image" || { ACTIVE_OPERATION=none; return "$RC_OPERATION"; }
+  printf '%s  %s\n' "$image_hash" "${image##*/}" > "$image.sha256" || { ACTIVE_OPERATION=none; return "$RC_OPERATION"; }
+  {
+    printf 'format=secure-linux-usbfixer-raw-v1\ndevice=%s\nmodel=%s\nserial=%s\nwwn=%s\nbytes=%s\nsha256=%s\n' \
+      "$DEVICE" "$D_MODEL" "$D_SERIAL" "$D_WWN" "$D_BYTES" "$image_hash"
+  } > "$meta.part" || { ACTIVE_OPERATION=none; return "$RC_OPERATION"; }
+  mv -- "$meta.part" "$meta" || { ACTIVE_OPERATION=none; return "$RC_OPERATION"; }
+  # A raw whole-disk image can contain passwords, documents and encryption keys.
+  # Keep it owner-only; read-only must not mean readable by other local users.
+  chmod 0400 "$image" || { say "Could not make the image private. Do not rely on its permissions." >&2; ACTIVE_OPERATION=none; return "$RC_OPERATION"; }
+  chmod 0444 "$image.sha256" "$meta" 2>/dev/null || true
+  run_command sync || { ACTIVE_OPERATION=none; return "$RC_OPERATION"; }
+  VERIFIED_IMAGE=$image
+  ACTIVE_OPERATION=none
+  say "IMAGE COMPLETE AND VERIFIED: $image"
+  say "Privacy: the raw image is owner-only (mode 0400) because it can contain passwords, documents and encryption keys."
+  say "Keep the .img, .img.sha256 and .img.usbfixer-image files together."
+  say "Verification used a fresh full SHA-256 read of both source and image. This is a raw image, not compressed."
+}
+
+# Offer imaging before any repair or format. FORMAT may explicitly skip only
+# after acknowledging that another backup exists. Repair has no skip path.
+VERIFIED_IMAGE=""
+offer_image_first() {
+  local purpose=$1 allow_skip=$2 answer
+  if [ "$NONINTERACTIVE" = 1 ]; then
+    if [ -n "$IMAGE" ]; then verify_image_for_device "$IMAGE" && VERIFIED_IMAGE=$IMAGE && return 0; return "$RC_OPERATION"; fi
+    if [ "$allow_skip" = 1 ] && [ "$SKIP_IMAGE" = 1 ]; then
+      say "Explicit --skip-image received. No new image was made; you are responsible for the separate backup."
+      return 0
+    fi
+    say "--image is required before $purpose. For format only, explicit --skip-image is allowed if another backup exists." >&2
+    return "$RC_SAFETY"
+  fi
+  say ""
+  say "SAVE THE ONLY COPY FIRST"
+  say "A $purpose can go wrong or make old files harder to recover. A whole-disk image is a second copy on another disk."
+  say "  1) Make and verify a whole-disk image now (recommended)"
+  say "  2) Use an existing verified image made by this tool"
+  [ "$allow_skip" = 1 ] && say "  3) I already have a separate backup; skip making an image"
+  say "  0) Stop and change nothing"
+  read -rp "Choose: " answer || { say "No answer received. Nothing was changed." >&2; return "$RC_SAFETY"; }
+  case "$answer" in
+    1)
+      [ -n "$OUT_DIR" ] || read -rp "Folder on ANOTHER disk for the image: " OUT_DIR || return "$RC_SAFETY"
+      create_image ;;
+    2)
+      [ -n "$IMAGE" ] || read -rp "Path to the verified .img file: " IMAGE || return "$RC_SAFETY"
+      verify_image_for_device "$IMAGE" || return "$RC_OPERATION"
+      VERIFIED_IMAGE=$IMAGE ;;
+    3)
+      [ "$allow_skip" = 1 ] || { say "Repair cannot work on the only copy. An image is required." >&2; return "$RC_SAFETY"; }
+      read -rp "Type I HAVE ANOTHER BACKUP to confirm that you are relying on it: " answer || return "$RC_SAFETY"
+      [ "$answer" = "I HAVE ANOTHER BACKUP" ] || { say "Not confirmed. Nothing was changed." >&2; return "$RC_SAFETY"; }
+      ;;
+    *) say "Stopped before $purpose. Nothing was changed."; return "$RC_SAFETY" ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------
+# Recovery: PhotoRec reads the verified image; TestDisk gets a scratch copy.
+make_scratch_image() {
+  local source=$1 need part
+  prepare_output_dir || return "$RC_SAFETY"
+  verify_image_file "$source" || return "$RC_OPERATION"
+  need=$((VI_BYTES + 16777216))
+  require_free_space "$need" || return "$RC_SAFETY"
+  SCRATCH_IMAGE="$OUT_DIR/usbfixer-working-copy-$(stamp)-$$.img"
+  part="$SCRATCH_IMAGE.part"
+  [ ! -e "$part" ] && [ ! -e "$SCRATCH_IMAGE" ] || { say "Working-copy path already exists. Refusing to overwrite it." >&2; return "$RC_SAFETY"; }
+  run_indeterminate "Making a disposable image copy (time unknown)" cp --reflink=auto -- "$source" "$part" || return "$RC_OPERATION"
+  mv -- "$part" "$SCRATCH_IMAGE" || return "$RC_OPERATION"
+  say "Disposable working copy: $SCRATCH_IMAGE"
+}
+recover_action() {
+  local answer out rc
+  if [ "$NONINTERACTIVE" = 0 ] && [ -z "$IMAGE" ]; then
+    say "Recovery is image-first so a failing USB disk is not stressed or changed."
+    say "  1) Use a verified image made by this tool"
+    say "  2) Make an image from a USB disk now"
+    say "  0) Stop"
+    read -rp "Choose: " answer || return "$RC_SAFETY"
+    case "$answer" in
+      1) read -rp "Path to verified .img: " IMAGE || return "$RC_SAFETY" ;;
+      2) prepare_selected_device || return "$RC_SAFETY"; require_admin || return "$RC_SAFETY"
+         read -rp "Folder on ANOTHER disk for the image: " OUT_DIR || return "$RC_SAFETY"
+         create_image || return "$RC_OPERATION"; IMAGE=$VERIFIED_IMAGE; OUT_DIR="" ;;
+      *) return "$RC_SAFETY" ;;
+    esac
+  fi
+  [ -n "$IMAGE" ] || { say "--image is required. Recovery never starts on the only copy." >&2; return "$RC_USAGE"; }
+  verify_image_file "$IMAGE" || return "$RC_OPERATION"
+  if [ -z "$RECOVERY_TOOL" ]; then
+    [ "$NONINTERACTIVE" = 0 ] || { say "--recovery-tool photorec|testdisk is required." >&2; return "$RC_USAGE"; }
+    say "  1) PhotoRec: carve photos/documents from the image into a separate folder (read-only source)"
+    say "  2) TestDisk: inspect partition/filesystem structure on a disposable image copy"
+    read -rp "Choose a recovery tool: " answer || return "$RC_SAFETY"
+    case "$answer" in 1) RECOVERY_TOOL=photorec ;; 2) RECOVERY_TOOL=testdisk ;; *) return "$RC_SAFETY" ;; esac
+  fi
+  case "$RECOVERY_TOOL" in photorec|testdisk) ;; *) say "Recovery tool must be photorec or testdisk." >&2; return "$RC_USAGE" ;; esac
+  have "$RECOVERY_TOOL" || {
+    say "CAPABILITY MISSING: $RECOVERY_TOOL is not installed. On Debian/SystemRescue it is normally supplied by the 'testdisk' package." >&2
+    say "No recovery was started and the verified image was not changed." >&2; return "$RC_SAFETY"; }
+  if [ "$NONINTERACTIVE" = 0 ] && [ -z "$OUT_DIR" ]; then
+    read -rp "Output folder on another disk with free space: " OUT_DIR || return "$RC_SAFETY"
+  fi
+  prepare_output_dir || return "$RC_SAFETY"
+  ACTIVE_OPERATION="$RECOVERY_TOOL recovery"
+  case "$RECOVERY_TOOL" in
+    photorec)
+      out="$OUT_DIR/photorec-$(stamp)-$$"
+      mkdir -p -- "$out" || { ACTIVE_OPERATION=none; return "$RC_OPERATION"; }
+      say "PhotoRec reads the verified image and writes carved files to $out. The amount of space and time cannot be known in advance."
+      say "No recovery tool can promise to find every file or restore original names and folders."
+      run_indeterminate "PhotoRec scan (indeterminate)" photorec /log /d "$out" /cmd "$IMAGE" options,partition_none,search
+      rc=$?
+      if [ "$rc" -ne 0 ]; then say "PhotoRec did not finish. Anything in $out is partial, not a successful recovery." >&2; ACTIVE_OPERATION=none; return "$RC_OPERATION"; fi
+      verify_image_file "$IMAGE" || { ACTIVE_OPERATION=none; return "$RC_OPERATION"; }
+      ACTIVE_OPERATION=none
+      say "PhotoRec finished its scan. Recovered files, if any, are in: $out"
+      say "The verified image is unchanged. Inspect the files; this is not a claim that everything was recovered."
+      ;;
+    testdisk)
+      make_scratch_image "$IMAGE" || { ACTIVE_OPERATION=none; return "$RC_OPERATION"; }
+      say "TestDisk will open its own screens on the DISPOSABLE COPY, not the verified image or USB disk."
+      say "Use Analyze first. Any Write choice affects only this working copy; keep the verified image as your safety copy."
+      run_indeterminate "TestDisk session (indeterminate)" testdisk /log "$SCRATCH_IMAGE"
+      rc=$?
+      if [ "$rc" -ne 0 ]; then say "TestDisk did not finish cleanly. The working copy is unverified and no recovery success is claimed." >&2; ACTIVE_OPERATION=none; return "$RC_OPERATION"; fi
+      verify_image_file "$IMAGE" || { ACTIVE_OPERATION=none; return "$RC_OPERATION"; }
+      ACTIVE_OPERATION=none
+      say "TestDisk closed. Working copy retained at: $SCRATCH_IMAGE"
+      say "The verified image is unchanged. Inspect the working copy before relying on it; no files were written back to the USB disk."
+      ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------
+# Repair on a loop-attached scratch image. The source disk is never a target.
+repair_tool_for() {
+  local fs=$1 mode=$2
+  REPAIR_TOOL=""; REPAIR_ARGS=()
+  case "$fs:$mode" in
+    ext2:repair|ext3:repair|ext4:repair) REPAIR_TOOL=e2fsck; REPAIR_ARGS=(-f -y) ;;
+    vfat:repair|fat16:repair|fat32:repair) REPAIR_TOOL=fsck.fat; REPAIR_ARGS=(-a) ;;
+    exfat:repair) REPAIR_TOOL=fsck.exfat; REPAIR_ARGS=(-y) ;;
+    ntfs:repair) REPAIR_TOOL=ntfsfix; REPAIR_ARGS=() ;;
+    xfs:repair) REPAIR_TOOL=xfs_repair; REPAIR_ARGS=() ;;
+    *) say "Repair is not supported for filesystem '${fs:-unknown}'. Image the disk and use a filesystem specialist; no automatic btrfs repair is attempted." >&2; return "$RC_SAFETY" ;;
+  esac
+  have "$REPAIR_TOOL" || { say "CAPABILITY MISSING: $REPAIR_TOOL is needed to repair $fs. Nothing was repaired." >&2; return "$RC_SAFETY"; }
+}
+detach_loop() {
+  if [ -n "$LOOP_NODE" ]; then run_command losetup -d "$LOOP_NODE" || return "$RC_OPERATION"; LOOP_NODE=""; fi
+}
+repair_action() {
+  local answer expected part_dev scratch_part fs
+  for tool in losetup cp blkid sha256sum stat; do have "$tool" || { say "Required repair tool '$tool' is missing. Nothing was repaired." >&2; return "$RC_SAFETY"; }; done
+  valid_uint "$PARTITION" && [ "$PARTITION" -gt 0 ] || {
+    if [ "$NONINTERACTIVE" = 1 ] || [ -z "$PARTITION" ] && [ "$NONINTERACTIVE" = 1 ]; then say "--partition N is required." >&2; return "$RC_USAGE"; fi
+    list_partitions | sed 's/^/  /'
+    read -rp "Partition NUMBER to repair on the image copy (for example 1): " PARTITION || return "$RC_SAFETY"
+    valid_uint "$PARTITION" && [ "$PARTITION" -gt 0 ] || { say "Invalid partition number." >&2; return "$RC_USAGE"; }
+  }
+  part_dev=$(partition_name "$DEVICE" "$PARTITION")
+  [ "$(node_field "$part_dev" TYPE)" = part ] || { say "$part_dev is not a partition on the selected disk." >&2; return "$RC_SAFETY"; }
+  offer_image_first repair 0 || return "$RC_SAFETY"
+  if [ "$NONINTERACTIVE" = 0 ] && [ -z "$OUT_DIR" ]; then read -rp "Folder for the disposable repaired image: " OUT_DIR || return "$RC_SAFETY"; fi
+  expected="REPAIR PARTITION $PARTITION"
+  if [ "$NONINTERACTIVE" = 1 ]; then
+    [ "$CONFIRM_REPAIR" = "$expected" ] || { say "Repair needs --confirm-repair '$expected'. Nothing was repaired." >&2; return "$RC_SAFETY"; }
+  else
+    say "Repair changes filesystem metadata. It will happen ONLY on a disposable copy of the verified image."
+    say "The original USB disk and verified image stay unchanged. No repaired image is automatically restored."
+    read -rp "Type exactly '$expected' to choose this repair: " answer || return "$RC_SAFETY"
+    [ "$answer" = "$expected" ] || { say "Repair not confirmed. Nothing was repaired." >&2; return "$RC_SAFETY"; }
+  fi
+  ACTIVE_OPERATION="Filesystem repair on an image copy"
+  make_scratch_image "$VERIFIED_IMAGE" || { ACTIVE_OPERATION=none; return "$RC_OPERATION"; }
+  LOOP_NODE=$(losetup --find --show --partscan "$SCRATCH_IMAGE" 2>/dev/null)
+  [ -n "$LOOP_NODE" ] || { say "Could not attach the scratch image as a loop device. Nothing was repaired." >&2; ACTIVE_OPERATION=none; return "$RC_OPERATION"; }
+  scratch_part=$(partition_name "$LOOP_NODE" "$PARTITION")
+  fs=$(blkid -o value -s TYPE "$scratch_part" 2>/dev/null)
+  repair_tool_for "$fs" repair || { detach_loop >/dev/null 2>&1; ACTIVE_OPERATION=none; return "$RC_SAFETY"; }
+  have "${CHECK_TOOL:-true}" >/dev/null 2>&1 || true
+  case "$fs" in
+    ext2|ext3|ext4) CHECK_TOOL=e2fsck ;; vfat|fat16|fat32) CHECK_TOOL=fsck.fat ;; exfat) CHECK_TOOL=fsck.exfat ;;
+    ntfs) CHECK_TOOL=ntfsfix ;; xfs) CHECK_TOOL=xfs_repair ;; *) CHECK_TOOL="" ;;
+  esac
+  [ -n "$CHECK_TOOL" ] && have "$CHECK_TOOL" || { say "The post-repair read-only checker is unavailable. Repair was not started." >&2; detach_loop >/dev/null 2>&1; ACTIVE_OPERATION=none; return "$RC_SAFETY"; }
+  say "Repairing $fs on $scratch_part, which belongs only to the disposable image."
+  run_indeterminate "Repairing $fs on the scratch image" "$REPAIR_TOOL" "${REPAIR_ARGS[@]}" "$scratch_part" || {
+    say "Repair did not finish. The working copy may be incomplete and is NOT marked repaired; originals are unchanged." >&2
+    detach_loop >/dev/null 2>&1; ACTIVE_OPERATION=none; return "$RC_OPERATION"; }
+  check_filesystem_readonly "$scratch_part" "$fs" verify || {
+    say "The repaired copy did not pass its read-only verification. It is NOT marked successful." >&2
+    detach_loop >/dev/null 2>&1; ACTIVE_OPERATION=none; return "$RC_OPERATION"; }
+  detach_loop || { ACTIVE_OPERATION=none; return "$RC_OPERATION"; }
+  verify_image_file "$VERIFIED_IMAGE" || { ACTIVE_OPERATION=none; return "$RC_OPERATION"; }
+  ACTIVE_OPERATION=none
+  say "REPAIR FINISHED AND READ-BACK CHECK PASSED ON THE IMAGE COPY: $SCRATCH_IMAGE"
+  say "The original USB disk and verified image were not changed. Inspect or copy files from the repaired image first."
+  [ "$fs" = ntfs ] && say "LIMITATION: ntfsfix performs basic NTFS fixes only. Run Windows chkdsk for a fuller repair."
+  say "No automatic restore was done; restoring an image is a separate destructive decision."
+}
+
+# ---------------------------------------------------------------------------
+# Reformatting. Every dependency and every confirmation is checked BEFORE wipefs.
+FORMAT_TOOL=""; declare -a FORMAT_ARGS=()
+normalize_filesystem() {
+  FILESYSTEM=$(tr '[:upper:]' '[:lower:]' <<< "$FILESYSTEM")
+  case "$FILESYSTEM" in vfat|fat) FILESYSTEM=fat32 ;; esac
+  case "$FILESYSTEM" in fat32|exfat|ntfs|ext4|ext3|ext2|xfs|btrfs) return 0 ;; *) say "Unsupported filesystem '$FILESYSTEM'. Choose fat32, exfat, ntfs, ext4, ext3, ext2, xfs or btrfs." >&2; return "$RC_USAGE" ;; esac
+}
+select_filesystem() {
+  local answer
+  if [ -n "$FILESYSTEM" ]; then normalize_filesystem; return "$?"; fi
+  say "Choose the new filesystem. Only installed formatters can actually be used:"
+  say "  1) FAT32 - very compatible, including large USB disks over 32 GiB"
+  say "     IMPORTANT: one file can be at most 4 GiB MINUS 1 BYTE (4,294,967,295 bytes)."
+  say "  2) exFAT - suitable for files larger than 4 GiB; Windows, macOS and Linux exchange"
+  say "  3) NTFS  - large files and Windows permissions; macOS writing may need extra software"
+  say "  4) ext4  - Linux files, permissions and journaling"
+  say "  5) ext3  - older Linux compatibility"
+  say "  6) ext2  - simple Linux filesystem without a journal"
+  say "  7) XFS   - large Linux storage"
+  say "  8) Btrfs - Linux checksums/snapshots; not a substitute for backup"
+  read -rp "Filesystem number (anything else cancels): " answer || return "$RC_SAFETY"
+  case "$answer" in 1) FILESYSTEM=fat32 ;; 2) FILESYSTEM=exfat ;; 3) FILESYSTEM=ntfs ;; 4) FILESYSTEM=ext4 ;; 5) FILESYSTEM=ext3 ;; 6) FILESYSTEM=ext2 ;; 7) FILESYSTEM=xfs ;; 8) FILESYSTEM=btrfs ;; *) return "$RC_SAFETY" ;; esac
+}
+validate_label() {
+  local max=32
+  case "$FILESYSTEM" in fat32) max=11 ;; exfat) max=15 ;; ext2|ext3|ext4) max=16 ;; xfs) max=12 ;; btrfs) max=255 ;; ntfs) max=32 ;; esac
+  [[ "$LABEL" =~ ^[A-Za-z0-9._\ -]+$ ]] && [ "${#LABEL}" -le "$max" ] && [ "${#LABEL}" -gt 0 ] || { say "Label '$LABEL' is invalid for $FILESYSTEM. Use letters, numbers, spaces, dot, underscore or dash; maximum $max characters." >&2; return "$RC_USAGE"; }
+  [ "$FILESYSTEM" = fat32 ] && LABEL=$(tr '[:lower:]' '[:upper:]' <<< "$LABEL")
+  return 0
+}
+format_preflight() {
+  local tool
+  for tool in lsblk findmnt df awk sed grep readlink stat umount wipefs parted partprobe blkid sync sha256sum; do
+    have "$tool" || { say "CAPABILITY MISSING: '$tool' is required for safe formatting. No wipe was started." >&2; return "$RC_SAFETY"; }
+  done
+  case "$FILESYSTEM" in
+    fat32)
+      if have mkfs.vfat; then FORMAT_TOOL=mkfs.vfat; FORMAT_ARGS=(-F 32 -n "$LABEL");
+      elif have mkfs.fat; then FORMAT_TOOL=mkfs.fat; FORMAT_ARGS=(-F 32 -n "$LABEL");
+      else say "CAPABILITY MISSING: install dosfstools for FAT32. No wipe was started." >&2; return "$RC_SAFETY"; fi
+      [ "$D_BYTES" -le 2199023255552 ] || { say "FAT32 is refused above 2 TiB for practical compatibility. Choose exFAT instead. No wipe was started." >&2; return "$RC_SAFETY"; }
+      ;;
+    exfat)
+      if have mkfs.exfat; then FORMAT_TOOL=mkfs.exfat; FORMAT_ARGS=(-n "$LABEL");
+      elif have mkexfatfs; then FORMAT_TOOL=mkexfatfs; FORMAT_ARGS=(-n "$LABEL");
+      else say "CAPABILITY MISSING: install exfatprogs (or exfat-utils) for exFAT. No wipe was started." >&2; return "$RC_SAFETY"; fi ;;
+    ntfs)
+      if have mkfs.ntfs; then FORMAT_TOOL=mkfs.ntfs; FORMAT_ARGS=(-f -L "$LABEL");
+      elif have mkntfs; then FORMAT_TOOL=mkntfs; FORMAT_ARGS=(-f -L "$LABEL");
+      else say "CAPABILITY MISSING: install ntfs-3g for NTFS. No wipe was started." >&2; return "$RC_SAFETY"; fi ;;
+    ext2|ext3|ext4) FORMAT_TOOL=mkfs.$FILESYSTEM; FORMAT_ARGS=(-F -L "$LABEL") ;;
+    xfs) FORMAT_TOOL=mkfs.xfs; FORMAT_ARGS=(-f -L "$LABEL") ;;
+    btrfs) FORMAT_TOOL=mkfs.btrfs; FORMAT_ARGS=(-f -L "$LABEL") ;;
+  esac
+  have "$FORMAT_TOOL" || { say "CAPABILITY MISSING: $FORMAT_TOOL is not installed. No wipe was started." >&2; return "$RC_SAFETY"; }
+}
+verify_new_filesystem() {
+  local part=$1 expected=$2 actual version checker="" limited=0
+  actual=$(blkid -o value -s TYPE "$(read_device "$part")" 2>/dev/null)
+  [ "$actual" = "$expected" ] || { say "FORMAT VERIFICATION FAILED: expected $expected but blkid reports '${actual:-nothing}'." >&2; return "$RC_OPERATION"; }
+  if [ "$FILESYSTEM" = fat32 ]; then
+    version=$(blkid -o value -s VERSION "$(read_device "$part")" 2>/dev/null)
+    [ -z "$version" ] || [ "$version" = FAT32 ] || { say "FORMAT VERIFICATION FAILED: the new FAT filesystem is $version, not FAT32." >&2; return "$RC_OPERATION"; }
+  fi
+  case "$FILESYSTEM" in
+    fat32) checker=fsck.fat ;; exfat) checker=fsck.exfat ;; ntfs) checker=ntfsfix ;;
+    ext2|ext3|ext4) checker=e2fsck ;; xfs) checker=xfs_repair ;; btrfs) checker=btrfs ;;
+  esac
+  if ! have "$checker"; then
+    limited=1
+    say "LIMITATION: the new filesystem is present and has the right type, but $checker is unavailable, so a full read-only consistency check could not be run."
+  else
+    check_filesystem_readonly "$part" "$expected" verify || { say "The new filesystem did not pass its read-only consistency check. Format is not marked verified." >&2; return "$RC_OPERATION"; }
+    say "Verification: blkid identity and the read-only $checker consistency check passed."
+  fi
+  [ "$FILESYSTEM" = ntfs ] && say "LIMITATION: NTFS creation was checked here, but Windows chkdsk is still recommended for fuller validation."
+  [ "$FILESYSTEM" = fat32 ] && say "FAT32 reminder: each individual file is limited to 4 GiB minus 1 byte (4,294,967,295 bytes)."
+  [ "$FILESYSTEM" = exfat ] && say "exFAT is suitable for large files and exchange between Windows, macOS and Linux."
+  return 0
+}
+format_action() {
+  local expected_target expected_erase answer part write_part n found
+  select_filesystem || return "$RC_SAFETY"
+  normalize_filesystem || return "$RC_USAGE"
+  validate_label || return "$RC_USAGE"
+  format_preflight || return "$RC_SAFETY"
+  say "Formatting is not a secure erase. Old data may remain recoverable until overwritten."
+  offer_image_first format 1 || return "$RC_SAFETY"
+  expected_target="TARGET $DEVICE $D_ID"
+  expected_erase="ERASE $DEVICE"
+  if [ "$NONINTERACTIVE" = 1 ]; then
+    [ "$CONFIRM_TARGET" = "$expected_target" ] || { say "First confirmation missing or wrong. Use --confirm-target '$expected_target'. No wipe was started." >&2; return "$RC_SAFETY"; }
+    [ "$CONFIRM_ERASE" = "$expected_erase" ] || { say "Second destructive confirmation missing or wrong. Use --confirm-erase '$expected_erase'. No wipe was started." >&2; return "$RC_SAFETY"; }
+  else
+    say "FINAL TARGET CHECK: $DEVICE, ${D_MODEL:-unknown model}, serial ${D_SERIAL:-unknown}, $(human "$D_BYTES")."
+    say "ALL partitions and files on this WHOLE DISK will be erased. Other disks are not targets."
+    say "First: type exactly '$expected_target'"
+    read -rp "> " answer || { say "No confirmation received. No wipe was started." >&2; return "$RC_SAFETY"; }
+    [ "$answer" = "$expected_target" ] || { say "Target confirmation did not match. No wipe was started." >&2; return "$RC_SAFETY"; }
+    say "Second: type exactly '$expected_erase' to erase this disk"
+    read -rp "> " answer || { say "No destructive confirmation received. No wipe was started." >&2; return "$RC_SAFETY"; }
+    [ "$answer" = "$expected_erase" ] || { say "Destructive confirmation did not match. No wipe was started." >&2; return "$RC_SAFETY"; }
+  fi
+  assert_same_disk || return "$RC_SAFETY"
+  if [ -n "$VERIFIED_IMAGE" ]; then
+    say "Rechecking the complete backup and current source after the final confirmation..."
+    verify_image_for_device "$VERIFIED_IMAGE" || { say "The backup or source changed after confirmation. No wipe was started." >&2; return "$RC_SAFETY"; }
+  fi
+  unmount_target || return "$RC_SAFETY"
+  assert_same_disk || return "$RC_SAFETY"
+  ACTIVE_OPERATION="Formatting $DEVICE as $FILESYSTEM"
+  run_indeterminate "Clearing old partition signatures" wipefs -a -f "$(read_device "$DEVICE")" || {
+    say "Formatting stopped at wipefs. The disk may be partly changed and is NOT marked formatted." >&2; ACTIVE_OPERATION=none; return "$RC_OPERATION"; }
+  run_indeterminate "Creating one GPT partition" parted -s "$(read_device "$DEVICE")" mklabel gpt mkpart primary 1MiB 100% || {
+    say "Partition creation failed. The disk is NOT marked formatted." >&2; ACTIVE_OPERATION=none; return "$RC_OPERATION"; }
+  run_command partprobe "$(read_device "$DEVICE")" || { say "The kernel did not accept the new partition table. Format is incomplete." >&2; ACTIVE_OPERATION=none; return "$RC_OPERATION"; }
+  have udevadm && run_command udevadm settle || true
+  part=$(partition_name "$DEVICE" 1); write_part=$(read_device "$part")
+  found=0
+  for n in 1 2 3 4 5 6 7 8 9 10; do
+    if [ "${SL_USBFIXER_TEST_MODE:-0}" = 1 ] || [ -b "$write_part" ]; then found=1; break; fi
+    sleep 1
+  done
+  [ "$found" = 1 ] || { say "The new partition did not appear. Waiting timed out as a FAILURE, never as confirmation. Format is incomplete." >&2; ACTIVE_OPERATION=none; return "$RC_OPERATION"; }
+  assert_same_disk || { ACTIVE_OPERATION=none; return "$RC_SAFETY"; }
+  run_indeterminate "Creating the $FILESYSTEM filesystem" "$FORMAT_TOOL" "${FORMAT_ARGS[@]}" "$write_part" || {
+    say "The formatter did not finish. The disk may be unusable and is NOT marked formatted." >&2; ACTIVE_OPERATION=none; return "$RC_OPERATION"; }
+  run_command sync || { ACTIVE_OPERATION=none; return "$RC_OPERATION"; }
+  verify_new_filesystem "$part" "$([ "$FILESYSTEM" = fat32 ] && printf vfat || printf '%s' "$FILESYSTEM")" || { ACTIVE_OPERATION=none; return "$RC_OPERATION"; }
+  ACTIVE_OPERATION=none
+  say "FORMAT COMPLETED: $DEVICE now has one GPT partition formatted as $FILESYSTEM with label $LABEL."
+  [ -n "$VERIFIED_IMAGE" ] && say "The verified pre-format image is: $VERIFIED_IMAGE"
+  say "Verification and any limitations are listed above. Use safe removal before unplugging the USB disk."
+}
+
+# ---------------------------------------------------------------------------
+capabilities_action() {
+  local t
+  say "Secure Linux USB Fixer capabilities on THIS system"
+  say "  lsblk: $(have lsblk && printf available || printf MISSING)"
+  say "  SMART (read-only): $(have smartctl && printf available || printf 'unavailable - install smartmontools; USB bridge may still not expose SMART')"
+  say "  TestDisk: $(have testdisk && printf available || printf 'unavailable - install testdisk')"
+  say "  PhotoRec: $(have photorec && printf available || printf 'unavailable - install testdisk')"
+  for t in mkfs.vfat mkfs.fat mkfs.exfat mkexfatfs mkfs.ntfs mkntfs mkfs.ext4 mkfs.ext3 mkfs.ext2 mkfs.xfs mkfs.btrfs; do have "$t" && say "  Formatter: $t"; done
+  for t in e2fsck fsck.fat fsck.exfat ntfsfix xfs_repair btrfs losetup blkid; do
+    if have "$t"; then say "  Check/repair support: $t"; else say "  Check/repair support: $t (not installed)"; fi
+  done
+  say "Missing tools are reported as unavailable capabilities, never as successful work."
+}
+
+guide_menu() {
+  local answer
+  cat <<'EOF'
+
+Secure Linux USB Fixer
+======================
+Use this when a USB stick or USB disk is unreadable, needs file recovery,
+or should be made empty for another purpose. Start with Look at my USB.
+Nothing is repaired or erased by looking, and no answer ever times out into yes.
+EOF
+  say "  1) Look at my USB (identity, capacity, filesystem and SMART; read-only)"
+  say "  2) Save a verified whole-disk image (the safest first step)"
+  say "  3) Recover files or partitions from an image (TestDisk / PhotoRec)"
+  say "  4) Repair a filesystem on a disposable image copy"
+  say "  5) Erase and reformat a USB disk"
+  say "  6) Show available tools and limitations"
+  say "  0) Quit"
+  read -rp "What would you like to do? " answer || { say "No answer received. Nothing was changed."; return "$RC_SAFETY"; }
+  case "$answer" in
+    1) ACTION=diagnose ;; 2) ACTION=image ;; 3) ACTION=recover ;; 4) ACTION=repair ;; 5) ACTION=format ;;
+    6) ACTION=capabilities ;; 0) ACTION=quit ;; *) say "That was not a menu choice. Nothing was changed." >&2; return "$RC_USAGE" ;;
+  esac
+}
+
+if [ "$ACTION" = guide ]; then guide_menu || exit "$?"; fi
+case "$ACTION" in
+  quit) say "Nothing was changed."; exit 0 ;;
+  capabilities) capabilities_action; exit 0 ;;
+  diagnose) prepare_selected_device || exit "$?"; diagnose_action; exit "$?" ;;
+  image)
+    require_admin || exit "$?"; prepare_selected_device || exit "$?"
+    create_image || exit "$?"; exit 0 ;;
+  recover) recover_action; exit "$?" ;;
+  repair)
+    require_admin || exit "$?"; prepare_selected_device || exit "$?"; repair_action; exit "$?" ;;
+  format)
+    require_admin || exit "$?"; prepare_selected_device || exit "$?"; format_action; exit "$?" ;;
+  *) say "Unknown action." >&2; exit "$RC_USAGE" ;;
+esac

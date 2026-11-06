@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Tips and Shortcuts
+GenericName=Windows habits on Linux
+Comment=Show the printable keyboard-shortcut poster and today's tip
+Exec=/usr/local/bin/secure-linux-tips --poster
+Icon=help-about
+Terminal=false
+Categories=Utility;
+Keywords=tips;shortcuts;keyboard;poster;help;

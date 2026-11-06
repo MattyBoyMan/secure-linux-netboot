@@ -1,0 +1,18 @@
+#!/bin/bash
+# Install or verify a staged, hash-locked offline application bundle.
+set -u
+SL_ROOT=${SL_ROOT:-/usr/local/lib/secure-linux}
+_command=${1:-verify}
+[ "$#" -eq 0 ] || shift
+if [ -n "${SL_OFFLINE_BUNDLE:-}" ]; then
+  _bundle=$SL_OFFLINE_BUNDLE
+else
+  _base=${SL_OFFLINE_CACHE_ROOT:-${SL_R:-}/var/cache/secure-linux/offline/app-bundles}
+  _current=$_base/current.json
+  [ -f "$_current" ] || { echo "No offline application bundle is staged (possibly outdated cache: absent)." >&2; exit 2; }
+  _version=$(sed -n 's/.*"bundle_version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$_current" | head -n1)
+  case $_version in ''|*[!A-Za-z0-9._-]*) echo "Invalid offline bundle version in $_current" >&2; exit 2 ;; esac
+  _bundle=$_base/$_version
+fi
+[ -d "$_bundle" ] || { echo "Offline application bundle does not exist: $_bundle" >&2; exit 2; }
+exec python3 "$SL_ROOT/lib/offline_bundle.py" "$_command" --bundle "$_bundle" "$@"

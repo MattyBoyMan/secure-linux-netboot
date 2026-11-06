@@ -9,7 +9,15 @@ _f_desk=$(sudo -u "$_f_u" xdg-user-dir DESKTOP 2>/dev/null)
 { [ -n "$_f_desk" ] && [ "$_f_desk" != "$_f_home" ]; } || _f_desk="$_f_home/Desktop"
 install -d -o "$_f_u" -g "$_f_u" "$_f_desk" 2>/dev/null || mkdir -p "$_f_desk"
 _f_report="$_f_desk/SETUP-REPORT.txt"
+# Run the final health check before claiming success in the report or event.
+if [ -x /usr/local/bin/secure-linux-check ]; then
+  try /usr/local/bin/secure-linux-check
+elif [ -x "$SL_ROOT/bin/secure-linux-check" ]; then
+  try "$SL_ROOT/bin/secure-linux-check"
+fi
 _f_nfail=0; [ -s "$SL_FAILS" ] && _f_nfail=$(grep -c . "$SL_FAILS")
+_f_sec_bad=0
+[ -s "$SL_STATE/checks" ] && _f_sec_bad=$(awk -F'|' '$1 ~ /^security-/ && $2 == "bad" {n++} END {print n+0}' "$SL_STATE/checks")
 _f_end=$(sl_support_end)
 
 if [ "$(sl_choice_get lite_auto_reboot no)" = yes ]; then
@@ -24,13 +32,16 @@ fi
   echo "THE COMPLETE SECURE LINUX PACKAGE (Debian) - setup report"
   echo "Finished: $(date '+%A %d %B %Y, %H:%M')      Computer type: $(sl_distro)      Mode: $SL_MODE"
   echo
-  if [ "$_f_nfail" -eq 0 ]; then
-    echo "PROBLEMS: none. Everything installed."
+  if [ "$_f_nfail" -eq 0 ] && [ "$_f_sec_bad" -eq 0 ]; then
+    echo "PROBLEMS: none. Everything installed and every required security control passed."
   else
-    echo "PROBLEMS: $_f_nfail item(s) didn't finish (often just a brief internet hiccup)."
-    echo "  To retry: open 'Secure Linux Status & Fixes' from the app menu and choose 'Repair setup'."
-    echo "  The items:"
+    echo "PROBLEMS: $_f_nfail setup item(s) didn't finish; $_f_sec_bad security control(s) failed verification."
+    echo "  This computer is NOT marked secure/ready. Retry: open 'Secure Linux Status & Fixes' and choose 'Repair setup'."
+    echo "  Security report: run 'secure-linux-security-audit report'."
+    echo "  The setup items:"
     sed 's/^/    /' "$SL_FAILS"
+    echo "  Failed security checks:"
+    awk -F'|' '$1 ~ /^security-/ && $2 == "bad" {print "    " $3 ": " $4}' "$SL_STATE/checks"
   fi
   echo
   echo "ABOUT THIS VERSION OF DEBIAN"
@@ -72,12 +83,15 @@ fi
 } > "$_f_report"
 chown "$_f_u:" "$_f_report" 2>/dev/null; chmod 0644 "$_f_report"
 
+mkdir -p "$SL_STATE"
 if [ "$SL_MODE" = install ]; then
-  if [ "$_f_nfail" -eq 0 ]; then
-    sl_event setup-finished "Setup finished" "Everything is installed. Your report is on the Desktop (SETUP-REPORT.txt)."
+  if [ "$_f_nfail" -eq 0 ] && [ "$_f_sec_bad" -eq 0 ]; then
+    sl_event setup-finished "Setup finished" "Everything is installed and required security checks passed. Your report is on the Desktop."
+    printf 'done|done|Setup finished\n' > "$SL_STATE/progress"
   else
-    sl_event setup-finished "Setup finished (a few items need a retry)" \
-      "$_f_nfail item(s) didn't install. Open 'Secure Linux Status & Fixes' and choose 'Repair setup'."
+    sl_event setup-finished "Setup needs attention" \
+      "$_f_nfail setup item(s) and $_f_sec_bad failed security control(s) need attention. The computer is not marked secure/ready."
+    printf 'failed|done|Setup incomplete; retry is required\n' > "$SL_STATE/progress"
   fi
   if sl_is_i386; then
     sl_event i386-browser-warning "About web browsers on this 32-bit computer" \
@@ -85,16 +99,8 @@ if [ "$SL_MODE" = install ]; then
   fi
 else
   sl_event "repair-$(date +%Y%m%d-%H%M)" "Repair finished" \
-    "$( [ "$_f_nfail" -eq 0 ] && echo "Everything is in order again." || echo "$_f_nfail item(s) still need attention; see SETUP-REPORT.txt on the Desktop.")"
+    "$( [ "$_f_nfail" -eq 0 ] && [ "$_f_sec_bad" -eq 0 ] && echo "Everything is in order again." || echo "$_f_nfail setup item(s) and $_f_sec_bad failed security control(s) still need attention; see SETUP-REPORT.txt.")"
 fi
 
-mkdir -p "$SL_STATE"
-printf 'done|done|Setup finished\n' > "$SL_STATE/progress"
-
-if [ -x /usr/local/bin/secure-linux-check ]; then
-  try /usr/local/bin/secure-linux-check
-elif [ -x "$SL_ROOT/bin/secure-linux-check" ]; then
-  try "$SL_ROOT/bin/secure-linux-check"
-fi
-unset _f_u _f_home _f_desk _f_report _f_nfail _f_updates _f_end
+unset _f_u _f_home _f_desk _f_report _f_nfail _f_updates _f_end _f_sec_bad
 return 0

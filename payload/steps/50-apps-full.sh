@@ -37,62 +37,115 @@ _exp50_steam_arm() {
   return 0
 }
 
-# ArtCraft launcher (getartcraft.com, Apache-2.0) from GitHub, checked against the release's SHA256SUMS
-# Intel/AMD: the x86_64 RPM. Apple Silicon: the aarch64/arm64 RPM if the makers publish one, else a clean skip.
+# ArtCraft launcher and all 16 ArtCraft-brand Craft apps. Every online RPM is checked against that
+# release's SHA256SUMS. The offline path installs the same complete suite from verified, possibly outdated payloads.
 _exp50_artcraft() {
-  local marker="$SL_STATE/artcraft.package" name url sums dir file pat
-  name=$(cat "$marker" 2>/dev/null)
-  [ -n "$name" ] && rpm -q "$name" >/dev/null 2>&1 && return 0
+  local repos=(storytold/craft-launcher storytold/photocraft storytold/vectorcraft storytold/filmcraft
+    storytold/lightcraft storytold/pdfcraft storytold/effectcraft storytold/designcraft storytold/figcraft
+    storytold/wordcraft storytold/soundcraft storytold/deckcraft storytold/cadcraft storytold/gridcraft
+    storytold/texturecraft storytold/materialcraft storytold/craft-anything)
+  local suite="$SL_STATE/artcraft.suite" cache_version="" repo marker name url sums dir file pat rc=0
   case "$(sl_arch)" in
     x86_64) pat='linux-x86_64\.rpm$' ;;
     aarch64) pat='linux-(aarch64|arm64)\.rpm$' ;;
     *) sl_skip_app ArtCraft "no version of ArtCraft exists for this type of computer ($(sl_arch))"; return 0 ;;
   esac
-  sl_online || { echo "ArtCraft: offline, will retry on the next repair."; echo "FAILED: ArtCraft (offline)" >> "$SL_FAILS"; return 1; }
-  url=$(exp_github_asset storytold/craft-launcher "$pat")
-  if [ -z "$url" ] && [ "$(sl_arch)" = aarch64 ] && [ -n "$(exp_github_asset storytold/craft-launcher 'linux.*\.rpm$')" ]; then
-    sl_skip_app ArtCraft "ArtCraft's makers don't offer a version for Apple Silicon (ARM) yet"; return 0
-  fi
-  sums=$(exp_github_asset storytold/craft-launcher 'SHA256SUMS(\.txt)?$')
-  if [ -z "$url" ] || [ -z "$sums" ]; then echo "FAILED: ArtCraft release not found" | tee -a "$SL_FAILS"; return 1; fi
-  dir=$(mktemp -d); file="$dir/$(basename "$url")"
-  if curl -fsSL -o "$file" "$url" && curl -fsSL -o "$dir/SHA256SUMS" "$sums" \
-     && exp_verify_sha256 "$file" "$dir/SHA256SUMS" "$(basename "$url")"; then
-    echo "ArtCraft: checksum OK"
-    rpm -qp --qf '%{NAME}' "$file" 2>/dev/null > "$marker.new" && mv "$marker.new" "$marker"
-    try dnf -y install "$file" && sl_unskip_app ArtCraft
+  if [ -n "${SL_OFFLINE_BUNDLE:-}" ]; then
+    cache_version=$(sha256sum "$SL_OFFLINE_BUNDLE/plan.json" 2>/dev/null | cut -d' ' -f1)
   else
-    echo "FAILED: ArtCraft download or checksum did not match (not installed)" | tee -a "$SL_FAILS"
+    cache_version=$(sed -n 's/.*"bundle_version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+      "${SL_R:-}/var/cache/secure-linux/offline/app-bundles/current.json" 2>/dev/null | head -n1)
   fi
-  rm -rf "$dir"
+  [ -n "$cache_version" ] && [ "$(cat "$suite" 2>/dev/null)" = "$cache_version" ] && return 0
+  if ! sl_online; then
+    echo "ArtCraft: trying the verified, possibly outdated offline suite."
+    if secure-linux-offline-bundle install --profile fedora-full --arch "$(sl_arch)" --kind artcraft; then
+      printf '%s\n' "${cache_version:-verified-cache}" > "$suite"; sl_unskip_app ArtCraft; return 0
+    fi
+    echo "FAILED: ArtCraft (offline and no complete verified cache)" >> "$SL_FAILS"; return 1
+  fi
+  for repo in "${repos[@]}"; do
+    marker="$SL_STATE/artcraft-${repo##*/}.package"
+    name=$(cat "$marker" 2>/dev/null)
+    [ -n "$name" ] && rpm -q "$name" >/dev/null 2>&1 && continue
+    url=$(exp_github_asset "$repo" "$pat")
+    if [ -z "$url" ] && [ "$(sl_arch)" = aarch64 ] && [ -n "$(exp_github_asset "$repo" 'linux.*\.rpm$')" ]; then
+      sl_skip_app ArtCraft "ArtCraft's makers don't offer a complete suite for Apple Silicon (ARM) yet"; return 0
+    fi
+    sums=$(exp_github_asset "$repo" 'SHA256SUMS(\.txt)?$')
+    if [ -z "$url" ] || [ -z "$sums" ]; then
+      echo "ArtCraft release asset missing for $repo; the verified cache will be tried."; rc=1; continue
+    fi
+    dir=$(mktemp -d); file="$dir/$(basename "$url")"
+    if curl -fsSL -o "$file" "$url" && curl -fsSL -o "$dir/SHA256SUMS" "$sums" \
+       && exp_verify_sha256 "$file" "$dir/SHA256SUMS" "$(basename "$url")" && try dnf -y install "$file"; then
+      echo "ArtCraft: ${repo##*/} checksum OK"
+      rpm -qp --qf '%{NAME}' "$file" 2>/dev/null > "$marker.new" && mv "$marker.new" "$marker"
+    else
+      echo "ArtCraft online download/checksum/install failed for $repo; the verified cache will be tried."; rc=1
+    fi
+    rm -rf "$dir"
+  done
+  if [ "$rc" -eq 0 ]; then
+    printf '%s\n' "${cache_version:-online}" > "$suite"; sl_unskip_app ArtCraft; return 0
+  fi
+  echo "ArtCraft: trying the verified, possibly outdated offline suite after an online failure."
+  if secure-linux-offline-bundle install --profile fedora-full --arch "$(sl_arch)" --kind artcraft; then
+    printf '%s\n' "${cache_version:-verified-cache}" > "$suite"; sl_unskip_app ArtCraft; return 0
+  fi
+  echo "FAILED: ArtCraft online suite and offline fallback were not complete" | tee -a "$SL_FAILS" >&2
+  return 1
 }
 
 # immich-go: uploads big photo batches (Google Takeout) to Immich. Verified against checksums.txt (A9).
 _exp50_immich_go() {
   local bin="$SL_R/usr/local/bin/immich-go" url sums dir pat
+  local payload_pid sums_pid payload_rc=0 sums_rc=0
   [ -x "$bin" ] && return 0                         # never re-download in repair mode
   case "$(sl_arch)" in    # upstream names: immich-go_Linux_x86_64.tar.gz and immich-go_Linux_arm64.tar.gz
     x86_64) pat='immich-go_Linux_x86_64\.tar\.gz$' ;;
     aarch64) pat='immich-go_Linux_arm64\.tar\.gz$' ;;
     *) sl_skip_app immich-go "no version of immich-go exists for this type of computer ($(sl_arch))"; return 0 ;;
   esac
-  sl_online || { echo "FAILED: immich-go (offline)" >> "$SL_FAILS"; return 1; }
+  if ! sl_online; then
+    echo "immich-go: trying the verified, possibly outdated offline archive."
+    if SL_OFFLINE_IMMICH_DEST="$bin" secure-linux-offline-bundle install --profile fedora-full --arch "$(sl_arch)" --kind immich-go; then
+      sl_unskip_app immich-go; return 0
+    fi
+    echo "FAILED: immich-go (offline and no verified cache)" >> "$SL_FAILS"; return 1
+  fi
   url=$(exp_github_asset simulot/immich-go "$pat")
   if [ -z "$url" ] && [ "$(sl_arch)" = aarch64 ] && [ -n "$(exp_github_asset simulot/immich-go 'immich-go_Linux_.*\.tar\.gz$')" ]; then
     sl_skip_app immich-go "immich-go's makers don't offer a version for Apple Silicon (ARM) yet"; return 0
   fi
   sums=$(exp_github_asset simulot/immich-go 'checksums\.txt$')
-  if [ -z "$url" ] || [ -z "$sums" ]; then echo "FAILED: immich-go release not found" | tee -a "$SL_FAILS"; return 1; fi
+  if [ -z "$url" ] || [ -z "$sums" ]; then
+    echo "immich-go release metadata was incomplete; trying the verified offline archive."
+    if SL_OFFLINE_IMMICH_DEST="$bin" secure-linux-offline-bundle install --profile fedora-full --arch "$(sl_arch)" --kind immich-go; then
+      sl_unskip_app immich-go; return 0
+    fi
+    echo "FAILED: immich-go release not found and no verified cache" | tee -a "$SL_FAILS" >&2; return 1
+  fi
   dir=$(mktemp -d)
-  if curl -fsSL -o "$dir/$(basename "$url")" "$url" && curl -fsSL -o "$dir/checksums.txt" "$sums" \
+  # These two reads are independent. Wait for both before verifying, unpacking or installing anything.
+  curl -fsSL -o "$dir/$(basename "$url")" "$url" & payload_pid=$!
+  curl -fsSL -o "$dir/checksums.txt" "$sums" & sums_pid=$!
+  wait "$payload_pid" || payload_rc=$?
+  wait "$sums_pid" || sums_rc=$?
+  if [ "$payload_rc" -eq 0 ] && [ "$sums_rc" -eq 0 ] \
      && exp_verify_sha256 "$dir/$(basename "$url")" "$dir/checksums.txt" "$(basename "$url")" \
      && tar -xzf "$dir/$(basename "$url")" -C "$dir" immich-go; then
     echo "immich-go: checksum OK"
     mkdir -p "$(dirname "$bin")"; install -m 0755 "$dir/immich-go" "$bin"; sl_unskip_app immich-go
-  else
-    echo "FAILED: immich-go download or checksum did not match (not installed)" | tee -a "$SL_FAILS"
+    rm -rf "$dir"; return 0
   fi
   rm -rf "$dir"
+  echo "immich-go online download/checksum failed; trying the verified, possibly outdated offline archive."
+  if SL_OFFLINE_IMMICH_DEST="$bin" secure-linux-offline-bundle install --profile fedora-full --arch "$(sl_arch)" --kind immich-go; then
+    sl_unskip_app immich-go; return 0
+  fi
+  echo "FAILED: immich-go download/checksum and offline fallback failed (not installed)" | tee -a "$SL_FAILS" >&2
+  return 1
 }
 
 _exp50_ollama() {
@@ -201,14 +254,6 @@ EOF
   exp_substep "Installing developer tools"
   rpm -q gcc make >/dev/null 2>&1 || try dnf -y group install development-tools
   sl_dnf_install python3-pip pipx nodejs npm java-latest-openjdk-devel gh distrobox podman yt-dlp gamemode
-  # qFlipper (Flipper Zero): Fedora package if available, otherwise the Flathub app
-  if ! rpm -q qflipper >/dev/null 2>&1 && ! flatpak info --system one.flipperzero.qFlipper >/dev/null 2>&1; then
-    if dnf -q info qflipper >/dev/null 2>&1; then sl_dnf_install qflipper; else _exp50_fp one.flipperzero.qFlipper; fi
-  fi
-  # Device permissions (#20): the RPM brings udev rules; with the Flathub app we add the same rules
-  if ! rpm -q qflipper >/dev/null 2>&1 && flatpak info --system one.flipperzero.qFlipper >/dev/null 2>&1; then
-    sl_install_file "$SL_EXP/42-flipperzero.rules" "$SL_R/etc/udev/rules.d/42-flipperzero.rules"
-  fi
 
   exp_substep "Installing ArtCraft"
   _exp50_artcraft

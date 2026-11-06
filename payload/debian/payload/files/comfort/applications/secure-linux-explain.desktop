@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Explain This Error
+GenericName=Plain-English help for error messages
+Comment=Copy an error message, then open this: your private offline AI explains it in plain English
+Exec=/usr/local/bin/secure-linux-explain
+Icon=help-hint
+Terminal=false
+Categories=Utility;System;
+Keywords=error;help;explain;ai;problem;message;

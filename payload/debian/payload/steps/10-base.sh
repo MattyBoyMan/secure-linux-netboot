@@ -26,7 +26,9 @@ fi
 
 sl_step "Base system tools"
 _b_pkgs curl wget git unzip zip p7zip-full htop ncdu smartmontools pciutils usbutils iw wireless-regdb \
-        xdg-utils xdg-user-dirs zenity libnotify-bin synaptic sudo ca-certificates python3 apt-transport-https
+        xdg-utils xdg-user-dirs zenity libnotify-bin synaptic sudo ca-certificates python3 python3-tk python3-gi gir1.2-gtk-4.0 gir1.2-adw-1 apt-transport-https \
+        testdisk dosfstools exfatprogs ntfs-3g e2fsprogs xfsprogs btrfs-progs util-linux \
+        qflipper dfu-util age gnupg
 # i386 has no Flatpak apps worth having (Flathub is 64-bit only), so Flatpak is only for 64-bit PCs
 [ "$(sl_arch)" = amd64 ] && _b_pkgs flatpak
 

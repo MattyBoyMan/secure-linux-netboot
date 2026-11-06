@@ -58,7 +58,9 @@ sl_step "Updating the system"
 
 sl_step "Base system tools"
 _sys_base=(curl wget git unzip zip p7zip p7zip-plugins htop flatpak vlc syncthing solaar fwupd lynis
-           btop fastfetch fzf ripgrep bat zoxide libnotify inxi smartmontools nvme-cli openssl python3 dnf5-plugins)
+           btop fastfetch fzf ripgrep bat zoxide libnotify inxi smartmontools nvme-cli openssl python3 python3-tkinter python3-gobject gtk4 libadwaita dnf5-plugins
+           # USB Fixer: recovery plus read-only checks and formatters (used only after explicit confirmation).
+           testdisk dosfstools exfatprogs ntfs-3g e2fsprogs xfsprogs btrfs-progs util-linux)
 [ "$_sys_profile" = lite ] && _sys_base+=(zenity)    # the Status & Fixes window uses kdialog on KDE, zenity on Xfce
 _sys_pkgs "${_sys_base[@]}"
 

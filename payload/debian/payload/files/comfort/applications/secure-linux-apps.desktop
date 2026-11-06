@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Install Apps & Fill In Missing Software
+GenericName=Choose app replacements and optional extras
+Comment=See familiar app replacements and install only the missing apps you explicitly choose
+Exec=/usr/local/bin/secure-linux-migrate page apps-you-used
+Icon=system-software-install
+Terminal=false
+Categories=System;Settings;
+Keywords=apps;install;software;missing;Windows;Mac;replacement;
+StartupNotify=true

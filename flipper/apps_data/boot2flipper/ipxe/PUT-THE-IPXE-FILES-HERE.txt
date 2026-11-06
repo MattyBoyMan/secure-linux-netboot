@@ -4,7 +4,11 @@ PUT THE IPXE BOOT FILES HERE
 This folder must hold two files, downloaded from https://boot.ipxe.org :
 
   ipxe.efi    (for UEFI computers - almost every PC since about 2012)
+              https://boot.ipxe.org/x86_64-efi/ipxe.efi
   ipxe.lkrn   (for legacy BIOS computers)
+              https://boot.ipxe.org/x86_64-pcbios/ipxe.lkrn
+
+The prepare-flipper.ps1 / prepare-flipper.sh scripts download these for you.
 
 So this folder then contains:
   apps_data/boot2flipper/ipxe/ipxe.efi

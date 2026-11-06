@@ -1,0 +1,25 @@
+# day<TAB>desktop(kde|xfce|all)<TAB>title<TAB>text<TAB>guide anchor   (comfort; defaults of Plasma 6 and Xfce 4.20)
+1	kde	The Start menu is the Meta key	Press the Windows key (called Meta here) and start typing: apps, settings and even pages of the guide show up.	fedora-kde
+1	xfce	Finding apps	Click the menu button in the panel, or press Alt+F2 and type the app's name.	linux-basics
+2	kde	Win+E still opens your files	Meta+E opens Dolphin, the file manager. Your Documents, Downloads and Pictures are on the left.	fedora-kde
+2	xfce	Your files	Open the File Manager from the menu (Thunar). Your Documents, Downloads and Pictures are on the left.	linux-basics
+3	kde	Lock the screen: Meta+L	Stepping away? Meta+L locks the screen, just like Win+L.	security-explained
+3	xfce	Lock the screen: Ctrl+Alt+L	Stepping away? Ctrl+Alt+L locks the screen.	security-explained
+4	kde	Clipboard history: Meta+V	Meta+V shows the last things you copied, like Win+V on Windows.	fedora-kde
+4	xfce	The terminal: Ctrl+Alt+T	Ctrl+Alt+T opens the terminal. The guide's commands are typed there; nothing to fear.	linux-basics
+5	kde	Screenshots: Print Screen	Press Print Screen: Spectacle opens and lets you grab the whole screen, a window or a rectangle.	fedora-kde
+5	xfce	Screenshots: Print Screen	Press Print Screen to take a screenshot and choose where to save it.	linux-basics
+6	all	Alt+Tab works as always	Alt+Tab switches windows, Alt+F4 closes one. Your Windows muscle memory still works.	linux-basics
+7	kde	See every window: Meta+W	Meta+W shows all open windows side by side (like Task View). Click one to jump to it.	fedora-kde
+7	xfce	Ctrl+C / Ctrl+V / Ctrl+Z	Copy, paste and undo are the same as on Windows, in every app.	linux-basics
+8	kde	Snap windows: Meta+Left / Meta+Right	Meta+Left and Meta+Right put a window on one half of the screen, like on Windows.	fedora-kde
+8	xfce	Snap windows by dragging	Drag a window to the left or right edge of the screen to make it fill that half.	linux-basics
+9	all	Your Task Manager is Mission Center	Something slow or frozen? Open Mission Center from the menu to see what's using the computer and stop it.	troubleshooting
+10	kde	Emoji: Meta+.	Meta+. (full stop) opens the emoji picker. Search for 'heart' or 'thumbs'.	fedora-kde
+10	xfce	Passwords in LibreWolf: Ctrl+Shift+L	With the Bitwarden extension, Ctrl+Shift+L fills in the login for the site you're on.	app-bitwarden
+11	kde	Search everything: Alt+Space	Alt+Space opens KRunner: type a file name, an app, a sum (12*7) or a unit (5 km in miles).	fedora-kde
+11	xfce	Passwords in LibreWolf: Ctrl+Shift+L	With the Bitwarden extension, Ctrl+Shift+L fills in the login for the site you're on.	app-bitwarden
+12	all	Updates look after themselves	Updates download quietly and install when you restart. No surprise reboots in the middle of your work.	what-runs-automatically
+13	all	An error message you don't understand?	Copy it (select it, Ctrl+C), then open 'Explain This Error' from the menu: your private offline AI explains it in plain English.	troubleshooting
+14	kde	The terminal: Ctrl+Alt+T	Ctrl+Alt+T opens Konsole. The guide's commands are typed there; nothing to fear. That's your last tip: well done!	linux-basics
+14	xfce	You made it!	That's your last daily tip. The START-HERE guide on your Desktop has everything else. Well done!	welcome

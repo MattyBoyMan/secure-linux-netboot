@@ -1,5 +1,5 @@
 # Fedora Kickstart: "The Complete Secure Linux Package" - NETBOOT build, rendered by netboot/render-netboot.sh
-# on 2026-11-04 (netboot render) (Fedora 44) from templates/fedora.ks. This is a PUBLIC file: no names, no password
+# on 2026-11-07 (netboot render) (Fedora 44) from templates/fedora.ks. This is a PUBLIC file: no names, no password
 # hashes, no Wi-Fi passwords. The setup screen asks for the login name and password instead (see the marked
 # netboot step in %pre). The Secure Linux payload and the guide are downloaded from the public repository
 # at install time (SL_PAYLOAD_SOURCE below), not embedded and not read from a USB stick.
@@ -327,10 +327,140 @@ mount_stick() {  # the Ventoy data partition, read-only (Ventoy 1.1.18+ exposes 
 }
 if mount_stick; then
   [ -f /tmp/ventoy-ro/linux-setup/wifi-networks.txt ] && cat /tmp/ventoy-ro/linux-setup/wifi-networks.txt >> /tmp/wifi-records.txt
+  [ -f /tmp/ventoy-ro/linux-setup/setup.conf ] && cp /tmp/ventoy-ro/linux-setup/setup.conf /tmp/setup.conf
+  # The builder already packages linux/. No template placeholder is needed here.
+  for SL_PROGRESS_LIB in /tmp/ventoy-ro/linux-setup/linux/lib/sl-progress.sh /tmp/ventoy-ro/linux-setup/kit/linux/lib/sl-progress.sh; do
+    [ -f "$SL_PROGRESS_LIB" ] && { cp "$SL_PROGRESS_LIB" /tmp/sl-progress.sh; break; }
+  done
   umount /tmp/ventoy-ro 2>/dev/null
 fi
+if [ -f /tmp/sl-progress.sh ]; then
+  . /tmp/sl-progress.sh
+else
+  sl_progress_spinner_start() { printf '%s\n' "$1"; }
+  sl_progress_spinner_stop() { [ -z "${1:-}" ] || printf '%s\n' "$1"; }
+fi
+SL_PRE_STEP=0
+sl_pre_begin() {
+  SL_PRE_STEP=$((SL_PRE_STEP + 1))
+  printf 'Preparation step %s: %s\n' "$SL_PRE_STEP" "$1"
+  sl_progress_spinner_start "$1"
+}
+sl_pre_end() { sl_progress_spinner_stop "${1:-}"; }
 WIFI_KIND=$(python3 /tmp/sl-wifi.py pick /tmp/wifi-records.txt "$SID" "$UID_" /tmp/sl-wifi-record 2>/dev/null)
 umask 022
+
+# Optional Setup-App hand-off. No file means the original interactive path below, byte for byte.
+# Blank values always fall back to the normal question. TARGET_DISK and TARGET_DISK_ERASE are separate on purpose:
+# a profile or Wi-Fi choice can never imply permission to erase a computer drive.
+SETUP_AUTO=0
+PROFILE=""; WIFI_MODE=ask; WIFI_SSID_B64=""; AI_MODEL=ask; SECURE_BOOT=ask; BACKUP_CONTINUE=ask
+TARGET_DISK=""; TARGET_DISK_ERASE=""; SETUP_CONF_VERSION=""
+STEP_SAVE_WIFI=no; STEP_SAVE_BROWSER_PASSWORDS=no; STEP_COLLECT_APPS=no
+STEP_RESCUE_TOOLS=yes; STEP_DEBIAN=yes; STEP_OFFLINE_PACKS=yes
+if [ -s /tmp/setup.conf ]; then
+  # BEGIN STRICT SETUP.CONF PARSER
+  # setup.conf is data, never shell code. Only the Setup app's single-quoted,
+  # one-key-per-line schema is accepted. No command substitution, eval, source,
+  # value echo, or partial application on a late malformed line is possible.
+  CONF_OK=1
+  declare -A CONF_VALUES=() CONF_SEEN=()
+  for CONF_KEY in SETUP_CONF_VERSION PROFILE WIFI_SSID_B64 TARGET_DISK TARGET_DISK_ERASE; do
+    CONF_VALUES[$CONF_KEY]=""
+  done
+  CONF_VALUES[WIFI_MODE]=ask
+  CONF_VALUES[AI_MODEL]=ask
+  CONF_VALUES[SECURE_BOOT]=ask
+  CONF_VALUES[BACKUP_CONTINUE]=ask
+  CONF_VALUES[STEP_SAVE_WIFI]=no
+  CONF_VALUES[STEP_SAVE_BROWSER_PASSWORDS]=no
+  CONF_VALUES[STEP_COLLECT_APPS]=no
+  CONF_VALUES[STEP_RESCUE_TOOLS]=yes
+  CONF_VALUES[STEP_DEBIAN]=yes
+  CONF_VALUES[STEP_OFFLINE_PACKS]=yes
+  CONF_LINE_N=0
+  while IFS= read -r CONF_LINE || [ -n "$CONF_LINE" ]; do
+    CONF_LINE_N=$((CONF_LINE_N + 1))
+    [ "$CONF_LINE_N" -le 64 ] || { CONF_OK=0; break; }
+    [[ "$CONF_LINE" =~ ^[[:space:]]*$ ]] && continue
+    [[ "$CONF_LINE" == \#* ]] && continue
+    CONF_ASSIGN_RE="^([A-Z_][A-Z0-9_]*)='([^']*)'$"
+    if [[ "$CONF_LINE" =~ $CONF_ASSIGN_RE ]]; then
+      CONF_KEY=${BASH_REMATCH[1]}
+      CONF_VALUE=${BASH_REMATCH[2]}
+    else
+      CONF_OK=0; break
+    fi
+    case "$CONF_KEY" in
+      SETUP_CONF_VERSION|PROFILE|WIFI_MODE|WIFI_SSID_B64|AI_MODEL|SECURE_BOOT|BACKUP_CONTINUE|TARGET_DISK|TARGET_DISK_ERASE|STEP_SAVE_WIFI|STEP_SAVE_BROWSER_PASSWORDS|STEP_COLLECT_APPS|STEP_RESCUE_TOOLS|STEP_DEBIAN|STEP_OFFLINE_PACKS) ;;
+      *) CONF_OK=0; break ;;
+    esac
+    [ -z "${CONF_SEEN[$CONF_KEY]:-}" ] || { CONF_OK=0; break; }
+    CONF_SEEN[$CONF_KEY]=1
+    CONF_VALUES[$CONF_KEY]=$CONF_VALUE
+  done < /tmp/setup.conf
+  [ "${CONF_VALUES[SETUP_CONF_VERSION]}" = 1 ] || CONF_OK=0
+  case "${CONF_VALUES[PROFILE]}" in ""|full|lite|min|atomic) ;; *) CONF_OK=0 ;; esac
+  case "${CONF_VALUES[WIFI_MODE]}" in ask|saved|skip) ;; *) CONF_OK=0 ;; esac
+  case "${CONF_VALUES[AI_MODEL]}" in ask|yes|no) ;; *) CONF_OK=0 ;; esac
+  case "${CONF_VALUES[SECURE_BOOT]}" in ask|on|off) ;; *) CONF_OK=0 ;; esac
+  case "${CONF_VALUES[BACKUP_CONTINUE]}" in ask|yes) ;; *) CONF_OK=0 ;; esac
+  case "${CONF_VALUES[TARGET_DISK]}" in ""|*[!a-z0-9]*) [ -z "${CONF_VALUES[TARGET_DISK]}" ] || CONF_OK=0 ;; esac
+  case "${CONF_VALUES[TARGET_DISK_ERASE]}" in ""|ERASE) ;; *) CONF_OK=0 ;; esac
+  [[ "${CONF_VALUES[WIFI_SSID_B64]}" =~ ^([A-Za-z0-9+/]{4})*([A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$ ]] || CONF_OK=0
+  for CONF_KEY in STEP_SAVE_WIFI STEP_SAVE_BROWSER_PASSWORDS STEP_COLLECT_APPS STEP_RESCUE_TOOLS STEP_DEBIAN STEP_OFFLINE_PACKS; do
+    case "${CONF_VALUES[$CONF_KEY]}" in yes|no) ;; *) CONF_OK=0 ;; esac
+  done
+  [ "${CONF_VALUES[TARGET_DISK_ERASE]}" = ERASE ] && [ -z "${CONF_VALUES[TARGET_DISK]}" ] && CONF_OK=0
+  if [ "$CONF_OK" = 1 ]; then
+    for CONF_KEY in "${!CONF_VALUES[@]}"; do
+      printf -v "$CONF_KEY" '%s' "${CONF_VALUES[$CONF_KEY]}"
+    done
+  fi
+  unset CONF_ASSIGN_RE CONF_VALUE CONF_LINE CONF_LINE_N CONF_KEY CONF_SEEN CONF_VALUES
+  # END STRICT SETUP.CONF PARSER
+  if [ "$CONF_OK" = 1 ]; then
+    SETUP_AUTO=1
+    header "your choices from Windows"
+    echo "   The Setup app on this USB stick saved these choices. Check them now:"
+    echo
+    [ -n "$PROFILE" ] && echo "     System: $PROFILE"
+    echo "     Wi-Fi: $WIFI_MODE"
+    [ -n "$WIFI_SSID_B64" ] && echo "     A home Wi-Fi network was selected (its name is not printed here)."
+    [ "$AI_MODEL" != ask ] && echo "     Optional AI model: $AI_MODEL"
+    [ "$SECURE_BOOT" != ask ] && echo "     Secure Boot intention: $SECURE_BOOT"
+    [ -n "$TARGET_DISK" ] && echo "     Target drive: /dev/$TARGET_DISK (erase confirmation: ${TARGET_DISK_ERASE:-none})"
+    echo
+    echo "     Steps switched off in Windows stay off. Anything blank is asked normally."
+    echo "     Nothing starts until you answer. There is no countdown and no automatic choice."
+    echo "     Press Enter to START WITH THESE SETTINGS, or C to CHANGE ANYTHING."
+    echo
+    while true; do
+      CHANGE=""
+      if ! read -rsn1 CHANGE; then
+        # End of input is not consent. Keep waiting instead of installing or erasing anything.
+        sleep 3600
+        continue
+      fi
+      case "$CHANGE" in
+        "")
+          rm -f /tmp/sl-copy-browser-passwords
+          [ "$STEP_SAVE_BROWSER_PASSWORDS" = yes ] && : > /tmp/sl-copy-browser-passwords
+          echo; break ;;
+        [Cc])
+          SETUP_AUTO=0; PROFILE=""; WIFI_MODE=ask; WIFI_SSID_B64=""; AI_MODEL=ask; SECURE_BOOT=ask; BACKUP_CONTINUE=ask
+          STEP_SAVE_BROWSER_PASSWORDS=no; rm -f /tmp/sl-copy-browser-passwords
+          TARGET_DISK=""; TARGET_DISK_ERASE=""
+          echo; echo "   No problem. Every question will be asked, just as before."
+          break
+          ;;
+        *) echo; echo "   Please press Enter to start with these settings, or C to change anything." ;;
+      esac
+    done
+  else
+    echo "   The setup.conf file is not valid, so it is ignored. Every question will be asked."
+  fi
+fi
 
 # ---------------------------------------------------------------- 0. which drive
 # Internal drives of 16 GB or more; never USB drives, SD cards, optical or virtual disks
@@ -364,8 +494,12 @@ if [ ${#NAMES[@]} -eq 0 ]; then
   echo "   No internal drive of 16 GB or more was found, so nothing can be installed."
   cancel
 fi
-PICK=0
-if [ ${#NAMES[@]} -gt 1 ]; then
+PICK=0; TARGET_PICKED=0
+if [ "$SETUP_AUTO" = 1 ] && [ -n "$TARGET_DISK" ]; then
+  for i in "${!NAMES[@]}"; do [ "${NAMES[$i]}" = "$TARGET_DISK" ] && { PICK=$i; TARGET_PICKED=1; break; }; done
+  [ "$TARGET_PICKED" = 1 ] || echo "   The recorded target /dev/$TARGET_DISK is not present. The normal drive question will be asked."
+fi
+if [ ${#NAMES[@]} -gt 1 ] && [ "$TARGET_PICKED" = 0 ]; then
   # Suggest the biggest SSD (fast); otherwise the biggest drive. The person still has to type the number.
   BEST=-1; BESTSIZE=0
   for i in "${!NAMES[@]}"; do [ "${SSD[$i]}" = SSD ] && [ "${SIZES[$i]}" -gt "$BESTSIZE" ] && { BEST=$i; BESTSIZE=${SIZES[$i]}; }; done
@@ -1035,7 +1169,9 @@ hw_check() {
   HW_DISTRO_REASON=$(sed -n 's/^HW_DISTRO_REASON=//p' /tmp/hw-report.raw | tail -1 | tr -cd ' -~' | cut -c1-200)
   grep -v '^HW_[A-Z_]*=' /tmp/hw-report.raw > /tmp/hw-report.txt
 }
+sl_pre_begin 'Checking this computer. No percentage is available for the hardware check.'
 hw_check
+sl_pre_end 'Hardware check finished.'
 if [ "$HW_STATUS" = UNSUPPORTED ]; then
   header "this computer"
   cat /tmp/hw-report.txt
@@ -1141,16 +1277,20 @@ case "$SUGGEST" in
   *) echo "   Recommended for this computer: LITE, because $WHY." ;;
 esac
 echo
-while true; do
-  answer "Type F, L or M and press Enter (Q to cancel):"
-  case "$REPLY_TEXT" in
-    [Ff]) PROFILE=full; break ;;
-    [Ll]) PROFILE=lite; break ;;
-    [Mm]) PROFILE=min; break ;;
-    [Aa]) PROFILE=atomic; break ;;
-    [Qq]) cancel ;;
-  esac
-done
+if [ "$SETUP_AUTO" = 1 ] && [ -n "$PROFILE" ]; then
+  echo "   Using the system you already confirmed in the Setup app: $PROFILE."
+else
+  while true; do
+    answer "Type F, L or M and press Enter (Q to cancel):"
+    case "$REPLY_TEXT" in
+      [Ff]) PROFILE=full; break ;;
+      [Ll]) PROFILE=lite; break ;;
+      [Mm]) PROFILE=min; break ;;
+      [Aa]) PROFILE=atomic; break ;;
+      [Qq]) cancel ;;
+    esac
+  done
+fi
 # MIN is for PCs with little memory: the graphical installer would run out of memory there
 # (it needs about 4.5 GB), so the installer always uses its simple text screens.
 [ "$PROFILE" = min ] && HW_TEXT_INSTALL=1
@@ -1164,7 +1304,10 @@ eth_up() {  # carrier on a non-wireless interface (loopback ignored)
   done
   return 1
 }
-if eth_up; then WIFI_STEP=0; else WIFI_STEP=1; fi
+if [ "$SETUP_AUTO" = 1 ] && [ "$WIFI_MODE" = skip ]; then WIFI_STEP=0
+elif eth_up; then WIFI_STEP=0
+else WIFI_STEP=1
+fi
 TOTAL=4
 [ "$PROFILE" = full ] && TOTAL=$((TOTAL + 1))
 [ -d /sys/firmware/efi ] && TOTAL=$((TOTAL + 1))
@@ -1195,13 +1338,18 @@ if [ "$PROFILE" = full ]; then
   echo "     version, and it may suggest destructive commands without warning:"
   echo "     never run its commands with sudo (as admin) without reading them first."
   echo
-  while true; do
-    answer "Add it? Type Y for yes or N for no:"
-    case "$REPLY_TEXT" in
-      [Yy]) echo "ai_abliterated=yes" >> /tmp/secure-linux-choices; break ;;
-      [Nn]) echo "ai_abliterated=no" >> /tmp/secure-linux-choices; break ;;
-    esac
-  done
+  if [ "$SETUP_AUTO" = 1 ] && [ "$AI_MODEL" != ask ]; then
+    echo "ai_abliterated=$AI_MODEL" >> /tmp/secure-linux-choices
+    echo "   Using your confirmed choice: $AI_MODEL."
+  else
+    while true; do
+      answer "Add it? Type Y for yes or N for no:"
+      case "$REPLY_TEXT" in
+        [Yy]) echo "ai_abliterated=yes" >> /tmp/secure-linux-choices; break ;;
+        [Nn]) echo "ai_abliterated=no" >> /tmp/secure-linux-choices; break ;;
+      esac
+    done
+  fi
 fi
 
 # ---------------------------------------------------------------- Secure Boot (UEFI machines)
@@ -1231,12 +1379,19 @@ if [ -d /sys/firmware/efi ]; then
   echo "      with it (rare, targeted). Your files stay encrypted either way."
   echo "    - The security-chip PIN unlock isn't available."
   echo
-  while true; do
-    answer "Type 1 or 2:"
-    case "$REPLY_TEXT" in 1) SB_WANT=on; break ;; 2) SB_WANT=off; break ;; esac
-  done
+  if [ "$SETUP_AUTO" = 1 ] && [ "$SECURE_BOOT" != ask ]; then
+    SB_WANT=$SECURE_BOOT
+    echo "   Using your confirmed Secure Boot intention: $SB_WANT."
+  else
+    while true; do
+      answer "Type 1 or 2:"
+      case "$REPLY_TEXT" in 1) SB_WANT=on; break ;; 2) SB_WANT=off; break ;; esac
+    done
+  fi
   echo "secureboot_intent=$SB_WANT" >> /tmp/secure-linux-choices
-  if [ "$SB_WANT" = off ] && [ "$SB_NOW" = ON ]; then
+  if [ "$SETUP_AUTO" = 1 ] && [ "$SECURE_BOOT" != ask ]; then
+    : # The intention was reviewed already; the explanatory text below is still shown when relevant.
+  elif [ "$SB_WANT" = off ] && [ "$SB_NOW" = ON ]; then
     echo
     echo "   Nothing changes now. After setup, turn it off in the BIOS (ASUS: F2 > Security >"
     echo "   Secure Boot > Disabled; Dell: F2 > Secure Boot). Hibernate turns on by itself then."
@@ -1262,8 +1417,8 @@ BACKUPS_END
 FOUND=""
 for id in "$SID" "$UID_"; do
   [ -n "$id" ] || continue
-  # awk, not grep -i -F: the lookup must work the same in every installer environment (some greps break on -i under LC_ALL=C)
-  FOUND=$(ID=$id awk 'BEGIN { id = tolower(ENVIRON["ID"]) "|" } index(tolower($0), id) { last = $0 } END { if (last != "") print last }' /tmp/backups.txt)
+  # Match only the complete first pipe-delimited field, never a substring of another machine ID.
+  FOUND=$(ID=$id awk -F '|' 'BEGIN { id = tolower(ENVIRON["ID"]) } tolower($1) == id { last = $0 } END { if (last != "") print last }' /tmp/backups.txt)
   [ -n "$FOUND" ] && break
 done
 PARTS=$(lsblk -nro NAME "/dev/$DISK" 2>/dev/null | tail -n +2 | wc -l)
@@ -1280,12 +1435,13 @@ if [ -n "$FOUND" ]; then
     echo "   A backup of this computer was made on $(echo "$FOUND" | cut -d'|' -f3)"
   fi
   echo "   to $(echo "$FOUND" | cut -d'|' -f4)."
+  echo "   This record is metadata only: it does NOT prove that the backup is readable or restorable."
   echo
-  answer "Type C and press Enter to continue:"
+  [ "$SETUP_AUTO" = 1 ] && [ "$BACKUP_CONTINUE" = yes ] || answer "Type C and press Enter to continue:"
 elif [ "$PARTS" -eq 0 ]; then
   echo "   This drive is empty (new or blank), so there is nothing to back up."
   echo
-  answer "Type C and press Enter to continue:"
+  [ "$SETUP_AUTO" = 1 ] && [ "$BACKUP_CONTINUE" = yes ] || answer "Type C and press Enter to continue:"
 else
   echo "   !! NO BACKUP has been recorded for this computer. !!"
   echo
@@ -1295,10 +1451,14 @@ else
   echo "     - Any PC: restart, and choose Clonezilla from this USB stick's menu to"
   echo "       save a full image of the drive to another drive."
   echo
-  while true; do
-    answer "Type B to stop and back up first, or C to continue WITHOUT a backup:"
-    case "$REPLY_TEXT" in [Bb]) cancel ;; [Cc]) break ;; esac
-  done
+  if [ "$SETUP_AUTO" = 1 ] && [ "$BACKUP_CONTINUE" = yes ]; then
+    echo "   You explicitly approved continuing without a new backup in the Setup app."
+  else
+    while true; do
+      answer "Type B to stop and back up first, or C to continue WITHOUT a backup:"
+      case "$REPLY_TEXT" in [Bb]) cancel ;; [Cc]) break ;; esac
+    done
+  fi
 fi
 
 # ---------------------------------------------------------------- internet for the install: cable first, then Wi-Fi
@@ -1341,7 +1501,22 @@ if [ "$WIFI_STEP" = 1 ]; then
       echo "   to Wi-Fi after the install by clicking the Wi-Fi icon."
       echo
     fi
-    if true; then   # B2: the condition was removed, not the body; the wrapper keeps this block's indentation
+    # Setup-App can pre-answer a saved home network, but only from the existing save-wifi record.
+    # A protected record still asks for its PIN. No match, no password or no record falls through to every normal question.
+    AUTO_WIFI_DONE=""
+    if [ "$SETUP_AUTO" = 1 ] && [ "$WIFI_MODE" = saved ] && [ -n "$OPENED" ] && [ -n "$WIFI_SSID_B64" ]; then
+      AUTO_WIFI_NAME=$(printf '%s' "$WIFI_SSID_B64" | base64 -d 2>/dev/null)
+      AUTO_WIFI_IDX=$(python3 /tmp/sl-wifi.py list /tmp/sl-wifi-bundle | awk -F'|' -v s="$AUTO_WIFI_NAME" '$2 == s { print $1; exit }')
+      if [ -n "$AUTO_WIFI_IDX" ]; then
+        sed -n "${AUTO_WIFI_IDX}p" /tmp/sl-wifi-bundle > /tmp/secure-linux-wifi
+        AUTO_WIFI_DONE=1
+        echo "   Using the home Wi-Fi network you selected in Windows: $AUTO_WIFI_NAME"
+        echo "   Its existing saved record is carried over to the installed Linux too."
+      else
+        echo "   The selected home network is not in this computer's saved record; the normal list follows."
+      fi
+    fi
+    if [ -z "$AUTO_WIFI_DONE" ]; then   # no setup.conf: exactly the original interactive body
       wifi_scan() {  # visible networks -> /tmp/sl-scan (name|signal|security, strongest first); 1 = cannot scan here
         : > /tmp/sl-scan
         command -v nmcli >/dev/null 2>&1 || return 1
@@ -1358,11 +1533,12 @@ if [ "$WIFI_STEP" = 1 ]; then
         return 0
       }
       wifi_fix() {  # the usual culprits: Wi-Fi switched off in the firmware, or a stuck network service
-        echo "   Trying to fix it: Wi-Fi is switched on and the network service restarts..."
+        sl_pre_begin 'Switching on Wi-Fi and restarting the network service. No percentage is available.'
         rfkill unblock all >/dev/null 2>&1
         nmcli radio wifi on >/dev/null 2>&1
         systemctl restart NetworkManager >/dev/null 2>&1
         sleep 4
+        sl_pre_end 'Wi-Fi restart finished.'
       }
       eth_cable() {  # wait for a network cable (or phone USB tethering) instead of Wi-Fi
         echo
@@ -1413,7 +1589,9 @@ if [ "$WIFI_STEP" = 1 ]; then
         return 1
       }
       NO_SCAN=""
+      sl_pre_begin 'Looking for Wi-Fi networks. No percentage is available for a scan.'
       wifi_scan || NO_SCAN=1
+      sl_pre_end 'Wi-Fi scan finished.'
       WIFI_DONE=""; FIXTRIED=""; ASKED_SAVED=""
       while [ -z "$NO_SCAN" ] && [ -z "$WIFI_DONE" ]; do
         if [ ! -s /tmp/sl-scan ]; then
@@ -1599,6 +1777,8 @@ PDISP=$PROFILE; [ "$PROFILE" = min ] && PDISP="min (light LXQt desktop)"
 echo "   Then the Complete Secure Linux Package ($PDISP) is installed,"
 echo "   with full-disk encryption, and all apps install by themselves."
 echo
+# The Setup app may preselect a drive, but it can never pre-authorize this final destructive step.
+# BACKUP_CONTINUE and TARGET_DISK_ERASE deliberately have no effect here.
 answer "Type ERASE (in capitals) to continue, or anything else to cancel:"
 [ "$REPLY_TEXT" = "ERASE" ] || cancel
 
@@ -3143,12 +3323,12 @@ case "$PROFILE" in
   full)
     printf 'url --mirrorlist="https://mirrors.fedoraproject.org/mirrorlist?repo=fedora-$releasever&arch=$basearch"\nrepo --name=updates --mirrorlist="https://mirrors.fedoraproject.org/mirrorlist?repo=updates-released-f$releasever&arch=$basearch"\n' > /tmp/payload.ks
     printf 'network --hostname=%s\nfirewall --enabled\n' "$HOST" > /tmp/profile.ks
-    printf '%%packages\n@^kde-desktop-environment\nflatpak\ncurl\ngit\nbtrfs-progs\nNetworkManager-wifi\n%s\n%%end\n' "$(echo $FIRMWARE | tr ' ' '\n')" > /tmp/packages.ks
+    printf '%%packages\n@^kde-desktop-environment\nflatpak\npython3\ncurl\ngit\nbtrfs-progs\nNetworkManager-wifi\n%s\n%%end\n' "$(echo $FIRMWARE | tr ' ' '\n')" > /tmp/packages.ks
     ;;
   lite)
     printf 'url --mirrorlist="https://mirrors.fedoraproject.org/mirrorlist?repo=fedora-$releasever&arch=$basearch"\nrepo --name=updates --mirrorlist="https://mirrors.fedoraproject.org/mirrorlist?repo=updates-released-f$releasever&arch=$basearch"\n' > /tmp/payload.ks
     printf 'network --hostname=%s\nfirewall --enabled --service=ssh\nservices --enabled=sshd\n' "$HOST" > /tmp/profile.ks
-    printf '%%packages\n@^xfce-desktop-environment\nopenssh-server\nflatpak\ncurl\ngit\nbtrfs-progs\nNetworkManager-wifi\n%s\n%%end\n' "$(echo $FIRMWARE | tr ' ' '\n')" > /tmp/packages.ks
+    printf '%%packages\n@^xfce-desktop-environment\nopenssh-server\nflatpak\npython3\ncurl\ngit\nbtrfs-progs\nNetworkManager-wifi\n%s\n%%end\n' "$(echo $FIRMWARE | tr ' ' '\n')" > /tmp/packages.ks
     ;;
   min)
     # fedora-min: the same Fedora from the same mirrors, but the lightest desktop (LXQt) for PCs with
@@ -3156,11 +3336,11 @@ case "$PROFILE" in
     # so only the desktop group differs.
     printf 'url --mirrorlist="https://mirrors.fedoraproject.org/mirrorlist?repo=fedora-$releasever&arch=$basearch"\nrepo --name=updates --mirrorlist="https://mirrors.fedoraproject.org/mirrorlist?repo=updates-released-f$releasever&arch=$basearch"\n' > /tmp/payload.ks
     printf 'network --hostname=%s\nfirewall --enabled --service=ssh\nservices --enabled=sshd\n' "$HOST" > /tmp/profile.ks
-    printf '%%packages\n@^lxqt-desktop-environment\nopenssh-server\nflatpak\ncurl\ngit\nbtrfs-progs\nNetworkManager-wifi\n%s\n%%end\n' "$(echo $FIRMWARE | tr ' ' '\n')" > /tmp/packages.ks
+    printf '%%packages\n@^lxqt-desktop-environment\nopenssh-server\nflatpak\npython3\ncurl\ngit\nbtrfs-progs\nNetworkManager-wifi\n%s\n%%end\n' "$(echo $FIRMWARE | tr ' ' '\n')" > /tmp/packages.ks
     ;;
   atomic)
     # Fedora Kinoite (KDE Plasma, image-based). No package list: the image is the system.
-    printf 'ostreecontainer --url=quay.io/fedora/fedora-kinoite:44 --no-signature-verification\n' > /tmp/payload.ks
+    printf 'ostreecontainer --url=quay.io/fedora/fedora-kinoite:44\n' > /tmp/payload.ks
     printf 'network --hostname=%s\nfirewall --enabled\n' "$HOST" > /tmp/profile.ks
     echo '# atomic: no package list (the Fedora Kinoite image is the system)' > /tmp/packages.ks
     ;;
@@ -3171,6 +3351,13 @@ if [ "$PROFILE" = min ]; then echo lite > /tmp/secure-linux-profile; else echo "
 # Installer screen: text mode on 2-4 GB machines (the graphical installer needs more memory)
 if [ "$HW_TEXT_INSTALL" = 1 ]; then sed -i '1i text' /tmp/profile.ks; else sed -i '1i graphical' /tmp/profile.ks; fi
 
+# Revalidate the selected hardware immediately before emitting Anaconda's destructive disk plan.
+CURRENT_SIZE=$(cat "/sys/block/$DISK/size" 2>/dev/null) || CURRENT_SIZE=""
+CURRENT_MODEL=$(sed 's/ *$//' "/sys/block/$DISK/device/model" 2>/dev/null)
+if [ "$CURRENT_SIZE" != "${SIZES[$PICK]}" ] || [ "$CURRENT_MODEL" != "$DISK_MODEL" ]; then
+  echo "   The selected drive's model or exact sector capacity changed. Nothing was installed."
+  cancel
+fi
 umask 077
 Q=${PW1//\\/\\\\}; Q=${Q//\"/\\\"}
 cat > /tmp/disk.ks <<EOF
@@ -3184,10 +3371,13 @@ umask 022
 
 # Network during install: saved Wi-Fi if this machine has a Wi-Fi card, otherwise wired
 : > /tmp/net.ks
+if ! { [ "$SETUP_AUTO" = 1 ] && [ "$WIFI_MODE" = skip ]; }; then
 # (netboot: no Wi-Fi is saved anywhere - the Wi-Fi question above connects this computer itself)
+: # netboot intentionally writes no saved Wi-Fi configuration
+fi
 # Without saved Wi-Fi (or a Wi-Fi chip the installer can't drive, e.g. old Broadcom) a cable is needed
 has_link() { local c; for c in /sys/class/net/*/carrier; do [ "$(cat "$c" 2>/dev/null)" = 1 ] && [ "$(basename "$(dirname "$c")")" != lo ] && return 0; done; return 1; }
-if [ ! -s /tmp/net.ks ] && ! has_link; then
+if [ ! -s /tmp/net.ks ] && ! has_link && ! { [ "$SETUP_AUTO" = 1 ] && [ "$WIFI_MODE" = skip ]; }; then
   header "internet for the install"
   echo "   The installer downloads Linux, so it needs the internet, but it can't use"
   echo "   Wi-Fi on this computer (no Wi-Fi saved on the stick, or no driver for its"
@@ -3223,6 +3413,18 @@ chvt 1
 %post --nochroot --log=/tmp/ks-post-nochroot.log
 # Runs in the installer, with the new system mounted at $SYSROOT: hands over the choices made above.
 SYSROOT=${ANA_INSTALL_PATH:-/mnt/sysroot}
+if [ -f /tmp/sl-progress.sh ]; then
+  . /tmp/sl-progress.sh
+else
+  sl_progress_start() { printf '%s\n' "$2"; }
+  sl_progress_update() { printf 'Secure Linux stage progress: %s of 100 points finished.\n' "$1"; }
+  sl_progress_spinner_start() { printf '%s\n' "$1"; }
+  sl_progress_spinner_stop() { [ -z "${1:-}" ] || printf '%s\n' "$1"; }
+fi
+sl_stage_finish() { sl_progress_spinner_stop "$2"; sl_progress_update "$1"; }
+sl_progress_start 100 'Secure Linux final setup. Percentages advance when real stages finish.'
+sl_progress_spinner_start 'Saving your choices. No percentage is available within this short stage.'
+[ -f /tmp/sl-progress.sh ] && install -m 0644 /tmp/sl-progress.sh "$SYSROOT/tmp/sl-progress.sh"
 install -d -m 0755 "$SYSROOT/etc/secure-linux"
 install -m 0644 /tmp/secure-linux-profile "$SYSROOT/etc/secure-linux/profile"
 touch "$SYSROOT/etc/secure-linux/choices"
@@ -3237,8 +3439,10 @@ if [ -s /tmp/secure-linux-wifi ]; then
   python3 /tmp/sl-wifi.py keyfiles /tmp/secure-linux-wifi "$SYSROOT/etc/NetworkManager/system-connections" ''
 fi
 rm -f /tmp/secure-linux-wifi
+sl_stage_finish 5 'Choices and saved Wi-Fi settings handed over.'
 
 # Optional unfiltered AI model: copy it from the USB stick if it is there; otherwise first boot downloads it.
+sl_progress_spinner_start 'Handling the optional AI model. No percentage is available during its copy.'
 MODEL_FILE='Qwen2.5-Coder-7B-Instruct-abliterated-Q4_K_M.gguf'
 MODEL_SHA256='fdf02c16fb654ff60b2c30f1e91573ebc603a7084df3449df89120dca2b18170'
 if grep -qx 'ai_abliterated=yes' /tmp/secure-linux-choices && [ -n "$MODEL_FILE" ]; then
@@ -3272,12 +3476,14 @@ if grep -qx 'ai_abliterated=yes' /tmp/secure-linux-choices && [ -n "$MODEL_FILE"
     echo "Couldn't open the USB stick's data partition: first boot will download the AI model."
   fi
 fi
+sl_stage_finish 20 'Optional AI model stage finished.'
 
 # Offline fix-packs from the USB stick (best-effort, silent if the stick or the files are not there): the ClamAV
 # virus list. Staged at /var/lib/secure-linux/offline/clamav, and copied into /var/lib/clamav when no database was
 # ever downloaded, so a fresh install can scan before (or without ever) downloading one. The files stay root-owned
 # here (the clamav user does not exist yet): the clamav package's own install fixes the folder's ownership, and
 # freshclam replaces the files at its first online update.
+sl_progress_spinner_start 'Copying offline fix-packs. No percentage is available during this copy.'
 OFF_MNT=/tmp/ventoy-offline
 mkdir -p "$OFF_MNT"
 if ! mountpoint -q "$OFF_MNT"; then
@@ -3297,13 +3503,57 @@ if mountpoint -q "$OFF_MNT" && [ -f "$OFF_MNT/linux-setup/offline/clamav/main.cv
     echo "Virus list copied from the USB stick: the scan works before the first online update."
   fi
 fi
+sl_stage_finish 30 'Offline fix-pack stage finished.'
+# Browser passwords: copy only after the person explicitly reviewed STEP_SAVE_BROWSER_PASSWORDS=yes in %pre.
+# The marker contains no secret. Without it, do not even enumerate CSV names (which can themselves be sensitive).
+sl_progress_spinner_start 'Browser-password export stage. No percentage is available.'
+if [ -f /tmp/sl-copy-browser-passwords ] && mountpoint -q "$OFF_MNT" && [ -d "$OFF_MNT/linux-setup/scan" ]; then
+  SL_INSTALL_USER=$(sed -n 's/^sl_username=//p' "$SYSROOT/etc/secure-linux/choices" | head -n 1)
+  [ -n "$SL_INSTALL_USER" ] || SL_INSTALL_USER=owner
+  PASS_DEST="$SYSROOT/home/$SL_INSTALL_USER/Documents/Import-These-Passwords"
+  find "$OFF_MNT/linux-setup/scan" -type f -name '*.csv' | while IFS= read -r csv; do
+    IFS= read -r csv_header < "$csv" || continue
+    case "$csv_header" in *password*username*|*username*password*|*password*login*|*login*password*) ;; *) continue ;; esac
+    install -d -m 0700 "$PASS_DEST"
+    cp "$csv" "$PASS_DEST/$(basename "$csv")"
+  done
+  if [ -d "$PASS_DEST" ]; then
+    chmod 0600 "$PASS_DEST"/*.csv 2>/dev/null
+    cat > "$PASS_DEST/READ-ME-FIRST.txt" <<'PASS_GUIDE'
+These are the password CSV files you explicitly exported from your browser.
+Open Bitwarden, choose Tools > Import Data, select the matching browser/CSV format and import each file.
+Check the imported passwords, then securely delete every CSV and this folder: anyone who reads a CSV can use the passwords.
+PASS_GUIDE
+    chmod 0600 "$PASS_DEST/READ-ME-FIRST.txt"
+    echo "Your exported browser-password CSV files are in Documents/Import-These-Passwords."
+  fi
+fi
 umount "$OFF_MNT" 2>/dev/null
+sl_stage_finish 35 'Browser export stage finished.'
 %end
 
 %post --log=/root/ks-post.log
 # Runs inside the new system.
+if [ -f /tmp/sl-progress.sh ]; then
+  . /tmp/sl-progress.sh
+else
+  sl_progress_start() { printf '%s\n' "$2"; }
+  sl_progress_update() { printf 'Secure Linux stage progress: %s of 100 points finished.\n' "$1"; }
+  sl_progress_spinner_start() { printf '%s\n' "$1"; }
+  sl_progress_spinner_stop() { [ -z "${1:-}" ] || printf '%s\n' "$1"; }
+fi
+sl_stage_finish() { sl_progress_spinner_stop "$2"; sl_progress_update "$1"; }
+sl_progress_start 100 'Secure Linux final setup continues in the new system.' >/dev/null
+sl_progress_update 35
+sl_progress_spinner_start 'Unpacking Secure Linux. No percentage is available during the unpack.'
 systemctl set-default graphical.target
 # Files written from outside this system (by the installer, above) get their proper SELinux labels
+SL_INSTALL_USER=$(sed -n 's/^sl_username=//p' /etc/secure-linux/choices | head -n 1)
+[ -n "$SL_INSTALL_USER" ] || SL_INSTALL_USER=owner
+if [ -d "/home/$SL_INSTALL_USER/Documents/Import-These-Passwords" ]; then
+  chown -R "$SL_INSTALL_USER:$SL_INSTALL_USER" "/home/$SL_INSTALL_USER/Documents/Import-These-Passwords"
+  restorecon -R "/home/$SL_INSTALL_USER/Documents/Import-These-Passwords" 2>/dev/null
+fi
 restorecon -R /etc/secure-linux /etc/NetworkManager/system-connections /var/lib/secure-linux /var/lib/clamav 2>/dev/null
 PROFILE=$(cat /etc/secure-linux/profile 2>/dev/null)
 case "$PROFILE" in full|lite|atomic) ;; *) PROFILE=full; echo full > /etc/secure-linux/profile ;; esac
@@ -3318,17 +3568,83 @@ chmod 0644 /etc/secure-linux/profile /etc/secure-linux/user /etc/secure-linux/ch
 # ---- Secure Linux: the public repository IS the payload (plain text files, no uploaded archive).
 # The whole-repository download is only the transport at install time. Its payload/ subtree has the
 # same root as the old USB archive (setup.sh, bin/...), and holds no names, hashes or Wi-Fi secrets.
+# Validate every archive member before extraction: even a transport archive must never write outside
+# its staging root or introduce links/special files. The release record prevents old/new payload drift.
 SL_PAYLOAD_SOURCE="https://codeload.github.com/MattyBoyMan/secure-linux-netboot/tar.gz/refs/heads/main"
+SL_EXPECTED_RELEASE="secure-linux-2026.11.06-f51e5fcefb47f0a3"
 SL=/usr/local/lib/secure-linux
 SLREPO=/tmp/sl-repo
 SLPAYLOAD="$SLREPO/secure-linux-netboot-main/payload"
+sl_unpack_repo() {
+  python3 - "$1" "$2" "$3" <<'SL_PAYLOAD_EXTRACT'
+import os
+from pathlib import Path, PurePosixPath
+import sys
+import tarfile
+
+archive, destination, expected_root = sys.argv[1:4]
+root = Path(destination).resolve()
+with tarfile.open(archive, "r:gz") as tar:
+    members = tar.getmembers()
+    seen = set()
+    for member in members:
+        pure = PurePosixPath(member.name)
+        relative = pure.as_posix()
+        if (not relative or pure.is_absolute() or "\\" in member.name
+                or any(part in {"", ".", ".."} for part in pure.parts)
+                or pure.parts[0] != expected_root
+                or member.name.rstrip("/") != relative):
+            raise SystemExit("unsafe or non-normalized path in payload archive: " + member.name)
+        if relative in seen:
+            raise SystemExit("duplicate path in payload archive: " + relative)
+        seen.add(relative)
+        if not (member.isfile() or member.isdir()):
+            raise SystemExit("links and special files are not allowed in payload archive")
+    for member in members:
+        relative = PurePosixPath(member.name).as_posix()
+        target = root.joinpath(*PurePosixPath(relative).parts)
+        target.resolve(strict=False).relative_to(root)
+        if member.isdir():
+            if target.exists() and not target.is_dir():
+                raise SystemExit("payload directory collides with a file")
+            target.mkdir(parents=True, exist_ok=True)
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if target.exists():
+            raise SystemExit("payload file collides with another archive entry")
+        source = tar.extractfile(member)
+        if source is None:
+            raise SystemExit("could not read payload archive member")
+        with source, target.open("xb") as output:
+            while True:
+                block = source.read(1024 * 1024)
+                if not block:
+                    break
+                output.write(block)
+        target.chmod(member.mode & 0o777)
+SL_PAYLOAD_EXTRACT
+}
+sl_release_matches() {
+  python3 - "$1" "$2" <<'SL_RELEASE_CHECK'
+import json
+import sys
+
+try:
+    with open(sys.argv[1], encoding="utf-8") as release_file:
+        actual = json.load(release_file)["release_id"]
+except (OSError, ValueError, KeyError, TypeError):
+    raise SystemExit(1)
+if actual != sys.argv[2]:
+    raise SystemExit(1)
+SL_RELEASE_CHECK
+}
 rm -rf "$SL" "$SLREPO"
 install -d -m 0755 "$SL" "$SLREPO"
 if ! curl -fsSL --retry 3 -o /tmp/sl-repo.tar.gz "$SL_PAYLOAD_SOURCE"; then
   echo "ERROR: could not download the Secure Linux payload from $SL_PAYLOAD_SOURCE"
   touch /root/secure-linux-payload-missing
-elif ! tar -xzf /tmp/sl-repo.tar.gz --no-same-owner -C "$SLREPO" || [ ! -f "$SLPAYLOAD/setup.sh" ] || [ ! -f "$SLPAYLOAD/build.conf" ]; then
-  echo "ERROR: the downloaded repository has no usable payload/ source tree (setup.sh and build.conf are required)"
+elif ! sl_unpack_repo /tmp/sl-repo.tar.gz "$SLREPO" "secure-linux-netboot-main" || [ ! -f "$SLPAYLOAD/setup.sh" ] || [ ! -f "$SLPAYLOAD/build.conf" ] || ! sl_release_matches "$SLPAYLOAD/release.json" "$SL_EXPECTED_RELEASE"; then
+  echo "ERROR: the downloaded payload is unsafe, incomplete, or from a different Secure Linux release"
   touch /root/secure-linux-payload-missing
 elif ! cp -a "$SLPAYLOAD/." "$SL/"; then
   echo "ERROR: could not copy the Secure Linux payload into place"
@@ -3344,8 +3660,10 @@ chmod 0755 "$SL/setup.sh" 2>/dev/null
 chmod 0755 "$SL"/bin/* 2>/dev/null
 # A tar written on Windows stores every file as 0666: every shell script in the kit must be runnable, not just the two above
 find "$SL" -type f -name '*.sh' -exec chmod 0755 {} + 2>/dev/null
+sl_stage_finish 55 'Secure Linux files unpacked.'
 
 # ---- The beginner's guide (opened on first login, also in the app menu)
+sl_progress_spinner_start 'Writing the beginner guide. No percentage is available within this short stage.'
 GUIDE_DIR=/usr/share/secure-linux
 [ "$PROFILE" = atomic ] && GUIDE_DIR=/usr/local/share/secure-linux   # /usr is read-only on atomic
 install -d -m 0755 "$GUIDE_DIR"
@@ -3355,7 +3673,9 @@ else
   echo "NOTE: the beginner's guide was not in the download; the computer still works, and the guide is online in the repository."
 fi
 chmod 0644 "$GUIDE_DIR/START-HERE.html"
+sl_stage_finish 60 'Beginner guide written.'
 
+sl_progress_spinner_start 'Saving Wi-Fi settings and preparing storage. No percentage is available within this stage.'
 # (netboot: no Wi-Fi is pre-configured - the first start asks)
 
 # ---- Separate Btrfs subvolumes (full/lite) so system snapshots don't keep old copies of
@@ -3382,8 +3702,10 @@ if [ "$PROFILE" != atomic ] && [ "$(stat -f -c %T /)" = btrfs ] && command -v bt
   make_subvol /var/lib/flatpak
   make_subvol /usr/share/ollama
 fi
+sl_stage_finish 70 'Wi-Fi and storage preparation finished.'
 
 # ---- First boot: wait for internet, run the full setup once (shutdown is blocked while it runs)
+sl_progress_spinner_start 'Creating the first-start service. No percentage is available within this short stage.'
 install -d -m 0755 /usr/local/sbin
 cat > /usr/local/sbin/secure-linux-firstboot <<'EOF'
 #!/bin/bash
@@ -3396,7 +3718,12 @@ done
 systemd-inhibit --what=shutdown:sleep:idle --who="Secure Linux" --why="Setting up apps" --mode=block \
   /usr/local/lib/secure-linux/setup.sh
 rc=$?
-touch /var/lib/firstboot-setup.done
+if [ "$rc" -eq 0 ] && [ ! -s /var/log/secure-linux/failures.log ]; then
+  touch /var/lib/firstboot-setup.done
+else
+  rm -f /var/lib/firstboot-setup.done
+  printf 'failed|?|Setup incomplete; run setup.sh and explicitly choose Resume or Fresh start\n' > /var/lib/secure-linux/progress
+fi
 exit $rc
 EOF
 chmod 0755 /usr/local/sbin/secure-linux-firstboot
@@ -3421,18 +3748,35 @@ ExecStart=/usr/local/sbin/secure-linux-firstboot
 WantedBy=multi-user.target
 EOF
 systemctl enable firstboot-setup.service
+sl_stage_finish 80 'First-start service created.'
 
 # ---- Helpers, welcome autostart, timers and menu entries in place before the first login
+sl_progress_spinner_start 'Preparing helpers and menus. No percentage is available within this stage.'
 if [ -x "$SL/setup.sh" ]; then
   "$SL/setup.sh" --early || echo "setup.sh --early reported a problem (first boot repeats everything)"
 fi
+sl_stage_finish 95 'Early setup finished.'
 %end
 
 %post --nochroot --log=/tmp/ks-post-scrub.log
 # Belt and braces: make sure the encryption passphrase isn't left in any saved installer file
 SYSROOT=${ANA_INSTALL_PATH:-/mnt/sysroot}
+if [ -f /tmp/sl-progress.sh ]; then
+  . /tmp/sl-progress.sh
+else
+  sl_progress_start() { printf '%s\n' "$2"; }
+  sl_progress_update() { printf 'Secure Linux stage progress: %s of 100 points finished.\n' "$1"; }
+  sl_progress_done() { printf 'Secure Linux final setup: 100%% complete.\n'; }
+  sl_progress_spinner_start() { printf '%s\n' "$1"; }
+  sl_progress_spinner_stop() { [ -z "${1:-}" ] || printf '%s\n' "$1"; }
+fi
+sl_progress_start 100 'Secure Linux final safety check.' >/dev/null
+sl_progress_update 95
+sl_progress_spinner_start 'Removing saved installer secrets. No percentage is available within this short stage.'
 for f in "$SYSROOT"/root/*.cfg "$SYSROOT"/root/*.ks "$SYSROOT"/var/log/anaconda/*; do
   [ -f "$f" ] && sed -i -E 's/(--passphrase)(=| )("[^"]*"|[^ ]+)/\1=REMOVED/g' "$f"
 done
 rm -f /tmp/disk.ks
+sl_progress_spinner_stop 'Final safety check finished.'
+sl_progress_done
 %end

@@ -9,6 +9,9 @@ the computer does the work.
   repair_setup.txt     re-check and repair this computer's Secure Linux setup
   health_check.txt     run the full hardware health check
   open_toolbox.txt     open the Secure Linux Toolbox
+  usb_fixer.txt        open image-first USB diagnosis, recovery and repair
+  usb_creator.txt      open Linux USB Installer Creator - Turn any blank USB into a Linux installer
+  flipper_companion.txt  open the Flipper Companion backup and SD-management menu
   status_window.txt    open the Status window (health + fix-it buttons)
   install_updates.txt  install all updates (asks for the login password)
 

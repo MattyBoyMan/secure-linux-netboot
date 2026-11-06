@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=My Computer Activity
+GenericName=Connections, background jobs and computer health
+Comment=Understand local network connections, Secure Linux jobs and system activity; read-only and offline
+Exec=/usr/local/bin/secure-linux-activity
+Icon=utilities-system-monitor
+Terminal=false
+Categories=System;Monitor;Security;
+Keywords=activity;network;connections;services;jobs;updates;privacy;local;firewall;login;USB;backup;
+StartupNotify=true

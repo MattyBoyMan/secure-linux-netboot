@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Back Up My Files
+GenericName=Encrypted backup setup
+Comment=Choose a USB drive or home server and open the existing encrypted backup app
+Exec=/usr/local/bin/secure-linux-welcome --page backup
+Icon=drive-harddisk
+Terminal=false
+Categories=Utility;Archiving;
+Keywords=backup;files;USB;server;Pika;Deja Dup;
+StartupNotify=true

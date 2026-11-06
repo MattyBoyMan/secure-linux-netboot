@@ -25,6 +25,11 @@ _e_tree() {   # _e_tree SRCDIR DESTDIR   every file below SRCDIR, keeping sub-fo
 for _e_f in "$SL_ROOT"/bin/secure-linux-*; do
   [ -f "$_e_f" ] && _e_put "$_e_f" "/usr/local/bin/${_e_f##*/}" 0755
 done
+# Flipper Zero Backup & Files: keep the complete app beside its /usr/local/bin launcher.
+_e_put "$SL_ROOT/lib/release_manifest.py" /usr/local/lib/release_manifest.py 0644
+while IFS= read -r _e_f; do
+  _e_put "$_e_f" "/usr/local/lib/flipper-companion/${_e_f#"$SL_ROOT/lib/flipper-companion"/}" 0644
+done < <(find "$SL_ROOT/lib/flipper-companion" -type f ! -path '*/__pycache__/*' ! -name '*.pyc' ! -name '*.pyo' | sort)
 for _e_area in "$SL_ROOT"/files/*/; do
   [ -d "$_e_area" ] || continue
   _e_area=${_e_area%/}

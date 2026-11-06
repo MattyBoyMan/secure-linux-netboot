@@ -1,0 +1,11 @@
+[Unit]
+Description=Secure Linux security audit (after boot, then every 6 hours)
+
+[Timer]
+OnBootSec=17min
+OnUnitActiveSec=6h
+RandomizedDelaySec=13min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

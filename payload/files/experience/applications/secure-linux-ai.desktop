@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Private AI
+GenericName=Private local coding assistant
+Comment=Scan your hardware, choose verified coding models and chat locally without a cloud account
+Exec=/usr/local/bin/secure-linux-ai gui
+Icon=applications-science
+Terminal=false
+Categories=Development;Utility;Science;
+Keywords=AI;coding;local;private;offline;Ollama;Colibri;Qwen;
+StartupNotify=true

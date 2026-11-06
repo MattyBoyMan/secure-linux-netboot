@@ -1,0 +1,10 @@
+#!/bin/bash
+# My Computer Activity: offline, read-only graphical dashboard.
+set -u
+ROOT=$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)
+if [ -n "${SL_ROOT:-}" ] && [ -f "$SL_ROOT/lib/activity_launcher.py" ]; then
+  ROOT=$SL_ROOT
+elif [ ! -f "$ROOT/lib/activity_launcher.py" ]; then
+  ROOT=/usr/local/lib/secure-linux
+fi
+exec python3 "$ROOT/lib/activity_launcher.py" "$@"

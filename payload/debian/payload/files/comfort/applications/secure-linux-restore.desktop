@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Restore My Files from a Backup
+GenericName=Restore personal folders safely
+Comment=Find a Secure Linux backup and copy personal folders home without silently replacing existing files
+Exec=/usr/local/bin/secure-linux-finish --gui restore
+Icon=document-revert
+Terminal=false
+Categories=Utility;Archiving;
+Keywords=restore;backup;files;Windows;Documents;Pictures;
+StartupNotify=true

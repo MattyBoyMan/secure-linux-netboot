@@ -13,5 +13,10 @@ done
 systemd-inhibit --what=shutdown:sleep:idle --who="Secure Linux" --why="Setting up apps" --mode=block \
   "$SL_ROOT/setup.sh"
 rc=$?
-touch "$STATE/firstboot.done"
+if [ "$rc" -eq 0 ] && [ ! -s /var/log/secure-linux/failures.log ]; then
+  touch "$STATE/firstboot.done"
+else
+  rm -f "$STATE/firstboot.done"
+  printf 'failed|?|Setup incomplete; run setup.sh and explicitly choose Resume or Fresh start\n' > "$STATE/progress"
+fi
 exit $rc

@@ -32,6 +32,23 @@ URANDOM=${SL_URANDOM:-/dev/urandom}
 umask 077
 mkdir -p "$ST"
 
+# Preparation work has no honest duration total. A step counter and loader are
+# used, never a timed percentage. The plain fallback works on older payloads.
+for SL_PROGRESS_LIB in "$DIR/lib/sl-progress.sh" "$DIR/linux/lib/sl-progress.sh" "$DIR/payload/lib/sl-progress.sh"; do
+  [ -f "$SL_PROGRESS_LIB" ] && { . "$SL_PROGRESS_LIB"; break; }
+done
+if ! command -v sl_progress_spinner_start >/dev/null 2>&1; then
+  sl_progress_spinner_start() { printf '%s\n' "$1"; }
+  sl_progress_spinner_stop() { [ -z "${1:-}" ] || printf '%s\n' "$1"; }
+fi
+SL_SCREEN_STEP=0
+sl_screen_begin() {
+  SL_SCREEN_STEP=$((SL_SCREEN_STEP + 1))
+  printf 'Preparation step %s: %s\n' "$SL_SCREEN_STEP" "$1"
+  sl_progress_spinner_start "$1"
+}
+sl_screen_end() { sl_progress_spinner_stop "${1:-}"; }
+
 # ---------------------------------------------------------------- the screen (console 2 of the installer)
 if [ -z "${SL_NOTTY:-}" ]; then
   TTY=${SL_TTY:-/dev/tty2}
@@ -111,6 +128,7 @@ UID_=$UUID;  junk_id "$UID_" && UID_=""
 if [ "$PHASE" = start ]; then
 
   # ---- hardware check (same rules as the Fedora screen; decides which Linux fits this computer)
+  sl_screen_begin 'Checking this computer. No percentage is available for the hardware check.'
   HW_STATUS=OK; HW_DISTRO=""; HW_REASON=""; HW_NEEDS_WIRED=0
   : > "$ST/hw-report.txt"
   if [ -f "$DIR/compat-check-min.sh" ]; then
@@ -122,6 +140,7 @@ if [ "$PHASE" = start ]; then
     v=$(sed -n 's/^HW_NEEDS_WIRED=//p' "$ST/hw-raw.txt" | tail -n 1);   case "$v" in 1) HW_NEEDS_WIRED=1 ;; esac
     grep -v '^HW_[A-Z_]*=' "$ST/hw-raw.txt" > "$ST/hw-report.txt"
   fi
+  sl_screen_end 'Hardware check finished.'
 
   header "this computer"
   rule
@@ -345,6 +364,7 @@ if [ "$PHASE" = start ]; then
     rule
     echo
   }
+  sl_screen_begin 'Preparing saved Wi-Fi records. No percentage is available for this check.'
   REC=""
   if [ -f "$DIR/wifi-records.txt" ]; then
     S1=$(printf '%s' "$SID" | tr 'A-Z' 'a-z'); U1=$(printf '%s' "$UID_" | tr 'A-Z' 'a-z')
@@ -355,6 +375,7 @@ if [ "$PHASE" = start ]; then
   # the home network's name, written by the builder (make-usb.ps1) into the payload
   HOME_SSID=""
   [ -f "$DIR/payload/build.conf" ] && HOME_SSID=$(sed -n 's/^HOME_WIFI_SSID=//p' "$DIR/payload/build.conf" | head -n 1)
+  sl_screen_end 'Saved Wi-Fi records prepared.'
 
   header "internet connection"
   NET_DONE=0

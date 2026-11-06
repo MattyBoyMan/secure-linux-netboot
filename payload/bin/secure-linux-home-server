@@ -1,0 +1,331 @@
+#!/bin/bash
+# Home & Server Helper: safe, beginner-friendly links to the existing home-server tools.
+# unRAID is always an EXTERNAL server running its own proprietary, separate OS. It is not bundled or installed here.
+set -u
+SL_ROOT=${SL_ROOT:-/usr/local/lib/secure-linux}
+. "$SL_ROOT/lib/common.sh"
+DRY=no
+[ "${1:-}" = --dry-run ] && { DRY=yes; shift; }
+
+say() { printf '%s\n' "$*"; }
+ask() { local a; printf '%s ' "$1" >&2; IFS= read -r a || return 1; printf '%s' "$a"; }
+
+_hs_confirm() {
+  local answer
+  say ""
+  say "Review: $1"
+  say "Nothing has been changed yet. Type exactly Confirm to continue; anything else cancels."
+  printf 'Confirmation: ' >&2
+  IFS= read -r answer || answer=""
+  [ "$answer" = Confirm ] || { say "Cancelled. Nothing was changed."; return 1; }
+  return 0
+}
+
+_hs_valid_target() {
+  local target=${1:-}
+  [[ "$target" =~ ^([A-Za-z_][A-Za-z0-9._-]{0,63}@)?[A-Za-z0-9][A-Za-z0-9.-]{0,253}$ ]] || return 1
+  case "$target" in *..*|*.-*|*-.*|*@-*|*@.*) return 1 ;; esac
+  return 0
+}
+
+_hs_valid_container() {
+  [[ "${1:-}" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$ ]]
+}
+
+_hs_valid_url() {
+  local url=${1:-} authority port
+  [[ "$url" =~ ^https?://[A-Za-z0-9][A-Za-z0-9.-]{0,253}(:[0-9]{1,5})?/?$ ]] || return 1
+  case "$url" in *..*|*.-*|*-.*) return 1 ;; esac
+  authority=${url#*://}; authority=${authority%/}
+  case "$authority" in
+    *:*) port=${authority##*:}; [ "$port" -ge 1 ] && [ "$port" -le 65535 ] || return 1 ;;
+  esac
+  return 0
+}
+
+_hs_unraid_note() {
+  say "unRAID is a proprietary, separate operating system on an external server."
+  say "It is not bundled with or installed by Secure Linux. This helper only uses its web UI, SSH or API."
+}
+
+_hs_kit() {
+  local u=${USER:-$(id -un)} root=${R:-} d
+  for d in ${SL_SERVER_KIT:+"$SL_SERVER_KIT"} "$SL_ROOT/server" \
+           "$root/run/media/$u"/*/linux-setup/server "$root/media/$u"/*/linux-setup/server \
+           "$root/mnt"/*/linux-setup/server "$root/run/media/$u"/*/*/linux-setup/server; do
+    [ -f "$d/setup-fleet-server.sh" ] && [ -d "$d/homeassistant" ] && { printf '%s\n' "$d"; return 0; }
+  done
+  return 1
+}
+
+_hs_ha() {
+  local action=${1:-open} helper args=()
+  case "$action" in
+    open) helper=secure-linux-ha; args=(open) ;;
+    setup) helper=secure-linux-ha-setup ;;
+    secure) helper=secure-linux-ha-secure; args=(--guided) ;;
+    learn) helper=secure-linux-ha-learn ;;
+    *) say "Use: secure-linux-home-server ha open|setup|secure|learn" >&2; return 2 ;;
+  esac
+  [ -x "$SL_ROOT/bin/$helper" ] || { say "The $helper tool is not included in this installation." >&2; return 1; }
+  if [ "$DRY" = yes ]; then say "[dry run] would run: $helper ${args[*]}"; return 0; fi
+  "$SL_ROOT/bin/$helper" "${args[@]}"
+}
+
+_hs_server_copy() {
+  local target=${1:-} kit
+  _hs_valid_target "$target" || { say "Invalid SSH login. Use a simple name like matt@server.local or matt@192.168.1.20." >&2; return 2; }
+  kit=$(_hs_kit) || {
+    say "The server kit is not available on this computer. Insert the Secure Linux USB stick and look for linux-setup/server, or set SL_SERVER_KIT to its folder. Nothing was copied." >&2
+    return 1
+  }
+  say "Server kit found: $kit"
+  say "This copies the existing scripts to ~/secure-linux-server on $target. It does not run an installer."
+  say "Files with the same names there may be replaced. Unrelated files are not intentionally deleted, and no remote backup is made."
+  say "Keep the server connected until copying finishes; an interrupted copy can be incomplete and should be copied again."
+  [ "$DRY" = yes ] && { say "[dry run] would copy the kit to $target with SSH; no connection made."; return 0; }
+  _hs_confirm "Copy the reviewed server kit to $target?" || return 1
+  ssh -o BatchMode=yes -o ConnectTimeout=10 -- "$target" 'mkdir -p secure-linux-server' || return 1
+  scp -r -- "$kit/." "$target:secure-linux-server/"
+}
+
+_hs_server_script() {
+  case "${1:-}" in
+    setup-fleet) printf '%s' setup-fleet-server.sh ;;
+    caddy) printf '%s' install-caddy.sh ;;
+    backup) printf '%s' setup-backup.sh ;;
+    immich-backup) printf '%s' immich-backup.sh ;;
+    ha-install) printf '%s' homeassistant/install-ha-container.sh ;;
+    ha-mosquitto) printf '%s' homeassistant/setup-mosquitto.sh ;;
+    ha-caddy) printf '%s' homeassistant/add-caddy.sh ;;
+    ha-firewall) printf '%s' homeassistant/firewall-lan-only.sh ;;
+    ha-harden) printf '%s' homeassistant/harden-host.sh ;;
+    ha-backup) printf '%s' homeassistant/setup-ha-backup.sh ;;
+    ha-update) printf '%s' homeassistant/safe-update.sh ;;
+    *) return 1 ;;
+  esac
+}
+
+_hs_server_run() {
+  local target=${1:-} action=${2:-} script
+  _hs_valid_target "$target" || { say "Invalid SSH login. Use name@server or name@IP-address." >&2; return 2; }
+  script=$(_hs_server_script "$action") || {
+    say "Unknown server action '$action'. Allowed: setup-fleet, caddy, backup, immich-backup, ha-install, ha-mosquitto, ha-caddy, ha-firewall, ha-harden, ha-backup, ha-update." >&2
+    return 2
+  }
+  say "This runs the existing $script on $target. That script may install or change server software and will ask its own questions."
+  say "Copy the kit first with: secure-linux-home-server server copy $target"
+  [ "$DRY" = yes ] && { say "[dry run] would run $script over SSH; no connection made."; return 0; }
+  _hs_confirm "Run $script as administrator on $target?" || return 1
+  ssh -t -- "$target" "sudo bash ~/secure-linux-server/$script"
+}
+
+_hs_unraid_web() {
+  local url=${1:-}
+  _hs_valid_url "$url" || { say "Invalid address. Use http://server.local or https://server.local:8443 (no login details in the address)." >&2; return 2; }
+  _hs_unraid_note
+  [ "$DRY" = yes ] && { say "[dry run] would open $url"; return 0; }
+  command -v xdg-open >/dev/null 2>&1 || { say "Open this address in your browser: $url"; return 0; }
+  xdg-open "$url"
+}
+
+_hs_unraid_status() {
+  local target=${1:-}
+  _hs_valid_target "$target" || { say "Invalid SSH login. Use name@server or name@IP-address." >&2; return 2; }
+  _hs_unraid_note
+  say "Read-only status: computer name, system version and a container list. Nothing is changed."
+  [ "$DRY" = yes ] && { say "[dry run] would request read-only status from $target"; return 0; }
+  ssh -o BatchMode=yes -o ConnectTimeout=10 -- "$target" 'printf "Server: "; hostname; uname -srmo; if command -v docker >/dev/null 2>&1; then docker ps --format "{{.Names}}\t{{.Status}}"; else echo "Docker command not found."; fi'
+}
+
+_hs_unraid_container() {
+  local action=${1:-} target=${2:-} name=${3:-}
+  case "$action" in start|stop) ;; *) return 2 ;; esac
+  _hs_valid_target "$target" || { say "Invalid SSH login." >&2; return 2; }
+  _hs_valid_container "$name" || { say "Invalid container name. Use only letters, numbers, dot, dash and underscore." >&2; return 2; }
+  _hs_unraid_note
+  say "Container: $name"
+  say "Action: $action on the external unRAID server $target. No software is installed by this action."
+  [ "$DRY" = yes ] && { say "[dry run] would $action $name on $target"; return 0; }
+  _hs_confirm "${action^} container $name on $target?" || return 1
+  ssh -t -- "$target" "sudo -n docker $action $name"
+}
+
+_hs_config_dir() { printf '%s' "${XDG_CONFIG_HOME:-$HOME/.config}/secure-linux/home-server"; }
+
+_hs_private_write() {
+  local path=$1 value=$2 dir tmp old_umask
+  dir=$(dirname "$path"); old_umask=$(umask); umask 077
+  mkdir -p "$dir"; chmod 0700 "$dir" 2>/dev/null || true
+  tmp=$(mktemp "$dir/.secret.XXXXXX") || { umask "$old_umask"; return 1; }
+  if ! printf '%s\n' "$value" > "$tmp"; then rm -f "$tmp"; umask "$old_umask"; return 1; fi
+  chmod 0600 "$tmp" && mv -f "$tmp" "$path" || { rm -f "$tmp"; umask "$old_umask"; return 1; }
+  chmod 0600 "$path" || { umask "$old_umask"; return 1; }
+  umask "$old_umask"
+}
+
+_hs_token_save() {
+  local url=${1:-} dir token
+  _hs_valid_url "$url" || { say "Invalid unRAID web address." >&2; return 2; }
+  _hs_unraid_note
+  say "The API token will be read without showing it, stored only for this user with mode 0600, and never put in a command-line argument or log."
+  dir=$(_hs_config_dir)
+  [ "$DRY" = yes ] && { say "[dry run] would privately save an API token for $url under $dir"; return 0; }
+  _hs_confirm "Save an API token for the external unRAID server $url?" || return 1
+  printf 'API token (input hidden): ' >&2
+  IFS= read -r -s token || token=""
+  printf '\n' >&2
+  [ -n "$token" ] && [ ${#token} -le 8192 ] || { say "No token saved: the token was empty or too long." >&2; return 1; }
+  case "$token" in *[$'\r\n\t']*) say "No token saved: control characters are not accepted." >&2; return 1 ;; esac
+  _hs_private_write "$dir/unraid-api-token" "$token" || { say "Could not save the private token file." >&2; return 1; }
+  _hs_private_write "$dir/unraid-url" "$url" || { say "Could not save the unRAID address." >&2; return 1; }
+  say "Token saved privately for $url. The token itself was not displayed."
+}
+
+_hs_api_test() {
+  local url=${1:-} dir token escaped api
+  dir=$(_hs_config_dir)
+  if [ -z "$url" ] && [ -r "$dir/unraid-url" ]; then IFS= read -r url < "$dir/unraid-url"; fi
+  _hs_valid_url "$url" || { say "Supply a valid unRAID address, or save one with unraid token-save." >&2; return 2; }
+  _hs_unraid_note
+  api=${url%/}/graphql
+  say "This sends a read-only GraphQL schema-introspection query. It does not assume any unRAID-specific API fields and changes nothing."
+  [ "$DRY" = yes ] && { say "[dry run] would test the API at $api with the privately stored token"; return 0; }
+  [ -r "$dir/unraid-api-token" ] || { say "No saved API token. Run unraid token-save first." >&2; return 1; }
+  IFS= read -r token < "$dir/unraid-api-token"
+  [ -n "$token" ] || { say "The saved token is empty; save it again." >&2; return 1; }
+  escaped=${token//\\/\\\\}; escaped=${escaped//\"/\\\"}
+  {
+    printf 'header = "Authorization: Bearer %s"\n' "$escaped"
+    printf '%s\n' 'header = "Content-Type: application/json"'
+    printf '%s\n' 'data = "{\"query\":\"{ __schema { queryType { name } } }\"}"'
+  } | curl --silent --show-error --fail --connect-timeout 10 --max-time 30 --request POST --config - "$api"
+}
+
+_hs_as_user() {
+  local user=$1 uid=$2 home=$3; shift 3
+  if [ "$(id -u)" = "$uid" ]; then
+    HOME="$home" USER="$user" LOGNAME="$user" XDG_RUNTIME_DIR="/run/user/$uid" "$@"
+  elif [ "$(id -u)" -eq 0 ]; then
+    runuser -u "$user" -- env HOME="$home" USER="$user" LOGNAME="$user" XDG_RUNTIME_DIR="/run/user/$uid" \
+      DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" "$@"
+  else
+    say "Run this as the main desktop user, not through sudo." >&2
+    return 1
+  fi
+}
+
+_hs_rootless() {
+  local user uid home
+  user=${SL_MAIN_USER:-${SUDO_USER:-${USER:-$(id -un)}}}
+  [ "$(id -u)" -ne 0 ] || user=${SL_MAIN_USER:-$(sl_user)}
+  uid=$(id -u "$user" 2>/dev/null) || { say "Could not find the main user account '$user'." >&2; return 1; }
+  home=$(getent passwd "$user" | cut -d: -f6)
+  [ -n "$home" ] || { say "Could not find the home folder for $user." >&2; return 1; }
+  say "Rootless Docker runs the daemon and containers as $user, reducing the impact of a Docker security problem."
+  say "The existing rootful Docker service stays intact for the server kit's sudo docker commands. No docker-group membership is granted."
+  say "The official dockerd-rootless-setuptool.sh installer will create a per-user service and select the rootless context. Linger lets it start at boot where supported."
+  if [ "$DRY" = yes ]; then
+    say "[dry run] would run dockerd-rootless-setuptool.sh install --force as $user, enable linger where available, and select the rootless context."
+    return 0
+  fi
+  _hs_confirm "Set up per-user rootless Docker for $user while leaving rootful Docker intact?" || return 1
+  command -v dockerd-rootless-setuptool.sh >/dev/null 2>&1 || {
+    say "dockerd-rootless-setuptool.sh is missing. Run Repair setup to install docker-ce-rootless-extras first." >&2
+    return 1
+  }
+  _hs_as_user "$user" "$uid" "$home" dockerd-rootless-setuptool.sh install --force || return 1
+  if command -v loginctl >/dev/null 2>&1; then
+    if [ "$(id -u)" -eq 0 ]; then loginctl enable-linger "$user" || return 1
+    else sudo loginctl enable-linger "$user" || return 1
+    fi
+  else
+    say "loginctl is unavailable; rootless Docker is installed but cannot start automatically at boot."
+  fi
+  _hs_as_user "$user" "$uid" "$home" docker context use rootless
+}
+
+_hs_docker_safety() {
+  say "Docker safety in plain English:"
+  say "  - The docker group is effectively unrestricted administrator/root access. This helper never adds you to it."
+  say "  - Use the rootless action for your own containers; it does not disable rootful sudo docker used by the server kit."
+  say "  - Containers and images still need updates and backups. Do not expose server ports directly to the internet."
+}
+
+_hs_help() {
+  sed -n '2,5p' "$0" | sed 's/^# \{0,1\}//'
+  cat <<'EOF'
+Use: secure-linux-home-server [--dry-run] COMMAND [ARGUMENTS]
+
+Home Assistant:
+  ha open | setup | secure | learn
+
+Existing home server (validated SSH target, reviewed changes):
+  server copy TARGET
+  server run TARGET ACTION
+  Actions: setup-fleet, caddy, backup, immich-backup, ha-install, ha-mosquitto,
+           ha-caddy, ha-firewall, ha-harden, ha-backup, ha-update
+
+External unRAID server (proprietary separate OS, never installed here):
+  unraid web URL
+  unraid status TARGET
+  unraid start TARGET CONTAINER
+  unraid stop TARGET CONTAINER
+  unraid token-save URL          (hidden token input; private 0600 file)
+  unraid api-test [URL]          (read-only schema introspection)
+
+Docker:
+  docker safety
+  docker rootless
+
+TARGET looks like matt@server.local or matt@192.168.1.20. URL is only http(s)://host[:port].
+Every copy, server change, container start/stop, token save and rootless setup asks for exactly Confirm.
+--dry-run makes no connection and saves or changes nothing.
+EOF
+}
+
+_hs_menu() {
+  local choice target action url
+  while true; do
+    cat <<'EOF'
+
+Home & Server Helper
+====================
+ 1) Open Home Assistant             2) Guided Home Assistant setup
+ 3) Home Assistant security check   4) Home Assistant lessons
+ 5) Copy the existing server kit    6) Run a reviewed server-kit action
+ 7) Open external unRAID web UI     8) Read external unRAID status
+ 9) Start/stop an unRAID container 10) Save/test an unRAID API token
+11) Explain Docker safety          12) Set up rootless Docker
+ 0) Exit
+EOF
+    choice=$(ask "Choose a number:") || { say "No answer received. Nothing was changed."; return 1; }
+    case "$choice" in
+      1) _hs_ha open ;; 2) _hs_ha setup ;; 3) _hs_ha secure ;; 4) _hs_ha learn ;;
+      5) target=$(ask "Server SSH login (name@server):"); _hs_server_copy "$target" ;;
+      6) target=$(ask "Server SSH login (name@server):"); action=$(ask "Action (for example ha-install or backup):"); _hs_server_run "$target" "$action" ;;
+      7) url=$(ask "External unRAID web address:"); _hs_unraid_web "$url" ;;
+      8) target=$(ask "External unRAID SSH login:"); _hs_unraid_status "$target" ;;
+      9) target=$(ask "External unRAID SSH login:"); action=$(ask "start or stop:"); url=$(ask "Container name:"); _hs_unraid_container "$action" "$target" "$url" ;;
+      10)
+        url=$(ask "External unRAID web address:"); action=$(ask "Type save or test:")
+        if [ "$action" = save ]; then _hs_token_save "$url"; else _hs_api_test "$url"; fi ;;
+      11) _hs_docker_safety ;; 12) _hs_rootless ;;
+      0) return 0 ;; *) say "Choose a number from 0 to 12." ;;
+    esac
+  done
+}
+
+case "${1:-menu}" in
+  -h|--help|help) _hs_help ;;
+  menu) _hs_menu ;;
+  ha) _hs_ha "${2:-open}" ;;
+  server) case "${2:-}" in copy) _hs_server_copy "${3:-}" ;; run) _hs_server_run "${3:-}" "${4:-}" ;; *) _hs_help; exit 2 ;; esac ;;
+  unraid) case "${2:-}" in
+    web) _hs_unraid_web "${3:-}" ;; status) _hs_unraid_status "${3:-}" ;;
+    start|stop) _hs_unraid_container "$2" "${3:-}" "${4:-}" ;;
+    token-save) _hs_token_save "${3:-}" ;; api-test) _hs_api_test "${3:-}" ;;
+    *) _hs_help; exit 2 ;; esac ;;
+  docker) case "${2:-safety}" in safety) _hs_docker_safety ;; rootless) _hs_rootless ;; *) _hs_help; exit 2 ;; esac ;;
+  *) _hs_help; exit 2 ;;
+esac

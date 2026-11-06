@@ -1,0 +1,7 @@
+{
+  "application": "secure-linux-release",
+  "release_id": "secure-linux-2026.11.06-f51e5fcefb47f0a3",
+  "release_manifest_sha256": "a824245858092688a632bc13cc22eac8e55ecd1845ff32f911b13a02f6c5917a",
+  "schema_version": 1,
+  "source_sha256": "f51e5fcefb47f0a3c29f5d2a8b5894ceb0017300cf6cb3b55194a48229e6fdc2"
+}

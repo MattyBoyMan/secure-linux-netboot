@@ -1,0 +1,21 @@
+{
+  "format": 1,
+  "purpose": "Separate offline-image handoff only; does not modify or activate offline-bundle",
+  "image": "pihole/pihole:2026.10.1@sha256:30f803ad5dd60ff96cc0a63008a2e9271af481c1b0399a182192b2e91152c1f9",
+  "version": "2026.10.1",
+  "registry_digest": "sha256:30f803ad5dd60ff96cc0a63008a2e9271af481c1b0399a182192b2e91152c1f9",
+  "registry_source": "https://hub.docker.com/v2/repositories/pihole/pihole/tags/2026.10.1",
+  "release_source": "https://github.com/pi-hole/docker-pi-hole/releases/tag/2026.10.1",
+  "export_command": "secure-linux-pihole export-image --destination /path/to/handoff",
+  "export_outputs": [
+    "pihole-<version>-<digest-prefix>.tar",
+    "pihole-<version>-<digest-prefix>.json",
+    "pihole-<version>-<digest-prefix>.sha256"
+  ],
+  "consumer_requirements": [
+    "Verify the archive SHA-256 against the sidecar before docker load",
+    "Load with docker load --input ARCHIVE on the target architecture",
+    "Do not rename the image to latest or strip the immutable digest",
+    "Leave the active offline-bundle unchanged until its owner integrates this handoff"
+  ]
+}

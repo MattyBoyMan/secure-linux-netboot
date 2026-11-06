@@ -48,6 +48,46 @@ root_create_user() {  # --create-user LOGIN "Full Name"   (password on stdin)
   echo "Created $login"
 }
 
+root_set_identity() { # --set-identity LOGIN "Full Name"   optional new password on stdin
+  exp_elevate --set-identity "$@"
+  local login=${1:-} full=${2:-} pw
+  printf '%s' "$login" | grep -qE '^[a-z_][a-z0-9_-]{0,30}$' || { echo "That login name isn't allowed." >&2; return 1; }
+  [ "$login" = "$(sl_user)" ] || { echo "The active login cannot be renamed safely during its session." >&2; return 1; }
+  id "$login" >/dev/null 2>&1 || { echo "The active account does not exist." >&2; return 1; }
+  case "$full" in *:*|*$'\n'*) echo "The full name can't contain ':' or a newline." >&2; return 1 ;; esac
+  IFS= read -r pw || true
+  if [ -n "$pw" ]; then
+    [ ${#pw} -ge 6 ] || { echo "The password is too short." >&2; return 1; }
+    printf '%s:%s\n' "$login" "$pw" | chpasswd || return 1
+  fi
+  [ -z "$full" ] || usermod -c "$full" "$login" || return 1
+}
+
+root_wifi_saved() { # --wifi-saved   saved-record PIN on stdin; import all, select none silently
+  exp_elevate --wifi-saved
+  local py=$SL_ROOT/sl-wifi.py rec=$SL_STATE/wifi-record staged=$SL_STATE/wifi-staged
+  local dest=/etc/NetworkManager/system-connections pin kind tmp opened=0
+  [ -s "$rec" ] || [ -s "$staged" ] || return 0
+  [ -r "$py" ] || { echo "The protected Wi-Fi import helper is missing." >&2; return 1; }
+  IFS= read -r pin || true
+  tmp=$(mktemp -d); chmod 700 "$tmp"; trap 'rm -rf "$tmp"' RETURN
+  if [ -s "$rec" ]; then
+    kind=$(cut -d'|' -f1 "$rec" | head -1)
+    if [ "$kind" = enc1 ]; then
+      [ -n "$pin" ] || { echo "The saved Wi-Fi PIN was not supplied; nothing was imported." >&2; return 1; }
+      SL_WIFI_PIN=$pin python3 "$py" open "$rec" "$tmp/bundle" >/dev/null 2>&1 && opened=1
+    else
+      python3 "$py" open "$rec" "$tmp/bundle" >/dev/null 2>&1 && opened=1
+    fi
+    [ "$opened" = 1 ] || { echo "The saved Wi-Fi record could not be opened; nothing was imported." >&2; return 1; }
+    python3 "$py" keyfiles "$tmp/bundle" "$dest" || return 1
+    rm -f "$rec"
+  fi
+  if [ -s "$staged" ]; then python3 "$py" keyfiles "$staged" "$dest" || return 1; rm -f "$staged"; fi
+  command -v nmcli >/dev/null 2>&1 && nmcli connection reload >/dev/null 2>&1
+  return 0
+}
+
 # ================================================================ user side
 USTATE=$HOME/.local/state/secure-linux
 DONE=$USTATE/wizard-pages          # answered pages, one per line
@@ -362,46 +402,31 @@ run_page() {
 }
 
 wizard() {
-  local p left=0 a
+  local p
   if ! is_main_user; then family_welcome; return; fi
   copy_guide_to_desktop
-  if [ ! -s "$DONE" ]; then
-    a=$(ui_ask welcome "Hello $(first_name), and welcome to your new computer!
-
-$(progress_text)
-
-A few friendly questions come next (about 10 minutes): VPN, home Wi-Fi, battery, backups and more. Every question can be skipped, and you can change any answer later from the app menu: \"Welcome & Setup Choices\"." "Let's start" "Not now")
-    if [ "$a" != yes ]; then
-      open_guide
-      exp_notify "Welcome!" "We'll ask the setup questions next time you log in. The START-HERE guide is on your Desktop."
-      return 0
+  # The default journey is exactly five screens. Built-in and plug-in questions remain available
+  # through --page / secure-linux-migrate after installation, never as a second first-run queue.
+  . "$SL_ROOT/wizard.d/00-core.sh"
+  if ! sl_wizard_run; then
+    exp_notify "Setup paused" "Nothing was applied. Open Welcome & Setup Choices whenever you are ready."
+    return 0
+  fi
+  for p in $PAGES; do mark_done "$p"; done
+  bash "$SL_EXP/user-setup.sh" screenlock >/dev/null 2>&1 || true
+  want welcome_done yes
+  flush
+  touch "$USTATE/welcomed"
+  # Readiness verification is informational and never adds another question page or traps the wizard.
+  if [ -r "$SL_ROOT/bin/secure-linux-ready" ]; then
+    if [ -n "${SL_WIZARD_ANSWERS:-}" ] && [ -n "${SL_TEST_SYSROOT:-}" ]; then
+      SL_READY_CHECK=${SL_READY_CHECK:-true} SL_READY_NO_FIX=1 SL_READY_ONLINE=yes \
+        bash "$SL_ROOT/bin/secure-linux-ready" || true
+    else
+      bash "$SL_ROOT/bin/secure-linux-ready" || true
     fi
   fi
-  for p in $PAGES; do
-    page_done "$p" && continue
-    run_page "$p" || left=$((left + 1))
-  done
-  run_plugin_pages
-  bash "$SL_EXP/user-setup.sh" screenlock >/dev/null 2>&1 || true   # in-session (Xfce needs the session bus)
-  if [ $left -eq 0 ]; then
-    want welcome_done yes
-    flush
-    touch "$USTATE/welcomed"
-    ui_info finish "All done. Thank you!
-
-$(progress_text)
-
-The START-HERE guide opens now: it explains every app and what to do if something goes wrong. It's also on your Desktop.
-
-Change any answer later: app menu > \"Welcome & Setup Choices\".
-Something not right? App menu > \"Secure Linux Status\"."
-    open_guide
-  else
-    flush
-    ui_info later "Thanks! $left question(s) need setup to finish first. We'll ask them next time you log in.
-
-$(progress_text)"
-  fi
+  open_guide
 }
 
 family_welcome() {
@@ -448,10 +473,12 @@ status() {
   echo "  $(progress_text)"
 }
 
-case "${1:-}" in --save|--create-user|-h|--help) ;; *) init_user_state ;; esac
+case "${1:-}" in --save|--create-user|--set-identity|--wifi-saved|-h|--help) ;; *) init_user_state ;; esac
 case "${1:-}" in
   --save) shift; root_save "$@" ;;
   --create-user) shift; root_create_user "$@" ;;
+  --set-identity) shift; root_set_identity "$@" ;;
+  --wifi-saved) shift; root_wifi_saved "$@" ;;
   --add-family-member) add_family_member ;;
   --autostart)
     if [ -f "$USTATE/welcomed" ]; then

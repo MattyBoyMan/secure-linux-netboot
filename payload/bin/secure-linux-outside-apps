@@ -1,6 +1,6 @@
 #!/bin/bash
 # secure-linux-outside-apps: keeps software that doesn't come from Fedora's own repositories up to date (A9):
-#   OpenSnitch (app firewall, RPMs from GitHub), the ArtCraft launcher (RPM from GitHub), immich-go (program).
+#   OpenSnitch (app firewall), the ArtCraft launcher and all 16 Craft apps (RPMs from GitHub), immich-go (program).
 #   secure-linux-outside-apps --check    compare installed versions with the latest GitHub releases (weekly
 #                                        timer); raises the alert "outside-apps-update" when something is newer
 #   secure-linux-outside-apps --update   download, verify the checksums and install the updates
@@ -40,20 +40,31 @@ newer() { [ "$1" != "$2" ] && [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail 
 
 # ---------------------------------------------------------------- what is installed
 inst_opensnitch() { rpm -q --qf '%{VERSION}\n' opensnitch 2>/dev/null | head -1 | grep -v 'not installed'; }
-artcraft_pkg() { rpm -qa --qf '%{NAME}\n' 2>/dev/null | grep -m1 -iE '^(artcraft|craft-launcher|craft_launcher|artcraft-launcher)$'; }   # VERIFY package name
-inst_artcraft() { local p; p=$(artcraft_pkg) && [ -n "$p" ] && rpm -q --qf '%{VERSION}\n' "$p" | head -1; }
+craft_pkg() {
+  local app=$1 marker p
+  [ "$app" = artcraft ] && app=craft-launcher
+  marker="$SL_STATE/artcraft-$app.package"
+  p=$(cat "$marker" 2>/dev/null)
+  if [ -z "$p" ] && [ "$app" = craft-launcher ]; then
+    p=$(rpm -qa --qf '%{NAME}\n' 2>/dev/null | grep -m1 -iE '^(artcraft|craft-launcher|craft_launcher|artcraft-launcher)$')
+  fi
+  printf '%s' "${p:-$app}"
+}
+inst_craft() { local p; p=$(craft_pkg "$1"); [ -n "$p" ] && rpm -q --qf '%{VERSION}\n' "$p" 2>/dev/null | head -1 | grep -v 'not installed'; }
 IMMICH_BIN=${SL_TEST_SYSROOT:-}/usr/local/bin/immich-go   # (SL_TEST_SYSROOT is only ever set by the test suites)
 inst_immichgo() { [ -x "$IMMICH_BIN" ] && "$IMMICH_BIN" --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1; }
+installed_version() { case "$1" in opensnitch) inst_opensnitch ;; immichgo) inst_immichgo ;; *) inst_craft "$1" ;; esac; }
 
-APPS=(opensnitch artcraft immichgo)
-repo_of() { case "$1" in opensnitch) echo evilsocket/opensnitch ;; artcraft) echo storytold/craft-launcher ;; immichgo) echo simulot/immich-go ;; esac; }
-name_of() { case "$1" in opensnitch) echo "OpenSnitch" ;; artcraft) echo "ArtCraft" ;; immichgo) echo "immich-go" ;; esac; }
+APPS=(opensnitch artcraft immichgo photocraft vectorcraft filmcraft lightcraft pdfcraft effectcraft designcraft
+      figcraft wordcraft soundcraft deckcraft cadcraft gridcraft texturecraft materialcraft craft-anything)
+repo_of() { case "$1" in opensnitch) echo evilsocket/opensnitch ;; artcraft) echo storytold/craft-launcher ;; immichgo) echo simulot/immich-go ;; *) echo "storytold/$1" ;; esac; }
+name_of() { case "$1" in opensnitch) echo "OpenSnitch" ;; artcraft) echo "ArtCraft launcher" ;; immichgo) echo "immich-go" ;; *) echo "$1" ;; esac; }
 
 check_all() {   # writes STATEF lines: app|installed|latest ; prints the names with updates
   local a i l j tmp; tmp=$(mktemp)
   for a in "${APPS[@]}"; do
     sl_is_atomic && [ "$a" != immichgo ] && continue
-    i=$("inst_$a"); [ -n "$i" ] || continue
+    i=$(installed_version "$a"); [ -n "$i" ] || continue
     if [ "$a" = opensnitch ] && ! sl_is_x86_64; then   # other CPUs use Fedora's own package: ask Fedora, not GitHub
       l=$(dnf -q repoquery --latest-limit=1 --qf '%{version}' opensnitch 2>/dev/null | head -1)
     else
@@ -111,26 +122,38 @@ update_immichgo() {
     && { have restorecon && restorecon "$IMMICH_BIN"; sl_unskip_app immich-go; echo "  immich-go updated."; }
 }
 
-update_artcraft() {
-  local j assets url sums f base re
+update_craft() {
+  local repository=$1 app=$2 j assets url sums f base re marker
   case "$(sl_arch)" in
     x86_64) re='linux-x86_64[.]rpm$' ;;
     aarch64) re='linux-(aarch64|arm64)[.]rpm$' ;;
-    *) skip_unavailable ArtCraft "There is no ArtCraft download for this type of computer ($(sl_arch))."; return 0 ;;
+    *) skip_unavailable "$app" "There is no $app download for this type of computer ($(sl_arch))."; return 0 ;;
   esac
-  j=$(release_json storytold/craft-launcher) || return 1
+  j=$(release_json "$repository") || return 1
   assets=$(printf '%s' "$j" | json_assets)
   url=$(printf '%s\n' "$assets" | awk -F'|' -v re="$re" '$1 ~ re {print $2; exit}')
-  sums=$(printf '%s\n' "$assets" | awk -F'|' '$1 == "SHA256SUMS.txt" {print $2; exit}')
+  sums=$(printf '%s\n' "$assets" | awk -F'|' '$1 == "SHA256SUMS.txt" || $1 == "SHA256SUMS" {print $2; exit}')
   if [ -z "$url" ] && [ "$(sl_arch)" = aarch64 ] && printf '%s\n' "$assets" | grep -q 'linux.*[.]rpm|'; then
-    skip_unavailable ArtCraft "ArtCraft's makers don't offer a version for Apple Silicon (ARM) yet."; return 0
+    skip_unavailable "$app" "$app's makers don't offer a version for Apple Silicon (ARM) yet."; return 0
   fi
-  [ -n "$url" ] && [ -n "$sums" ] || { echo "  The ArtCraft download or its SHA256SUMS.txt is missing on GitHub."; return 1; }
+  [ -n "$url" ] && [ -n "$sums" ] || { echo "  The $app download or its SHA256SUMS.txt is missing on GitHub."; return 1; }
   base=${url##*/}; f="$WORK/$base"
-  fetch "$url" "$f" && fetch "$sums" "$WORK/SHA256SUMS.txt" || { echo "  Download failed."; return 1; }
-  (cd "$WORK" && grep -E "[ *]$(printf '%s' "$base" | sed 's/[.[\*^$]/\\&/g')\$" SHA256SUMS.txt | sed 's/ \*/  /' | sha256sum -c -) \
+  fetch "$url" "$f" && fetch "$sums" "$WORK/SHA256SUMS.$app.txt" || { echo "  Download failed."; return 1; }
+  (cd "$WORK" && grep -E "[ *]$(printf '%s' "$base" | sed 's/[.[\*^$]/\\&/g')\$" "SHA256SUMS.$app.txt" | sed 's/ \*/  /' | sha256sum -c -) \
     || { echo "  CHECKSUM MISMATCH: not installed."; return 1; }
-  dnf -y install "$f" && { sl_unskip_app ArtCraft; echo "  ArtCraft updated."; }
+  dnf -y install "$f" || return 1
+  [ "$app" = artcraft ] && app=craft-launcher
+  marker="$SL_STATE/artcraft-$app.package"
+  rpm -qp --qf '%{NAME}' "$f" 2>/dev/null > "$marker.new" && mv -f "$marker.new" "$marker"
+  sl_unskip_app "$app"; echo "  $app updated."
+}
+update_app() {
+  case "$1" in
+    opensnitch) update_opensnitch ;;
+    immichgo) update_immichgo ;;
+    artcraft) update_craft storytold/craft-launcher artcraft ;;
+    *) update_craft "storytold/$1" "$1" ;;
+  esac
 }
 
 # Mirrors files/security/opensnitch/install.sh:  full = daemon + window (opensnitch-ui); lite = daemon only (the window
@@ -188,7 +211,7 @@ case "$MODE" in
     for u in "${ups[@]}"; do      # (not a `while read` loop: the updates may ask a question on the keyboard)
       IFS='|' read -r a i l <<<"$u"
       echo; echo "$(name_of "$a"): $i -> $l"
-      "update_$a" || echo "  $(name_of "$a") was not updated."
+      update_app "$a" || echo "  $(name_of "$a") was not updated."
     done
     check_all; raise_or_clear ;;
   --show)

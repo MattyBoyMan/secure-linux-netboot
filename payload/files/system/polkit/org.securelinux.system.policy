@@ -17,6 +17,16 @@
     </defaults>
     <annotate key="org.freedesktop.policykit.exec.path">/usr/local/bin/secure-linux-check</annotate>
   </action>
+  <action id="org.securelinux.security-audit">
+    <description>Check security evidence on this computer</description>
+    <message>Secure Linux needs your password to check security evidence on this computer (it only looks, it changes nothing)</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/bin/secure-linux-security-audit</annotate>
+  </action>
   <action id="org.securelinux.diag">
     <description>Make a diagnostics file</description>
     <message>Secure Linux needs your password to collect system information for a diagnostics file (private details are blanked out)</message>

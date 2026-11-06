@@ -1,0 +1,86 @@
+{
+  "version": 1,
+  "font": {
+    "family": "Cantarell, Adwaita Sans, sans-serif",
+    "body_px": 16,
+    "small_px": 13,
+    "title_px": 30,
+    "section_px": 22
+  },
+  "space": {
+    "1": 4,
+    "2": 8,
+    "3": 12,
+    "4": 16,
+    "5": 20,
+    "6": 24,
+    "8": 32,
+    "10": 40,
+    "12": 48
+  },
+  "size": {
+    "target_px": 44,
+    "compact_nav_px": 720,
+    "content_max_px": 1180,
+    "motion_ms": 160
+  },
+  "themes": {
+    "light": {
+      "window": "#f4f5f2",
+      "surface": "#fcfdfb",
+      "sidebar": "#e8ebe6",
+      "text": "#202724",
+      "muted": "#59635e",
+      "border": "#d3dad4",
+      "accent": "#087d70",
+      "accent_hover": "#06675d",
+      "accent_soft": "#dcf0ea",
+      "on_accent": "#f7fffc",
+      "success": "#25734e",
+      "success_soft": "#e0f1e5",
+      "warning": "#8a5a14",
+      "warning_soft": "#f6ead4",
+      "danger": "#a23b3f",
+      "danger_soft": "#f6e4e3",
+      "focus": "#087d70"
+    },
+    "dark": {
+      "window": "#161a18",
+      "surface": "#202522",
+      "sidebar": "#1b201d",
+      "text": "#edf1ec",
+      "muted": "#abb5ae",
+      "border": "#424b45",
+      "accent": "#71d4c4",
+      "accent_hover": "#94e2d5",
+      "accent_soft": "#23473f",
+      "on_accent": "#102a25",
+      "success": "#8ed3aa",
+      "success_soft": "#263e30",
+      "warning": "#e5bd79",
+      "warning_soft": "#453822",
+      "danger": "#f0a3a5",
+      "danger_soft": "#482b2d",
+      "focus": "#94e2d5"
+    },
+    "high-contrast": {
+      "window": "#f7f8f5",
+      "surface": "#f7f8f5",
+      "sidebar": "#e2e6df",
+      "text": "#111512",
+      "muted": "#29322c",
+      "border": "#39423c",
+      "accent": "#005f55",
+      "accent_hover": "#004a43",
+      "accent_soft": "#d1e9e1",
+      "on_accent": "#f7fffc",
+      "success": "#075e32",
+      "success_soft": "#d7ecdc",
+      "warning": "#694000",
+      "warning_soft": "#f3e2be",
+      "danger": "#8b171d",
+      "danger_soft": "#f3d8d7",
+      "focus": "#005f55"
+    }
+  }
+}

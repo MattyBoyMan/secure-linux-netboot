@@ -1,0 +1,16 @@
+#!/bin/sh
+# Optional whole-home Pi-hole: graphical by default, narrow CLI with arguments.
+set -eu
+SELF=$(readlink -f "$0" 2>/dev/null || printf '%s\n' "$0")
+HERE=$(dirname "$SELF")
+if [ -n "${SL_ROOT:-}" ] && [ -r "$SL_ROOT/lib/pihole_cli.py" ]; then
+  LIB=$SL_ROOT/lib
+elif [ -r "$HERE/../lib/pihole_cli.py" ]; then
+  LIB=$HERE/../lib
+else
+  LIB=/usr/local/lib/secure-linux/lib
+fi
+if [ "$#" -eq 0 ]; then
+  exec python3 "$LIB/pihole_gui.py"
+fi
+exec python3 "$LIB/pihole_cli.py" "$@"

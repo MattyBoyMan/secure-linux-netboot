@@ -1,0 +1,13 @@
+#!/bin/sh
+# Graphical frontend only; disk operations stay in secure-linux-usb-fixer.
+set -eu
+SELF=$(readlink -f "$0" 2>/dev/null || printf '%s\n' "$0")
+HERE=$(dirname "$SELF")
+if [ -n "${SL_ROOT:-}" ] && [ -r "$SL_ROOT/lib/gui_tools_launcher.py" ]; then
+  APP=$SL_ROOT/lib/gui_tools_launcher.py
+elif [ -r "$HERE/../lib/gui_tools_launcher.py" ]; then
+  APP=$HERE/../lib/gui_tools_launcher.py
+else
+  APP=/usr/local/lib/secure-linux/lib/gui_tools_launcher.py
+fi
+exec python3 "$APP" --app usb --view fixer "$@"

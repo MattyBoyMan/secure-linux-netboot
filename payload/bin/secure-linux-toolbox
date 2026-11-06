@@ -3,7 +3,7 @@
 #   secure-linux-toolbox              open the Toolbox (it first runs a quick check that only LOOKS, then shows green / amber / red)
 #   secure-linux-toolbox --autopilot  "Look after my computer": check, then fix the safe things, update, tidy and check again.
 #                                     You say yes once. Nothing risky is ever done without its own, separate yes.
-#   secure-linux-toolbox --screen NAME  go straight to one screen: autopilot problems fixall health rescue trouble windows
+#   secure-linux-toolbox --screen NAME  go straight to one screen: autopilot problems fixall health rescue recommended trouble windows
 #                                     clean security updates backup help advanced settings
 #   secure-linux-toolbox --check      print the quick check as text and stop (exit 0 healthy, 1 attention, 2 problem)
 #   secure-linux-toolbox --dry-run    show what every step would do, change nothing
@@ -502,21 +502,59 @@ tb_settings() {
   ui_reinit; UI_APP="Secure Linux Toolbox"; ui_say "Saved. The new look is used from now on."
   ui_pop; ui_wait
 }
+tb_recommended_launch() {   # command title [arguments]: keep interactive confirmation inside the completed tool
+  local cmd=$1 title=$2
+  shift 2
+  if [ ! -f "$SL_ROOT/bin/$cmd" ]; then
+    ui_error "That tool is not installed here." "Repair the Secure Linux setup, then try again." "$SL_ROOT/bin/$cmd is missing"
+    ui_wait; return 1
+  fi
+  if [ "$TB_DRY" = 1 ]; then
+    ui_say "[dry run] would open: $title. Nothing was opened or changed."
+    ui_wait; return 0
+  fi
+  tb_term "$SL_ROOT/bin/$cmd" "$@"
+  ui_wait
+}
+tb_recommended() {
+  ui_push "Recommended tools"
+  while :; do
+    ui_header "Recommended tools"
+    ui_say "Friendly tools for a USB drive, a Flipper Zero, a home server, or the last setup steps. Each tool explains itself and asks before it changes anything."
+    ui_menu "What would you like to open?" \
+      "usbfixer|Fix or recover a USB drive|Look first, save an image, then choose repair or reformat" \
+      "usbcreator|Linux USB Installer Creator - Turn any blank USB into a Linux installer|Save a master and verify every clone" \
+      "flipper|Flipper Zero companion|Back up, prepare and manage RogueMaster safely" \
+      "homeserver|Home & Server Helper|Home Assistant, an existing server and safer Docker" \
+      "finish|Finish my setup|Restore files, finish apps and check what still needs you" || break
+    case $UI_REPLY in
+      usbfixer) tb_recommended_launch secure-linux-usb-fixer "Secure Linux USB Fixer" ;;
+      usbcreator) tb_recommended_launch secure-linux-usb-creator "Linux USB Installer Creator - Turn any blank USB into a Linux installer" ;;
+      flipper) tb_recommended_launch secure-linux-flipper "Secure Linux Flipper Companion" menu ;;
+      homeserver) tb_recommended_launch secure-linux-home-server "Home & Server Helper" ;;
+      finish) tb_recommended_launch secure-linux-finish "Finish my setup" ;;
+    esac
+  done
+  ui_pop
+}
 tb_more() {
   ui_push "Advanced / Show me more"
   while :; do
     ui_header "Advanced / Show me more"
     ui_menu "More things you can do" \
+      "recommended|Recommended tools|USB repair, installer creation, Flipper, home server and finishing" \
       "clean|Clean up and speed up|Frees space safely" \
       "security|Security check|Is everything locked down?" \
       "updates|Updates|Install waiting updates" \
       "backup|Back up my files|Copy them to an external drive" \
+      "ready|Is my computer ready?|Check everything, safely fix what we can, then check again" \
       "fleet|Join a home fleet|Lets your main computer help look after this PC - only if you say yes" \
       "help|Get help|Search the guide, explain an error" \
       "advanced|Every original tool|With a safe preview" \
       "settings|Easier to read|High contrast and plain text" || break
     case $UI_REPLY in
-      clean) tb_clean_flow ;; security) tb_security ;; updates) tb_updates_flow ;; backup) tb_backup ;;
+      recommended) tb_recommended ;; clean) tb_clean_flow ;; security) tb_security ;; updates) tb_updates_flow ;; backup) tb_backup ;;
+      ready) tb_term "$SL_ROOT/bin/secure-linux-ready" ;;
       fleet) tb_fleet ;; help) tb_help ;; advanced) tb_advanced ;; settings) tb_settings ;;
     esac
   done
@@ -551,12 +589,13 @@ tb_home() {
     [ ${#FIX_SAFE[@]} -gt 0 ] && it+=("fixall|Fix everything safely|${#FIX_SAFE[@]} fix(es), one OK from you")
     [ "$N_ATTN" -gt 0 ] && it+=("problems|Look at the problems|One at a time, in plain English")
     it+=("health|Check my hardware|Drive, memory, battery and more" "rescue|Rescue my files|Copy them to another drive, safely")
+    it+=("recommended|Recommended tools|USB repair, installer creation, Flipper, home server and finishing")
     if [ "$TB_WINONLY" = 1 ]; then it+=("windows|Windows help|Start-up, password, disk check"); else it+=("trouble|Will not start, or locked out|Start-up repair, passwords"); fi
     it+=("more|Advanced / Show me more|Updates, clean up, every tool")
     UI_MENU_BACK="Quit" ui_menu "What would you like to do?" "${it[@]}" || break
     case $UI_REPLY in
       autopilot) tb_autopilot ;; fixall) tb_fixall ;; problems) tb_problems ;; health) tb_health_flow ;; rescue) tb_rescue_files ;;
-      trouble) tb_trouble ;; windows) tb_windows_help ;; more) tb_more ;;
+      recommended) tb_recommended ;; trouble) tb_trouble ;; windows) tb_windows_help ;; more) tb_more ;;
     esac
   done
   ui_pop
@@ -566,7 +605,7 @@ tb_home() {
 # ---------------------------------------------------------------- main
 tb_detect
 case $TB_SCREEN in
-  rescue|windows|clean|updates|security|backup|help|advanced|settings|trouble|health) TB_NOCHECK=1 ;;
+  recommended|rescue|windows|clean|updates|security|backup|help|advanced|settings|trouble|health) TB_NOCHECK=1 ;;
 esac
 need_check=0
 { [ -z "$TB_SCREEN" ] || [ "$TB_SCREEN" = problems ] || [ "$TB_SCREEN" = fixall ] || [ "$TB_CHECK_ONLY" = 1 ]; } && need_check=1
@@ -585,8 +624,8 @@ if [ "$TB_AUTOPILOT" = 1 ]; then tb_autopilot; exit 0; fi
 case $TB_SCREEN in
   "") tb_home ;;
   autopilot) tb_autopilot ;; problems) tb_problems ;; fixall) tb_fixall ;; health) tb_health_flow ;; rescue) tb_rescue_files ;;
-  trouble) tb_trouble ;; windows) tb_windows_help ;; clean) tb_clean_flow ;; security) tb_security ;; updates) tb_updates_flow ;;
+  recommended) tb_recommended ;; trouble) tb_trouble ;; windows) tb_windows_help ;; clean) tb_clean_flow ;; security) tb_security ;; updates) tb_updates_flow ;;
   backup) tb_backup ;; help) tb_help ;; advanced) tb_advanced ;; settings) tb_settings ;;
-  *) echo "Unknown screen '$TB_SCREEN'. Screens: autopilot problems fixall health rescue trouble windows clean security updates backup help advanced settings" >&2; exit 3 ;;
+  *) echo "Unknown screen '$TB_SCREEN'. Screens: autopilot problems fixall health rescue recommended trouble windows clean security updates backup help advanced settings" >&2; exit 3 ;;
 esac
 exit 0

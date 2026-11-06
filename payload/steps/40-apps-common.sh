@@ -29,6 +29,24 @@ _exp40() {
   exp_substep "Installing office, video player and small tools"
   #   vlc: plays everything; solaar: Logitech mice/keyboards; the rest are terminal tools the guide explains
   sl_dnf_install vlc syncthing solaar htop btop fastfetch fzf ripgrep bat zoxide
+
+  exp_substep "Installing Flipper Zero backup and file tools"
+  # The companion itself is installed in early mode; these packages add device access and encryption.
+  sl_dnf_install dfu-util age gnupg2
+  # qFlipper: prefer Fedora's package (including its udev rules), otherwise use Flathub.
+  if ! rpm -q qflipper >/dev/null 2>&1 && ! flatpak info --system one.flipperzero.qFlipper >/dev/null 2>&1; then
+    if dnf -q info qflipper >/dev/null 2>&1; then
+      sl_dnf_install qflipper
+    elif ! sl_is_arm || sl_flatpak_has_build one.flipperzero.qFlipper; then
+      sl_flatpak_install one.flipperzero.qFlipper
+    else
+      sl_skip_app one.flipperzero.qFlipper "Flathub has no version of this app for Apple Silicon (ARM) computers"
+    fi
+  fi
+  if ! rpm -q qflipper >/dev/null 2>&1 && flatpak info --system one.flipperzero.qFlipper >/dev/null 2>&1; then
+    sl_install_file "$SL_EXP/42-flipperzero.rules" "$SL_R/etc/udev/rules.d/42-flipperzero.rules"
+  fi
+
   # Logitech receivers (e.g. MX Ergo) usable without admin rights: udev rules (#20). Fedora splits
   # them into solaar-udev; VERIFY the package name on Fedora 44 (older builds shipped them in solaar).
   if ! rpm -q solaar-udev >/dev/null 2>&1 && ! ls /usr/lib/udev/rules.d/*logitech*.rules >/dev/null 2>&1; then

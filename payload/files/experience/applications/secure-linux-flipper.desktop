@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Flipper Zero Backup & Files
+Comment=Safely update, back up, restore, and manage your RogueMaster Flipper Zero
+Exec=secure-linux-flipper
+Terminal=false
+Icon=usb-creator
+Categories=System;Utility;Accessibility;
+Keywords=Flipper;RogueMaster;qFlipper;backup;SD;
+StartupNotify=true

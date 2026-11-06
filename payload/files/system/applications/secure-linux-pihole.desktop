@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Whole-home Pi-hole
+GenericName=Optional home DNS and ad filtering
+Comment=Assess, install and maintain a reviewed LAN-only Pi-hole with clear router and sleep guidance
+Exec=/usr/local/bin/secure-linux-pihole
+Icon=network-workgroup
+Terminal=false
+Categories=System;Settings;Network;
+Keywords=Pi-hole;DNS;ad filtering;Docker;router;DHCP;home network;

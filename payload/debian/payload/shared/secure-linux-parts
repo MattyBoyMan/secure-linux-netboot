@@ -207,6 +207,7 @@ online() {
 metered() { have nmcli && nmcli -t -f GENERAL.METERED device show 2>/dev/null | grep -q ':yes'; }
 state_dir() { echo "$SL_STATE/parts"; }
 record_installed() {   # remember packages (for repair mode) -> parts/installed.list
+  [ $# -gt 0 ] || return 0   # a completely failed install has no history to reassert
   local f; f="$(state_dir)/installed.list"; mkdir -p "$(state_dir)" 2>/dev/null || return 0
   { cat "$f" 2>/dev/null; printf '%s\n' "$@"; } | sed '/^$/d' | sort -u > "$f.new" 2>/dev/null && mv -f "$f.new" "$f"
 }
@@ -279,7 +280,11 @@ case "$ACTION" in
         if have secure-linux-drivers; then say "Graphics / Wi-Fi / Mac drivers: running secure-linux-drivers install (this can take several minutes)."; secure-linux-drivers install; else say "secure-linux-drivers is not installed here; skipped the graphics / Wi-Fi drivers."; fi
       fi
     fi
-    if [ "$rc" = 5 ]; then slh_alert parts-pending "Software for your hardware is waiting" "Some hardware needs software that could not be downloaded because there was no internet. It installs when you connect and run: secure-linux-parts --install" "Connect to the internet, then run secure-linux-parts --install" 2>/dev/null
+    if [ "$rc" = 5 ]; then
+      slh_alert parts-pending "Software for your hardware is waiting" "Some hardware needs software that could not be downloaded because there was no internet. It installs when you connect and run: secure-linux-parts --install" "Connect to the internet, then run secure-linux-parts --install" 2>/dev/null
+      # Offline optional packages are deferred, not a failed install. The rescan/report still says MISSING and no
+      # installed.list entry is written; package-manager and other genuine failures keep their nonzero status.
+      rc=0
     else slh_alert_clear parts-pending; fi
     # remember what is here, so hot-plugging only reports NEW devices
     mkdir -p "$(state_dir)" 2>/dev/null; for ((i = 0; i < N; i++)); do echo "${M_ID[i]}"; done | sort -u > "$(state_dir)/seen" 2>/dev/null

@@ -5,8 +5,8 @@
 #                                    open the login page, then put everything back exactly as it was.
 #
 # Protection comes back when you press Enter, when you close the window, or after MINUTES (default 15),
-# whichever is first. A kill switch is only switched back on if it was on before AND the VPN reconnected
-# (so you're never left without internet).
+# whichever is first. A kill switch chosen before the pause is restored even if the VPN cannot reconnect:
+# that can block the internet, but it never silently leaks traffic outside the VPN.
 set -u   # no pipefail: "cmd | grep -q" must not fail when grep stops reading early
 SL_ROOT=${SL_ROOT:-/usr/local/lib/secure-linux}
 . "$SL_ROOT/lib/common.sh"
@@ -31,9 +31,11 @@ warp_connected()   { have warp-cli && systemctl is-active --quiet warp-svc.servi
                      && warp-cli status 2>/dev/null | grep -qiE 'Status update: *Connected'; }
 
 RESTORED=0
+RESTORE_FAILED=0
 restore() {
-  [ "$RESTORED" = 1 ] && return 0
+  [ "$RESTORED" = 1 ] && return "$RESTORE_FAILED"
   RESTORED=1
+  RESTORE_FAILED=0
   trap '' HUP INT TERM PIPE
   # The window may already be gone: keep a log instead of writing to a closed terminal.
   [ -t 1 ] || exec >>"$STATE_DIR/hotspot.log" 2>&1
@@ -41,27 +43,43 @@ restore() {
   # shellcheck disable=SC1090
   [ -f "$PENDING" ] && . "$PENDING"
   if [ "${DNS_WAS:-encrypted}" != paused ] && [ "${DNS_WAS:-}" != off ]; then   # encrypted, family or vpn
-    "$SEC_BIN/secure-linux-dns" secure >/dev/null 2>&1
+    "$SEC_BIN/secure-linux-dns" secure >/dev/null 2>&1 || RESTORE_FAILED=1
   fi
   if [ "${WARP_WAS:-0}" = 1 ]; then
-    warp-cli connect >/dev/null 2>&1 && echo "  Cloudflare WARP: reconnected."
+    if warp-cli connect >/dev/null 2>&1 && warp_connected; then echo "  Cloudflare WARP: reconnected."
+    else echo "  Cloudflare WARP didn't reconnect; protection needs attention."; RESTORE_FAILED=1; fi
   fi
   if [ "${NORD_WAS:-0}" = 1 ]; then
     nordvpn connect ${NORD_SERVER:+"$NORD_SERVER"} >/dev/null 2>&1
     local i; for i in $(seq 1 20); do nord_connected && break; sleep 1; done
     if nord_connected; then
       echo "  NordVPN: reconnected${NORD_SERVER:+ to $NORD_SERVER}."
-      if [ "${KS_WAS:-0}" = 1 ]; then nordvpn set killswitch on >/dev/null 2>&1 && echo "  Kill switch: back on."; fi
+      if [ "${KS_WAS:-0}" = 1 ]; then
+        if nordvpn set killswitch on >/dev/null 2>&1 && nord_killswitch_on; then echo "  Kill switch: back on."
+        else echo "  Kill switch couldn't be restored; protection needs attention."; RESTORE_FAILED=1; fi
+      fi
     else
-      echo "  NordVPN didn't reconnect. Your kill switch was left OFF so you stay online."
+      RESTORE_FAILED=1
+      if [ "${KS_WAS:-0}" = 1 ]; then
+        if nordvpn set killswitch on >/dev/null 2>&1 && nord_killswitch_on; then
+          echo "  NordVPN didn't reconnect. Your chosen kill switch is back ON, so traffic cannot leak."
+          echo "  The internet may stay blocked until NordVPN reconnects or you explicitly choose 'VPN off'."
+        else
+          echo "  NordVPN didn't reconnect AND the kill switch couldn't be restored. Do not use this network for private activity."
+        fi
+      else
+        echo "  NordVPN didn't reconnect. Your kill switch was off before this helper, so it stays off by your choice."
+      fi
       echo "  Open 'Secure Linux VPN' (or run: secure-linux-vpn private) to connect again."
-      have notify-send && notify-send -a "Secure Linux" -i network-vpn "VPN didn't reconnect" \
-        "After the Wi-Fi login the VPN couldn't reconnect. Run 'secure-linux-vpn private' to try again." 2>/dev/null
+      have notify-send && notify-send -a "Secure Linux" -i network-vpn "VPN restoration needs attention" \
+        "The VPN did not reconnect after Wi-Fi login. Your previous kill-switch choice was not silently changed." 2>/dev/null
     fi
   fi
-  "$SEC_BIN/secure-linux-dns" sync >/dev/null 2>&1
+  "$SEC_BIN/secure-linux-dns" sync >/dev/null 2>&1 || RESTORE_FAILED=1
   rm -f "$PENDING"
-  echo "Protection is back on."
+  if [ "$RESTORE_FAILED" = 0 ]; then echo "Protection is back on."
+  else echo "Protection is NOT fully restored; read the messages above."; fi
+  return "$RESTORE_FAILED"
 }
 
 mkdir -p "$STATE_DIR"
@@ -102,8 +120,9 @@ echo "     Closing this window also switches protection back on."
 echo
 read -r -t $((MINUTES * 60)) -p "  Press Enter when you're online... " _ || echo
 restore
+RESTORE_RC=$?
 echo
-echo "  If the internet stops working now, this network blocks private DNS."
+echo "  If the internet stops working now, this network blocks private DNS or the VPN is not connected."
 echo "  Fix: turn on the VPN (secure-linux-vpn private), or run this helper again."
 sec_pause "  Press Enter to close this window. "
-exit 0
+exit "$RESTORE_RC"

@@ -38,6 +38,9 @@ ACTIONS="diagnose health data boot fs snapshot kernel gpu packages network windo
 FIXES=""; declare -F rp_fix_ids >/dev/null && FIXES=$(rp_fix_ids | tr '\n' ' ') && FIXES=${FIXES% }
 
 for _f in "$HLIB"/fix-*.sh ${SL_REPAIR_FIXDIR:+"$SL_REPAIR_FIXDIR"/fix-*.sh}; do [ -r "$_f" ] && . "$_f"; done     # the problem finder's fixes (optional; SL_REPAIR_FIXDIR is a test hook)
+# Load the detector at top level. Its arrays must stay global when rp_fix_engine is called inside a function;
+# sourcing it there would make the knowledge base local and every direct fix would incorrectly find nothing to do.
+. "$HLIB/diagnose-lib.sh"; . "$HLIB/diagnose-detect.sh"
 RP_APPROVED=0; RP_APPROVED_TYPED=0; RP_NONINT=0; FIX_ARGS=()
 rp_risk() {   # rp_risk ACTION -> safe | asks | risky (a fix_NAME_risk function can say; otherwise a fixed table)
   local f="fix_${1//-/_}_risk"

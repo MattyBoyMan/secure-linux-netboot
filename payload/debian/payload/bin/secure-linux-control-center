@@ -1,0 +1,34 @@
+#!/bin/sh
+# Secure Linux Control Centre: native GTK4/Libadwaita security choices.
+# Runs as the desktop user. Privileged helpers use pkexec or sudo's GUI askpass.
+set -eu
+SELF=$(readlink -f "$0" 2>/dev/null || printf '%s\n' "$0")
+HERE=$(dirname "$SELF")
+if [ -n "${SL_ROOT:-}" ] && [ -r "$SL_ROOT/lib/control-center.py" ]; then
+  APP=$SL_ROOT/lib/control-center.py
+elif [ -r "$HERE/../lib/control-center.py" ]; then
+  APP=$HERE/../lib/control-center.py
+else
+  APP=/usr/local/lib/secure-linux/lib/control-center.py
+fi
+if [ ! -r "$APP" ]; then
+  printf '%s\n' "Secure Linux Control Centre cannot find its graphical application: $APP" >&2
+  exit 1
+fi
+if ! command -v python3 >/dev/null 2>&1; then
+  printf '%s\n' "Python 3 is needed for Secure Linux Control Centre." >&2
+  exit 1
+fi
+# Never degrade to a CLI or a localhost/web backend when native GTK is absent.
+if ! python3 -c 'import gi; gi.require_version("Gtk", "4.0"); gi.require_version("Adw", "1"); from gi.repository import Gtk, Adw' >/dev/null 2>&1; then
+  MESSAGE="The native GTK4/Libadwaita packages are missing. Install python3-gobject, gtk4 and libadwaita (Fedora), or python3-gi, gir1.2-gtk-4.0 and gir1.2-adw-1 (Debian), then open Secure Linux Control Centre again."
+  if [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ] && command -v zenity >/dev/null 2>&1; then
+    zenity --error --title="Secure Linux Control Centre" --width=520 --text="$MESSAGE"
+  elif [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ] && command -v kdialog >/dev/null 2>&1; then
+    kdialog --title "Secure Linux Control Centre" --error "$MESSAGE"
+  else
+    printf '%s\n' "$MESSAGE" >&2
+  fi
+  exit 1
+fi
+exec python3 "$APP" "$@"

@@ -5,8 +5,8 @@ After=network-online.target
 
 [Service]
 Type=oneshot
-# A list that fails its sanity check or doesn't download is simply skipped (the last good copy stays), so a
-# non-zero exit here is not an error worth showing.
-ExecStart=-/usr/local/bin/secure-linux-netguard update-lists
+# A failed download keeps the last good copy, but MUST remain a failed service result: the security audit
+# distinguishes "installed timer" from "update actually succeeded" and shows the failure to the user.
+ExecStart=/usr/local/bin/secure-linux-netguard update-lists
 Nice=15
 IOSchedulingClass=idle

@@ -16,6 +16,12 @@ on:
 permissions:
   contents: write   # to create/update the "flipper-fap" release
 
+# Never let a manual run and the monthly run clobber the same asset with
+# different moving-head source revisions at the same time.
+concurrency:
+  group: flipper-fap-release
+  cancel-in-progress: false
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -38,7 +44,7 @@ jobs:
           # fbt downloads the matching toolchain by itself on the first run
           ./fbt fap_boot2flipper
 
-      - name: Collect the built app
+      - name: Collect the built app and record its exact provenance
         run: |
           mkdir -p dist
           FAP=$(find firmware/build -name 'boot2flipper.fap' | head -n 1)
@@ -46,13 +52,23 @@ jobs:
             echo "::error::boot2flipper.fap was not produced"; find firmware/build -name '*.fap' | head; exit 1
           fi
           cp "$FAP" dist/boot2flipper.fap
+          {
+            echo "Boot2Flipper source: https://github.com/Stella-IT/boot2flipper/commit/$(git -C firmware/applications_user/boot2flipper rev-parse HEAD)"
+            echo "RogueMaster firmware: https://github.com/RogueMaster/flipperzero-firmware-wPlugins/commit/$(git -C firmware rev-parse HEAD)"
+            echo "boot2flipper.fap SHA-256: $(sha256sum dist/boot2flipper.fap | cut -d' ' -f1)"
+            echo "Built by GitHub Actions run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+            echo "A successful build does not guarantee compatibility with every RogueMaster release."
+          } > dist/build-info.txt
+          cat dist/build-info.txt
           ls -la dist/
 
       - name: Upload the app as a workflow artifact
         uses: actions/upload-artifact@v4
         with:
           name: boot2flipper-fap
-          path: dist/boot2flipper.fap
+          path: |
+            dist/boot2flipper.fap
+            dist/build-info.txt
 
       - name: Publish the app in the "flipper-fap" release
         env:
@@ -61,6 +77,8 @@ jobs:
           if ! gh release view flipper-fap >/dev/null 2>&1; then
             gh release create flipper-fap \
               --title "Boot2Flipper app for the Flipper Zero" \
-              --notes "boot2flipper.fap, built automatically from https://github.com/Stella-IT/boot2flipper with the RogueMaster firmware toolchain. Put it on the Flipper's SD card under apps/USB/ - see flipper/README-FLIPPER.txt."
+              --notes-file dist/build-info.txt
+          else
+            gh release edit flipper-fap --notes-file dist/build-info.txt
           fi
-          gh release upload flipper-fap dist/boot2flipper.fap --clobber
+          gh release upload flipper-fap dist/boot2flipper.fap dist/build-info.txt --clobber

@@ -77,6 +77,12 @@ sl_apt_update() {  # once per run, and only when something is about to be instal
 _sl_apt_get() { apt-get -y -q -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold "$@"; }
 # sl_pkg_install [--no-recommends] pkg...   installs only missing packages; one unknown or broken package name
 # doesn't block the rest (they are retried one by one and each failure is recorded)
+sl_offline_bundle_install() { # sl_offline_bundle_install KIND ARCH [item...]
+  local kind=$1 arch=$2
+  shift 2
+  command -v secure-linux-offline-bundle >/dev/null 2>&1 || return 2
+  secure-linux-offline-bundle install --profile debian-lite --arch "$arch" --kind "$kind" --packages "$@"
+}
 sl_pkg_install() {
   local rec=() missing=() p
   [ "${1:-}" = --no-recommends ] && { rec=(--no-install-recommends); shift; }
@@ -85,6 +91,8 @@ sl_pkg_install() {
   sl_apt_update
   echo ">> apt-get install ${rec[*]} ${missing[*]}"
   _sl_apt_get install "${rec[@]}" "${missing[@]}" && return 0
+  echo "Online apt install failed; trying the verified, possibly outdated offline cache."
+  sl_offline_bundle_install system "$(sl_arch)" "${missing[@]}" && return 0
   local rc=0
   for p in "${missing[@]}"; do
     sl_pkg_installed "$p" && continue
@@ -94,12 +102,14 @@ sl_pkg_install() {
 }
 sl_dnf_install() { sl_pkg_install "$@"; }      # name used by helpers shared with the Fedora setup
 sl_flatpak_ok() { [ "$(sl_arch)" = amd64 ] && command -v flatpak >/dev/null 2>&1; }   # Flathub has no i386 apps
-sl_flatpak_install() { # sl_flatpak_install app-id...   system-wide from Flathub, only missing ones
+sl_flatpak_install() { # sl_flatpak_install app-id...   system-wide, online first then a verified USB OSTree repository
   local id rc=0
   sl_flatpak_ok || { echo "skip (no Flatpak on this computer): $*"; return 0; }
   for id in "$@"; do
     flatpak info --system "$id" >/dev/null 2>&1 && continue
-    try flatpak install -y --noninteractive --system flathub "$id" || rc=1
+    if try flatpak install -y --noninteractive --system flathub "$id"; then continue; fi
+    echo "Online Flatpak install failed; trying the verified, possibly outdated offline cache: $id"
+    sl_offline_bundle_install flatpak "$(sl_arch)" "$id" || rc=1
   done
   return $rc
 }
@@ -123,6 +133,7 @@ sl_write_file() {
   tmp=$(mktemp); cat > "$tmp"
   sumf="$SL_STATE/written/$(printf '%s' "${path#"$R"}" | md5sum | cut -d' ' -f1)"
   mkdir -p "$SL_STATE/written" "$(dirname "$path")"
+  command -v sl_recovery_artifact_add >/dev/null 2>&1 && sl_recovery_artifact_add "$path"
   new=$(md5sum < "$tmp" | cut -d' ' -f1)
   if [ -f "$path" ]; then
     old=$(md5sum < "$path" | cut -d' ' -f1)

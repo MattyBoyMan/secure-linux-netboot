@@ -1,0 +1,186 @@
+#!/usr/bin/env python3
+"""Secure Linux Welcome & Setup: native GTK4/Libadwaita guided-tool hub.
+
+Every action uses a fixed argument vector with shell=False. Privileged and
+destructive choices remain inside the existing tools, with their own explicit
+confirmation. This launcher never creates a terminal, server, socket or web view.
+"""
+from __future__ import annotations
+
+import argparse
+import importlib.util
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+
+APP_NAME = "Secure Linux Welcome & Setup"
+HERE = Path(__file__).resolve().parent
+LIB = HERE.parent / "lib"
+if not (LIB / "secure-ui.py").is_file():
+    LIB = Path("/usr/local/lib/secure-linux/lib")
+
+# Keep these names and commands in step with tests/beginner-journeys/run.py.
+JOURNEYS = (
+    {"key": "welcome", "title": "Welcome & Setup Choices", "description": "Review the friendly first-login questions: browser, Wi-Fi, battery, recovery key and more.", "commands": (("secure-linux-welcome", "--again"),)},
+    {"key": "finish", "title": "Finish Setting Up My Computer", "description": "Bring files across, finish app setup, carry safe choices and check ongoing care.", "commands": (("secure-linux-finish", "--gui"),)},
+    {"key": "apps", "title": "Install Apps & Fill In Missing Software", "description": "See familiar app replacements and choose only the optional apps you want.", "commands": (("secure-linux-migrate", "page", "apps-you-used"),)},
+    {"key": "passwords", "title": "Move My Passwords from Chrome or Edge", "description": "Export your old passwords, import them yourself, then remove the plain-text export after checking.", "commands": (("secure-linux-migrate", "page", "passwords"),)},
+    {"key": "backup", "title": "Back Up My Files", "description": "Choose a USB drive or your home server and open the existing encrypted backup app.", "commands": (("secure-linux-welcome", "--page", "backup"),)},
+    {"key": "restore", "title": "Restore My Files from a Backup", "description": "Find a Secure Linux backup and copy personal folders home without silently replacing files.", "commands": (("secure-linux-finish", "--gui", "restore"),)},
+    {"key": "security", "title": "Security & Privacy", "description": "Review protection, firewall, updates and privacy choices in the graphical Control Centre.", "commands": (("secure-linux-control-center",),)},
+    {"key": "activity", "title": "My Computer Activity", "description": "See connections, background jobs and health in the read-only, offline activity dashboard.", "commands": (("secure-linux-activity",),)},
+    {"key": "flipper", "title": "Flipper Zero — Open qFlipper", "description": "Open the official graphical qFlipper app with the companion's accessible display setting.", "commands": (("secure-linux-flipper", "qflipper", "--yes"),)},
+    {"key": "usb", "title": "USB Drives — View, Format & Check", "description": "Use the installed graphical disk tool. Verified installer cloning and advanced recovery stay in their own menu entries.", "commands": (("gnome-disks",), ("partitionmanager",))},
+    {"key": "home-assistant", "title": "Home Assistant", "description": "Open your existing smart-home dashboard. Advanced server setup remains in Home & Server Helper.", "commands": (("secure-linux-ha", "open"),)},
+    {"key": "updates", "title": "Install System & App Updates", "description": "Review and install updates with an explicit yes first. No restart is triggered by this shortcut.", "commands": (("secure-linux-update-gui",),)},
+    {"key": "customise", "title": "Customise My Apps & Desktop", "description": "Change display, accessibility, meetings, devices and other comfort choices through guided pages.", "commands": (("secure-linux-migrate",),)},
+)
+JOURNEY_BY_KEY = {item["key"]: item for item in JOURNEYS}
+
+
+def load_library(name: str):
+    spec = importlib.util.spec_from_file_location(name.replace("-", "_"), LIB / name)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
+def _installed_command(name: str) -> str | None:
+    """Find a fixed command without evaluating any user-supplied text."""
+    override = os.environ.get("SL_SETUP_HUB_BIN")
+    candidates = []
+    if override:
+        candidates.append(Path(override) / name)
+    candidates.append(Path("/usr/local/bin") / name)
+    for candidate in candidates:
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return str(candidate)
+    return shutil.which(name)
+
+
+def launch_tool(commands: tuple[tuple[str, ...], ...]) -> None:
+    """Launch the first available graphical backend and return immediately."""
+    for argv in commands:
+        executable = _installed_command(argv[0])
+        if executable:
+            subprocess.Popen(  # noqa: S603 - fixed allow-listed argv, shell=False
+                [executable, *argv[1:]],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            return
+    names = " or ".join(command[0] for command in commands)
+    raise FileNotFoundError(f"No installed graphical tool was found ({names}).")
+
+
+class JourneyButton:
+    """Toolkit-independent invocable used by regression tests and native cards."""
+    def __init__(self, app: "SetupHubApp", key: str):
+        self.app = app
+        self.key = key
+        self.accessible_name = JOURNEY_BY_KEY[key]["title"]
+
+    def invoke(self) -> None:
+        self.app.launch(self.key)
+
+
+class SetupHubApp:
+    """Headless controller; GTK is only one view of these fixed journeys."""
+    def __init__(self, root=None, launcher=None, demo: bool = False, on_message=None):
+        self.root = root
+        self.launcher = launcher or launch_tool
+        self.demo = demo
+        self.on_message = on_message
+        self.last_error = None
+        self.buttons = {item["key"]: JourneyButton(self, item["key"]) for item in JOURNEYS}
+
+    def launch(self, key: str) -> None:
+        item = JOURNEY_BY_KEY[key]
+        if self.demo:
+            if self.on_message:
+                self.on_message("Preview only", f"This would open: {item['title']}. No tool was launched.")
+            return
+        try:
+            self.launcher(item["commands"])
+        except (OSError, subprocess.SubprocessError) as exc:
+            self.last_error = str(exc)
+            message = (
+                "That tool could not be opened. Nothing was changed.\n\n"
+                "Open ‘Install Apps & Fill In Missing Software’ or ‘Secure Linux Status & Fixes’ and try again.\n\n"
+                f"Detail for a helper: {exc}"
+            )
+            if self.on_message:
+                self.on_message(APP_NAME, message)
+            else:
+                raise
+
+
+def build_native_window(application, controller: SetupHubApp):
+    ui = load_library("secure-ui-gtk.py")
+    Gtk = ui.Gtk
+
+    class SetupWindow(ui.SecureShell):
+        def __init__(self):
+            super().__init__(application, APP_NAME, "Choose a task. Every guided tool keeps its own safeguards.", demo=controller.demo)
+            setup = ui.page_box()
+            ui.add_heading(setup, "What would you like to do?", "Plain-English paths through tools already on your computer. Opening a tool changes nothing by itself.")
+            grid = ui.flow_box()
+            icons = {
+                "welcome": "go-home-symbolic", "finish": "view-list-symbolic", "apps": "system-software-install-symbolic",
+                "passwords": "dialog-password-symbolic", "backup": "document-save-symbolic", "restore": "document-revert-symbolic",
+                "security": "security-high-symbolic", "activity": "utilities-system-monitor-symbolic", "flipper": "drive-removable-media-symbolic",
+                "usb": "drive-harddisk-symbolic", "home-assistant": "go-home-symbolic", "updates": "software-update-available-symbolic",
+                "customise": "preferences-system-symbolic",
+            }
+            for item in JOURNEYS:
+                grid.append(ui.task_card(item["title"], item["description"], "Open guided tool", lambda key=item["key"]: controller.launch(key), icon=icons[item["key"]]))
+            setup.append(grid)
+            setup.append(ui.label("Advanced recovery and verified USB cloning stay in their named app-menu entries. Installing, replacing, erasing and administrator actions always ask first.", css=("sl-caption",)))
+            self.add_page("setup", "Welcome & Setup", "go-home-symbolic", setup)
+
+            privacy = ui.page_box()
+            ui.add_heading(privacy, "Security & privacy", "A readable local status, not a cloud score. Secure Linux does not send telemetry from this hub.")
+            privacy.append(ui.task_card("Secure Linux Control Centre", "Review protection, encryption, app access and specialist tools. Every apply step has a separate review.", "Open Control Centre", lambda: controller.launch("security"), icon="security-high-symbolic"))
+            privacy.append(ui.task_card("My Computer Activity", "Inspect the existing read-only offline activity dashboard.", "Open activity", lambda: controller.launch("activity"), icon="utilities-system-monitor-symbolic"))
+            self.add_page("privacy", "Security & Privacy", "security-high-symbolic", privacy)
+            self.navigate("setup")
+
+    return SetupWindow()
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--demo", action="store_true", help="show a read-only preview; buttons do not launch tools")
+    parser.add_argument("--list-journeys", action="store_true", help="list the fixed journey names for integration checks")
+    args = parser.parse_args(argv)
+    if args.list_journeys:
+        for item in JOURNEYS:
+            print(f"{item['key']}|{item['title']}")
+        return 0
+    try:
+        ui = load_library("secure-ui-gtk.py")
+    except (ImportError, ValueError) as exc:
+        design = load_library("secure-ui.py")
+        print(f"{design.gtk_dependency_error()}\n{exc}", file=sys.stderr)
+        return 1
+    controller_box = {}
+    def message(title, body):
+        window = controller_box.get("window")
+        if window:
+            ui.message_dialog(window, title, body)
+    controller = SetupHubApp(demo=args.demo, on_message=message)
+    def build(application):
+        window = build_native_window(application, controller)
+        controller_box["window"] = window
+        return window
+    return ui.run_application("org.securelinux.SetupHub", build, [sys.argv[0]])
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

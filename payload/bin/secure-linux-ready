@@ -1,0 +1,361 @@
+#!/bin/bash
+# secure-linux-ready: the last check at the end of Welcome, and a manual "is this computer ready?" command.
+# Runs the distribution's real checker, adds the desktop and chosen-app checks, tries only repairs explicitly
+# marked safe in the existing repair knowledge base, then checks everything again. Exit 0 means ready.
+# Test hooks: SL_READY_CHECK / SL_READY_REPAIR (helper paths), SL_READY_ONLINE=yes|no, SL_READY_DESKTOP=1,
+# SL_READY_NO_FIX=1. SL_TEST_SYSROOT / SL_SYSROOT and the usual SL_* state overrides redirect system files.
+set -u
+export LC_ALL=C
+SL_ROOT=${SL_ROOT:-/usr/local/lib/secure-linux}
+# shellcheck source=../lib/common.sh
+. "$SL_ROOT/lib/common.sh"
+R=${SL_TEST_SYSROOT:-${SL_SYSROOT:-}}
+WELCOME='Welcome to Linux! Good job, you made the right choice'
+CHECK=${SL_READY_CHECK:-$SL_ROOT/bin/secure-linux-check}
+REPAIR=${SL_READY_REPAIR:-$SL_ROOT/bin/secure-linux-repair}
+WORK=$(mktemp -d "${TMPDIR:-/tmp}/sl-ready.XXXXXX") || exit 3
+trap 'rm -rf "$WORK"' EXIT
+trap 'rm -rf "$WORK"; exit 130' INT
+GUIDE=/usr/share/secure-linux/START-HERE.html
+DISTRO=fedora
+declare -F sl_distro >/dev/null && DISTRO=debian
+READY_COLLECT_ACTIONS=1
+FIX_ATTEMPTS=0
+
+case "${1:-}" in
+  -h|--help)
+    sed -n '2,6p' "$0" | sed 's/^# \{0,1\}//'
+    exit 0 ;;
+  "") ;;
+  *) echo "Unknown option: $1 (try --help)" >&2; exit 2 ;;
+esac
+
+have() { command -v "$1" >/dev/null 2>&1; }
+run_file() { local p=$1; shift; if [[ $p = */* ]] && [ ! -x "$p" ]; then bash "$p" "$@"; else "$p" "$@"; fi; }
+row() { printf '%s|%s|%s|%s|%s\n' "$1" "$2" "$3" "${4:-}" "${5:-}" >> "$WORK/pass.rows"; }
+action() {
+  [ "$READY_COLLECT_ACTIONS" = 1 ] || return 0
+  case "$1" in fix-nm-start|fix-restart-audio|fix-dns-flush) printf '%s|%s\n' "$1" "$2" >> "$WORK/actions" ;; esac
+}
+
+# Only the readiness rows belong here. Choices such as no VPN, no recovery key or no cloud backup must not
+# turn an otherwise healthy first login red. Disk, update, firewall, service, setup, snapshot and firmware
+# warnings DO count: this command promises a ready computer, not merely a computer that boots.
+base_relevant() {
+  local id=$1 st=${2:-}
+  # Security advisories (for example an optional rootless Docker context or broad Flatpak access) stay visible
+  # without blocking readiness. Any FAILED security control, and missing audit execution evidence, must block it.
+  case "$id" in security-audit-run) return 0 ;; security-*) [ "$st" = bad ] && return 0 ;; esac
+  if [ "$DISTRO" = debian ]; then
+    case "$id" in setup-running|setup-failures|updates-auto|updates-stale|updates-waiting|firewall|dns|disk-full|disk-health|services|snapshots) return 0 ;; esac
+  else
+    case "$id" in updates-off|updates-failed|firewall-off|services-failed|disk-full|setup-failures|snapshot-space|disk-health|disk-health-*|btrfs-errors|scrub-errors|firmware-updates) return 0 ;; esac
+  fi
+  return 1
+}
+run_base() {
+  local rc=0
+  run_file "$CHECK" > "$WORK/check.log" 2>&1 || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    row ready-check bad "The system check finished" "The checker stopped with error $rc; run Repair setup" repair
+  fi
+  if [ ! -s "$SL_STATE/checks" ]; then
+    row ready-check-results bad "The system check saved its results" "No results file was produced; run Repair setup" repair
+    return 0
+  fi
+  local id st label detail fix
+  while IFS='|' read -r id st label detail fix; do
+    [ -n "$id" ] || continue
+    base_relevant "$id" "$st" || continue
+    case "$st" in ok|warn|bad) ;; *) st=bad; detail="Unrecognised checker result: ${detail:-$st}" ;; esac
+    row "$id" "$st" "$label" "$detail" "$fix"
+  done < "$SL_STATE/checks"
+}
+require_row() {
+  grep -q "^$1|" "$WORK/pass.rows" 2>/dev/null || row "ready-missing-$1" bad "$2" "The system checker did not report this; run Repair setup" repair
+}
+require_base_rows() {
+  local id
+  require_row security-audit-run "The security audit actually completed"
+  if [ "$DISTRO" = debian ]; then
+    for id in updates-auto updates-stale firewall dns disk-full disk-health setup-failures services; do require_row "$id" "Core system checks ran"; done
+    [ -e "$SL_ROOT/bin/secure-linux-snapshot" ] && require_row snapshots "System snapshots are ready"
+  else
+    for id in updates-off updates-failed firewall-off services-failed disk-full disk-health setup-failures firmware-updates; do require_row "$id" "Core system checks ran"; done
+    if [ "$(findmnt -no FSTYPE / 2>/dev/null)" = btrfs ] || [ "$(sl_profile)" = atomic ]; then require_row snapshot-space "System snapshots are ready"; fi
+  fi
+}
+
+probe_network() {
+  if have systemctl && systemctl is-active --quiet NetworkManager 2>/dev/null; then
+    row ready-network-service ok "The network service is running"
+  else
+    row ready-network-service bad "The network service is running" "NetworkManager is stopped" diag
+    action fix-nm-start "Start the network service"
+  fi
+  if [ "${SL_READY_ONLINE:-}" = yes ] || { [ "${SL_READY_ONLINE:-}" != no ] && sl_online; }; then
+    row ready-internet ok "The internet connection works"
+  else
+    row ready-internet bad "The internet connection works" "No secure website could be reached; check Wi-Fi or plug in a cable" diag
+    # This is the established safe DNS repair, used only when raw IP networking works but names do not.
+    if have getent && have ping && ! getent hosts dl.flathub.org >/dev/null 2>&1 && ping -c1 -W3 1.1.1.1 >/dev/null 2>&1; then
+      action fix-dns-flush "Clear the stuck website-name service"
+    fi
+  fi
+}
+user_run() {
+  if [ "$(id -u)" != 0 ]; then "$@"; else sl_user_run "$@"; fi
+}
+desktop_check() { [ "${SL_READY_DESKTOP:-}" = 1 ] || [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]; }
+probe_audio_video() {
+  if ! desktop_check; then
+    row ready-audio ok "Sound is ready" "No desktop sound session is running here"
+    row ready-video ok "Video is ready" "No desktop video session is running here"
+    return 0
+  fi
+  if user_run systemctl --user is-active --quiet pipewire.service >/dev/null 2>&1 \
+     && user_run systemctl --user is-active --quiet pipewire-pulse.service >/dev/null 2>&1 \
+     && user_run systemctl --user is-active --quiet wireplumber.service >/dev/null 2>&1; then
+    row ready-audio ok "Sound is ready" "PipeWire and WirePlumber are running"
+  elif have pactl && user_run pactl info >/dev/null 2>&1; then
+    row ready-audio ok "Sound is ready" "The desktop sound server is running"
+  else
+    row ready-audio bad "Sound is ready" "The desktop sound service is not running" diag
+    action fix-restart-audio "Restart the desktop sound service"
+  fi
+  if have systemctl && systemctl is-active --quiet graphical.target 2>/dev/null; then
+    row ready-video ok "Video is ready" "The graphical desktop is running"
+  else
+    row ready-video bad "Video is ready" "The graphical desktop is not running" diag
+  fi
+}
+probe_guide() {
+  local f
+  for f in "$R/usr/share/secure-linux/START-HERE.html" "$R/usr/local/share/secure-linux/START-HERE.html"; do
+    if [ -s "$f" ]; then GUIDE=${f#"$R"}; row ready-guide ok "The START-HERE guide is installed" "$GUIDE"; return 0; fi
+  done
+  GUIDE=/usr/share/secure-linux/START-HERE.html
+  row ready-guide bad "The START-HERE guide is installed" "Missing: $GUIDE; run Repair setup" repair
+}
+probe_firmware_debian() {
+  [ "$DISTRO" = debian ] || return 0
+  have fwupdmgr || { row ready-firmware bad "Firmware was checked with fwupdmgr" "fwupdmgr is missing; run Repair setup" repair; return 0; }
+  local out rc n
+  out=$(timeout 45 fwupdmgr get-updates --json --no-unreported-check --no-metadata-check </dev/null 2>/dev/null); rc=$?
+  if [ "$rc" -ne 0 ] && [ "$rc" -ne 2 ] && [ -z "$out" ]; then out=$(timeout 45 fwupdmgr get-updates --json </dev/null 2>/dev/null); rc=$?; fi
+  n=$(printf '%s\n' "$out" | grep -c '"Releases"')
+  if [ "$rc" -eq 0 ] && [ "$n" -gt 0 ]; then
+    row ready-firmware warn "Firmware is up to date" "$n device(s) have a firmware update" firmware
+  elif [ "$rc" -eq 0 ] || [ "$rc" -eq 2 ]; then
+    row ready-firmware ok "Firmware was checked with fwupdmgr"
+  else
+    row ready-firmware bad "Firmware was checked with fwupdmgr" "fwupdmgr could not finish (error $rc)" diag
+  fi
+}
+probe_snapshot_timer() {
+  [ "$DISTRO" = debian ] && [ -e "$SL_ROOT/bin/secure-linux-snapshot" ] || return 0
+  if systemctl is-enabled --quiet secure-linux-snapshot.timer 2>/dev/null; then
+    row ready-snapshot-timer ok "The snapshot tidy-up timer is on"
+  else
+    row ready-snapshot-timer bad "The snapshot tidy-up timer is on" "secure-linux-snapshot.timer is not enabled" repair
+  fi
+}
+
+skipped_app() { [ -s "$SL_STATE/skipped-apps" ] && awk -F'|' -v id="$1" '$1 == id { yes=1 } END { exit !yes }' "$SL_STATE/skipped-apps"; }
+app() {   # app flatpak|rpm|dpkg ID LABEL
+  local type=$1 id=$2 label=$3
+  if skipped_app "$id"; then row "ready-app-$id" ok "$label" "Deliberately skipped on this computer"; return 0; fi
+  case "$type" in
+    flatpak) have flatpak && flatpak info --system "$id" >/dev/null 2>&1 ;;
+    rpm) have rpm && rpm "-q" "$id" >/dev/null 2>&1 ;;
+    dpkg) have dpkg-query && dpkg-query -W -f='${Status}' "$id" 2>/dev/null | grep -q 'install ok installed' ;;
+    *) return 1 ;;
+  esac
+  if [ $? -eq 0 ]; then row "ready-app-$id" ok "$label"; else row "ready-app-$id" bad "$label" "$id is not installed; run Repair setup" repair; fi
+}
+app_any_email() {
+  if skipped_app org.mozilla.Thunderbird || skipped_app thunderbird; then
+    row ready-app-email ok "Your chosen email app is installed" "Deliberately skipped on this computer"
+  elif { have flatpak && flatpak info --system org.mozilla.Thunderbird >/dev/null 2>&1; } || { have rpm && rpm "-q" thunderbird >/dev/null 2>&1; }; then
+    row ready-app-email ok "Your chosen email app is installed"
+  else row ready-app-email bad "Your chosen email app is installed" "Thunderbird is missing; run Repair setup" repair; fi
+}
+app_file() {   # app_file SLUG LABEL
+  if skipped_app "$1"; then row "ready-app-$1" ok "$2" "Deliberately skipped on this computer"
+  elif [ -s "$R/usr/share/applications/secure-linux-web-$1.desktop" ]; then row "ready-app-$1" ok "$2"
+  else row "ready-app-$1" bad "$2" "Its app-menu entry is missing; run Repair setup" repair; fi
+}
+extra_apps() {
+  local ids=$1 db=$SL_ROOT/setup-data/app-equivalents.tsv id type pkg
+  [ -r "$db" ] || { row ready-extra-apps bad "Your chosen extra apps are installed" "The reviewed app mapping is missing" repair; return 0; }
+  for id in $ids; do
+    case "$id" in *[!A-Za-z0-9._-]*|"") row "ready-extra-$id" bad "Your chosen extra apps are installed" "An invalid app id was recorded; run Repair setup" repair; continue ;; esac
+    if [ "$DISTRO" = debian ]; then
+      pkg=$(awk -F '\t' -v id="$id" '$2 == id && $9 == "extra" { print $8; found=1; exit } END { if (!found) exit 2 }' "$db") || {
+        row "ready-extra-$id" bad "Your chosen extra apps are installed" "Unknown app id: $id" repair; continue; }
+      [ -n "$pkg" ] && app dpkg "$pkg" "Chosen app: $id"
+    else
+      type=$(awk -F '\t' -v id="$id" '$2 == id && $9 == "extra" { print $3; found=1; exit } END { if (!found) exit 2 }' "$db") || {
+        row "ready-extra-$id" bad "Your chosen extra apps are installed" "Unknown app id: $id" repair; continue; }
+      case "$type" in
+        flatpak) app flatpak "$id" "Chosen app: $id" ;;
+        rpm) sl_is_atomic || app rpm "$id" "Chosen app: $id" ;;
+        *) row "ready-extra-$id" bad "Your chosen extra apps are installed" "No safe package mapping for $id" repair ;;
+      esac
+    fi
+  done
+}
+probe_choices() {
+  local profile v item
+  profile=$(sl_profile)
+  if [ "$DISTRO" = debian ]; then
+    case "$(sl_choice_get default_browser)" in
+      librewolf) app dpkg librewolf "Your chosen browser is installed" ;;
+      firefox) app dpkg firefox-esr "Your chosen browser is installed" ;;
+    esac
+    [ "$(sl_choice_get backup_gui)" = deja-dup ] && app dpkg deja-dup "Your chosen backup app is installed"
+    [ "$(sl_choice_get disk_usage)" = baobab ] && app dpkg baobab "Your chosen disk-usage app is installed"
+    [ "$(sl_choice_get disk_utility)" = gnome-disks ] && app dpkg gnome-disk-utility "Your chosen disk utility is installed"
+    v=$(sl_choice_get extra_apps); case "$v" in ""|none) ;; *) extra_apps "$v" ;; esac
+    return 0
+  fi
+  [ "$(sl_choice_get office)" = onlyoffice ] && [ "$profile" != lite ] && app flatpak org.onlyoffice.desktopeditors "Your chosen office apps are installed"
+  v=$(sl_choice_get notes_app); case "$v" in obsidian|both) [ "$profile" != lite ] && app flatpak md.obsidian.Obsidian "Your chosen notes app is installed" ;; esac
+  [ "$(sl_choice_get conda)" = yes ] && ! sl_is_atomic && app rpm conda "Your chosen Python environment tool is installed"
+  v=$(sl_choice_get matlab); case "$v" in octave|both) if sl_is_atomic; then app flatpak org.octave.Octave "Your chosen maths app is installed"; else app rpm octave "Your chosen maths app is installed"; fi ;; esac
+  case "$(sl_choice_get email_client)" in thunderbird) app_any_email ;; betterbird) app flatpak eu.betterbird.Betterbird "Your chosen email app is installed" ;; esac
+  if [ "$(sl_choice_get keepassxc)" = yes ]; then if sl_is_atomic; then app flatpak org.keepassxc.KeePassXC "Your chosen KeePass app is installed"; else app rpm keepassxc "Your chosen KeePass app is installed"; fi; fi
+  [ "$(sl_choice_get backup_gui)" = deja-dup ] && [ "$profile" = lite ] && ! sl_is_atomic && app rpm deja-dup "Your chosen backup app is installed"
+  [ "$(sl_choice_get disk_usage)" = baobab ] && [ "$profile" = lite ] && ! sl_is_atomic && app rpm baobab "Your chosen disk-usage app is installed"
+  [ "$(sl_choice_get disk_utility)" = gnome-disks ] && [ "$profile" = lite ] && ! sl_is_atomic && app rpm gnome-disk-utility "Your chosen disk utility is installed"
+  if [ "$(sl_choice_get android_dev)" = yes ] && [ "$profile" = full ]; then app flatpak com.google.AndroidStudio "Android Studio is installed"; sl_is_atomic || app rpm android-tools "Android phone tools are installed"; fi
+  [ "$(sl_choice_get game_saves)" = yes ] && app flatpak com.github.mtkennerly.ludusavi "Your game-save backup app is installed"
+  v=$(sl_choice_get meetings)
+  for item in ${v//,/ }; do
+    case "$item" in vesktop) if [ "$profile" = lite ]; then app_file discord "Discord is ready"; else app flatpak dev.vencord.Vesktop "Your chosen chat app is installed"; fi ;;
+      teams) app_file teams "Microsoft Teams is ready" ;; zoom) app_file zoom "Zoom is ready" ;; esac
+  done
+  v=$(sl_choice_get accessibility)
+  for item in ${v//,/ }; do
+    case "$item" in orca) sl_is_atomic || app rpm orca "Your chosen screen reader is installed" ;;
+      dyslexia) sl_is_atomic || app rpm opendyslexic-fonts "Your chosen reading font is installed" ;;
+      captions) [ "$profile" = lite ] || app flatpak net.sapples.LiveCaptions "Your chosen live-captions app is installed" ;; esac
+  done
+  if [ "$(sl_choice_get extras_tools)" = yes ] && [ "$profile" != lite ]; then
+    local id
+    for id in net.mkiol.SpeechNote com.github.dynobo.normcap com.github.tenderowl.frog com.github.jeromerobert.pdfarranger fr.romainvigier.MetadataCleaner; do app flatpak "$id" "Chosen tools pack: $id"; done
+    sl_is_atomic || app rpm ocrmypdf "Your chosen searchable-PDF tool is installed"
+  fi
+  if [ "$(sl_choice_get extras_apps)" = yes ]; then
+    app flatpak com.github.johnfactotum.Foliate "Your chosen e-book reader is installed"
+    app flatpak com.rustdesk.RustDesk "Your chosen remote-help app is installed"
+    if [ "$profile" = lite ]; then :; else app flatpak app.organicmaps.desktop "Your chosen maps app is installed"; app flatpak com.calibre_ebook.calibre "Your chosen e-book library is installed"; fi
+  fi
+  v=$(sl_choice_get extra_apps); case "$v" in ""|none) ;; *) extra_apps "$v" ;; esac
+}
+
+collect() {
+  : > "$WORK/pass.rows"
+  run_base
+  require_base_rows
+  probe_network
+  probe_audio_video
+  probe_guide
+  probe_firmware_debian
+  probe_snapshot_timer
+  probe_choices
+}
+apply_safe_fixes() {
+  [ "${SL_READY_NO_FIX:-}" != 1 ] && [ -s "$WORK/actions" ] || return 0
+  local a label rc
+  while IFS='|' read -r a label; do
+    [ -n "$a" ] || continue
+    printf 'Trying the safe fix: %s\n' "$label"
+    rc=0
+    run_file "$REPAIR" --action "$a" --approved > "$WORK/fix-$a.log" 2>&1 || rc=$?
+    printf '%s|rc=%s\n' "$a" "$rc" >> "$WORK/fix-results"
+    FIX_ATTEMPTS=$((FIX_ATTEMPTS + 1))
+  done < <(awk -F'|' '!seen[$1]++' "$WORK/actions")
+}
+bad_count() { awk -F'|' '$2 == "warn" || $2 == "bad" { n++ } END { print n+0 }' "$1"; }
+fixed_count() {
+  local id n=0
+  while IFS='|' read -r id _; do
+    [ -n "$id" ] || continue
+    awk -F'|' -v id="$id" '$1 == id && ($2 == "warn" || $2 == "bad") { bad=1 } END { exit !bad }' "$WORK/final.rows" || n=$((n + 1))
+  done < <(awk -F'|' '$2 == "warn" || $2 == "bad" { print $1 }' "$WORK/first.rows")
+  printf '%s' "$n"
+}
+issue_summary() {
+  awk -F'|' '$2 == "warn" || $2 == "bad" { if (n < 3) { s = s (n ? "; " : "") $3 ($4 != "" ? ": " $4 : ""); n++ } else more++ } END { if (more) s = s " (and " more " more)"; print substr(s, 1, 220) }' "$WORK/final.rows"
+}
+next_step() {
+  local fix
+  fix=$(awk -F'|' '$2 == "warn" || $2 == "bad" { print $5; exit }' "$WORK/final.rows")
+  case "$fix" in
+    repair) printf "Next step: open Secure Linux Status & Fixes and choose 'Repair setup'." ;;
+    updates) printf "Next step: open Secure Linux Status & Fixes and choose 'Install updates now'." ;;
+    restart) printf 'Next step: save your work, then restart the computer and run secure-linux-ready again.' ;;
+    firmware) printf "Next step: plug in the charger, open Secure Linux Status & Fixes and choose 'Update firmware'." ;;
+    snapshots-clean) printf "Next step: open Secure Linux Status & Fixes and choose 'Free space from old snapshots'." ;;
+    disk) printf "Next step: open Secure Linux Status & Fixes and choose 'See what's using disk space'." ;;
+    *) printf "Next step: open Secure Linux Status & Fixes and choose 'Create a diagnostics file', then ask a helper." ;;
+  esac
+}
+box_message() {
+  local line folded
+  printf '+----------------------------------------------------------------------+\n'
+  for line in "$WELCOME" "$1" "$2" "$3"; do
+    while IFS= read -r folded; do printf '| %-68s |\n' "$folded"; done < <(printf '%s\n' "$line" | fold -s -w 68)
+  done
+  printf '+----------------------------------------------------------------------+\n'
+}
+present() {
+  local ready=$1 body rc
+  if [ "$ready" = 0 ]; then
+    if [ "$FIX_ATTEMPTS" -gt 0 ]; then
+      local fixed; fixed=$(fixed_count)
+      body="Ready now: $fixed problem(s) were fixed, and the full recheck passed."
+    else body='Your computer is ready. Every check passed; nothing needed fixing.'; fi
+  else body="Still needs attention: $(issue_summary). $(next_step)"; fi
+  rc=$ready
+  if [ -r "$SL_ROOT/lib/sl-ui.sh" ]; then
+    # shellcheck source=../lib/sl-ui.sh
+    . "$SL_ROOT/lib/sl-ui.sh"
+    ui_prefer_gui
+    ui_init
+    if [ "$UI_MODE" = gui ]; then
+      UI_APP='Secure Linux ready check' ui_info "$WELCOME"$'\n\n'"$body"$'\n\n'"Open the START-HERE guide: $GUIDE"$'\n\n''Keep the USB stick: it is your rescue drive if you need to repair or reinstall.' 'Welcome to Linux'
+    elif [ "$UI_MODE" = rich ]; then
+      ui_card "$([ "$ready" = 0 ] && echo ok || echo fail)" "$WELCOME" '' "$body" '' "Open the START-HERE guide: $GUIDE" '' 'Keep the USB stick: it is your rescue drive if you need to repair or reinstall.'
+      [ "$UI_TTY" = 1 ] && ui_wait
+    else
+      box_message "$body" "Open the START-HERE guide: $GUIDE" 'Keep the USB stick: it is your rescue drive if you need to repair or reinstall.'
+    fi
+  elif [ -z "${SL_WIZARD_ANSWERS:-}" ] && [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ] && have zenity; then
+    if [ "$ready" = 0 ]; then
+      zenity --info --no-markup --title='Welcome to Linux' --width=640 --text="$WELCOME"$'\n\n'"$body"$'\n\n'"Open the START-HERE guide: $GUIDE"$'\n\n''Keep the USB stick: it is your rescue drive if you need to repair or reinstall.' >/dev/null 2>&1
+    else
+      zenity --warning --no-markup --title='Welcome to Linux' --width=640 --text="$WELCOME"$'\n\n'"$body"$'\n\n'"Open the START-HERE guide: $GUIDE"$'\n\n''Keep the USB stick: it is your rescue drive if you need to repair or reinstall.' >/dev/null 2>&1
+    fi
+  else
+    box_message "$body" "Open the START-HERE guide: $GUIDE" 'Keep the USB stick: it is your rescue drive if you need to repair or reinstall.'
+  fi
+  return "$rc"
+}
+
+: > "$WORK/actions"
+collect
+cp "$WORK/pass.rows" "$WORK/first.rows"
+if [ "$(bad_count "$WORK/first.rows")" -gt 0 ]; then apply_safe_fixes; fi
+if [ "$FIX_ATTEMPTS" -gt 0 ]; then
+  READY_COLLECT_ACTIONS=0
+  collect
+else
+  cp "$WORK/first.rows" "$WORK/pass.rows"
+fi
+cp "$WORK/pass.rows" "$WORK/final.rows"
+READY=0
+[ "$(bad_count "$WORK/final.rows")" -eq 0 ] || READY=1
+present "$READY"
+exit "$READY"

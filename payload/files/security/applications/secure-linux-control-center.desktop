@@ -1,0 +1,23 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Secure Linux Control Centre
+GenericName=Security settings
+Comment=Choose and verify beginner-friendly security protection
+Exec=secure-linux-control-center
+Icon=security-high
+Terminal=false
+Categories=System;Settings;Security;
+Keywords=security;firewall;VPN;DNS;updates;virus;privacy;
+StartupNotify=true
+StartupWMClass=secure-linux-control-center
+Actions=Recommended;Status;
+X-GNOME-UsesNotifications=false
+
+[Desktop Action Recommended]
+Name=Review recommended protection
+Exec=secure-linux-control-center
+
+[Desktop Action Status]
+Name=Open security status and fixes
+Exec=secure-linux-status-gui

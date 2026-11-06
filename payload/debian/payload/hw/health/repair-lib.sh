@@ -72,11 +72,41 @@ rp_need_cmd() {  # rp_need_cmd tool "package" -> 0 if present; otherwise explain
 rp_pause() { [ "$RP_DRY" = 1 ] && return 0; local x; slh_read x "Press Enter to continue. " || true; }
 
 # ---------------------------------------------------------------- disks
-rp_parent_disk() {   # /dev/sda3 -> /dev/sda ; /dev/mapper/x -> its underlying disk when lsblk knows it
-  local d=$1 pk
-  pk=$(lsblk -no PKNAME "$d" 2>/dev/null | head -n1)
-  [ -n "$pk" ] && { printf '/dev/%s' "$pk"; return; }
-  printf '%s' "$d"
+rp_parent_disk() {   # follow the WHOLE parent chain: /dev/mapper/x -> ... -> /dev/sda; unknown/cyclic ancestry is an error
+  local current=$1 row name pk extra lines
+  declare -A seen=()
+  while [ -n "$current" ] && [ "$current" != "-" ]; do
+    if [ -n "${seen[$current]:-}" ]; then
+      echo "A device-parent cycle was found at $current. I can't safely identify the physical drive." >&2
+      return 1
+    fi
+    seen[$current]=1
+    row=$(lsblk -nbo NAME,PKNAME "$current" 2>/dev/null) || {
+      echo "The parent of $current could not be queried. I can't safely identify the physical drive." >&2
+      return 1
+    }
+    lines=$(printf '%s\n' "$row" | wc -l)
+    name=""; pk=""; extra=""
+    read -r name pk extra <<< "$row"
+    # More than one parent (or an unexpected answer) does not prove that two devices are separate.
+    if [ "$name" != "$current" ] || [ -n "$extra" ] || [ "$lines" -ne 1 ]; then
+      echo "The device identity or parents of $current could not be confirmed. Treating it as unsafe." >&2
+      return 1
+    fi
+    case "$pk" in
+      ""|-) printf '%s' "$current"; return 0 ;;
+      /*) current=$pk ;;
+      *) current=/dev/$pk ;;
+    esac
+  done
+  echo "The physical drive for $1 could not be identified. Treating it as unsafe." >&2
+  return 1
+}
+rp_same_disk() {   # 0 = same drive OR cannot prove separation (always refuse); 1 = confirmed different whole drives
+  local a b
+  a=$(rp_parent_disk "$1") || { echo "I can't safely tell which drive $1 belongs to. Nothing will be written there." >&2; return 0; }
+  b=$(rp_parent_disk "$2") || { echo "I can't safely tell which drive $2 belongs to. Nothing will be written there." >&2; return 0; }
+  [ "$a" = "$b" ]
 }
 rp_disk_label() {    # "/dev/sda (Samsung SSD 860, 465.8G)"
   local d=$1 m s
@@ -264,18 +294,29 @@ rp_target_ensure() {   # rp_target_ensure rw|ro  -> sets RP_TARGET; returns 1 if
 }
 
 # ---------------------------------------------------------------- backup before changes
-rp_backup() {   # rp_backup "why" -> saves the boot-related files of the system being repaired, and a btrfs snapshot if snapper is there
-  local t stamp dir
-  t=$(rp_t); stamp=$(date +%Y%m%d-%H%M%S); dir="$t/var/lib/secure-linux/repair-backup"
+rp_backup() {   # rp_backup "why" -> verified boot-file archive; a real repair STOPS if it cannot be made and read back
+  local t stamp dir archive
+  t=$(rp_t); stamp=$(date +%Y%m%d-%H%M%S); dir="$t/var/lib/secure-linux/repair-backup"; archive="$dir/boot-$stamp.tar.gz"
   echo; echo "Safety copy first ($1)..."
   if [ "$RP_DRY" = 1 ]; then
     printf '  [dry run] would run: tar czf %s/boot-%s.tar.gz  etc/fstab etc/default/grub boot/grub2/grub.cfg boot/loader boot/efi/EFI\n' "$dir" "$stamp"
+    printf '  [dry run] would check the saved archive with: tar tzf %s/boot-%s.tar.gz\n' "$dir" "$stamp"
     have snapper && printf '  [dry run] would run: snapper -c root create -d "before secure-linux-repair"\n'
     return 0
   fi
-  mkdir -p "$dir" 2>/dev/null
-  ( cd "$t" && tar czf "$dir/boot-$stamp.tar.gz" etc/fstab etc/default/grub boot/grub2/grub.cfg boot/loader boot/efi/EFI 2>/dev/null ) \
-    && echo "  Saved: ${dir#"${t%/}"}/boot-$stamp.tar.gz" || echo "  (could not save a copy of the boot files; continuing carefully)"
+  if ! mkdir -p "$dir" 2>/dev/null || \
+     ! ( cd "$t" && tar czf "$archive" etc/fstab etc/default/grub boot/grub2/grub.cfg boot/loader boot/efi/EFI 2>/dev/null ) || \
+     [ ! -s "$archive" ] || ! tar tzf "$archive" >/dev/null 2>&1; then
+    rm -f "$archive" 2>/dev/null
+    cat >&2 <<'EOF'
+STOP: I could not make and check a safety copy of the boot files. No boot repair will be done.
+Free some space, check that the system drive is writable, then run this again. You can also restart from the
+Secure Linux USB stick and copy your files somewhere safe before asking for help with the boot repair.
+EOF
+    # Callers historically ignored this warning. A failed prerequisite is fatal, so none can print "Done" or repair anyway.
+    exit 1
+  fi
+  echo "  Saved and checked: ${dir#"${t%/}"}/boot-$stamp.tar.gz"
   if [ "$t" = / ] && have snapper && snapper list-configs 2>/dev/null | grep -q root; then
     snapper -c root create -d "before secure-linux-repair $stamp" >/dev/null 2>&1 && echo "  Snapshot created: before secure-linux-repair $stamp"
   fi
@@ -287,8 +328,21 @@ rp_ask() {   # rp_ask VAR "prompt" [default]
   if [ "$RP_DRY" = 1 ] && [ -n "${SL_REPAIR_AUTO:-}" ]; then printf -v "$1" '%s' "${3:-}"; printf '%s[auto: %s]\n' "$2" "${3:-}"; return 0; fi
   slh_read "$1" "$2"
 }
-rp_dev_of_path() { findmnt -no SOURCE -T "$1" 2>/dev/null | head -n1; }
-rp_size_bytes() { blockdev --getsize64 "$1" 2>/dev/null || lsblk -bdno SIZE "$1" 2>/dev/null | head -n1; }
+rp_dev_of_path() {
+  local src
+  src=$(findmnt -no SOURCE -T "$1" 2>/dev/null) || return 1
+  src=${src%%$'\n'*}; src=${src%%\[*}
+  [ -n "$src" ] || return 1
+  printf '%s' "$src"
+}
+rp_size_bytes() {
+  local bytes
+  bytes=$(blockdev --getsize64 "$1" 2>/dev/null) && [[ "$bytes" =~ ^[0-9]+$ ]] && { printf '%s' "$bytes"; return 0; }
+  bytes=$(lsblk -bdno SIZE "$1" 2>/dev/null) || return 1
+  bytes=${bytes%%$'\n'*}; bytes=${bytes//[[:space:]]/}
+  [[ "$bytes" =~ ^[0-9]+$ ]] || return 1
+  printf '%s' "$bytes"
+}
 rp_free_bytes() { df -P -B1 "$1" 2>/dev/null | awk 'NR==2{print $4}'; }
 rp_list_partitions() {   # numbered list on stderr; fills RP_PART_DEV[] ; prints nothing on stdout
   local i=0 dev fs size label mp

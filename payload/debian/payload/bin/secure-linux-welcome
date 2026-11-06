@@ -109,10 +109,104 @@ wz_done() { grep -qx "$1" "$DONE" 2>/dev/null || echo "$1" >> "$DONE"; }
 wz_is_done() { grep -qx "$1" "$DONE" 2>/dev/null; }
 remember() { sed -i "/^$1=/d" "$ANS" 2>/dev/null; printf '%s=%s\n' "$1" "$2" >> "$ANS"; }   # remember KEY VALUE (your answers, per person)
 
+# Compatibility surface for the shared five-screen core. These functions only apply choices after Confirm.
+SL_WIZARD_DISTRO=debian
+SL_EXP=$SL_ROOT/files/experience; SL_BIN=$SL_ROOT/bin
+current_ssid() { have nmcli && nmcli -t -f active,ssid dev wifi 2>/dev/null | sed -n 's/^yes://p' | head -1; }
+ui_terminal() { wz_term "$@"; }
+bg() { if [ "$(ui_tool)" = script ]; then "$@"; else "$@" >/dev/null 2>&1 & fi; }
+want() { wz_root "$SL_ROOT/bin/secure-linux-choice" set "$1" "$2"; }
+flush() { return 0; }
+
+sl_wizard_distro_apply() {
+  local C=$SL_ROOT/bin/secure-linux-choice value mode url repair=0
+  sl_wizard_apply_security || return 1
+  if sl_wizard_selected steps browser; then
+    "$SL_ROOT/bin/secure-linux-browser" set librewolf >/dev/null 2>&1 || return 1
+  fi
+  if sl_wizard_selected steps apps; then
+    value=$(sl_wizard_list extra_apps); value=${value//,/ }
+    want extra_apps "${value:-none}"
+    [ -z "$value" ] || repair=1
+  fi
+  if sl_wizard_selected steps backup; then
+    value=$(sl_wizard_get backup_target usb)
+    want backup_target "$value"; want backup_gui deja-dup
+    repair=1
+  fi
+  if [ "$(sl_wizard_get docker no)" = yes ]; then
+    # Repair repeats the hardware gate before adding Docker's repository or packages.
+    sl_wizard_root "$C" set docker yes || return 1
+    repair=1
+  fi
+  [ "$repair" = 0 ] || sl_wizard_root "$SL_ROOT/setup.sh" --repair || return 1
+  if sl_wizard_selected steps backup && [ "$(sl_wizard_get backup_target usb)" != later ]; then
+    command -v deja-dup >/dev/null 2>&1 || { echo "Backup was selected, but Deja Dup is not available after Repair setup." >&2; return 1; }
+    bg deja-dup
+  fi
+  if sl_wizard_selected steps recovery && needs_recovery; then ui_terminal secure-linux-recovery-key create || return 1; fi
+  if sl_wizard_selected steps hardware && have secure-linux-health; then secure-linux-health --gui || return 1; fi
+  if [ "$(sl_wizard_get wifi_mode skip)" = saved ]; then
+    printf '%s\n' "${SL_WIZARD_SECRET[wifi_pin]:-}" | pkexec "$SELF" --wifi-saved || return 1
+    SL_WIZARD_SECRET[wifi_pin]=""
+  fi
+  mode=$(sl_wizard_get home_assistant none)
+  case $mode in
+    existing)
+      url=$(sl_wizard_get ha_url "")
+      case $url in http://*|https://*) ;; *) echo "Enter an http:// or https:// Home Assistant address." >&2; return 1 ;; esac
+      sl_wizard_root "$C" set ha_url "$url" || return 1
+      sl_wizard_root "$C" set ha_have_server yes || return 1 ;;
+    guided) bg ui_terminal "$SL_ROOT/bin/secure-linux-ha-setup" || return 1 ;;
+  esac
+  if sl_wizard_yes fleet; then ui_terminal "$SL_ROOT/bin/secure-linux-fleet-join" || return 1; fi
+  # Detected driver choices keep their specialist safety text and explicit consent after Confirm.
+  if drivers_offer Broadcom; then q_broadcom || return 1; fi
+  if drivers_offer NVIDIA; then q_nvidia || return 1; fi
+  return 0
+}
+
+root_set_identity() { # --set-identity LOGIN "Full Name"; optional password on stdin
+  local login=${1:-} full=${2:-} pw
+  [ "$(id -u)" -eq 0 ] || exec pkexec "$SELF" --set-identity "$@"
+  printf '%s' "$login" | grep -qE '^[a-z_][a-z0-9_-]{0,30}$' || return 1
+  [ "$login" = "$(sl_user)" ] && id "$login" >/dev/null 2>&1 || return 1
+  case "$full" in *:*|*$'\n'*) return 1 ;; esac
+  IFS= read -r pw || true
+  if [ -n "$pw" ]; then [ ${#pw} -ge 6 ] || return 1; printf '%s:%s\n' "$login" "$pw" | chpasswd || return 1; fi
+  [ -z "$full" ] || usermod -c "$full" "$login"
+}
+
+root_wifi_saved() { # --wifi-saved; PIN on stdin, all saved networks, protected 0600 schema
+  local py=$SL_ROOT/sl-wifi.py rec=$SL_STATE/wifi-record staged=$SL_STATE/wifi-staged
+  local dest=$R/etc/NetworkManager/system-connections pin kind tmp opened=0
+  [ "$(id -u)" -eq 0 ] || [ -n "$SL_SYSROOT" ] || exec pkexec "$SELF" --wifi-saved
+  [ -s "$rec" ] || [ -s "$staged" ] || return 0
+  IFS= read -r pin || true; tmp=$(mktemp -d); chmod 700 "$tmp"; trap 'rm -rf "$tmp"' RETURN
+  if [ -s "$rec" ]; then
+    kind=$(cut -d'|' -f1 "$rec" | head -1)
+    if [ "$kind" = enc1 ]; then
+      [ -n "$pin" ] || return 1
+      SL_WIFI_PIN=$pin python3 "$py" open "$rec" "$tmp/bundle" >/dev/null 2>&1 && opened=1
+    else python3 "$py" open "$rec" "$tmp/bundle" >/dev/null 2>&1 && opened=1; fi
+    [ "$opened" = 1 ] || return 1
+    python3 "$py" keyfiles "$tmp/bundle" "$dest" || return 1
+    rm -f "$rec"
+  fi
+  if [ -s "$staged" ]; then python3 "$py" keyfiles "$staged" "$dest" || return 1; rm -f "$staged"; fi
+  command -v nmcli >/dev/null 2>&1 && nmcli connection reload >/dev/null 2>&1
+  return 0
+}
+
 # ---------------------------------------------------------------- detection (decides what is worth asking)
 connected() { [ "$(nmcli -t -f STATE general 2>/dev/null)" = connected ]; }
 sb_on() { have mokutil && mokutil --sb-state 2>/dev/null | grep -qi 'SecureBoot enabled'; }
-drivers_offer() { have secure-linux-drivers && secure-linux-drivers check 2>/dev/null | grep -q "OFFER.*$1"; }
+DRIVER_CHECK=""
+drivers_offer() {
+  have secure-linux-drivers || return 1
+  [ -n "$DRIVER_CHECK" ] || DRIVER_CHECK=$(secure-linux-drivers check 2>/dev/null)
+  grep -q "OFFER.*$1" <<< "$DRIVER_CHECK"
+}
 needs_recovery() {
   have secure-linux-recovery-key || return 1
   lsblk -rno FSTYPE 2>/dev/null | grep -q crypto_LUKS || return 1
@@ -251,22 +345,28 @@ run_plugin() {   # a page from another area; one that fails never stops the wiza
     . "$f" 2>/dev/null && declare -F page_run >/dev/null && page_run ) || true
 }
 
-wizard() {   # wizard [again]
-  local again=${1:-} asked=0 q p
+wizard() {   # exactly five screens; old q_* and plug-ins remain post-install tools
+  local again=${1:-} q
+  [ "$again" = again ] || anything_open || return 0
   [ "$(ui_tool)" = none ] && { echo "No screen or terminal to ask on; the welcome wizard will run at your next login."; return 0; }
-  for q in wifi broadcom recovery nvidia browser; do
-    [ "$asked" -ge "$MAXQ" ] && break
-    if [ "$again" != again ] && wz_is_done "q-$q"; then continue; fi
-    if "q_$q"; then asked=$((asked + 1)); fi
-  done
-  # pages from other areas only while there is room for more questions
-  if [ "$asked" -lt "$MAXQ" ]; then for p in $(page_ids); do CUR=$(basename "$p" .sh); run_plugin "$p"; done; fi
-  # one summary, once (or whenever asked for again)
-  if [ "$again" = again ] || ! wz_is_done summary; then CUR=summary; wz_info "$(summary_text)"; wz_done summary; fi
+  . "$SL_ROOT/wizard.d/00-core.sh"
+  sl_wizard_run || return 0
+  for q in wifi broadcom recovery nvidia browser; do wz_done "q-$q"; done
+  wz_done summary
+  if [ -r "$SL_ROOT/bin/secure-linux-ready" ]; then
+    if [ -n "${SL_WIZARD_ANSWERS:-}" ] && [ -n "${SL_SYSROOT:-}" ]; then
+      SL_READY_CHECK=${SL_READY_CHECK:-true} SL_READY_NO_FIX=1 SL_READY_ONLINE=yes \
+        bash "$SL_ROOT/bin/secure-linux-ready" || true
+    else
+      bash "$SL_ROOT/bin/secure-linux-ready" || true
+    fi
+  fi
   return 0
 }
 
 case "${1:-}" in
+  --set-identity) shift; root_set_identity "$@" ;;
+  --wifi-saved) shift; root_wifi_saved "$@" ;;
   -h|--help) sed -n '2,/^# Tests:/p' "$0" | sed 's/^# \{0,1\}//' ;;
   --list) for p in $PAGES; do printf '%-10s %-34s %s\n' "$p" "$(page_title_of "$p")" "$(wz_is_done "q-$p" && echo done || echo 'not asked / nothing to ask')"; done ;;
   --status) echo "$(grep -c '^q-' "$DONE") question(s) answered; summary $(wz_is_done summary && echo shown || echo 'not shown yet')" ;;

@@ -1,0 +1,47 @@
+#!/bin/bash
+# secure-linux-finish: the last, friendly steps after Secure Linux is installed.
+#   secure-linux-finish                 choose a finishing job
+#   secure-linux-finish --gui [JOB]     use native graphical questions and folder pickers
+#   secure-linux-finish stuff           restore the remaining files, bookmarks and password CSV
+#   secure-linux-finish restore [BACKUP] copy standard backup folders home without silent overwrites
+#   secure-linux-finish copy [FOLDER]   copy one chosen folder to ~/Transferred
+#   secure-linux-finish apps            individually choose which apps to finish
+#   secure-linux-finish export [FOLDER] export safe app/comfort choices to secure-linux-choices.json
+#   secure-linux-finish import FILE     validate and apply a choices file through secure-linux-migrate
+#   secure-linux-finish care            health summary, established safe fixes and a one-page care sheet
+#   secure-linux-finish summary         show what is set up and what still needs you
+# Every account sign-in, password import, device pairing and overwrite needs the person at the keyboard.
+# No passwords or tokens are requested. Nothing runs on a timer from this command.
+set -uo pipefail
+SL_ROOT=${SL_ROOT:-/usr/local/lib/secure-linux}
+# shellcheck source=../lib/common.sh
+. "$SL_ROOT/lib/common.sh"
+# shellcheck source=../files/comfort/comfort-lib.sh
+. "$SL_ROOT/files/comfort/comfort-lib.sh"
+# shellcheck source=../lib/finish-lib.sh
+. "$SL_ROOT/lib/finish-lib.sh"
+umask 077
+finish_init
+
+usage() { sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'; }
+
+if [ "${1:-}" = --gui ]; then
+  SL_FINISH_UI=gui
+  shift
+  finish_gui_init || exit 1
+fi
+
+case "${1:-}" in
+  -h|--help|help) usage ;;
+  "") finish_main_menu ;;
+  stuff) finish_stuff ;;
+  restore) shift; finish_restore_backup "${1:-}"; rc=$?; finish_summary; exit "$rc" ;;
+  copy) shift; finish_copy_extra "${1:-}"; rc=$?; finish_summary; exit "$rc" ;;
+  apps) finish_apps ;;
+  export|choices-export) shift; finish_choices_export "${1:-}"; rc=$?; finish_summary; exit "$rc" ;;
+  import|choices-import) shift; [ $# -eq 1 ] || { echo 'Usage: secure-linux-finish import FILE' >&2; exit 2; }
+    finish_choices_import "$1"; rc=$?; finish_summary; exit "$rc" ;;
+  care) finish_care ;;
+  summary) finish_summary ;;
+  *) usage; exit 2 ;;
+esac

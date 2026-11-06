@@ -123,36 +123,42 @@ do_checklist() {
 ha_remember_remote() { "$SL_ROOT/bin/secure-linux-choice" set ha_remote_mode "$1" >/dev/null 2>&1; return 0; }
 
 do_guided() {
-  say "Home Assistant security check"
-  say "============================="
-  say "This looks at how your Home Assistant is set up and gives it a grade from A to F, with plain-English fixes."
-  say "It only LOOKS. Nothing is changed unless you say yes later. Passwords and tokens are never shown or saved in the report."
+  # Beginner contract: at most three inputs and three screens. The complete
+  # 20-question checklist remains available explicitly as --checklist.
+  say "Home Assistant security check — 3 short screens at most"
+  say "======================================================"
+  say "It only LOOKS. Passwords and tokens are never shown or saved in the report."
+  say "Saved server, token and local-config choices are discovered automatically."
   say ""
+  say "Screen 1 of 3: find Home Assistant"
   if [ -z "$cfg$sshto" ] && [ $api = no ]; then
-    say "How should I look?"
-    say "  1) Over SSH at my home server   (most complete)"
-    say "  2) At a copy of the config folder on this computer"
-    say "  3) Ask Home Assistant itself with an access token"
-    local c; c=$(ask "Type 1, 2 or 3 (Enter to cancel):")
-    case $c in
-      1) sshto=$(ask "Server address like matt@10.0.30.42:"); ha_valid_target "$sshto" || { say "That doesn't look like name@address."; return 1; } ;;
-      2) cfg=$(ask "Folder (the one that holds configuration.yaml):"); cfg=${cfg:-$(ha_config_dir)} ;;
-      3) api=yes; [ -e "$tokfile" ] || { say "You need a token first: secure-linux-ha token-set"; return 1; } ;;
-      *) say "Okay, nothing done."; return 0 ;;
-    esac
+    if pick_source; then
+      say "Using your saved or safely detected source; no address question is needed."
+    else
+      say "No saved source was found. Choose once (advanced flags can skip this screen):"
+      say "  1) Over SSH at my home server   (most complete)"
+      say "  2) At a copy of the config folder on this computer"
+      say "  3) Ask Home Assistant itself with an access token"
+      local c; c=$(ask "Type 1, 2 or 3 (Enter to cancel):")
+      case $c in
+        1) sshto=$(ask "Server address like matt@10.0.30.42:"); ha_valid_target "$sshto" || { say "That doesn't look like name@address."; return 1; } ;;
+        2) cfg=$(ask "Folder (the one that holds configuration.yaml):"); cfg=${cfg:-$(ha_config_dir)} ;;
+        3) api=yes; [ -e "$tokfile" ] || { say "You need a token first: secure-linux-ha token-set"; return 1; } ;;
+        *) say "Okay, nothing done."; return 0 ;;
+      esac
+    fi
   fi
   build_src || return 1
   if need_root_for_token; then say "Your token is kept in a private file; I'll ask for your password to read it."; fi
-  run_check
+  say ""; say "Screen 2 of 3: read the results"
+  run_check || return $?
   if [ -n "$cfg" ]; then
+    say ""; say "Screen 3 of 3: optional safe fixes"
     local a; a=$(ask "Fix the safe things automatically? You'll see each change first. (yes/no)")
     [ "$a" = yes ] && "${ENG[@]}" apply --config "$cfg" --attest "$attest" "${now_args[@]}"
   fi
-  if grep -q 'I NEED YOUR ANSWER' "${LASTOUT:-/dev/null}" 2>/dev/null; then
-    local b; b=$(ask "Answer the questions only you can answer, to complete the picture? (yes/no)")
-    [ "$b" = yes ] && do_checklist
-  fi
-  say ""; say "Run this again after fixing things. Aim for a B or better."
+  say ""; say "Advanced details: secure-linux-ha-secure --checklist answers the 20 router, backup and habit questions separately."
+  say "The default guide does not launch that checklist or repeat its questions. Run this check again after fixing things."
 }
 
 pick_source_needed() { case $action in check|apply|report|guided) return 0 ;; *) return 1 ;; esac; }

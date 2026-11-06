@@ -68,7 +68,7 @@ case $choice in
     ;;
   b|B)
     say ""
-    say "Container on your home server"
+    say "Container on your home server — 3 inputs at most"
     def=$(sl_build_get IMMICH_URL); def=${def#*://}; def=${def%%[:/]*}
     target=$(ask "Your server's login (like matt@${def:-10.0.30.42}):")
     [ -n "$target" ] || { say "Okay, stopping. Run this again when you're ready."; exit 0; }
@@ -88,31 +88,25 @@ case $choice in
     kit=$(kit_dir) || { say "I can't find the server kit (server/homeassistant) on this computer. It's on your Secure Linux USB stick under linux/server/homeassistant."; exit 1; }
     say "Found the server kit: $kit"
     say ""
-    say "It will: install Home Assistant (Container) with a pinned version, open it only to your home network,"
-    say "optionally add Mosquitto (MQTT with a password), Zigbee2MQTT, ESPHome, Node-RED, a Matter server and HTTPS with Caddy."
-    say "Each extra is a question you answer on the server. Nothing is forwarded to the internet."
-    if yesno "Copy the kit to $target (into ~/ha-kit) now?"; then
-      if [ $DRY = yes ]; then say "  [dry run] would run: scp -r -- $kit $target:ha-kit"
+    say "One reviewed action now: copy the kit, then install just Home Assistant with the detected LAN and no optional extras."
+    say "Nothing is forwarded to the internet. Advanced extras stay available later with install-ha-container.sh --advanced or --with LIST."
+    if yesno "Copy the kit and run the safe-default installer on $target now?"; then
+      if [ $DRY = yes ]; then
+        say "  [dry run] would run: scp -r -- $kit $target:ha-kit"
+        say "  [dry run] would run the installer over ssh with --yes (no further prompts)"
       else
         ssh -o BatchMode=yes -- "$target" 'mkdir -p ha-kit' && scp -r -- "$kit" "$target:ha-kit/" \
           && scp -r -- "$SL_ROOT/files/homeassistant/starter" "$target:ha-kit/" || { say "The copy failed. Check the connection and try again."; exit 1; }
+        ssh -t -- "$target" 'sudo bash ~/ha-kit/homeassistant/install-ha-container.sh --yes' || { say "The installer did not finish; read its output before retrying."; exit 1; }
       fi
-      say "Copied."
-      say ""
-      say "Now run the installer ON THE SERVER. You can do it here (it opens a normal login session you can watch):"
-      say "   ssh -t $target 'sudo bash ~/ha-kit/homeassistant/install-ha-container.sh'"
-      if yesno "Run it now?"; then
-        if [ $DRY = yes ]; then say "  [dry run] would run the installer over ssh"
-        else ssh -t -- "$target" 'sudo bash ~/ha-kit/homeassistant/install-ha-container.sh'; fi
-      else
-        say "No problem. Run that command when you're ready, or log in to the server and run it there."
-      fi
+    else
+      say "Nothing was copied or installed. For separate advanced steps, use Home & Server Studio > Existing server."
     fi
     save ha_ssh "$target"
     save ha_have_server yes
     srv=${target#*@}
-    say ""
-    if yesno "Set http://$srv:8123 as the address of your Home Assistant? (you can change it any time)"; then save ha_url "http://$srv:8123"; fi
+    say "Saving http://$srv:8123 as the discovered default address (you can change it any time)."
+    save ha_url "http://$srv:8123"
     ;;
   *) say "Okay, nothing done. Run secure-linux-ha-setup when you want to start."; exit 0 ;;
 esac

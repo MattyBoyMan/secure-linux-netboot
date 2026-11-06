@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Bring My Stuff from Windows
+GenericName=Move passwords, bookmarks, photos and files
+Comment=Step-by-step help moving passwords, bookmarks, photos, OneDrive files and more
+Exec=/usr/local/bin/secure-linux-migrate
+Icon=document-import
+Terminal=false
+Categories=Utility;
+Keywords=windows;import;passwords;bookmarks;onedrive;photos;migrate;

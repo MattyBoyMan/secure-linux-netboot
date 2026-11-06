@@ -28,8 +28,8 @@ everything itself. Works two ways:
 
 1. **Boot-menu key** on the PC (F12 on Dell/Lenovo, F9 on HP, F8 on Asus, Esc on many others, Option on
    an Intel Mac) and pick the Flipper ("FLIPPER Boot2Flipper") or your iPXE device.
-2. **Enter** on "Install Secure Linux (recommended)" - or just wait 10 seconds; the menu starts the
-   recommended option by itself.
+2. **Enter** on "Install Secure Linux (recommended)". It is highlighted for you, but the menu waits
+   forever: nothing starts until you press Enter.
 3. **Answer the installer's questions.** Nothing is chosen for you beyond that default: the installer
    checks the computer and recommends a setup, asks which drive to erase (you type `ERASE`), asks for
    your login name and password, and asks about Wi-Fi. That is the same setup screen the USB stick
@@ -79,9 +79,25 @@ turned into a one-way hash in memory and never sent anywhere. The test suite
 Boot2Flipper has no prebuilt releases. After the one manual step above, a GitHub Action in this
 repository (`.github/workflows/build-flipper-fap.yml`) builds it from source with the RogueMaster
 firmware toolchain, monthly and on demand, and attaches `boot2flipper.fap` to this repository's
-**"flipper-fap" release**. Download that file, put it on the Flipper's SD card under `apps/USB/`,
+**"flipper-fap" release**. Download exactly `boot2flipper.fap` from that tag (the prep scripts do not use an unrelated "latest" release), put it on the Flipper's SD card under `apps/USB/`,
 copy the `flipper/` folder's contents to the SD card root, add the two iPXE files from
-<https://boot.ipxe.org>, and follow `flipper/README-FLIPPER.txt`.
+<https://boot.ipxe.org>, and follow `flipper/README-FLIPPER.txt`. The release records both source commit IDs and the asset SHA-256; a successful build against current RogueMaster source is not a guarantee of compatibility with every RogueMaster release.
+
+### Prepare the card with one script
+
+From this `flipper/` folder, Windows users can right-click `prepare-flipper.ps1` and choose **Run with
+PowerShell**. Linux and macOS users run `bash prepare-flipper.sh`. Both versions list the removable
+drives, ask you to pick the SD card by number, and show the exact writes for confirmation before doing
+anything. They copy the SD pack, download and sanity-check the two iPXE files, and fetch the latest
+released `.fap` when one exists. If no app release exists, they print the manual GitHub steps above;
+run the same script again afterwards to finish automatically.
+
+## Keeping the Flipper in sync
+
+Any new USB feature must ship its Flipper equivalent - a BadUSB script or a netboot menu entry - in the
+same change. Do not leave the Flipper version for later. `tests/netboot/run.sh` enforces the command
+side: every `secure-linux-*` command invoked by a BadUSB script must exist in `linux/bin/` or
+`debian/setup/bin/`, so a renamed or missing command fails the netboot suite.
 
 ## Honest limits
 

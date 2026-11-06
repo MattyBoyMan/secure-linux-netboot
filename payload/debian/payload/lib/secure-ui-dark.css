@@ -1,0 +1,17 @@
+@define-color sl_window #161a18;
+@define-color sl_surface #202522;
+@define-color sl_sidebar #1b201d;
+@define-color sl_text #edf1ec;
+@define-color sl_muted #abb5ae;
+@define-color sl_border #424b45;
+@define-color sl_accent #71d4c4;
+@define-color sl_accent_hover #94e2d5;
+@define-color sl_accent_soft #23473f;
+@define-color sl_on_accent #102a25;
+@define-color sl_success #8ed3aa;
+@define-color sl_success_soft #263e30;
+@define-color sl_warning #e5bd79;
+@define-color sl_warning_soft #453822;
+@define-color sl_danger #f0a3a5;
+@define-color sl_danger_soft #482b2d;
+@define-color sl_focus #94e2d5;

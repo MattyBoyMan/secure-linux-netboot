@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Linux USB Installer Creator - Turn any blank USB into a Linux installer
+GenericName=Verified Linux USB installer cloning
+Comment=Save a finished Linux USB master and make fully verified installer clones
+Exec=/usr/local/bin/secure-linux-usb-creator-gui
+Icon=usb-creator
+Terminal=false
+Categories=System;Utility;
+Keywords=USB;Linux;installer;clone;verify;
+StartupNotify=true

@@ -26,6 +26,38 @@ fi
 # Ventoy key removal scheduled before the last restart: confirm it's gone
 [ "$(sl_choice_get mok_removed no)" = pending ] && "$SL_ROOT/bin/secure-linux-mok-remove" check
 
+# ---------------------------------------------------------------- USB device control + security event log
+sl_step "USB device control and security event logging"
+# Both are read-back by secure-linux-security-audit. Atomic keeps the existing no-layering design and reports
+# the limitation instead of pretending these controls are present.
+sl_enable secure-linux-security-audit.timer
+if sl_is_atomic; then
+  echo "Note: USBGuard and auditd aren't installed on the atomic setup; the security report records this limitation."
+else
+  if [ "$(sl_choice_get usbguard yes)" = no ]; then
+    echo "USBGuard is switched off by your saved choice; the security report keeps that choice visible."
+    systemctl -q is-enabled usbguard.service 2>/dev/null && try systemctl disable --now usbguard.service
+  else
+    sl_dnf_install usbguard
+    sl_install_file "$SECF/usbguard-daemon.conf" "$SEC_PREFIX/etc/usbguard/usbguard-daemon.conf" 0600
+    # Beginner-safe first boot: keep every device already present (keyboard, storage, hubs), block only new ones.
+    if [ ! -s "$SEC_PREFIX/etc/usbguard/rules.conf" ]; then
+      _sec_usb_rules=$(mktemp)
+      if usbguard generate-policy > "$_sec_usb_rules" 2>/dev/null && [ -s "$_sec_usb_rules" ]; then
+        install -D -m 0600 "$_sec_usb_rules" "$SEC_PREFIX/etc/usbguard/rules.conf"
+      else
+        echo "FAILED: couldn't create USBGuard's initial allowed-device list; not enabling a blank block-everything policy" | tee -a "$SL_FAILS" >&2
+      fi
+      rm -f "$_sec_usb_rules"
+      unset _sec_usb_rules
+    fi
+    [ -s "$SEC_PREFIX/etc/usbguard/rules.conf" ] && sl_enable usbguard.service
+  fi
+  sl_dnf_install audit
+  sl_install_file "$SECF/secure-linux.rules" "$SEC_PREFIX/etc/audit/rules.d/secure-linux.rules" 0600
+  sl_enable auditd.service
+fi
+
 # ---------------------------------------------------------------- SSH (older PCs only)
 if [ "$SL_PROFILE" = lite ] && ! sl_is_atomic; then
   sl_step "SSH remote login protection"

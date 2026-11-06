@@ -1,0 +1,22 @@
+[Unit]
+Description=Secure Linux read-only security audit
+Documentation=man:secure-linux-security-audit
+Wants=network-online.target
+After=network-online.target local-fs.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/secure-linux-security-audit --scheduled
+Nice=10
+IOSchedulingClass=idle
+TimeoutStartSec=15min
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=read-only
+ProtectSystem=strict
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+ReadWritePaths=/var/lib/secure-linux /var/log/secure-linux

@@ -1,0 +1,7 @@
+REM Flipper Zero BadUSB: opens Linux USB Installer Creator - Turn any blank USB into a Linux installer.
+REM Copy to the Flipper SD card under /badusb/ (qFlipper does this). Only use on your own machines.
+DELAY 1000
+CTRL-ALT t
+DELAY 2000
+STRING secure-linux-usb-creator
+ENTER

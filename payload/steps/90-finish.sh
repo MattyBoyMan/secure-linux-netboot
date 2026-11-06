@@ -34,7 +34,15 @@ if [ "$SL_MODE" = repair ] && [ -f "$_sys_apps_list" ] && command -v flatpak >/d
     sl_online && sl_flatpak_install "${_sys_missing[@]}"
   fi
 fi
+# Run the final checks before claiming success in the report, event or progress.
+if [ -x /usr/local/bin/secure-linux-check ]; then
+  try /usr/local/bin/secure-linux-check
+elif [ -x "$SL_ROOT/bin/secure-linux-check" ]; then
+  try "$SL_ROOT/bin/secure-linux-check"
+fi
 _sys_nfail=0; [ -s "$SL_FAILS" ] && _sys_nfail=$(grep -c . "$SL_FAILS")
+_sys_sec_bad=0
+[ -s "$SL_STATE/checks" ] && _sys_sec_bad=$(awk -F'|' '$1 ~ /^security-/ && $2 == "bad" {n++} END {print n+0}' "$SL_STATE/checks")
 
 case "$_sys_profile" in
   full)   _sys_updates="All updates (system, apps and firmware information) download by themselves every day.
@@ -55,13 +63,16 @@ esac
   echo "THE COMPLETE SECURE LINUX PACKAGE - setup report"
   echo "Finished: $(date '+%A %d %B %Y, %H:%M')      Setup type: $_sys_profile      Mode: $SL_MODE"
   echo
-  if [ "$_sys_nfail" -eq 0 ]; then
-    echo "PROBLEMS: none. Everything installed."
+  if [ "$_sys_nfail" -eq 0 ] && [ "$_sys_sec_bad" -eq 0 ]; then
+    echo "PROBLEMS: none. Everything installed and every required security control passed."
   else
-    echo "PROBLEMS: $_sys_nfail item(s) didn't finish (often just a brief internet hiccup)."
-    echo "  To retry: open 'Secure Linux Status & Fixes' from the app menu and choose 'Repair setup'."
-    echo "  The items:"
+    echo "PROBLEMS: $_sys_nfail setup item(s) didn't finish; $_sys_sec_bad security control(s) failed verification."
+    echo "  This computer is NOT marked secure/ready. Retry: open 'Secure Linux Status & Fixes' and choose 'Repair setup'."
+    echo "  Security report: run 'secure-linux-security-audit report'."
+    echo "  The setup items:"
     sed 's/^/    /' "$SL_FAILS"
+    echo "  Failed security checks:"
+    awk -F'|' '$1 ~ /^security-/ && $2 == "bad" {print "    " $3 ": " $4}' "$SL_STATE/checks"
   fi
   echo
   echo "NEXT STEP"
@@ -91,31 +102,25 @@ esac
 } > "$_sys_report"
 chown "$_sys_u:" "$_sys_report" 2>/dev/null; chmod 0644 "$_sys_report"
 
+mkdir -p "$SL_STATE"
 if [ "$SL_MODE" = install ]; then
-  if [ "$_sys_nfail" -eq 0 ]; then
-    sl_event setup-finished "Setup finished" "Everything is installed. Your report is on the Desktop (SETUP-REPORT.txt)."
+  if [ "$_sys_nfail" -eq 0 ] && [ "$_sys_sec_bad" -eq 0 ]; then
+    sl_event setup-finished "Setup finished" "Everything is installed and required security checks passed. Your report is on the Desktop."
+    printf 'done|done|Setup finished\n' > "$SL_STATE/progress"
   else
-    sl_event setup-finished "Setup finished (a few items need a retry)" \
-      "$_sys_nfail item(s) didn't install. Open 'Secure Linux Status & Fixes' and choose 'Repair setup'."
+    sl_event setup-finished "Setup needs attention" \
+      "$_sys_nfail setup item(s) and $_sys_sec_bad failed security control(s) need attention. The computer is not marked secure/ready."
+    printf 'failed|done|Setup incomplete; retry is required\n' > "$SL_STATE/progress"
   fi
 else
   sl_event "repair-$(date +%Y%m%d-%H%M)" "Repair finished" \
-    "$( [ "$_sys_nfail" -eq 0 ] && echo "Everything is in order again." || echo "$_sys_nfail item(s) still need attention; see SETUP-REPORT.txt on the Desktop.")"
+    "$( [ "$_sys_nfail" -eq 0 ] && [ "$_sys_sec_bad" -eq 0 ] && echo "Everything is in order again." || echo "$_sys_nfail setup item(s) and $_sys_sec_bad failed security control(s) still need attention; see SETUP-REPORT.txt.")"
 fi
-
-mkdir -p "$SL_STATE"
-printf 'done|done|Setup finished\n' > "$SL_STATE/progress"
 
 # One-time notice if firmware (BIOS, SSD, other parts) can be updated; flashing is always the user's decision.
 if [ "$SL_MODE" = install ] && [ -x /usr/local/bin/secure-linux-firmware ]; then
   timeout 300 /usr/local/bin/secure-linux-firmware check || echo "firmware check skipped"
 fi
 
-if [ -x /usr/local/bin/secure-linux-check ]; then
-  try /usr/local/bin/secure-linux-check
-elif [ -x "$SL_ROOT/bin/secure-linux-check" ]; then
-  try "$SL_ROOT/bin/secure-linux-check"
-fi
-
-unset _sys_profile _sys_u _sys_home _sys_desk _sys_report _sys_nfail _sys_updates _sys_apps_list _sys_missing _sys_id
+unset _sys_profile _sys_u _sys_home _sys_desk _sys_report _sys_nfail _sys_updates _sys_apps_list _sys_missing _sys_id _sys_sec_bad
 return 0

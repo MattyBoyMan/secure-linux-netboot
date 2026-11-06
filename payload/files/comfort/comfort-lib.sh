@@ -18,8 +18,16 @@ CF_GUIDE=$CF_R/usr/share/secure-linux/START-HERE.html
 CF_USTATE=${HOME:-/root}/.local/state/secure-linux
 CF_IMMICH_DEFAULT=http://10.0.30.42:8080
 
+# The app scanner may save only package ids explicitly marked "extra" in its reviewed mapping.
+# Never turn a scanned app name into a package command: the TSV is the strict allow-list.
+CF_APP_DB=${SL_APP_EQUIVALENTS:-$SL_ROOT/setup-data/app-equivalents.tsv}
+cf_extra_app_known() {   # cf_extra_app_known LINUX_ID
+  [ -r "$CF_APP_DB" ] || return 1
+  awk -F '\t' -v id="$1" '$2 == id && $9 == "extra" { yes=1 } END { exit !yes }' "$CF_APP_DB"
+}
+
 # Choice keys the comfort area owns, and the values allowed for each (checked before saving as root).
-# A value may be a comma list for the "list" keys.
+# A value may be a comma list for the "list" keys; extra_apps is a space-separated package-id list.
 cf_key_allowed() {   # cf_key_allowed KEY VALUE
   local k=$1 v=$2 item
   case $k in
@@ -31,6 +39,10 @@ cf_key_allowed() {   # cf_key_allowed KEY VALUE
     disk_usage)      [[ $v =~ ^(baobab|none)$ ]] ;;
     disk_utility)    [[ $v =~ ^(gnome-disks|none)$ ]] ;;
     keepassxc)       [[ $v =~ ^(yes|no)$ ]] ;;
+    extra_apps)
+      [ "$v" = none ] && return 0
+      [[ $v =~ ^[A-Za-z0-9._-]+( [A-Za-z0-9._-]+)*$ ]] || return 1
+      for item in $v; do cf_extra_app_known "$item" || return 1; done ;;
     conda|android_dev|game_saves|extras_tools|extras_apps|family_mode|guest_account|tips|drm)
                      [[ $v =~ ^(yes|no)$ ]] ;;
     fleet|fleet_screen)

@@ -62,10 +62,31 @@ EOF
   return 0
 }
 
+# Optional apps found by the old-app scan. Re-validate every id against the TSV even when the choice file
+# was edited by hand. Unknown ids, blank Debian-style names and shell text never reach a package manager.
+_cf45_extra_apps() {
+  local id type rc=0
+  for id in $1; do
+    if ! cf_extra_app_known "$id"; then
+      echo "Refusing unknown extra_apps package id: $id" >&2; rc=2; continue
+    fi
+    type=$(awk -F '\t' -v id="$id" '$2 == id && $9 == "extra" { print $3; exit }' "$CF_APP_DB")
+    case $type in
+      flatpak) sl_flatpak_install "$id" || rc=1 ;;
+      rpm)
+        if sl_is_atomic; then echo "Skipping $id: this atomic setup installs Flatpaks only."
+        else sl_dnf_install "$id" || rc=1; fi ;;
+      *) echo "Refusing extra_apps id with no package type: $id" >&2; rc=2 ;;
+    esac
+  done
+  return $rc
+}
+
 # Install what one migration choice needs (also used by secure-linux-migrate install)
 _cf45_apply() {   # _cf45_apply KEY VALUE
   local k=$1 v=$2 u; u=$(sl_user)
   case "$k=$v" in
+    extra_apps=*) [ "$v" = none ] || _cf45_extra_apps "$v" ;;
     office=onlyoffice) [ "$SL_PROFILE" = lite ] || sl_flatpak_install org.onlyoffice.desktopeditors ;;   # too heavy for old PCs
     notes_app=obsidian|notes_app=both) [ "$SL_PROFILE" = lite ] || sl_flatpak_install md.obsidian.Obsidian ;;
     conda=yes) sl_is_atomic || sl_dnf_install conda ;;
@@ -128,7 +149,7 @@ _cf45() {
 
   # Choices made in the wizard (unset = not chosen yet: nothing to do)
   local k v
-  for k in office notes_app conda matlab android_dev game_saves email_client keepassxc backup_gui disk_usage disk_utility; do
+  for k in office notes_app conda matlab android_dev game_saves email_client keepassxc backup_gui disk_usage disk_utility extra_apps; do
     v=$(sl_choice_get "$k")
     [ -n "$v" ] && _cf45_apply "$k" "$v"
   done
@@ -137,6 +158,6 @@ _cf45() {
 
 # secure-linux-migrate sources this file with CF45_LIB_ONLY=1 to reuse _cf45_apply
 if [ -z "${CF45_LIB_ONLY:-}" ]; then
-  _cf45; unset -f _cf45 _cf45_apply _cf45_fontconfig _cf45_android_udev _cf45_each _cf45_dejadup_defaults
+  _cf45; unset -f _cf45 _cf45_apply _cf45_extra_apps _cf45_fontconfig _cf45_android_udev _cf45_each _cf45_dejadup_defaults
 fi
 return 0

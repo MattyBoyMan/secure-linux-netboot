@@ -1,0 +1,98 @@
+#!/bin/bash
+# Install system and app updates from a graphical, explicit-confirmation launcher.
+# Uses the installed software centre when available; otherwise reuses the same
+# update helpers/actions as Secure Linux Status & Fixes. Never restarts the PC.
+set -uo pipefail
+TITLE="Install System & App Updates"
+have() { command -v "$1" >/dev/null 2>&1; }
+
+case "${1:-}" in
+  -h|--help) sed -n '2,5p' "$0"; exit 0 ;;
+  "") ;;
+  *) echo "Use: secure-linux-update-gui" >&2; exit 2 ;;
+esac
+
+UI=""
+if [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]; then
+  if [[ "${XDG_CURRENT_DESKTOP:-}" == *KDE* ]] && have kdialog; then UI=kdialog
+  elif have zenity; then UI=zenity
+  elif have kdialog; then UI=kdialog
+  fi
+fi
+# A text console has no practical graphical interface. Keep the established route.
+if [ -z "$UI" ]; then
+  if have secure-linux-status-gui; then exec secure-linux-status-gui; fi
+  echo "Open Secure Linux Status & Fixes and choose Install updates now." >&2
+  exit 1
+fi
+
+info() {
+  if [ "$UI" = kdialog ]; then kdialog --title "$TITLE" --msgbox "$1"
+  else zenity --info --no-markup --title="$TITLE" --width=560 --text="$1"
+  fi
+}
+error() {
+  if [ "$UI" = kdialog ]; then kdialog --title "$TITLE" --error "$1"
+  else zenity --error --no-markup --title="$TITLE" --width=560 --text="$1"
+  fi
+}
+show_log() {
+  if [ "$UI" = kdialog ]; then kdialog --title "$TITLE" --textbox "$1" 820 540
+  else zenity --text-info --title="$TITLE" --width=820 --height=540 --filename="$1"
+  fi
+}
+
+TEXT="Check for and install system and app updates now?
+
+Your existing update tools will be used. Administrator permission may be requested.
+No restart is triggered by this launcher. Save your work before installing updates."
+if ! [ -x /usr/local/bin/secure-linux-update-now ] && have apt-get; then
+  TEXT="$TEXT
+
+On this Debian computer, packages that are no longer needed may be removed by the normal apt autoremove step."
+fi
+if [ "$UI" = kdialog ]; then
+  kdialog --title "$TITLE" --yes-label "Install updates" --no-label "Cancel" --yesno "$TEXT" || exit 0
+else
+  zenity --question --no-markup --title="$TITLE" --width=620 --ok-label="Install updates" --cancel-label="Cancel" --text="$TEXT" || exit 0
+fi
+
+# A full graphical software centre is preferable: its own Update All button is
+# the final explicit action and it shows package details and progress natively.
+if have plasma-discover; then
+  plasma-discover --mode update >/dev/null 2>&1 &
+  info "The software centre is opening its Updates page. Review the list, then press Update All when you are ready."
+  exit 0
+fi
+if have gnome-software; then
+  gnome-software --mode=updated >/dev/null 2>&1 &
+  info "The software centre is opening its Updates page. Review the list, then choose Update All when you are ready."
+  exit 0
+fi
+
+# Keep every supported update route tied to this helper's audited polkit
+# action; never elevate a generic shell with an inline command.
+if [ ! -x /usr/local/bin/secure-linux-update-now ] && ! have apt-get; then
+  error "The Secure Linux update helper is not installed. Nothing was changed. Open Secure Linux Status & Fixes for help."
+  exit 1
+fi
+
+LOG=$(mktemp "${TMPDIR:-/tmp}/secure-linux-updates.XXXXXX") || exit 1
+trap 'rm -f "$LOG"' EXIT
+if [ "$UI" = zenity ]; then
+  pkexec /usr/local/bin/secure-linux-update-now 2>&1 | tee "$LOG" | zenity --progress --pulsate --auto-close --no-cancel \
+    --title="$TITLE" --width=560 --text="Installing updates. Please keep the computer on and connected."
+  RC=${PIPESTATUS[0]}
+else
+  kdialog --title "$TITLE" --passivepopup "Installing updates. Please keep the computer on and connected." 20 >/dev/null 2>&1 &
+  pkexec /usr/local/bin/secure-linux-update-now >"$LOG" 2>&1
+  RC=$?
+fi
+
+if [ "$RC" -eq 0 ]; then
+  info "Updates finished successfully. If a restart is needed, you can choose when to do it."
+  exit 0
+fi
+show_log "$LOG"
+error "Some updates could not be installed. No restart was triggered. Try again later, or open Secure Linux Status & Fixes for help."
+exit "$RC"

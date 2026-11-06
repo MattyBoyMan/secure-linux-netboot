@@ -99,6 +99,39 @@ rp_mount_ro() {   # rp_mount_ro DEV -> prints the folder it is mounted at (read-
   esac
   RP_MOUNTED+=("$mp"); printf '%s' "$mp"
 }
+rp_copy_bytes() {   # regular image file or block device -> exact byte length, or failure
+  if [ -f "$1" ]; then stat -c %s -- "$1" 2>/dev/null; else rp_size_bytes "$1"; fi
+}
+rp_verify_copy_size() {   # rp_verify_copy_size DEST EXPECTED_BYTES
+  local got
+  [[ "$2" =~ ^[0-9]+$ ]] && [ "$2" -gt 0 ] || { echo "The source size is unknown, so I can't check that the copy is complete."; return 1; }
+  got=$(rp_copy_bytes "$1") || { echo "The destination size could not be read, so I can't check that the copy is complete."; return 1; }
+  if [ "$got" != "$2" ]; then
+    echo "The copy is incomplete: it has $got bytes, but the source has $2 bytes."
+    return 1
+  fi
+  return 0
+}
+rp_ddrescue_map_complete() {   # every finished area in the map must be '+'; bad, untried and unfinished areas mean no success
+  [ -r "$1" ] || return 1
+  awk '
+    /^[[:space:]]*#/ || /^[[:space:]]*$/ { next }
+    { areas++; if ($3 != "+") unfinished = 1 }
+    END { exit !(areas > 0 && !unfinished) }
+  ' "$1"
+}
+rp_verify_ddrescue_copy() {   # rp_verify_ddrescue_copy DEST MAP EXPECTED_BYTES
+  rp_verify_copy_size "$1" "$3" || return 1
+  if ! rp_ddrescue_map_complete "$2"; then
+    echo "The ddrescue map is missing or still shows unreadable/unfinished parts. The image is NOT complete."
+    return 1
+  fi
+  return 0
+}
+rp_copy_stopped() {
+  echo "The copy did NOT finish and must not be relied on as a backup."
+  [ -z "${1:-}" ] || echo "The partial copy and its map are kept at $1 and $1.map; run the same rescue option again to resume."
+}
 act_data() {
   local choice src dest srcdir bytes free sdev ddev
   echo; echo "=== Rescue my files ==="
@@ -125,13 +158,14 @@ act_data() {
       rp_ask dest "Folder to copy TO, on ANOTHER drive (e.g. /run/media/you/MyDisk/rescue): " "/mnt/sl-rescue-copy" || return 0
       [ -n "$dest" ] || { echo "Cancelled."; return 0; }
       if [ "$RP_DRY" != 1 ]; then
-        mkdir -p "$dest" 2>/dev/null || { echo "Can't create $dest."; return 0; }
-        ddev=$(rp_dev_of_path "$dest"); [ -n "$ddev" ] && [ "$ddev" = "$(rp_dev_of_path "$src")" ] && { echo "That is the same drive as the source. Pick a folder on a different drive. Nothing was copied."; return 0; }
+        mkdir -p "$dest" 2>/dev/null || { echo "Can't create $dest."; return 1; }
+        ddev=$(rp_dev_of_path "$dest") || { echo "I can't identify the destination drive. Pick a folder on another drive. Nothing was copied."; return 1; }
+        if rp_same_disk "$ddev" "$(rp_dev_of_path "$src")"; then echo "That is the same drive as the source, or I can't prove it is separate. Pick a different drive. Nothing was copied."; return 0; fi
         bytes=$(du -sb "$src" 2>/dev/null | cut -f1); free=$(rp_free_bytes "$dest")
         if [ -n "$bytes" ] && [ -n "$free" ] && [ "$bytes" -gt "$free" ]; then echo "Not enough room: the files need $(slh_human_bytes "$bytes"), the destination has $(slh_human_bytes "$free") free."; return 0; fi
       fi
       if rp_step "Copy the files" "Copies everything in $src to $dest with rsync. Files that can't be read are skipped and listed; copying carries on. Nothing in $src is changed or deleted."; then
-        rp_run rsync -aHAX --info=progress2 --partial "$src"/ "$dest"/
+        rp_run rsync -aHAX --info=progress2 --partial "$src"/ "$dest"/ || { rp_copy_stopped; exit 1; }
         echo "When it finishes, open a few files in $dest to check they work before you repair or erase anything."
       fi ;;
     2)
@@ -141,13 +175,20 @@ act_data() {
       rp_ask dest "Image file to create, on ANOTHER drive with enough room (e.g. /run/media/you/MyDisk/rescue.img): " "/mnt/sl-rescue-copy/rescue.img" || return 0
       [ -n "$dest" ] || { echo "Cancelled."; return 0; }
       if [ "$RP_DRY" != 1 ]; then
-        ddev=$(rp_dev_of_path "$(dirname "$dest")"); [ -n "$ddev" ] && [ "$(rp_parent_disk "$ddev")" = "$(rp_parent_disk "$sdev")" ] && { echo "The image would go on the SAME physical drive. Pick another drive. Nothing was changed."; return 0; }
-        bytes=$(rp_size_bytes "$sdev"); free=$(rp_free_bytes "$(dirname "$dest")")
-        [ -n "$bytes" ] && [ -n "$free" ] && [ "$bytes" -gt "$free" ] && { echo "Not enough room for the image: $(slh_human_bytes "$bytes") needed, $(slh_human_bytes "$free") free."; return 0; }
+        ddev=$(rp_dev_of_path "$(dirname "$dest")") || { echo "I can't identify the image destination drive. Pick another drive. Nothing was changed."; return 1; }
+        if rp_same_disk "$ddev" "$sdev"; then echo "The image would go on the SAME physical drive, or I can't prove it is separate. Pick another drive. Nothing was changed."; return 0; fi
+        bytes=$(rp_size_bytes "$sdev") && [ "$bytes" -gt 0 ] || { echo "I can't measure the source, so I can't verify a complete image. Nothing was changed."; return 1; }
+        free=$(rp_free_bytes "$(dirname "$dest")")
+        [ -n "$free" ] && [ "$bytes" -gt "$free" ] && { echo "Not enough room for the image: $(slh_human_bytes "$bytes") needed, $(slh_human_bytes "$free") free."; return 0; }
       fi
       if rp_step "Image $sdev to $dest" "Pass 1 copies the easy parts quickly (ddrescue -n), pass 2 goes back for the bad parts with retries (ddrescue -d -r3). Progress is saved in $dest.map, so you can stop (Ctrl+C) and continue later by running the same thing again. Reads $sdev only."; then
-        rp_run ddrescue -f -n "$sdev" "$dest" "$dest.map"
-        rp_run ddrescue -f -d -r3 "$sdev" "$dest" "$dest.map"
+        rp_run ddrescue -f -n "$sdev" "$dest" "$dest.map" || { rp_copy_stopped "$dest"; exit 1; }
+        if [ "$RP_DRY" != 1 ]; then rp_verify_copy_size "$dest" "$bytes" || { rp_copy_stopped "$dest"; exit 1; }; fi
+        rp_run ddrescue -f -d -r3 "$sdev" "$dest" "$dest.map" || { rp_copy_stopped "$dest"; exit 1; }
+        if [ "$RP_DRY" != 1 ]; then
+          rp_verify_ddrescue_copy "$dest" "$dest.map" "$bytes" || { rp_copy_stopped "$dest"; exit 1; }
+          echo "The image copy is complete. Its size and rescue map were checked."
+        fi
         echo "Then look inside the image:  losetup -fP --show $dest ; mount -o ro /dev/loopXp1 /mnt/x   (or run Check and repair on the IMAGE, never on the failing drive)."
       fi ;;
     3)
@@ -156,10 +197,13 @@ act_data() {
       sdev=$RP_PICK
       rp_ask dest "Folder to save found files in, on a DIFFERENT drive: " "/mnt/sl-rescue-copy" || return 0
       [ -n "$dest" ] || { echo "Cancelled."; return 0; }
-      if [ "$RP_DRY" != 1 ]; then ddev=$(rp_dev_of_path "$dest"); [ -n "$ddev" ] && [ "$(rp_parent_disk "$ddev")" = "$(rp_parent_disk "$sdev")" ] && { echo "Saving onto the same drive would overwrite the files you are trying to recover. Pick another drive."; return 0; }; fi
+      if [ "$RP_DRY" != 1 ]; then
+        ddev=$(rp_dev_of_path "$dest") || { echo "I can't identify the destination drive. Pick another drive. Nothing was changed."; return 1; }
+        if rp_same_disk "$ddev" "$sdev"; then echo "Saving there could overwrite the files you are trying to recover, or the drives can't be safely separated. Pick another drive."; return 0; fi
+      fi
       if rp_step "Search $sdev for deleted files" "Runs PhotoRec (menu-driven): it reads $sdev and writes the files it finds into $dest/recovered. File NAMES are usually lost, but the contents come back. For a deleted PARTITION use TestDisk instead (testdisk $sdev)."; then
-        [ "$RP_DRY" = 1 ] || mkdir -p "$dest/recovered"
-        rp_run photorec /d "$dest/recovered/" "$sdev"
+        if [ "$RP_DRY" != 1 ]; then mkdir -p "$dest/recovered" || { echo "Can't create $dest/recovered."; return 1; }; fi
+        rp_run photorec /d "$dest/recovered/" "$sdev" || { echo "The file search did not finish. Anything already found is in $dest/recovered; run it again before relying on the result."; return 1; }
       fi ;;
     *) echo "Cancelled." ;;
   esac
@@ -168,18 +212,21 @@ act_data() {
 
 # ---------------------------------------------------------------- clone / back up a whole drive
 act_clone() {
-  local src dst ssz dsz sm dm img
+  local src dst ssz dsz sm dm mounts map
   echo; echo "=== Back up or clone a whole drive ==="
   echo "For a complete, compressed backup image, the Clonezilla entry on the Secure Linux USB stick's boot menu is the easiest and"
   echo "safest tool (restart, choose Clonezilla, follow its questions). This menu is for a straight copy of one drive onto another."
   rp_pick_partition "Which drive do you want to COPY FROM? (pick any partition of it)" || return 0
-  src=$(rp_parent_disk "$RP_PICK")
+  src=$(rp_parent_disk "$RP_PICK") || { echo "I can't safely identify the source drive. Nothing was changed."; return 1; }
   rp_pick_partition "Which drive do you want to COPY TO? (ALL its contents will be replaced!) Pick any partition of it" || return 0
-  dst=$(rp_parent_disk "$RP_PICK")
+  dst=$(rp_parent_disk "$RP_PICK") || { echo "I can't safely identify the destination drive. Nothing was changed."; return 1; }
   if [ "$src" = "$dst" ]; then echo "Source and destination are the same drive. Nothing was done."; return 0; fi
-  if lsblk -no MOUNTPOINT "$dst" 2>/dev/null | grep -q . && [ "$RP_DRY" != 1 ]; then echo "$dst has partitions in use. Unmount them first (or restart from the rescue stick). Nothing was done."; return 0; fi
-  ssz=$(rp_size_bytes "$src"); dsz=$(rp_size_bytes "$dst")
-  if [ "$RP_DRY" != 1 ] && [ -n "$ssz" ] && [ -n "$dsz" ] && [ "$dsz" -lt "$ssz" ]; then echo "The destination ($(slh_human_bytes "$dsz")) is smaller than the source ($(slh_human_bytes "$ssz")). A straight copy will not fit. Use Clonezilla (it can copy only the used parts)."; return 0; fi
+  if [ "$RP_DRY" != 1 ]; then
+    mounts=$(lsblk -rno MOUNTPOINT "$dst" 2>/dev/null) || { echo "I can't check whether $dst is in use. Nothing was changed."; return 1; }
+    if printf '%s' "$mounts" | grep -q .; then echo "$dst has partitions in use. Unmount them first (or restart from the rescue stick). Nothing was done."; return 0; fi
+    ssz=$(rp_size_bytes "$src") && dsz=$(rp_size_bytes "$dst") && [ "$ssz" -gt 0 ] || { echo "I can't measure both drives, so the copy can't be checked. Nothing was changed."; return 1; }
+    if [ "$dsz" -lt "$ssz" ]; then echo "The destination ($(slh_human_bytes "$dsz")) is smaller than the source ($(slh_human_bytes "$ssz")). A straight copy will not fit. Use Clonezilla (it can copy only the used parts)."; return 0; fi
+  else ssz=$(rp_size_bytes "$src"); dsz=$(rp_size_bytes "$dst"); fi
   sm=$(rp_disk_label "$src"); dm=$(rp_disk_label "$dst")
   cat <<EOF
 
@@ -188,10 +235,18 @@ act_clone() {
 EOF
   rp_smart_guard "$src" || return 0
   rp_typed "CLONE $(basename "$src") TO $(basename "$dst")" "Check the two drives above very carefully. There is no undo." || { echo "Not confirmed. Nothing was changed."; return 0; }
-  if have ddrescue; then rp_run ddrescue -f "$src" "$dst" "/root/clone-$(basename "$src").map"
-  else rp_run dd if="$src" of="$dst" bs=4M conv=fsync,noerror,sync status=progress; fi
-  rp_run sync
-  echo "Done. Before you rely on the copy, open the destination and look at some files."
+  if have ddrescue; then
+    map="/root/clone-$(basename "$src").map"
+    rp_run ddrescue -f "$src" "$dst" "$map" || { rp_copy_stopped; exit 1; }
+    if [ "$RP_DRY" != 1 ]; then rp_verify_ddrescue_copy "$dst" "$map" "$ssz" || { rp_copy_stopped; exit 1; }; fi
+  else
+    # Without ddrescue there is no map of bad areas. Stop on the first read error instead of hiding it with noerror.
+    rp_run dd if="$src" of="$dst" bs=4M conv=fsync,sync status=progress || { rp_copy_stopped; exit 1; }
+    if [ "$RP_DRY" != 1 ]; then rp_verify_copy_size "$dst" "$ssz" || { rp_copy_stopped; exit 1; }; fi
+  fi
+  rp_run sync || { echo "The copied data could not be flushed to the destination. Do not rely on the copy."; exit 1; }
+  if [ "$RP_DRY" = 1 ]; then echo "Dry run finished. No copy was made."
+  else echo "Done. The copy finished and its size was checked. Before you rely on it, open the destination and look at some files."; fi
   return 0
 }
 

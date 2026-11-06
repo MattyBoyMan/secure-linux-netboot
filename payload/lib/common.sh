@@ -101,18 +101,32 @@ sl_flatpak_has_build() {
 }
 
 # ---------------------------------------------------------------- installing (idempotent)
-sl_dnf_install() { # sl_dnf_install pkg...   installs only missing packages
+sl_offline_bundle_install() { # sl_offline_bundle_install KIND ARCH [item...]
+  local kind=$1 arch=$2 profile
+  shift 2
+  command -v secure-linux-offline-bundle >/dev/null 2>&1 || return 2
+  profile=$(sl_profile)
+  case "$profile" in atomic) profile=full ;; full|lite) ;; *) return 2 ;; esac
+  secure-linux-offline-bundle install --profile "fedora-$profile" --arch "$arch" --kind "$kind" --packages "$@"
+}
+sl_dnf_install() { # sl_dnf_install pkg...   online first, then a verified offline repository, only missing packages
   sl_is_atomic && { echo "skip (atomic): dnf install $*"; return 0; }
+  # One query covers the common repair/re-run case. Keep the per-package fallback for virtual provides and partial installs.
+  if [ "$#" -gt 0 ] && rpm -q "$@" >/dev/null 2>&1; then return 0; fi
   local missing=() p
   for p in "$@"; do rpm -q "$p" >/dev/null 2>&1 || rpm -q --whatprovides "$p" >/dev/null 2>&1 || missing+=("$p"); done
   [ ${#missing[@]} -eq 0 ] && return 0
-  try dnf -y install "${missing[@]}"
+  try dnf -y install "${missing[@]}" && return 0
+  echo "Online dnf install failed; trying the verified, possibly outdated offline cache."
+  sl_offline_bundle_install system "$(sl_arch)" "${missing[@]}"
 }
-sl_flatpak_install() { # sl_flatpak_install app-id...   system-wide from Flathub, only missing ones
+sl_flatpak_install() { # sl_flatpak_install app-id...   system-wide, online first then a verified USB OSTree repository
   local id rc=0
   for id in "$@"; do
     flatpak info --system "$id" >/dev/null 2>&1 && continue
-    try flatpak install -y --noninteractive --system flathub "$id" || rc=1
+    if try flatpak install -y --noninteractive --system flathub "$id"; then continue; fi
+    echo "Online Flatpak install failed; trying the verified, possibly outdated offline cache: $id"
+    sl_offline_bundle_install flatpak "$(sl_arch)" "$id" || rc=1
   done
   return $rc
 }
@@ -129,6 +143,7 @@ sl_write_file() {
   tmp=$(mktemp); cat > "$tmp"
   sumf="$SL_STATE/written/$(printf '%s' "$path" | md5sum | cut -d' ' -f1)"
   mkdir -p "$SL_STATE/written" "$(dirname "$path")"
+  command -v sl_recovery_artifact_add >/dev/null 2>&1 && sl_recovery_artifact_add "$path"
   new=$(md5sum < "$tmp" | cut -d' ' -f1)
   if [ -f "$path" ]; then
     old=$(md5sum < "$path" | cut -d' ' -f1)

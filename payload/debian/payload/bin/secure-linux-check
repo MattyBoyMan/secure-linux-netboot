@@ -47,7 +47,7 @@ if [ -f "$SL_STATE/progress" ] && ! grep -q '^done' "$SL_STATE/progress"; then
   IFS='|' read -r pn pt ptext < "$SL_STATE/progress"
   note setup-running warn "Setup is still running" "Step $pn of $pt: $ptext"
 fi
-if [ -s "$SL_FAILS" ] && grep -q '^done' "$SL_STATE/progress" 2>/dev/null; then
+if [ -s "$SL_FAILS" ]; then
   problem setup-failures warn "Some setup items didn't finish" "$(grep -c . "$SL_FAILS") item(s); usually a brief internet problem" repair \
     "A few things didn't install" "Often just an internet hiccup. Running Repair tries them again."
 else
@@ -81,6 +81,26 @@ if [ -f "$R/run/reboot-required" ] || [ -f "$R/var/run/reboot-required" ]; then
 else
   good updates-waiting "No restart is waiting"
 fi
+
+# ---------------------------------------------------------------- independent security audit
+_sec_audit="$SL_ROOT/bin/secure-linux-security-audit"
+[ -x "$_sec_audit" ] || _sec_audit=/usr/local/bin/secure-linux-security-audit
+_sec_rc=0
+if [ ! -x "$_sec_audit" ]; then
+  problem security-audit-run bad "Security audit execution evidence" "The security auditor is missing" repair \
+    "The security audit is missing" "Repair setup must restore it; missing evidence cannot be treated as secure."
+else
+  "$_sec_audit" run > "$SL_LOGDIR/security-audit.log" 2>&1 || _sec_rc=$?
+  if [ "$_sec_rc" -ne 0 ] || [ ! -s "$SL_STATE/security-audit.rows" ] || [ ! -s "$SL_STATE/security-audit.last-success" ]; then
+    problem security-audit-run bad "Security audit execution evidence" "Audit exit $_sec_rc or missing current result/completion stamp" repair \
+      "The security audit did not complete" "No previous result is being presented as current. See $SL_LOGDIR/security-audit.log."
+  else
+    while IFS='|' read -r _sec_id _sec_st _sec_label _sec_detail _sec_fix; do
+      case "$_sec_id" in security-*) row "$_sec_id" "$_sec_st" "$_sec_label" "$_sec_detail" "$_sec_fix" ;; esac
+    done < "$SL_STATE/security-audit.rows"
+  fi
+fi
+unset _sec_audit _sec_rc _sec_id _sec_st _sec_label _sec_detail _sec_fix
 
 # ---------------------------------------------------------------- firewall and DNS
 if have ufw && ufw status 2>/dev/null | grep -q '^Status: active'; then

@@ -1,0 +1,189 @@
+#!/usr/bin/env python3
+"""Stamp or check one coherent Secure Linux release across every surface."""
+from __future__ import annotations
+
+import argparse
+import json
+from pathlib import Path
+import sys
+
+HERE = Path(__file__).resolve().parent
+KIT_ROOT = HERE.parent
+DEFAULT_ROOT = KIT_ROOT.parent if (KIT_ROOT.parent / "netboot").is_dir() else KIT_ROOT
+LIB = KIT_ROOT / "lib"
+if str(LIB) not in sys.path:
+    sys.path.insert(0, str(LIB))
+
+from release_manifest import (  # noqa: E402
+    ReleaseError,
+    atomic_write,
+    canonical_path,
+    installed_path,
+    load_canonical,
+    master_problems,
+    netboot_path,
+    netboot_problems,
+    read_json,
+    restore_records,
+    snapshot_records,
+    source_problems,
+    stamp,
+    installed_problems,
+)
+
+
+def companion_module(root: Path):
+    companion_lib = root / "linux" / "lib" / "flipper-companion"
+    # Isolated fixtures and a USB's rebuildable kit may carry manifests without
+    # duplicating the implementation. Production checkouts use their own copy.
+    if not (companion_lib / "flipper_companion_core.py").is_file():
+        companion_lib = KIT_ROOT / "lib" / "flipper-companion"
+    if str(companion_lib) not in sys.path:
+        sys.path.insert(0, str(companion_lib))
+    import flipper_companion_core
+    return flipper_companion_core
+
+
+def companion_mirror_path(root: Path) -> Path | None:
+    """Return the generated Debian mirror only in a full-kit checkout."""
+    payload = root / "debian" / "setup"
+    return payload / "lib/flipper-companion/version.json" if payload.is_dir() else None
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="secure-linux-release",
+        description="Content-derived release stamping and fail-closed drift checks.",
+    )
+    parser.add_argument("--root", type=Path, default=DEFAULT_ROOT, help="full-kit source checkout")
+    commands = parser.add_subparsers(dest="command", required=True)
+    commands.add_parser("stamp", help="stamp current source and deliberately refresh Flipper metadata")
+    check = commands.add_parser("check", help="fail on source, installed, Flipper, netboot, or master drift")
+    check.add_argument("--no-netboot", action="store_true", help="explicitly check only non-netboot surfaces")
+    check.add_argument("--netboot-root", type=Path, help="rendered output to check (default: ROOT/netboot/dist)")
+    check.add_argument("--master", type=Path, action="append", default=[], help="saved USB creator manifest.json to check")
+    check.add_argument("--master-store", type=Path, help="check the store's current generation manifest")
+    show = commands.add_parser("show", help="print the canonical release ID and source digest")
+    show.add_argument("--json", action="store_true", help="print the full canonical manifest")
+    return parser
+
+
+def current_master(store: Path) -> Path:
+    try:
+        master_id = (store / "current").read_text(encoding="ascii").strip()
+    except OSError as exc:
+        raise ReleaseError(f"cannot read current master pointer: {store / 'current'}") from exc
+    if not master_id or any(part in {"", ".", ".."} for part in Path(master_id).parts) or "/" in master_id or "\\" in master_id:
+        raise ReleaseError("current master pointer is unsafe or invalid")
+    return store / "generations" / master_id / "manifest.json"
+
+
+def stamp_all(root: Path) -> tuple[dict, dict]:
+    """Stamp every release record atomically, including both companion copies."""
+    root = root.expanduser().resolve()
+    companion = companion_module(root)
+    companion_path = companion.metadata_path(root)
+    mirror = companion_mirror_path(root)
+    records = [canonical_path(root), installed_path(root), companion_path]
+    if mirror is not None:
+        records.append(mirror)
+    previous = snapshot_records(records)
+    try:
+        stamp(root)
+        # This is the deliberate Flipper refresh. A direct refresh-version call
+        # cannot mint a release from stale source; it must use this new manifest.
+        manifest, raw = load_canonical(root)
+        metadata = companion.refresh_metadata(root, manifest["release_id"])
+        if mirror is not None:
+            atomic_write(mirror, companion_path.read_bytes())
+        problems = source_problems(root, manifest)
+        problems += installed_problems(root, manifest, raw)
+        problems += companion.check_metadata(root, check_source=False)
+        if mirror is not None and mirror.read_bytes() != companion_path.read_bytes():
+            problems.append("Debian Flipper companion mirror does not match the Fedora copy")
+        if problems:
+            raise ReleaseError("release stamping did not produce coherent records: " + "; ".join(problems))
+        return manifest, metadata
+    except BaseException:
+        restore_records(previous)
+        raise
+
+
+def run(args: argparse.Namespace) -> int:
+    root = args.root.expanduser().resolve()
+    if args.command == "stamp":
+        manifest, metadata = stamp_all(root)
+        print(f"Release: {manifest['release_id']}")
+        print(f"Source: {manifest['source']['file_count']} files, SHA-256 {manifest['source']['sha256']}")
+        print(f"Installed record: {installed_path(root)}")
+        print(f"Flipper payload: {len(metadata['assets'])} current files linked")
+        print("Netboot is not edited by stamping; regenerate its render, then run check.")
+        return 0
+
+    if args.command == "show":
+        manifest, _ = load_canonical(root)
+        if args.json:
+            print(json.dumps(manifest, indent=2, sort_keys=True))
+        else:
+            print(manifest["release_id"])
+            print(manifest["source"]["sha256"])
+        return 0
+
+    problems: list[str] = []
+    try:
+        manifest, raw = load_canonical(root)
+    except ReleaseError as exc:
+        print(f"RELEASE DRIFT:\n{exc}", file=sys.stderr)
+        return 1
+    problems += source_problems(root, manifest)
+    problems += installed_problems(root, manifest, raw)
+    try:
+        problems += companion_module(root).check_metadata(root, check_source=False)
+    except Exception as exc:
+        # Metadata errors are expected user-facing drift, never a successful check.
+        problems.append(f"Flipper companion: {exc}")
+    mirror = companion_mirror_path(root)
+    if mirror is not None:
+        try:
+            if mirror.read_bytes() != companion_module(root).metadata_path(root).read_bytes():
+                problems.append("Debian Flipper companion mirror is missing, stale, or different")
+        except OSError as exc:
+            problems.append(f"Debian Flipper companion mirror: {exc}")
+    if not args.no_netboot:
+        output = args.netboot_root.expanduser().resolve() if args.netboot_root else netboot_path(root).parent
+        problems += netboot_problems(manifest, raw, output)
+    masters = list(args.master)
+    if args.master_store:
+        masters.append(current_master(args.master_store.expanduser().resolve()))
+    for master in masters:
+        try:
+            saved, _ = read_json(master)
+            master_issues = master_problems(saved, installed_path(root))
+            problems += [f"{master}: {issue}" for issue in master_issues]
+        except ReleaseError as exc:
+            problems.append(str(exc))
+    if problems:
+        print("RELEASE DRIFT:", file=sys.stderr)
+        for problem in problems:
+            print(f"- {problem}", file=sys.stderr)
+        print("Run secure-linux-release stamp, regenerate affected outputs/masters, then check again.", file=sys.stderr)
+        return 1
+    print(f"RELEASE COHERENT: {manifest['release_id']}")
+    print("Source, installed copy, Flipper payload" + ("" if args.no_netboot else ", netboot render") +
+          (", and selected master(s)" if masters else "") + " match the canonical manifest.")
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    try:
+        return run(build_parser().parse_args(argv))
+    except ReleaseError as exc:
+        print(f"RELEASE DRIFT: {exc}", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        print("Cancelled; existing manifests were not declared current.", file=sys.stderr)
+        return 130
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

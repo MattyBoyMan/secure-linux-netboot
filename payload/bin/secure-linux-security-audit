@@ -1,0 +1,400 @@
+#!/bin/bash
+# secure-linux-security-audit: read-only post-install security evidence, for Fedora and Debian.
+#   run       check live controls, save a plain-English report and result rows (default)
+#   report    show the last saved report
+#   status    show the last saved machine-readable rows
+#   bad-count print the number of failed (not merely advisory) controls
+# The auditor never deletes secrets, changes permissions, connects a VPN, installs updates or confirms a choice.
+set -u
+export LC_ALL=C
+SL_ROOT=${SL_ROOT:-/usr/local/lib/secure-linux}
+. "$SL_ROOT/lib/common.sh"
+R=${SL_TEST_SYSROOT:-${SL_SYSROOT:-}}
+ROWS=$SL_STATE/security-audit.rows
+REPORT=$SL_STATE/security-audit.txt
+STAMP=$SL_STATE/security-audit.last-success
+ATTEMPT=$SL_STATE/security-audit.last-attempt
+DISTRO=fedora
+declare -F sl_distro >/dev/null && DISTRO=debian
+PROFILE=$(sl_profile)
+declare -F sl_is_atomic >/dev/null && sl_is_atomic && PROFILE=atomic
+NOW=$(date +%s)
+WORK=""
+BAD=0
+WARN=0
+
+usage() { sed -n '2,8p' "$0" | sed 's/^# \{0,1\}//'; }
+have() { command -v "$1" >/dev/null 2>&1; }
+active() { systemctl is-active --quiet "$1" 2>/dev/null; }
+enabled() { systemctl is-enabled --quiet "$1" 2>/dev/null; }
+failed() { systemctl is-failed --quiet "$1" 2>/dev/null; }
+age_days() { local m; m=$(stat -c %Y "$1" 2>/dev/null) || { echo 99999; return; }; echo $(( (NOW - m) / 86400 )); }
+row() {
+  printf '%s|%s|%s|%s|%s\n' "$1" "$2" "$3" "${4:-}" "${5:-}" >> "$WORK/rows"
+  case "$2" in bad) BAD=$((BAD + 1)) ;; warn) WARN=$((WARN + 1)) ;; esac
+}
+good() { row "$1" ok "$2" "${3:-}" ""; sl_clear "$1"; }
+note() { row "$1" "$2" "$3" "${4:-}" "${5:-}"; sl_clear "$1"; }
+problem() {
+  row "$1" "$2" "$3" "$4" "$5"
+  sl_alert "$1" "$6" "$7" "This check changed nothing. Open 'Secure Linux Status & Fixes' or run secure-linux-security-audit report."
+}
+choice_off() { [ "$(sl_choice_get "$1")" = no ]; }
+
+# A timer being installed is not evidence that its service ran successfully.
+automation() { # automation ID TIMER SERVICE LABEL
+  local id=$1 timer=$2 service=$3 label=$4 result status
+  if ! enabled "$timer" || ! active "$timer"; then
+    problem "security-automation-$id" bad "$label" "$timer is not enabled and active" repair \
+      "A security check is not scheduled" "$timer is off. Repair setup restores the schedule; no update or setting is approved automatically."
+    return 0
+  fi
+  if failed "$service"; then
+    problem "security-automation-$id" bad "$label" "$service failed on its last run" repair \
+      "A scheduled security job failed" "$service failed. The failure is kept visible; repair or ask for help rather than assuming protection ran."
+    return 0
+  fi
+  result=$(systemctl show "$service" -p Result --value 2>/dev/null)
+  status=$(systemctl show "$service" -p ExecMainStatus --value 2>/dev/null)
+  case "${result:-success}" in success|"") ;; *)
+    problem "security-automation-$id" bad "$label" "$service result: $result" repair \
+      "A scheduled security job failed" "$service ended with result $result. This is not reported as healthy merely because its timer exists."
+    return 0 ;;
+  esac
+  case "${status:-0}" in ''|*[!0-9]*|0) ;; *)
+    problem "security-automation-$id" bad "$label" "$service exit status $status" repair \
+      "A scheduled security job failed" "$service exited with status $status. Review it before relying on this protection."
+    return 0 ;;
+  esac
+  local started triggered
+  started=$(systemctl show "$service" -p ExecMainStartTimestamp --value 2>/dev/null)
+  case "$started" in
+    ''|0|n/a|'N/A')
+      triggered=$(systemctl show "$timer" -p LastTriggerUSec --value 2>/dev/null)
+      if [ -n "$triggered" ] && [ "$triggered" != 0 ] && [ "$triggered" != n/a ]; then
+        problem "security-automation-$id" bad "$label" "$timer triggered, but $service has no execution start evidence" repair \
+          "A scheduled security job left no execution evidence" "Do not assume this protection ran. Repair setup and inspect $service."
+      else
+        note "security-automation-$id" warn "$label" "$timer is active; the first service run has not happened yet" repair
+      fi
+      return 0 ;;
+  esac
+  good "security-automation-$id" "$label" "$service started: $started; result ${result:-success}, exit ${status:-0}"
+}
+
+check_firewall() {
+  if [ "$DISTRO" = debian ]; then
+    local out
+    out=$(ufw status verbose 2>/dev/null)
+    if printf '%s\n' "$out" | grep -q '^Status: active' && printf '%s\n' "$out" | grep -Eiq 'Default:.*(deny|reject) \(incoming\)'; then
+      good security-firewall "Firewall blocks unsolicited incoming connections" "ufw active; incoming default deny/reject"
+    else
+      problem security-firewall bad "Firewall blocks unsolicited incoming connections" "ufw is inactive or its incoming default is not deny/reject" repair \
+        "The firewall is not safely configured" "Run Repair setup. Do not mark the computer secure until ufw is active with incoming connections denied by default."
+    fi
+  else
+    local zone
+    zone=$(firewall-cmd --get-default-zone 2>/dev/null)
+    if active firewalld.service && [ "$zone" = public ]; then
+      good security-firewall "Firewall blocks unsolicited incoming connections" "firewalld active; default zone public"
+    else
+      problem security-firewall bad "Firewall blocks unsolicited incoming connections" "firewalld inactive or default zone is '${zone:-unknown}', not public" repair \
+        "The firewall is not safely configured" "Run Repair setup to restore firewalld and the public default zone."
+    fi
+  fi
+}
+
+check_opensnitch() {
+  [ "$DISTRO" = fedora ] || return 0
+  if [ "$PROFILE" = atomic ]; then
+    note security-opensnitch warn "Application firewall" "Not available in the atomic package design; the network firewall still applies" repair
+    return 0
+  fi
+  if choice_off opensnitch; then
+    note security-opensnitch warn "Application firewall" "Switched off by your saved choice; network firewall remains required" repair
+    return 0
+  fi
+  if [ -f "$SL_STATE/events.d/opensnitch-skipped" ]; then
+    note security-opensnitch warn "Application firewall" "Not available for this architecture/profile or below its memory floor; network firewall remains required" repair
+    return 0
+  fi
+  if active opensnitch.service; then
+    good security-opensnitch "Application firewall is running" "OpenSnitch daemon is active"
+  else
+    problem security-opensnitch bad "Application firewall is running" "OpenSnitch was requested but its daemon is not active" repair \
+      "OpenSnitch is not running" "Run Repair setup or secure-linux-netguard check. A package or timer alone is not proof of protection."
+  fi
+  automation opensnitch-health secure-linux-netguard-check.timer secure-linux-netguard-check.service "OpenSnitch health automation ran"
+  automation opensnitch-lists secure-linux-netguard-lists.timer secure-linux-netguard-lists.service "OpenSnitch block-list update automation ran"
+  automation opensnitch-summary secure-linux-netguard-summary.timer secure-linux-netguard-summary.service "OpenSnitch reporting automation ran"
+  if [ "$PROFILE" != full ]; then
+    note security-opensnitch-notifications ok "OpenSnitch user notifications" "Lite profile uses silent block lists without per-app prompts"
+  elif active secure-linux-netguard-watch.service; then good security-opensnitch-notifications "OpenSnitch user notifications" "watch service is active"
+  else problem security-opensnitch-notifications bad "OpenSnitch user notifications" "watch service is not active; blocks may have no user-visible explanation" repair \
+    "OpenSnitch notifications stopped" "Repair the watch service so a block is explained and any exception is an explicit choice."; fi
+}
+
+check_dns() {
+  local st=missing
+  if [ "$DISTRO" = debian ]; then
+    if active systemd-resolved.service && [ -s "$R/etc/systemd/resolved.conf.d/10-secure-linux-dns.conf" ]; then st=encrypted; fi
+  elif have secure-linux-dns; then
+    st=$(secure-linux-dns status --short 2>/dev/null)
+  elif [ -x "$SL_ROOT/bin/secure-linux-dns" ]; then
+    st=$("$SL_ROOT/bin/secure-linux-dns" status --short 2>/dev/null)
+  fi
+  case "$st" in
+    encrypted|family|vpn) good security-dns "Private DNS is active" "$st" ;;
+    paused) note security-dns warn "Private DNS is active" "Temporarily paused for a Wi-Fi login; restore it after logging in" hotspot ;;
+    *) problem security-dns bad "Private DNS is active" "Could not verify encrypted DNS (state: ${st:-unknown})" repair \
+         "Private DNS cannot be verified" "Run Repair setup and check secure-linux-dns status. Missing evidence is not treated as secure." ;;
+  esac
+}
+
+check_vpn() {
+  local mode current kills
+  mode=$(sl_choice_get vpn_mode)
+  [ "$DISTRO" = fedora ] || return 0
+  have secure-linux-vpn || [ -x "$SL_ROOT/bin/secure-linux-vpn" ] || return 0
+  if have secure-linux-vpn; then current=$(secure-linux-vpn status --short 2>/dev/null); else current=$("$SL_ROOT/bin/secure-linux-vpn" status --short 2>/dev/null); fi
+  if [ "$current" = both ]; then
+    problem security-vpn bad "VPN state is unambiguous" "NordVPN and Cloudflare WARP are connected together" vpn \
+      "Two VPNs are connected" "Choose one explicitly with secure-linux-vpn private or secure-linux-vpn home."
+    return 0
+  fi
+  case "$mode" in
+    private)
+      [ "$current" = private ] || { problem security-vpn bad "Chosen VPN protection is active" "Private mode was saved, but NordVPN is not connected" vpn \
+        "Your chosen VPN is not connected" "Run secure-linux-vpn private. The auditor did not connect it or change your consent."; return; } ;;
+    home)
+      if [ "$(sl_choice_get warp no)" = yes ]; then [ "$current" = warp ] || { problem security-vpn bad "Chosen VPN protection is active" "WARP home mode was saved, but WARP is not connected" vpn \
+        "Your chosen WARP connection is off" "Run secure-linux-vpn home to reconnect explicitly."; return; }
+      else [ "$current" = home ] || { problem security-vpn bad "Chosen VPN protection is active" "Meshnet home mode was saved, but NordVPN Meshnet is not active" vpn \
+        "Your chosen home VPN is off" "Run secure-linux-vpn home to reconnect explicitly."; return; }; fi ;;
+    ""|off) good security-vpn "VPN choice" "${mode:-not chosen}; no connection is required" ; return 0 ;;
+  esac
+  if [ "$current" = private ] && [ "$(sl_choice_get nord_killswitch no)" = yes ]; then
+    kills=$(nordvpn settings 2>/dev/null)
+    if printf '%s\n' "$kills" | grep -qiE '^Kill Switch: *(enabled|on)'; then
+      good security-vpn "VPN and consented kill switch are active"
+    else
+      problem security-vpn bad "VPN and consented kill switch are active" "NordVPN is connected but the consented kill switch is off" vpn \
+        "The VPN kill switch is off" "You previously chose the kill switch. Run secure-linux-vpn private to restore it after a working connection."
+    fi
+  else
+    good security-vpn "Chosen VPN protection is active" "$current"
+  fi
+}
+
+check_updates() {
+  if [ "$DISTRO" = debian ]; then
+    automation updates apt-daily-upgrade.timer apt-daily-upgrade.service "Security update automation ran"
+    automation update-metadata apt-daily.timer apt-daily.service "Update metadata automation ran"
+  else
+    case "$PROFILE" in
+      full) automation updates secure-linux-offline-updates.timer secure-linux-offline-updates.service "Security update download automation ran" ;;
+      atomic) automation updates rpm-ostreed-automatic.timer rpm-ostreed-automatic.service "Atomic update automation ran" ;;
+      *) automation updates dnf5-automatic.timer dnf5-automatic.service "Security update automation ran" ;;
+    esac
+  fi
+  if have flatpak; then automation flatpak secure-linux-flatpak-update.timer secure-linux-flatpak-update.service "Flatpak security update automation ran"; fi
+}
+
+check_clamav() {
+  have clamscan || { note security-clamav warn "Antivirus" "Not installed on this profile/computer; see the setup report for the reason" repair; return 0; }
+  if choice_off antivirus; then note security-clamav warn "Antivirus" "Switched off by your saved choice" repair; return 0; fi
+  if active clamav-freshclam.service; then good security-clamav-signatures "Antivirus signatures update" "freshclam is active"
+  else problem security-clamav-signatures bad "Antivirus signatures update" "freshclam is not active" repair \
+    "Antivirus updates are not running" "Run Repair setup and check the freshclam service."; fi
+  if [ "$DISTRO" = debian ]; then automation clamav secure-linux-scan.timer secure-linux-scan.service "Weekly antivirus automation ran"
+  else automation clamav secure-linux-clamscan.timer secure-linux-clamscan.service "Weekly antivirus automation ran"; fi
+  local latest=""
+  [ -d "$SL_LOGDIR/clamscan" ] && latest=$(ls -1 "$SL_LOGDIR/clamscan"/*.log 2>/dev/null | sort | tail -1)
+  if [ -n "$latest" ] && [ "$(age_days "$latest")" -gt 8 ]; then
+    note security-clamav-last-scan warn "Antivirus scan evidence" "Latest scan is more than 8 days old" repair
+  else good security-clamav-last-scan "Antivirus scan evidence" "${latest:+latest $(basename "$latest")}"; fi
+}
+
+check_usbguard() {
+  if [ "$PROFILE" = atomic ]; then note security-usbguard warn "USB device control" "USBGuard is unavailable without layering a package on this atomic setup" repair; return 0; fi
+  if choice_off usbguard; then note security-usbguard warn "USB device control" "Switched off by your saved choice" repair; return 0; fi
+  if ! active usbguard.service; then
+    problem security-usbguard bad "USB device control is active" "USBGuard is not active" repair \
+      "USB device control is not running" "Run Repair setup. Existing devices were allow-listed during setup; new devices require an explicit choice."
+    return 0
+  fi
+  if grep -Eq '^[[:space:]]*ImplicitPolicyTarget[[:space:]]*=[[:space:]]*block' "$R/etc/usbguard/usbguard-daemon.conf" 2>/dev/null \
+     && grep -Eq '^[[:space:]]*InsertedDevicePolicy[[:space:]]*=[[:space:]]*block' "$R/etc/usbguard/usbguard-daemon.conf" 2>/dev/null; then
+    good security-usbguard "USB device control is active" "new devices block by default; setup devices were explicitly allowed"
+  else
+    problem security-usbguard bad "USB device control is active" "Service runs but new-device block defaults are missing" repair \
+      "USBGuard defaults need repair" "The daemon is running, but its new-device policy is not block. Repair setup without deleting your allowed-device rules."
+  fi
+}
+
+check_auditd() {
+  if [ "$PROFILE" = atomic ]; then note security-auditd warn "Security event logging" "auditd is unavailable without layering a package on this atomic setup" repair; return 0; fi
+  if active auditd.service && [ -s "$R/etc/audit/rules.d/secure-linux.rules" ]; then
+    good security-auditd "Security event logging is active" "auditd and local audit rules are present"
+  else
+    problem security-auditd bad "Security event logging is active" "auditd is inactive or its rules are missing" repair \
+      "Security event logging needs repair" "Run Repair setup. Do not disable auditing to make this warning disappear."
+  fi
+}
+
+check_fail2ban() {
+  local wanted=no
+  if [ "$DISTRO" = debian ]; then [ "$(sl_choice_get ssh_server yes)" = yes ] && wanted=yes
+  elif [ "$PROFILE" = lite ]; then wanted=yes; fi
+  [ "$wanted" = yes ] || { good security-fail2ban "SSH login throttling" "SSH server is not offered by this profile/choice"; return 0; }
+  if active fail2ban.service && grep -Eq '^[[:space:]]*enabled[[:space:]]*=[[:space:]]*true' "$R/etc/fail2ban/jail.d/sshd.local" 2>/dev/null; then
+    good security-fail2ban "SSH login throttling is active" "sshd jail enabled"
+  else
+    problem security-fail2ban bad "SSH login throttling is active" "fail2ban or its sshd jail is not active" repair \
+      "SSH brute-force protection is off" "Run Repair setup. SSH should not be considered hardened until fail2ban is active."
+  fi
+}
+
+check_mac() {
+  if [ "$DISTRO" = debian ]; then
+    if active apparmor.service; then good security-mac "Mandatory access control" "AppArmor is active"
+    else problem security-mac bad "Mandatory access control" "AppArmor is not active" repair "AppArmor is off" "Run Repair setup to restore this core security layer."; fi
+  else
+    case "$(getenforce 2>/dev/null)" in Enforcing) good security-mac "Mandatory access control" "SELinux is enforcing" ;;
+      *) problem security-mac bad "Mandatory access control" "SELinux is not enforcing" repair "SELinux is off" "Run Repair setup to restore SELinux enforcing mode." ;; esac
+  fi
+}
+
+check_sysctl() {
+  local missing="" key expected actual path
+  while read -r key expected; do
+    [ -n "$key" ] || continue
+    path=$R/proc/sys/${key//./\/}
+    if [ -r "$path" ]; then actual=$(cat "$path" 2>/dev/null); else actual=$(sysctl -n "$key" 2>/dev/null); fi
+    [ "$actual" = "$expected" ] || missing="$missing $key=${actual:-unknown}(wanted $expected)"
+  done <<'EOF'
+kernel.kptr_restrict 2
+kernel.dmesg_restrict 1
+kernel.yama.ptrace_scope 1
+fs.protected_fifos 2
+fs.protected_regular 2
+fs.protected_symlinks 1
+fs.protected_hardlinks 1
+net.ipv4.conf.all.accept_redirects 0
+net.ipv6.conf.all.accept_redirects 0
+EOF
+  if [ -z "$missing" ]; then good security-sysctl "Kernel hardening is live" "checked running values, not just the configuration file"
+  else problem security-sysctl bad "Kernel hardening is live" "$missing" repair "Kernel hardening is incomplete" "Run Repair setup and investigate any values that cannot be applied."; fi
+}
+
+check_luks_boot() {
+  if have lsblk && lsblk -rno TYPE 2>/dev/null | grep -qx crypt; then
+    good security-encryption "System disk encryption" "A live LUKS/crypt mapping is present"
+    if [ "$(sl_choice_get recovery_key_done no)" = yes ]; then good security-luks-recovery "Disk recovery key" "Recorded as saved"
+    else note security-luks-recovery warn "Disk recovery key" "No saved recovery key recorded; run secure-linux-recovery-key create" recovery-key; fi
+  else
+    problem security-encryption bad "System disk encryption" "No live LUKS/crypt mapping was found" diag \
+      "The system disk is not encrypted" "Encryption normally requires reinstalling with LUKS. Back up first; the auditor does not repartition or encrypt a live disk."
+  fi
+  local sb=""
+  have mokutil && sb=$(mokutil --sb-state 2>/dev/null)
+  if printf '%s\n' "$sb" | grep -qi 'SecureBoot enabled'; then
+    good security-secureboot "Secure Boot" "Enabled in firmware"
+    case "$(sl_choice_get mok_removed no)" in
+      pending) problem security-mok bad "Installer Secure Boot key" "Ventoy key removal is waiting for firmware confirmation" restart \
+        "Finish removing the installer key" "Restart and explicitly confirm the blue MOK screen. Nothing is confirmed by a timer." ;;
+      yes) good security-mok "Installer Secure Boot key" "Ventoy key removal recorded" ;;
+      *) note security-mok warn "Installer Secure Boot key" "Removal is not confirmed; run secure-linux-mok-remove status" repair ;;
+    esac
+  else
+    problem security-secureboot bad "Secure Boot" "${sb:-Secure Boot state unavailable or firmware has no UEFI Secure Boot}" diag \
+      "Secure Boot is not protecting this boot" "If firmware supports it, enable Secure Boot in UEFI settings. Legacy/unsupported firmware remains a hardware limitation."
+  fi
+}
+
+check_flatpak() {
+  have flatpak || return 0
+  local id perms risky="" n=0
+  while read -r id; do
+    case "$id" in ''|*[!A-Za-z0-9_.-]*) continue ;; esac
+    perms=$(flatpak info --show-permissions --system "$id" 2>/dev/null)
+    if printf '%s\n' "$perms" | grep -Eq '(^|[;[:space:]])(filesystems?=.*(host|home)|device=all|socket=(system|session)-bus)'; then
+      risky="$risky $id"; n=$((n + 1)); [ "$n" -ge 6 ] && break
+    fi
+  done < <(flatpak list --system --app --columns=application 2>/dev/null)
+  if [ -n "$risky" ]; then
+    note security-flatpak-permissions warn "Flatpak permissions need review" "Broad access:$risky. Review in Flatseal; revoke only permissions the app does not need" repair
+  else good security-flatpak-permissions "Flatpak permissions reviewed" "No host/home/device=all/system-bus broad access found"; fi
+}
+
+check_docker() {
+  local u=$(sl_user) context=""
+  have docker || return 0
+  if [ -n "$u" ] && id -nG "$u" 2>/dev/null | grep -qw docker; then
+    problem security-docker-group bad "Docker privilege boundary" "$u is in the docker group (equivalent to root)" repair \
+      "Docker group grants administrator access" "After using rootless Docker, explicitly remove this account from the docker group and log in again. Do not hide this warning."
+  else good security-docker-group "Docker privilege boundary" "The desktop user is not in the root-equivalent docker group"; fi
+  if [ -n "$u" ]; then context=$(timeout 10 sudo -u "$u" docker context show 2>/dev/null); fi
+  if [ "$context" = rootless ]; then good security-docker-rootless "Everyday Docker context" "rootless"
+  else note security-docker-rootless warn "Everyday Docker context" "Rootless is not selected. Optional explicit setup: secure-linux-home-server docker rootless" repair; fi
+}
+
+check_password_exports() {
+  local home=$(sl_user_home) found=""
+  [ -d "$home" ] || return 0
+  found=$(find "$home/Downloads" "$home/Desktop" -maxdepth 1 -type f \( -iname '*password*.csv' -o -iname '*passwords*.csv' \) -print 2>/dev/null | head -3)
+  if [ -n "$found" ]; then
+    note security-password-exports warn "Password export files" "Possible plain-text exports remain: $(printf '%s' "$found" | tr '\n' ' '). After verifying import, run secure-linux-migrate shred FILE for each" repair
+  else good security-password-exports "Password export files" "No password-named CSV exports found on Desktop/Downloads"; fi
+}
+
+run_audit() {
+  [ "$(id -u)" -eq 0 ] || [ -n "$R" ] || exec pkexec "$0" run
+  mkdir -p "$SL_STATE/alerts.d" "$SL_STATE/events.d" || return 70
+  WORK=$(mktemp -d "${TMPDIR:-/tmp}/sl-security-audit.XXXXXX") || return 70
+  date -u '+%Y-%m-%dT%H:%M:%SZ' > "$ATTEMPT"
+  : > "$WORK/rows"
+  check_firewall
+  check_opensnitch
+  check_dns
+  check_vpn
+  check_updates
+  check_clamav
+  check_usbguard
+  check_auditd
+  check_fail2ban
+  check_mac
+  check_sysctl
+  check_luks_boot
+  check_flatpak
+  check_docker
+  check_password_exports
+  automation general-health secure-linux-check.timer secure-linux-check.service "General health-check automation ran"
+  good security-audit-run "Security audit execution evidence" "completed $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+  {
+    printf 'SECURE LINUX SECURITY AUDIT\n'
+    printf 'Completed: %s UTC\nDistribution/profile: %s/%s\n' "$(date -u '+%Y-%m-%d %H:%M:%S')" "$DISTRO" "$PROFILE"
+    printf 'Result: %s failed control(s), %s advisory choice/review item(s).\n' "$BAD" "$WARN"
+    printf 'This is live evidence, not a guarantee against unknown attacks. The audit changed nothing.\n\n'
+    awk -F'|' '{printf "%-5s %-42s %s%s\n", toupper($2), $3, $4, ($5 != "" ? " [next: " $5 "]" : "")}' "$WORK/rows"
+    printf '\nExplicit choices: no VPN, no recovery key, no rootless Docker and no Flatpak revocation are never silently made for you.\n'
+    printf 'Hardware limits: legacy firmware may lack Secure Boot; unencrypted disks require a backup/reinstall; atomic images may not include USBGuard/auditd/OpenSnitch.\n'
+  } > "$WORK/report"
+  mv -f "$WORK/rows" "$ROWS.new" && mv -f "$ROWS.new" "$ROWS" || { rm -rf "$WORK"; return 71; }
+  mv -f "$WORK/report" "$REPORT.new" && mv -f "$REPORT.new" "$REPORT" || { rm -rf "$WORK"; return 71; }
+  date -u '+%Y-%m-%dT%H:%M:%SZ' > "$WORK/stamp" || { rm -rf "$WORK"; return 71; }
+  mv -f "$WORK/stamp" "$STAMP.new" && mv -f "$STAMP.new" "$STAMP" || { rm -rf "$WORK"; return 71; }
+  chmod 0644 "$ROWS" "$REPORT" "$STAMP" "$ATTEMPT" || { rm -rf "$WORK"; return 71; }
+  rm -rf "$WORK"; WORK=""
+  printf 'Security audit finished: %s failed control(s), %s advisory item(s). Report: %s\n' "$BAD" "$WARN" "$REPORT"
+  return 0
+}
+
+case "${1:-run}" in
+  -h|--help|help) usage ;;
+  run|--scheduled) trap '[ -n "$WORK" ] && rm -rf "$WORK"' EXIT; run_audit ;;
+  report) [ -r "$REPORT" ] && cat "$REPORT" || { echo "No security audit has completed. Run: secure-linux-security-audit run" >&2; exit 1; } ;;
+  status) [ -r "$ROWS" ] && cat "$ROWS" || { echo "No security audit has completed." >&2; exit 1; } ;;
+  bad-count) [ -r "$ROWS" ] && awk -F'|' '$2 == "bad" {n++} END {print n+0}' "$ROWS" || echo 1 ;;
+  *) echo "Unknown command: $1" >&2; usage; exit 2 ;;
+esac

@@ -3571,7 +3571,7 @@ chmod 0644 /etc/secure-linux/profile /etc/secure-linux/user /etc/secure-linux/ch
 # Validate every archive member before extraction: even a transport archive must never write outside
 # its staging root or introduce links/special files. The release record prevents old/new payload drift.
 SL_PAYLOAD_SOURCE="https://codeload.github.com/MattyBoyMan/secure-linux-netboot/tar.gz/refs/heads/main"
-SL_EXPECTED_RELEASE="secure-linux-2026.11.06-f51e5fcefb47f0a3"
+SL_EXPECTED_RELEASE="secure-linux-2026.11.06-f925a1e49792acd3"
 SL=/usr/local/lib/secure-linux
 SLREPO=/tmp/sl-repo
 SLPAYLOAD="$SLREPO/secure-linux-netboot-main/payload"

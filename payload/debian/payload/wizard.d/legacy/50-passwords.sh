@@ -3,6 +3,20 @@
 # also offers KeePassXC for people who want no cloud at all (passwords in one encrypted file on this PC).
 page_title() { echo "Move your passwords to Bitwarden"; }
 
+_pw_valid_csv() {
+  python3 - "$1" <<'PY'
+import csv, sys
+try:
+    with open(sys.argv[1], encoding="utf-8-sig", newline="") as handle:
+        header = next(csv.reader(handle))
+    names = {name.strip().lower() for name in header}
+    valid = "password" in names and bool(names & {"username", "login", "login_username", "user"})
+except (OSError, StopIteration, csv.Error, UnicodeError):
+    valid = False
+sys.exit(0 if valid else 1)
+PY
+}
+
 # KeePassXC: the no-cloud path. Installs it (choice keepassxc=yes) and shows how to load the same Google file.
 _pw_keepassxc() {
   local M=$SL_ROOT/bin/secure-linux-migrate
@@ -25,16 +39,18 @@ page_run() {
   . "$SL_ROOT/files/comfort/comfort-lib.sh"
   wz_is_done comfort-passwords && return 0
   local a csv dl M=$SL_ROOT/bin/secure-linux-migrate
-  a=$(wz_choice "Move your saved passwords from Google to a password manager?
+  a=$(wz_choice "Move your saved browser passwords to a password manager?
 
-On Windows, Chrome kept your passwords in Google Password Manager. Here, Bitwarden keeps them: it's encrypted so that only you can read your vault, it's open source, and it works in LibreWolf and on your phone.
+Already used the USB's 'Save my passwords and Wi-Fi only' tool? Plug that USB in: this page finds the export automatically, checks its format, and skips the old-browser export step.
 
-Prefer no cloud at all? KeePassXC keeps your passwords in one encrypted file on this PC only - no account, no company - and it can load the same Google file.
+Bitwarden keeps your passwords encrypted so only you can read your vault. It is open source and works in LibreWolf and on your phone. Your Bitwarden sign-in or unlock is always required; this page never uploads passwords by itself.
 
-Either way it takes about 5 minutes:
-  1. Download your passwords from Google (one file).
-  2. Load that file into the password manager.
-  3. Delete the file, and remove the passwords from Google." \
+Prefer no cloud at all? KeePassXC keeps your passwords in one encrypted file on this PC only and can load the same Chrome or Edge file.
+
+The guided route:
+  1. Find your existing export, or help you export once.
+  2. You load that file into the password manager and confirm it worked.
+  3. The page deletes the readable CSV. Removing Google's old copy remains a separate, optional step." \
     "Yes, move my passwords (Bitwarden)" "Not now (ask me next time)" "No thanks" "KeePassXC instead (no cloud, a file only on this PC)")
   case $a in
     "No thanks") wz_done comfort-passwords; return 0 ;;
@@ -50,31 +66,56 @@ Bitwarden opens now. If you don't have a Bitwarden account yet, click \"Create a
 Leave Bitwarden open and click OK here."
   flatpak run com.bitwarden.desktop >/dev/null 2>&1 &
 
-  wz_info "Step 2 of 4: download your passwords from Google.
+  dl=$(xdg-user-dir DOWNLOAD 2>/dev/null || echo "$HOME/Downloads")
+  # Reuse the explicit Windows browser export first. Discovery never reads or uploads credentials;
+  # the header-only check below merely rejects files that are not browser password exports.
+  local candidate
+  csv=
+  for candidate in "$dl"/*.csv "$HOME/linux-setup/scan"/*.csv "$HOME/scan"/*.csv \
+                   /run/media/"$USER"/*/linux-setup/scan/*/*.csv /run/media/"$USER"/*/linux-setup/scan/*.csv \
+                   /run/media/"$USER"/*/scan/*.csv; do
+    [ -f "$candidate" ] || continue
+    _pw_valid_csv "$candidate" || continue
+    csv=$candidate
+    break
+  done
+  if [ -n "$csv" ]; then
+    wz_info "Step 2 of 4: found your exported password file.
 
-Your browser now opens Google Password Manager's settings.
+Found automatically: $csv
+
+You do not need to export it again. Nothing has been uploaded. The app will check only the CSV header, then show you exactly how to import it into Bitwarden."
+  else
+    wz_info "Step 2 of 4: export your passwords once.
+
+If you used the USB's 'Save my passwords and Wi-Fi only' tool, plug that USB in and run this page again: it will find the file for you.
+
+Otherwise your browser opens Google Password Manager's settings:
   1. Sign in to Google if asked.
   2. Click \"Export passwords\", then \"Export\" (Google asks for your Google password again).
-  3. A file called \"Google Passwords.csv\" lands in your Downloads folder.
+  3. A file called \"Google Passwords.csv\" lands in Downloads.
 
 Click OK once it has downloaded, then choose that file in the next window."
-  wz_open "https://passwords.google.com/options"
-  dl=$(xdg-user-dir DOWNLOAD 2>/dev/null || echo "$HOME/Downloads")
+    wz_open "https://passwords.google.com/options"
+  fi
   # Native sessions get a cancellable picker instead of an invisible polling wait.
   # Scripted and specialist harnesses keep the established wz_input contract.
   local native_picker=0
-  csv=
-  if declare -F _ui_tool >/dev/null && [ -z "${SL_WIZARD_ANSWERS:-}" ]; then
+  if [ -z "$csv" ] && declare -F _ui_tool >/dev/null && [ -z "${SL_WIZARD_ANSWERS:-}" ]; then
     case $(_ui_tool) in
       kdialog) csv=$(kdialog --title "Choose the exported password CSV" --getopenfilename "$dl" '*.csv'); native_picker=1 ;;
       zenity) csv=$(zenity --file-selection --title="Choose the exported password CSV" --filename="$dl/Google Passwords.csv" \
                        --file-filter='Password CSV files | *.csv' --file-filter='All files | *'); native_picker=1 ;;
     esac
   fi
-  if [ "$native_picker" -eq 0 ]; then
+  if [ -z "$csv" ] && [ "$native_picker" -eq 0 ]; then
     csv=$(wz_input "Type the exported CSV path (or leave empty to stop for now):" "$dl/Google Passwords.csv")
   fi
   [ -n "$csv" ] && [ -f "$csv" ] || { wz_info "No problem: we'll ask again next time. Nothing has changed."; return 0; }
+  if ! _pw_valid_csv "$csv"; then
+    wz_info "That file is not a recognised Chrome, Edge or Google password CSV. Nothing was imported or deleted. Choose the browser's Export passwords file instead."
+    return 1
+  fi
 
   wz_info "Step 3 of 4: load the file into Bitwarden.
 
@@ -97,7 +138,7 @@ Scroll through \"My vault\": you should see your websites listed."; then
 
 Plain truth: this laptop has an SSD, and SSDs can keep old copies of data in places no delete command can reach. Whole-disk encryption protects those leftovers when the computer is off; it does not prove that overwritten blocks are physically erased.
 
-Never email that file to yourself or put it on a USB stick."
+Never email that file or copy it to shared cloud storage. If it came from the USB, keep that USB private until the verified import and deletion finish."
     else
       wz_info "The import finished, but the passwords file could NOT be deleted: $csv
 
@@ -105,9 +146,9 @@ Nothing is marked complete. Please close programs using the file, then choose 'M
       return 1
     fi
   else
-    wz_info "No worries. The file is still in your Downloads folder: $csv
+    wz_info "No worries. The readable password file is still here: $csv
 
-Try the import again, or ask for help. Once your passwords are in Bitwarden, open \"Bring My Stuff from Windows\" > \"Move your passwords\" again and we'll delete the file safely.
+Nothing was uploaded or deleted. Try the import again, or ask for help. Once your passwords are in Bitwarden, open Setup Hub > \"Move My Passwords from Chrome or Edge\" again and we'll find the same file and delete it after you confirm the import.
 
 Please don't leave that file lying around: it holds all your passwords in plain text."
     return 0

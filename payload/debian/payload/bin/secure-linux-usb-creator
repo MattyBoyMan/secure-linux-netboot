@@ -57,6 +57,28 @@ PORTABLE_BOOT_ASSETS = (
     "EFI/BOOT/BOOTIA32.EFI",
     "ENROLL_THIS_KEY_IN_MOKMANAGER.cer",
 )
+# The ONLINE-ONLY variant leaves the offline app cache off the target stick, so the
+# copy fits drives too small for the FULL variant (apps then install with internet).
+ONLINE_ONLY_EXCLUDED_PREFIX = "linux-setup/offline/app-bundles/"
+VARIANTS = ("full", "online-only")
+# Personal-storage partitioning: only offered when the drive has more room than the
+# copy needs by this margin. Space is reserved at Ventoy install time (-r MB), then
+# partition #3 is created in the reserved area after the copy verifies.
+STORAGE_SURPLUS_MIN_BYTES = 5 * 1024**3
+STORAGE_RESERVE_CUSHION_BYTES = 512 * 1024**2
+STORAGE_PARTITION_TYPES = {
+    "ntfs": "0x07", "exfat": "0x07", "fat32": "0x0b",
+    "ext4": "0x83", "btrfs": "0x83", "xfs": "0x83", "f2fs": "0x83",
+}
+STORAGE_FORMAT_TOOL_CANDIDATES = {
+    "ntfs": (("mkfs.ntfs", ("-F", "-Q")), ("mkntfs", ("-F", "-Q"))),
+    "exfat": (("mkfs.exfat", ()), ("mkexfatfs", ())),
+    "fat32": (("mkfs.vfat", ("-F", "32")),),
+    "ext4": (("mkfs.ext4", ("-F",)),),
+    "btrfs": (("mkfs.btrfs", ("-f",)),),
+    "xfs": (("mkfs.xfs", ("-f",)),),
+    "f2fs": (("mkfs.f2fs", ("-f",)),),
+}
 HASH_RE = re.compile(r"^[0-9a-f]{64}$")
 ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 DEFAULT_CURRENT_RELEASE = _KIT_ROOT / "release.json"
@@ -1279,20 +1301,34 @@ def clone_master(args):
             os.close(fd)
 
 
-def portable_measurements(manifest):
+def variant_files(portable, variant):
+    """File entries for a copy variant: the ONLINE-ONLY variant excludes the offline app cache."""
+    if variant == "online-only":
+        return [entry for entry in portable["files"] if not entry["path"].startswith(ONLINE_ONLY_EXCLUDED_PREFIX)]
+    if variant != "full":
+        raise CreatorError(f"unknown variant {variant!r}; choose one of: {', '.join(VARIANTS)}")
+    return list(portable["files"])
+
+
+def portable_measurements(manifest, variant="full"):
     portable = manifest.get("portable")
     if portable is None:
         raise VerificationError("this saved master has no portable file manifest; recreate it with --source-root")
     validate_portable_manifest(portable)
-    allocated = sum(max(4096, ((entry["size"] + 4095) // 4096) * 4096) for entry in portable["files"])
+    files = variant_files(portable, variant)
+    if not files:
+        raise CreatorError(f"variant {variant!r} has no files to copy")
+    payload = sum(entry["size"] for entry in files)
+    allocated = sum(max(4096, ((entry["size"] + 4095) // 4096) * 4096) for entry in files)
     filesystem = max(
         PORTABLE_MIN_FILESYSTEM_OVERHEAD,
-        portable["file_count"] * 4096 + allocated // 100,
+        len(files) * 4096 + allocated // 100,
     )
     subtotal = allocated + PORTABLE_VENTOY_OVERHEAD + filesystem
     safety = max(PORTABLE_MIN_SAFETY_MARGIN, subtotal // 10)
     return {
-        "source_used_bytes": portable["payload_bytes"],
+        "variant": variant,
+        "source_used_bytes": payload,
         "allocated_payload_bytes": allocated,
         "ventoy_partition_overhead_bytes": PORTABLE_VENTOY_OVERHEAD,
         "filesystem_overhead_bytes": filesystem,
@@ -1300,8 +1336,72 @@ def portable_measurements(manifest):
         "exact_clone_minimum_bytes": manifest["image"]["raw_size_bytes"],
         "portable_copy_minimum_bytes": subtotal + safety,
         "required_destination_bytes": subtotal + safety,
-        "portable_file_count": portable["file_count"],
+        "portable_file_count": len(files),
     }
+
+
+def storage_format_tools(mock):
+    """Formats whose mkfs tool exists on this system (mock mode pretends the common set is present)."""
+    available = []
+    for name, candidates in STORAGE_FORMAT_TOOL_CANDIDATES.items():
+        if mock:
+            available.append(name)
+            continue
+        for tool, args in candidates:
+            path = shutil.which(tool)
+            if path:
+                available.append(name)
+                break
+    return available
+
+
+def resolve_storage_tool(name, mock):
+    if name not in STORAGE_FORMAT_TOOL_CANDIDATES:
+        raise CreatorError(f"unknown storage format {name!r}")
+    for tool, args in STORAGE_FORMAT_TOOL_CANDIDATES[name]:
+        path = shutil.which(tool) if not mock else ("/usr/sbin/" + tool)
+        if path:
+            return path, list(args)
+    raise CreatorError(
+        f"no mkfs tool for {name!r} found on this system; install it or pick one of: "
+        + ", ".join(storage_format_tools(mock))
+    )
+
+
+def create_storage_partition(device_path, fmt, mock):
+    """Create partition #3 in Ventoy's reserved area and format it. Returns a description dict."""
+    resolve_storage_tool(fmt, mock)
+    if mock:
+        return {"format": fmt, "partition": "mock", "created": True}
+    existing = set(storage_partition_nodes(device_path))
+    partition_type = STORAGE_PARTITION_TYPES.get(fmt, "0x83")
+    proc = subprocess.run(
+        ["sfdisk", "--append", device_path],
+        input=f"type={partition_type}\n",
+        text=True,
+        capture_output=True,
+    )
+    if proc.returncode != 0:
+        raise CreatorError(f"could not create the storage partition: {proc.stderr.strip() or proc.stdout.strip()}")
+    subprocess.run(["blockdev", "--rereadpt", device_path], capture_output=True)
+    node = None
+    for candidate in storage_partition_nodes(device_path):
+        if candidate not in existing:
+            node = candidate
+    if not node:
+        raise CreatorError("the new storage partition did not appear after re-reading the partition table")
+    tool, args = resolve_storage_tool(fmt, mock)
+    proc = subprocess.run([tool, *args, node], capture_output=True, text=True)
+    if proc.returncode != 0:
+        raise CreatorError(f"formatting the storage partition failed: {proc.stderr.strip() or proc.stdout.strip()}")
+    return {"format": fmt, "partition": node, "created": True}
+
+
+def storage_partition_nodes(device_path):
+    proc = subprocess.run(["lsblk", "-nr", "-o", "PATH", device_path], capture_output=True, text=True)
+    if proc.returncode != 0:
+        return []
+    return [line.strip() for line in proc.stdout.splitlines() if line.strip() and line.strip() != device_path]
 
 
 def usb_guidance():
@@ -1314,7 +1414,11 @@ def measure_command(args):
     _, _, _, manifest = load_master(
         args.store, args.master_id, payload=True, show_progress=not args.json, current_release=args.current_release
     )
-    result = portable_measurements(manifest)
+    result = portable_measurements(manifest, args.variant)
+    online = portable_measurements(manifest, "online-only")
+    result["online_only_copy_minimum_bytes"] = online["portable_copy_minimum_bytes"]
+    result["online_only_file_count"] = online["portable_file_count"]
+    result["online_only_used_bytes"] = online["source_used_bytes"]
     target = None
     if args.target:
         devices = Devices(args.mock_devices)
@@ -1326,22 +1430,33 @@ def measure_command(args):
         result["target_capacity_bytes"] = target["size"]
         result["exact_clone_fits"] = target["size"] >= result["exact_clone_minimum_bytes"]
         result["portable_copy_fits"] = target["size"] >= result["portable_copy_minimum_bytes"]
+        result["online_only_copy_fits"] = target["size"] >= result["online_only_copy_minimum_bytes"]
+        surplus = target["size"] - result["portable_copy_minimum_bytes"]
+        result["storage_partition_offered"] = surplus > STORAGE_SURPLUS_MIN_BYTES
+        result["storage_partition_bytes"] = max(0, surplus - STORAGE_RESERVE_CUSHION_BYTES) if result["storage_partition_offered"] else 0
     if args.json:
         say(json.dumps(result, indent=2, sort_keys=True))
         return 0
     say("MEASURED USB CAPACITY — based on the verified saved file manifest")
+    say(f"Variant measured: {result['variant']}")
     say(f"Source used bytes (actual finished tools/files): {result['source_used_bytes']} ({human(result['source_used_bytes'])})")
     say(f"Filesystem-allocation allowance: {result['allocated_payload_bytes']} bytes")
     say(f"Ventoy/partition overhead: {result['ventoy_partition_overhead_bytes']} bytes")
     say(f"Additional filesystem overhead: {result['filesystem_overhead_bytes']} bytes")
     say(f"Safety margin: {result['safety_margin_bytes']} bytes")
-    say(f"Required destination bytes for Portable tools copy: {result['required_destination_bytes']} ({human(result['required_destination_bytes'])})")
+    say(f"Required destination bytes for this variant: {result['required_destination_bytes']} ({human(result['required_destination_bytes'])})")
     say(f"Exact-clone minimum: {result['exact_clone_minimum_bytes']} bytes (the entire source medium)")
-    say(f"Portable-copy minimum: {result['portable_copy_minimum_bytes']} bytes")
+    say(f"Portable-copy minimum ({result['variant']}): {result['portable_copy_minimum_bytes']} bytes")
+    say(f"Portable-copy minimum (online-only): {result['online_only_copy_minimum_bytes']} bytes ({result['online_only_file_count']} files; no offline app cache)")
     if target:
         say(f"Selected target capacity: {target['size']} bytes")
         say(f"Exact whole-device clone fits: {'yes' if result['exact_clone_fits'] else 'no'}")
-        say(f"Portable tools copy fits: {'yes' if result['portable_copy_fits'] else 'no'}")
+        say(f"Portable tools copy fits ({result['variant']}): {'yes' if result['portable_copy_fits'] else 'no'}")
+        say(f"Online-only copy fits: {'yes' if result['online_only_copy_fits'] else 'no'}")
+        if result["storage_partition_offered"]:
+            say(f"A personal storage partition can be created with the remaining {human(result['storage_partition_bytes'])}.")
+        else:
+            say("No room for a separate storage partition (surplus under 5 GB).")
     usb_guidance()
     return 0
 
@@ -1468,10 +1583,10 @@ def ensure_payload_destination(data_root, relative):
     return destination
 
 
-def verify_portable_files(data_root, portable):
-    progress = Progress("Full post-copy per-file SHA-256 verification", portable["payload_bytes"])
+def verify_portable_files(data_root, files, portable):
+    progress = Progress("Full post-copy per-file SHA-256 verification", sum(entry["size"] for entry in files))
     tree = hashlib.sha256()
-    for entry in portable["files"]:
+    for entry in files:
         path = Path(data_root) / entry["path"]
         if path.is_symlink() or not path.is_file():
             raise VerificationError(f"copied file is missing or not regular: {entry['path']}")
@@ -1481,7 +1596,7 @@ def verify_portable_files(data_root, portable):
         tree.update(entry["path"].encode("utf-8") + b"\0" + digest.encode("ascii") + b"\n")
         progress.advance(size)
     progress.finish()
-    release = next(entry for entry in portable["files"] if entry["path"] == portable["source_release_path"])
+    release = next(entry for entry in files if entry["path"] == portable["source_release_path"])
     if release["sha256"] != portable["source_release_sha256"]:
         raise VerificationError("copied current release manifest does not match the verified source master")
     return tree.hexdigest()
@@ -1499,7 +1614,9 @@ def portable_copy(args):
         args.store, args.master_id, payload=True, current_release=args.current_release
     )
     portable = manifest["portable"]
-    measurements = portable_measurements(manifest)
+    variant = args.variant
+    files = variant_files(portable, variant)
+    measurements = portable_measurements(manifest, variant)
     _, installer_command, installer_hashes = validate_ventoy_installer(args.ventoy_installer, bool(args.mock_devices))
     devices = Devices(args.mock_devices)
     rows = devices.scan()
@@ -1520,17 +1637,56 @@ def portable_copy(args):
     if args.resume and not matching_receipt:
         raise CreatorError("no matching interrupted portable copy exists; use --restart to create a new Ventoy layout")
     can_resume = not args.restart and bool(matching_receipt)
+    if can_resume and previous.get("variant", variant) != variant:
+        raise CreatorError("this interrupted copy used a different variant; rerun without --resume or with the same variant")
+    # --- Storage partition: decided UP FRONT (with the erase confirmation), never asked mid-run ---
+    surplus = target["size"] - minimum
+    storage_plan = None
+    if can_resume:
+        storage_plan = previous.get("storage")
+    elif surplus > STORAGE_SURPLUS_MIN_BYTES:
+        available_formats = storage_format_tools(devices.mock)
+        want_storage = args.storage == "remaining"
+        storage_format = args.storage_format
+        if args.storage == "auto" and not args.non_interactive:
+            say("")
+            say(f"This drive has {human(surplus)} more than the {variant} copy needs.")
+            answer = input("Create a personal storage partition with the remaining space? (y/n) [y]: ").strip().lower()
+            if answer in ("", "y", "yes"):
+                want_storage = True
+        if want_storage:
+            if not available_formats:
+                say("No mkfs tools for a storage partition were found on this system; continuing without one.")
+            else:
+                if args.storage == "auto" and not args.non_interactive:
+                    say("Formats available on this system: " + ", ".join(available_formats))
+                    storage_format = input(f"Format for the storage partition [{available_formats[0]}]: ").strip().lower() or available_formats[0]
+                if not storage_format:
+                    raise CreatorError("--storage-format is required with --storage remaining in non-interactive mode")
+                if storage_format not in available_formats:
+                    raise CreatorError(
+                        f"format {storage_format!r} is not available; choose one of: {', '.join(available_formats)}"
+                    )
+                reserve_mb = (surplus - STORAGE_RESERVE_CUSHION_BYTES) // (1024 * 1024)
+                if reserve_mb >= 5000:
+                    storage_plan = {"reserve_mb": int(reserve_mb), "format": storage_format, "created": False}
+                else:
+                    say("Remaining space after the copy is under 5 GB; no storage partition will be created.")
     phrase = "ERASE " + identity_label(target)
     say("")
     say("PORTABLE TOOLS COPY — a separate option from exact whole-device clone")
     say("This creates a functionally equivalent bootable Ventoy USB; it is not a byte-for-byte exact clone.")
-    say(f"Verified source used bytes: {measurements['source_used_bytes']}")
+    say(f"Variant: {variant} ({len(files)} files; {measurements['source_used_bytes']} bytes of content)")
     say(f"Ventoy/partition overhead: {measurements['ventoy_partition_overhead_bytes']} bytes")
     say(f"Safety margin: {measurements['safety_margin_bytes']} bytes")
     say(f"Required destination bytes: {minimum}; selected target: {target['size']} bytes")
     say(f"Exact whole-device clone would still require {measurements['exact_clone_minimum_bytes']} bytes.")
+    if storage_plan:
+        say(f"A personal storage partition of about {storage_plan['reserve_mb']} MB (format: {storage_plan['format']}) will be created in the remaining space.")
+    elif not can_resume and surplus > STORAGE_SURPLUS_MIN_BYTES:
+        say(f"The target is larger than required; {human(surplus)} would remain unpartitioned (no storage partition requested).")
     if target["size"] > minimum:
-        say("The target is larger than required; space beyond the copied payload is not content-verified and may retain residual old data.")
+        say("Space beyond the copied payload is not content-verified and may retain residual old data.")
     say("WARNING: Ventoy installation permanently erases and repartitions ALL existing data on this exact whole drive.")
     say("This is not a secure erase. There is no confirmation timeout. Nothing is written until the exact phrase is entered.")
     usb_guidance()
@@ -1554,7 +1710,9 @@ def portable_copy(args):
         "mode": "portable-tools-copy",
         "master_id": master_id,
         "master_raw_sha256": manifest["image"]["raw_sha256"],
-        "portable_tree_sha256": sha256_bytes(json_data(portable["files"])),
+        "portable_tree_sha256": sha256_bytes(json_data(files)),
+        "variant": variant,
+        "storage": storage_plan,
         "target": {
             "identity": target_id,
             "serial": target["serial"],
@@ -1583,7 +1741,11 @@ def portable_copy(args):
             say("Resume: retaining the existing Ventoy layout and re-hashing every already copied file.")
         else:
             say("Starting genuine Ventoy installation; no substitute boot-sector writer is used.")
-            result = subprocess.run(installer_command + [refreshed["path"]])
+            install_command = list(installer_command)
+            if storage_plan:
+                install_command += ["-r", str(storage_plan["reserve_mb"])]
+                say(f"Reserving {storage_plan['reserve_mb']} MB at the end of the disk for your storage partition.")
+            result = subprocess.run(install_command + [refreshed["path"]])
             if result.returncode:
                 raise CreatorError(
                     f"Ventoy installer failed with exit status {result.returncode}; target is INCOMPLETE / NOT VERIFIED"
@@ -1599,8 +1761,8 @@ def portable_copy(args):
         current["phase"] = "copying"
         current["boot_asset_sha256"] = boot_hashes
         save_state(state_path, current)
-        progress = Progress("Copying verified tools, release and offline content", portable["payload_bytes"])
-        for index, entry in enumerate(portable["files"]):
+        progress = Progress("Copying verified tools, release and offline content", sum(entry["size"] for entry in files))
+        for index, entry in enumerate(files):
             source = Path(root) / "payload" / entry["path"]
             destination = ensure_payload_destination(data_root, entry["path"])
             retained = False
@@ -1611,7 +1773,7 @@ def portable_copy(args):
                 except VerificationError:
                     retained = False
             if retained:
-                say(f"Verified existing file {index + 1}/{len(portable['files'])}: {entry['path']}")
+                say(f"Verified existing file {index + 1}/{len(files)}: {entry['path']}")
             else:
                 temporary_fd, temporary = tempfile.mkstemp(prefix=".secure-linux-copy-", dir=destination.parent)
                 try:
@@ -1657,27 +1819,34 @@ def portable_copy(args):
                 changed.write(bytes([original[0] ^ 1]))
                 changed.flush()
                 os.fsync(changed.fileno())
-        tree_hash = verify_portable_files(data_root, portable)
+        tree_hash = verify_portable_files(data_root, files, portable)
         if verify_boot_assets(efi_root) != boot_hashes:
             raise VerificationError("Ventoy boot assets changed during portable file copying")
         if hasattr(os, "sync"):
             os.sync()
+        if storage_plan and not storage_plan.get("created"):
+            say(f"Creating your storage partition now (format: {storage_plan['format']})...")
+            storage_info = create_storage_partition(refreshed["path"], storage_plan["format"], devices.mock)
+            storage_plan = dict(storage_plan)
+            storage_plan.update(storage_info)
+            say(f"Storage partition created: {storage_plan.get('partition')} ({storage_plan['format']}).")
         final_state = dict(base_state)
         final_state.update({
             "status": "verified",
             "verified": True,
             "phase": "complete",
-            "next_file": len(portable["files"]),
+            "next_file": len(files),
             "message": "VERIFIED PORTABLE TOOLS COPY",
-            "verified_file_count": len(portable["files"]),
+            "verified_file_count": len(files),
             "verified_tree_sha256": tree_hash,
             "boot_asset_sha256": boot_hashes,
+            "storage": storage_plan,
             "verified_at": utc_now(),
         })
         save_state(state_path, final_state)
         completed = True
         say("")
-        say(f"VERIFIED PORTABLE TOOLS COPY: all {len(portable['files'])} file hashes and every required Ventoy boot asset passed.")
+        say(f"VERIFIED PORTABLE TOOLS COPY: all {len(files)} file hashes and every required Ventoy boot asset passed.")
         say("The current release manifest, finished tools/files and offline content were copied from the verified saved master.")
         say("This is functionally equivalent Ventoy content, not a byte-for-byte exact clone.")
         if target["size"] > minimum:
@@ -1883,7 +2052,21 @@ def build_parser():
     portable_mode.add_argument("--resume", action="store_true", help="retain existing Ventoy and hash-matching copied files")
     portable_mode.add_argument("--restart", action="store_true", help="reinstall Ventoy and restart the complete file copy")
     portable.add_argument("--non-interactive", action="store_true")
+    portable.add_argument(
+        "--variant",
+        choices=VARIANTS,
+        default="full",
+        help="full includes the offline app cache; online-only leaves it off (app installs then need internet)",
+    )
+    portable.add_argument(
+        "--storage",
+        choices=("auto", "remaining", "none"),
+        default="auto",
+        help="auto asks up front when the drive has 5+ GB spare (interactive only); remaining always creates a storage partition when possible; none never does",
+    )
+    portable.add_argument("--storage-format", help="filesystem for the storage partition (ntfs/exfat/fat32/ext4/btrfs/xfs/f2fs as available)")
     measure = sub.add_parser("measure", help="report source used bytes and exact/portable minimum destination sizes")
+    measure.add_argument("--variant", choices=VARIANTS, default="full", help="variant to report as the primary minimum")
     add_store(measure)
     measure.add_argument("--target", help="optional target for a read-only fit check")
     measure.add_argument("--json", action="store_true")

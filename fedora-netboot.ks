@@ -1,5 +1,5 @@
 # Fedora Kickstart: "The Complete Secure Linux Package" - NETBOOT build, rendered by netboot/render-netboot.sh
-# on 2026-11-08 (netboot render) (Fedora 44) from templates/fedora.ks. This is a PUBLIC file: no names, no password
+# on 2026-11-10 (netboot render) (Fedora 44) from templates/fedora.ks. This is a PUBLIC file: no names, no password
 # hashes, no Wi-Fi passwords. The setup screen asks for the login name and password instead (see the marked
 # netboot step in %pre). The Secure Linux payload and the guide are downloaded from the public repository
 # at install time (SL_PAYLOAD_SOURCE below), not embedded and not read from a USB stick.
@@ -3571,7 +3571,7 @@ chmod 0644 /etc/secure-linux/profile /etc/secure-linux/user /etc/secure-linux/ch
 # Validate every archive member before extraction: even a transport archive must never write outside
 # its staging root or introduce links/special files. The release record prevents old/new payload drift.
 SL_PAYLOAD_SOURCE="https://codeload.github.com/MattyBoyMan/secure-linux-netboot/tar.gz/refs/heads/main"
-SL_EXPECTED_RELEASE="secure-linux-2026.11.08-693e939126e4b367"
+SL_EXPECTED_RELEASE="secure-linux-2026.11.09-a87d757003bec7c9"
 SL=/usr/local/lib/secure-linux
 SLREPO=/tmp/sl-repo
 SLPAYLOAD="$SLREPO/secure-linux-netboot-main/payload"

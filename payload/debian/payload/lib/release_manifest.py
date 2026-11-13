@@ -53,6 +53,7 @@ SOURCE_DIRECTORIES = (
     "guide",
     "setup-app",
     "setup-app-mac",
+    "stick-theme",
     "offline-bundle",
 )
 EXCLUDED_FILES = {CANONICAL, INSTALLED, COMPANION, DEBIAN_COMPANION}

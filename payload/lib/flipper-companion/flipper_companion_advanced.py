@@ -90,6 +90,8 @@ def download_and_install_latest(
     reporter("Do not run no-argument qFlipper-cli: its default update can select official stock firmware.")
     reporter("Do not substitute firmware.dfu or dfu-util -D: Core1-only flashing is not a complete RogueMaster update.")
     reporter("If qFlipper asks for a device reboot/button action, follow its prompt. Recovery button sequences are not normal updates.")
+    reporter("This is the one complete official RogueMaster package (firmware and every bundled app); there is no separate games-only download.")
+    reporter("If the Flipper menu then shows only games, it is in Game Mode: on its desktop press Up, choose the Game Mode entry to switch it off, and the full app menu returns.")
     return {
         "workflow": "Download and Install Latest RogueMaster Update for Flipper Device",
         "status": "awaiting-user-qflipper",

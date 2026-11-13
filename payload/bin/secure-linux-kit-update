@@ -1,0 +1,439 @@
+#!/usr/bin/env python3
+"""secure-linux-kit-update: use the local Secure Linux files, plus anything newer that was published.
+
+One rule, used by the installer and by the USB creator:
+  1. The local copy (on the drive, or already on this computer) is always enough on its own.
+  2. With internet, compare the local release with the published one (one tiny file).
+  3. Same release  -> nothing to do.
+  4. Newer release -> fetch ONLY the files whose SHA-256 differs, verify every one, then swap them in.
+  5. No internet, or any doubt at all (bad hash, older release, half-published state) -> keep the local copy.
+
+Nothing is changed until every new file has been downloaded and has matched the published SHA-256.
+This tool never fails an install: every refusal is reported and the local copy stays as it was.
+
+  secure-linux-kit-update manifest --payload DIR --release-id ID --output FILE   (release tooling only)
+  secure-linux-kit-update check --tree DIR
+  secure-linux-kit-update apply --tree DIR
+"""
+from __future__ import annotations
+
+import argparse
+import datetime
+import hashlib
+import io
+import json
+import os
+from pathlib import Path, PurePosixPath
+import re
+import shutil
+import sys
+import tarfile
+import tempfile
+import time
+import urllib.error
+import urllib.request
+
+REPO = "MattyBoyMan/secure-linux-netboot"
+DEFAULT_BASE = f"https://raw.githubusercontent.com/{REPO}/main"
+DEFAULT_TARBALL = f"https://codeload.github.com/{REPO}/tar.gz/refs/heads/main"
+TARBALL_ROOT = "secure-linux-netboot-main"
+MANIFEST_NAME = "payload-files.json"
+RECORD_NAME = ".kit-update.json"
+FILES_NAME = ".kit-update-files.json"   # the published file list that was applied here
+SCHEMA = 1
+RELEASE_ID_RE = re.compile(r"^secure-linux-([0-9]{4})\.([0-9]{2})\.([0-9]{2})-[0-9a-f]{16}$")
+HASH_RE = re.compile(r"^[0-9a-f]{64}$")
+# Never part of the published payload (same rules as netboot/render-netboot.sh and make-usb.ps1's
+# $PayloadSkipTop / $PayloadSkipPaths), or written per computer / per release beside it.
+# "debian" is the separate Debian installer payload that sits beside these files in the published tree.
+SKIP_TOP = {"rescue", "server", "asahi", "build.conf", "debian"}
+SKIP_PATHS = {("hw", "mac")}
+GENERATED_DIRS = {"__pycache__"}
+GENERATED_SUFFIXES = (".pyc", ".pyo")
+UNMANAGED = {"release.json", "build.conf", "START-HERE.html", RECORD_NAME, FILES_NAME, MANIFEST_NAME}
+MAX_FILES = 5000
+MAX_FILE_BYTES = 8 * 1024 * 1024
+MAX_MANIFEST_BYTES = 2 * 1024 * 1024
+MAX_TARBALL_BYTES = 200 * 1024 * 1024
+TARBALL_THRESHOLD = 40          # more changed files than this: one archive is quicker than many requests
+REQUEST_TIMEOUT = 15
+TOTAL_DEADLINE = 240
+
+
+class Keep(Exception):
+    """A safe reason to keep the local copy unchanged."""
+
+
+class Offline(Exception):
+    """The published release could not be reached at all."""
+
+
+def say(text: str) -> None:
+    print(text, flush=True)
+
+
+def normalise(data: bytes) -> bytes:
+    """The published payload is plain text with no BOM and LF line ends; compare like with like."""
+    if data.startswith(b"\xef\xbb\xbf"):
+        data = data[3:]
+    return data.replace(b"\r\n", b"\n")
+
+
+def sha256(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def safe_relative(value: object) -> str:
+    if not isinstance(value, str) or not value or "\\" in value or "\0" in value:
+        raise Keep("the published file list contains an unsafe path")
+    pure = PurePosixPath(value)
+    if pure.is_absolute() or pure.as_posix() != value or any(part in {"", ".", ".."} for part in pure.parts):
+        raise Keep(f"the published file list contains an unsafe path: {value!r}")
+    return value
+
+
+def managed(relative: str) -> bool:
+    parts = PurePosixPath(relative).parts
+    if relative in UNMANAGED or parts[0] in SKIP_TOP:
+        return False
+    if any(part in GENERATED_DIRS for part in parts) or relative.endswith(GENERATED_SUFFIXES):
+        return False
+    return not any(parts[: len(skip)] == skip for skip in SKIP_PATHS)
+
+
+def local_files(tree: Path) -> dict[str, Path]:
+    """Every managed regular file of a payload tree. Links are never followed or replaced."""
+    found: dict[str, Path] = {}
+    for base, directories, files in os.walk(tree, followlinks=False):
+        directories[:] = sorted(d for d in directories if not (Path(base) / d).is_symlink())
+        for name in sorted(files):
+            path = Path(base) / name
+            relative = path.relative_to(tree).as_posix()
+            if path.is_symlink() or not path.is_file() or not managed(relative):
+                continue
+            found[relative] = path
+    return found
+
+
+def release_id_of(path: Path) -> str:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))["release_id"]
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        raise Keep(f"the local release record cannot be read ({path.name})") from exc
+    if not isinstance(value, str) or not RELEASE_ID_RE.match(value):
+        raise Keep("the local release record has an invalid release ID")
+    return value
+
+
+def release_date(release_id: str) -> tuple[int, int, int]:
+    match = RELEASE_ID_RE.match(release_id)
+    if not match:
+        raise Keep("a release ID is not in the expected form")
+    return int(match.group(1)), int(match.group(2)), int(match.group(3))
+
+
+# ------------------------------------------------------------------ fetching
+class Source:
+    def __init__(self) -> None:
+        self.base = os.environ.get("SL_KIT_UPDATE_BASE", DEFAULT_BASE).rstrip("/")
+        self.tarball = os.environ.get("SL_KIT_UPDATE_TARBALL", DEFAULT_TARBALL)
+        self.tarball_root = os.environ.get("SL_KIT_UPDATE_TARBALL_ROOT", TARBALL_ROOT)
+        test = os.environ.get("SL_KIT_UPDATE_TEST_SOURCE") == "1"
+        for url in (self.base, self.tarball):
+            if not (url.startswith("https://") or (test and url.startswith(("http://127.0.0.1:", "http://localhost:")))):
+                raise Keep("the update address is not a secure (https) address")
+        self.started = time.monotonic()
+
+    def get(self, url: str, limit: int) -> bytes:
+        if time.monotonic() - self.started > TOTAL_DEADLINE:
+            raise Keep("the update took too long")
+        request = urllib.request.Request(url, headers={"User-Agent": "secure-linux-kit-update", "Cache-Control": "no-cache"})
+        with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT) as response:
+            final = response.geturl()
+            if not final.startswith(url.split("/", 3)[0] + "//" + url.split("/", 3)[2]):
+                raise Keep("the update address redirected somewhere unexpected")
+            data = response.read(limit + 1)
+        if len(data) > limit:
+            raise Keep("a published file is larger than allowed")
+        return data
+
+
+def load_remote(source: Source) -> tuple[str, dict, bytes]:
+    """The published release ID, its file list, and the exact release record to install with it."""
+    try:
+        record_raw = source.get(source.base + "/release.json", 65536)
+    except (urllib.error.URLError, OSError, TimeoutError) as exc:
+        raise Offline(str(getattr(exc, "reason", exc))) from exc
+    try:
+        record = json.loads(record_raw.decode("utf-8"))
+        remote_id = record["release_id"]
+    except (ValueError, KeyError, TypeError) as exc:
+        raise Keep("the published release record is not readable") from exc
+    if not isinstance(remote_id, str) or not RELEASE_ID_RE.match(remote_id):
+        raise Keep("the published release record has an invalid release ID")
+    return remote_id, record, record_raw
+
+
+def load_manifest(source: Source, remote_id: str) -> dict:
+    try:
+        raw = source.get(f"{source.base}/{MANIFEST_NAME}", MAX_MANIFEST_BYTES)
+        manifest = json.loads(raw.decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        raise Keep(f"the published release has no file list yet (HTTP {exc.code})") from exc
+    except (urllib.error.URLError, OSError, TimeoutError) as exc:
+        raise Keep("the published file list could not be downloaded") from exc
+    except ValueError as exc:
+        raise Keep("the published file list is not readable") from exc
+    return check_manifest(manifest, remote_id)
+
+
+def check_manifest(manifest: object, remote_id: str) -> dict:
+    if not isinstance(manifest, dict) or manifest.get("schema_version") != SCHEMA:
+        raise Keep("the published file list is in a form this version does not understand")
+    if manifest.get("release_id") != remote_id:
+        raise Keep("the published file list belongs to a different release (publishing may be in progress)")
+    files = manifest.get("files")
+    if not isinstance(files, dict) or not files or len(files) > MAX_FILES:
+        raise Keep("the published file list is empty or too large")
+    for relative, digest in files.items():
+        safe_relative(relative)
+        if not managed(relative):
+            raise Keep(f"the published file list names a file that is never updated this way: {relative}")
+        if not isinstance(digest, str) or not HASH_RE.match(digest):
+            raise Keep(f"the published file list has an invalid SHA-256 for {relative}")
+    if "setup.sh" not in files:
+        raise Keep("the published file list is incomplete (no setup.sh)")
+    try:
+        datetime.datetime.fromisoformat(str(manifest.get("created_at")))
+    except ValueError as exc:
+        raise Keep("the published file list has no valid creation time") from exc
+    return manifest
+
+
+def refuse_older(tree: Path, local_id: str, remote_id: str, manifest: dict) -> None:
+    """Never swap a newer local copy for an older published one."""
+    if release_date(remote_id) < release_date(local_id):
+        raise Keep("the published release is older than the local one")
+    record = tree / RECORD_NAME
+    if record.is_file():
+        try:
+            applied = datetime.datetime.fromisoformat(json.loads(record.read_text(encoding="utf-8"))["created_at"])
+        except (OSError, ValueError, KeyError, TypeError):
+            return
+        if datetime.datetime.fromisoformat(manifest["created_at"]) < applied:
+            raise Keep("the published release is older than the one already applied here")
+
+
+def plan(tree: Path, manifest: dict) -> tuple[list[str], list[str]]:
+    """(files to fetch, local files to remove) - everything else is already identical."""
+    local = local_files(tree)
+    fetch = []
+    for relative, digest in sorted(manifest["files"].items()):
+        path = local.get(relative)
+        if path is None or sha256(normalise(path.read_bytes())) != digest:
+            fetch.append(relative)
+    remove = sorted(relative for relative in local if relative not in manifest["files"])
+    return fetch, remove
+
+
+def fetch_each(source: Source, manifest: dict, wanted: list[str], stage: Path) -> None:
+    for relative in wanted:
+        try:
+            data = source.get(f"{source.base}/payload/{relative}", MAX_FILE_BYTES)
+        except (urllib.error.URLError, OSError, TimeoutError) as exc:
+            raise Keep(f"a changed file could not be downloaded: {relative}") from exc
+        store(stage, relative, data, manifest)
+
+
+def fetch_archive(source: Source, manifest: dict, wanted: list[str], stage: Path) -> None:
+    try:
+        raw = source.get(source.tarball, MAX_TARBALL_BYTES)
+    except (urllib.error.URLError, OSError, TimeoutError) as exc:
+        raise Keep("the published archive could not be downloaded") from exc
+    prefix = f"{source.tarball_root}/payload/"
+    need = set(wanted)
+    try:
+        with tarfile.open(fileobj=io.BytesIO(raw), mode="r:gz") as archive:
+            for member in archive:
+                if not member.isfile() or not member.name.startswith(prefix):
+                    continue
+                relative = member.name[len(prefix):]
+                if relative not in need or member.size > MAX_FILE_BYTES:
+                    continue
+                handle = archive.extractfile(member)
+                if handle is None:
+                    continue
+                store(stage, relative, handle.read(MAX_FILE_BYTES + 1), manifest)
+                need.discard(relative)
+    except (tarfile.TarError, OSError, EOFError) as exc:
+        raise Keep("the published archive could not be read") from exc
+    if need:
+        raise Keep(f"the published archive is missing {len(need)} changed file(s), starting with {sorted(need)[0]}")
+
+
+def store(stage: Path, relative: str, data: bytes, manifest: dict) -> None:
+    """Keep a downloaded file only if it is exactly the published one."""
+    if sha256(data) != manifest["files"][relative]:
+        raise Keep(f"a downloaded file did not match its published SHA-256: {relative}")
+    target = stage.joinpath(*PurePosixPath(relative).parts)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(data)
+
+
+def swap_in(tree: Path, stage: Path, fetch: list[str], remove: list[str], manifest: dict, record_raw: bytes) -> None:
+    """Every new file is already verified; now replace only what changed. The release record goes last."""
+    root = tree.resolve()
+    for relative in fetch:      # look at every destination BEFORE the first write, so a refusal changes nothing
+        target = tree.joinpath(*PurePosixPath(relative).parts)
+        folder = target.parent
+        while not folder.exists():
+            folder = folder.parent
+        if folder.resolve() != root and root not in folder.resolve().parents:
+            raise Keep(f"a local folder points outside the Secure Linux files: {relative}")
+        if target.is_symlink() or (target.exists() and not target.is_file()):
+            raise Keep(f"a local file is a link or folder and is never replaced: {relative}")
+    for relative in fetch:
+        target = tree.joinpath(*PurePosixPath(relative).parts)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        mode = 0o755 if (relative.endswith(".sh") or PurePosixPath(relative).parts[0] == "bin") else 0o644
+        staged = stage.joinpath(*PurePosixPath(relative).parts)
+        os.chmod(staged, mode)
+        temporary = target.with_name(target.name + ".kit-update-new")
+        shutil.copyfile(staged, temporary)
+        os.chmod(temporary, mode)
+        os.replace(temporary, target)
+    for relative in remove:
+        target = tree.joinpath(*PurePosixPath(relative).parts)
+        if target.is_file() and not target.is_symlink():
+            target.unlink()
+    note = {"schema_version": SCHEMA, "release_id": manifest["release_id"], "created_at": manifest["created_at"],
+            "files_updated": len(fetch), "files_removed": len(remove),
+            "applied_at": datetime.datetime.now(datetime.timezone.utc).isoformat()}
+    (tree / RECORD_NAME).write_text(json.dumps(note, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    temporary = tree / (FILES_NAME + ".kit-update-new")
+    temporary.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    os.replace(temporary, tree / FILES_NAME)
+    temporary = tree / "release.json.kit-update-new"
+    temporary.write_bytes(record_raw)
+    os.replace(temporary, tree / "release.json")
+
+
+def run_update(tree: Path, apply: bool) -> str:
+    if not (tree / "setup.sh").is_file():
+        raise Keep("this folder does not hold the Secure Linux files (no setup.sh)")
+    local_id = release_id_of(tree / "release.json")
+    source = Source()
+    remote_id, _, record_raw = load_remote(source)
+    if remote_id == local_id:
+        return f"KIT UPDATE: already the latest release ({local_id}). Using the local copy."
+    manifest = load_manifest(source, remote_id)
+    refuse_older(tree, local_id, remote_id, manifest)
+    fetch, remove = plan(tree, manifest)
+    if not apply:
+        return (f"KIT UPDATE: a newer release is published ({remote_id}; local {local_id}): "
+                f"{len(fetch)} file(s) differ, {len(remove)} to remove.")
+    stage = Path(tempfile.mkdtemp(prefix="sl-kit-update-"))
+    try:
+        if len(fetch) > TARBALL_THRESHOLD:
+            fetch_archive(source, manifest, fetch, stage)
+        else:
+            fetch_each(source, manifest, fetch, stage)
+        # The published release must not have moved while we were fetching.
+        again_id, _, again_raw = load_remote(source)
+        if again_id != remote_id or again_raw != record_raw:
+            raise Keep("the published release changed during the download")
+        swap_in(tree, stage, fetch, remove, manifest, record_raw)
+    finally:
+        shutil.rmtree(stage, ignore_errors=True)
+    return (f"KIT UPDATE: updated to {remote_id} (was {local_id}): {len(fetch)} changed file(s) fetched and verified, "
+            f"{len(remove)} removed; everything else was already identical.")
+
+
+def sync_plan(source: Path, destination: Path) -> tuple[list[str], list[str]]:
+    """Which files a sync_from_tree would replace and remove (nothing is changed)."""
+    listed = check_manifest(read_applied_list(source), release_id_of(source / "release.json"))
+    return plan(destination, listed)
+
+
+def read_applied_list(source: Path) -> object:
+    try:
+        return json.loads((source / FILES_NAME).read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise Keep("this computer holds no published file list to update from (it was never updated online)") from exc
+
+
+def sync_from_tree(source: Path, destination: Path) -> tuple[int, int, str]:
+    """Bring another local copy (a saved master, a packed installer payload) up to the release this
+    computer already holds. No network: the newer files are taken from `source`, and each one must still
+    match the published file list that was applied there. Returns (files changed, files removed, release ID).
+    """
+    source_id = release_id_of(source / "release.json")
+    listed = check_manifest(read_applied_list(source), source_id)
+    if not (destination / "setup.sh").is_file():
+        raise Keep("the copy to update does not hold the Secure Linux files (no setup.sh)")
+    fetch, remove = plan(destination, listed)
+    stage = Path(tempfile.mkdtemp(prefix="sl-kit-sync-"))
+    try:
+        for relative in fetch:
+            path = source.joinpath(*PurePosixPath(relative).parts)
+            if path.is_symlink() or not path.is_file():
+                raise Keep(f"this computer's copy is missing a published file: {relative}")
+            store(stage, relative, normalise(path.read_bytes()), listed)
+        swap_in(destination, stage, fetch, remove, listed, (source / "release.json").read_bytes())
+    finally:
+        shutil.rmtree(stage, ignore_errors=True)
+    return len(fetch), len(remove), source_id
+
+
+def write_manifest(payload: Path, release_id: str, output: Path) -> int:
+    if not RELEASE_ID_RE.match(release_id):
+        say("ERROR: invalid release ID")
+        return 2
+    files = {}
+    for relative, path in sorted(local_files(payload).items()):
+        data = path.read_bytes()
+        if normalise(data) != data:
+            say(f"ERROR: payload file is not normalised plain text: {relative}")
+            return 2
+        files[relative] = sha256(data)
+    created = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    if output.is_file():      # an unchanged payload keeps its time, so re-rendering is repeatable
+        try:
+            previous = json.loads(output.read_text(encoding="utf-8"))
+            if previous.get("release_id") == release_id and previous.get("files") == files:
+                created = previous["created_at"]
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
+    manifest = {"schema_version": SCHEMA, "release_id": release_id, "created_at": created,
+                "file_count": len(files), "files": files}
+    output.write_bytes((json.dumps(manifest, indent=2, sort_keys=True) + "\n").encode("utf-8"))
+    say(f"payload file list: {len(files)} files for {release_id}")
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="secure-linux-kit-update", description=__doc__.split("\n")[0])
+    commands = parser.add_subparsers(dest="command", required=True)
+    for name in ("check", "apply"):
+        sub = commands.add_parser(name)
+        sub.add_argument("--tree", required=True, type=Path, help="folder holding setup.sh and release.json")
+    manifest = commands.add_parser("manifest")
+    manifest.add_argument("--payload", required=True, type=Path)
+    manifest.add_argument("--release-id", required=True)
+    manifest.add_argument("--output", required=True, type=Path)
+    args = parser.parse_args(argv)
+    if args.command == "manifest":
+        return write_manifest(args.payload, args.release_id, args.output)
+    try:
+        say(run_update(args.tree, apply=args.command == "apply"))
+    except Offline as exc:
+        say(f"KIT UPDATE: no internet connection to the published release ({exc}). Using the local copy.")
+    except Keep as exc:
+        say(f"KIT UPDATE: kept the local copy unchanged - {exc}.")
+    except Exception as exc:  # an update check must never be the reason an install stops
+        say(f"KIT UPDATE: kept the local copy unchanged - unexpected problem ({type(exc).__name__}: {exc}).")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,5 +1,5 @@
 # Fedora Kickstart: "The Complete Secure Linux Package" - NETBOOT build, rendered by netboot/render-netboot.sh
-# on 2026-11-13 (netboot render) (Fedora 44) from templates/fedora.ks. This is a PUBLIC file: no names, no password
+# on 2026-11-14 (netboot render) (Fedora 44) from templates/fedora.ks. This is a PUBLIC file: no names, no password
 # hashes, no Wi-Fi passwords. The setup screen asks for the login name and password instead (see the marked
 # netboot step in %pre). The Secure Linux payload and the guide are downloaded from the public repository
 # at install time (SL_PAYLOAD_SOURCE below), not embedded and not read from a USB stick.
@@ -3528,6 +3528,33 @@ PASS_GUIDE
     echo "Your exported browser-password CSV files are in Documents/Import-These-Passwords."
   fi
 fi
+# ---- Master copy: keep the stick's own files on this computer, so it can make new sticks later without the
+# original. Files only (installer, tools, setup apps, install images: several GB), each one hashed while copied
+# and read back. Left out: the offline app collection (large; it can be added later from a plugged-in stick) and
+# anything personal (PC scan, exported browser passwords, recovery notes). Skipped quietly when the computer has
+# little free space, the stick's tool is older than this feature, or anything fails: the install carries on.
+MASTER_TOOL="$OFF_MNT/linux-setup/linux/bin/secure-linux-usb-creator"
+MASTER_REL="$OFF_MNT/linux-setup/linux/release.json"
+MASTER_STORE="$SYSROOT/var/lib/secure-linux/usb-master"
+if mountpoint -q "$OFF_MNT" && [ -f "$MASTER_REL" ] && command -v python3 >/dev/null 2>&1 \
+   && grep -q -- '--files-only' "$MASTER_TOOL" 2>/dev/null; then
+  MASTER_FREE_KB=$(df -Pk "$SYSROOT/var" 2>/dev/null | awk 'NR==2 {print $4}')
+  if [ "${MASTER_FREE_KB:-0}" -ge 41943040 ]; then
+    sl_progress_spinner_start 'Saving a master copy of this stick on the computer. No percentage is available during this copy.'
+    install -d -m 0700 "$MASTER_STORE"
+    if timeout 5400 env PYTHONDONTWRITEBYTECODE=1 SL_USBC_PROGRESS_INTERVAL=30 python3 "$MASTER_TOOL" create --files-only \
+         --variant online-only --store "$MASTER_STORE" --source-root "$OFF_MNT" --source-release "$MASTER_REL" \
+         --current-release "$MASTER_REL" --non-interactive > /tmp/sl-master-save.log 2>&1; then
+      echo "Master copy saved: this computer can make new Secure Linux sticks without the original."
+    else
+      echo "The master copy was not saved (the install is not affected). Last lines of its log:"
+      tail -n 3 /tmp/sl-master-save.log 2>/dev/null
+      chmod -R u+rwX "$MASTER_STORE" 2>/dev/null; rm -rf "$MASTER_STORE"
+    fi
+  else
+    echo "Master copy not saved: under 40 GB free on this computer. It can be saved later from the stick."
+  fi
+fi
 umount "$OFF_MNT" 2>/dev/null
 sl_stage_finish 35 'Browser export stage finished.'
 %end
@@ -3571,7 +3598,7 @@ chmod 0644 /etc/secure-linux/profile /etc/secure-linux/user /etc/secure-linux/ch
 # Validate every archive member before extraction: even a transport archive must never write outside
 # its staging root or introduce links/special files. The release record prevents old/new payload drift.
 SL_PAYLOAD_SOURCE="https://codeload.github.com/MattyBoyMan/secure-linux-netboot/tar.gz/refs/heads/main"
-SL_EXPECTED_RELEASE="secure-linux-2026.11.13-e2a11259f20c6237"
+SL_EXPECTED_RELEASE="secure-linux-2026.11.13-dd55a464400fead2"
 SL=/usr/local/lib/secure-linux
 SLREPO=/tmp/sl-repo
 SLPAYLOAD="$SLREPO/secure-linux-netboot-main/payload"
@@ -3660,6 +3687,16 @@ chmod 0755 "$SL/setup.sh" 2>/dev/null
 chmod 0755 "$SL"/bin/* 2>/dev/null
 # A tar written on Windows stores every file as 0666: every shell script in the kit must be runnable, not just the two above
 find "$SL" -type f -name '*.sh' -exec chmod 0755 {} + 2>/dev/null
+# ---- Is a newer Secure Linux release published? The files just unpacked from the stick are always
+# enough on their own. With internet, one tiny file is compared; only files whose SHA-256 differs are
+# fetched, each one verified before anything is replaced. No internet, an older or half-published
+# release, or any failed check: the stick's copy is used unchanged. This step can never stop the install.
+if [ -f "$SL/bin/secure-linux-kit-update" ] && command -v python3 >/dev/null 2>&1; then
+  timeout 300 python3 "$SL/bin/secure-linux-kit-update" apply --tree "$SL" 2>&1 | tail -n 2 \
+    || echo "KIT UPDATE: the check did not finish; using the stick's copy."
+  chmod 0755 "$SL/setup.sh" "$SL"/bin/* 2>/dev/null
+  find "$SL" -type f -name '*.sh' -exec chmod 0755 {} + 2>/dev/null
+fi
 sl_stage_finish 55 'Secure Linux files unpacked.'
 
 # ---- The beginner's guide (opened on first login, also in the app menu)

@@ -8,6 +8,7 @@ files; it can never write a physical device.
 """
 
 import argparse
+import base64
 import datetime
 import errno
 try:
@@ -16,6 +17,7 @@ except ImportError:  # Windows is supported only for regular-file mock tests.
     fcntl = None
 import gzip
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -25,6 +27,7 @@ import stat
 import struct
 import subprocess
 import sys
+import tarfile
 import tempfile
 import time
 import uuid
@@ -38,6 +41,7 @@ from release_manifest import (  # noqa: E402
     canonical_path,
     capture_master_release,
     master_problems,
+    read_json,
     validate_master_release_block,
 )
 
@@ -61,6 +65,15 @@ PORTABLE_BOOT_ASSETS = (
 # copy fits drives too small for the FULL variant (apps then install with internet).
 ONLINE_ONLY_EXCLUDED_PREFIX = "linux-setup/offline/app-bundles/"
 VARIANTS = ("full", "online-only")
+FILES_ONLY_KIND = "files-only"
+# A files-only master is kept on a computer to make drives for anyone, so one person's exported
+# browser passwords, PC scan and recovery notes never go into it, nor does Windows' own housekeeping.
+FILES_ONLY_SKIP_PREFIXES = (
+    "linux-setup/scan/",
+    "linux-setup/recovery/",
+    "$RECYCLE.BIN/",
+    "System Volume Information/",
+)
 # Personal-storage partitioning: only offered when the drive has more room than the
 # copy needs by this margin. Space is reserved at Ventoy install time (-r MB), then
 # partition #3 is created in the reserved area after the copy verifies.
@@ -528,10 +541,14 @@ def safe_payload_path(value):
     return value
 
 
-def source_file_entries(root):
+def source_file_entries(root, skip_prefixes=()):
     """Return a complete regular-file inventory; never silently omit symlinks."""
     entries = []
     for base, directories, files in os.walk(root, followlinks=False):
+        if skip_prefixes:
+            here = Path(base).relative_to(root).as_posix()
+            here = "" if here == "." else here + "/"
+            directories[:] = [name for name in directories if not (here + name + "/").startswith(tuple(skip_prefixes))]
         directories.sort()
         files.sort()
         for name in directories:
@@ -549,7 +566,27 @@ def source_file_entries(root):
     return entries
 
 
-def capture_portable_payload(source_root, staging, source_release):
+def is_files_only(manifest):
+    """A files-only master holds the verified file tree but no whole-device image (no exact clones)."""
+    return manifest.get("kind") == FILES_ONLY_KIND
+
+
+def master_fingerprint(manifest):
+    """One SHA-256 that names the saved master's content in receipts."""
+    if is_files_only(manifest):
+        return sha256_bytes(json_data(manifest["portable"]["files"]))
+    return manifest["image"]["raw_sha256"]
+
+
+def require_image(manifest, what):
+    if is_files_only(manifest):
+        raise CreatorError(
+            f"this saved master holds the drive's files only, so {what} is not available; "
+            "use the Portable tools copy, which builds a complete, verified, bootable drive from those files"
+        )
+
+
+def capture_portable_payload(source_root, staging, source_release, variant="full", skip_prefixes=()):
     """Snapshot all D:/finished-USB files and prove a stable, complete second pass."""
     root = Path(source_root).expanduser().resolve()
     release = Path(source_release).expanduser().resolve()
@@ -559,7 +596,9 @@ def capture_portable_payload(source_root, staging, source_release):
         release_relative = safe_payload_path(release.relative_to(root).as_posix())
     except ValueError as exc:
         raise CreatorError("--source-release must be inside --source-root so the current release is preserved") from exc
-    entries = source_file_entries(root)
+    entries = source_file_entries(root, skip_prefixes)
+    if variant == "online-only":
+        entries = [entry for entry in entries if not entry[0].startswith(ONLINE_ONLY_EXCLUDED_PREFIX)]
     by_name = {name: (path, size) for name, path, size in entries}
     if release_relative not in by_name:
         raise CreatorError("the finished USB release record is missing from the portable source file tree")
@@ -597,7 +636,9 @@ def capture_portable_payload(source_root, staging, source_release):
         _, saved_hash = hash_file(payload / entry["path"], entry["size"])
         if saved_hash != entry["sha256"]:
             raise VerificationError(f"saved portable payload failed read-back: {entry['path']}")
+    captured = {"captured_variant": variant} if variant != "full" else {}
     return {
+        **captured,
         "format": PORTABLE_FORMAT,
         "source_root_at_capture": str(root),
         "source_release_path": release_relative,
@@ -662,6 +703,20 @@ def validate_portable_manifest(portable):
 def validate_manifest(manifest):
     if manifest.get("schema_version") != SCHEMA or manifest.get("application") != APP:
         raise VerificationError("unsupported or wrong-application master manifest")
+    if is_files_only(manifest):
+        if "image" in manifest or "portable" not in manifest:
+            raise VerificationError("a files-only master must hold the file manifest and no device image")
+        release = manifest.get("release")
+        if not isinstance(release, dict):
+            raise VerificationError("master has no kit release linkage; recreate it from a current finished USB")
+        try:
+            validate_master_release_block(release)
+        except ReleaseError as exc:
+            raise VerificationError(str(exc)) from exc
+        validate_portable_manifest(manifest["portable"])
+        if manifest["portable"]["source_release_sha256"] != release["source_release_sha256"]:
+            raise VerificationError("portable file manifest's current release differs from the verified master release")
+        return
     image = manifest.get("image", {})
     source = manifest.get("source", {})
     if not HASH_RE.fullmatch(image.get("raw_sha256", "")):
@@ -745,6 +800,12 @@ def decompress_chunk(path, expected_size):
 
 
 def verify_master_payload(root, manifest, show_progress=True):
+    if not is_files_only(manifest):
+        verify_master_image(root, manifest, show_progress)
+    verify_master_files(root, manifest)
+
+
+def verify_master_image(root, manifest, show_progress=True):
     total = manifest["image"]["raw_size_bytes"]
     progress = Progress("Checking every byte of saved master", total) if show_progress else None
     whole = hashlib.sha256()
@@ -779,6 +840,9 @@ def verify_master_payload(root, manifest, show_progress=True):
         raise VerificationError("full decompressed master SHA-256 does not match its manifest")
     if progress:
         progress.finish()
+
+
+def verify_master_files(root, manifest):
     portable = manifest.get("portable")
     if portable:
         payload = Path(root) / "payload"
@@ -861,7 +925,364 @@ def mock_hook(name, mock):
     return os.environ.get(name) if mock else None
 
 
+def create_files_master(args):
+    """Save a finished USB as verified files only: no whole-device image, so it needs room for the files, not the drive.
+
+    This is what an installed computer keeps so it can make new drives without the original. Every file is
+    hashed while copied, the source is re-read to prove it did not change, and the saved copy is read back.
+    """
+    if not args.source_root or not getattr(args, "source_release", None):
+        raise CreatorError("--files-only needs --source-root (the finished USB's files) and --source-release")
+    current_release = Path(getattr(args, "current_release", None) or DEFAULT_CURRENT_RELEASE).expanduser().resolve()
+    source_release = Path(args.source_release).expanduser().resolve()
+    check_root = _REPOSITORY_ROOT if current_release == DEFAULT_CURRENT_RELEASE else None
+    try:
+        release_link = capture_master_release(current_release, source_release, check_root)
+    except ReleaseError as exc:
+        raise CreatorError(f"finished USB release check failed: {exc}") from exc
+    source_root = Path(args.source_root).expanduser().resolve()
+    store = os.path.abspath(args.store)
+    try:
+        Path(store).resolve().relative_to(source_root)
+    except ValueError:
+        pass
+    else:
+        raise CreatorError("--store must be outside --source-root; otherwise the master would recursively copy itself")
+    variant = getattr(args, "variant", "full") or "full"
+    wanted = source_file_entries(source_root, FILES_ONLY_SKIP_PREFIXES)
+    if variant == "online-only":
+        wanted = [entry for entry in wanted if not entry[0].startswith(ONLINE_ONLY_EXCLUDED_PREFIX)]
+    payload_bytes = sum(size for _, _, size in wanted)
+    os.makedirs(store, exist_ok=True)
+    required = payload_bytes + payload_bytes // 20 + 64 * 1024 * 1024
+    free = shutil.disk_usage(store).free
+    if free < required:
+        raise CreatorError(
+            f"master storage has {free} bytes free; {required} bytes are required for the drive's files plus a safety allowance"
+        )
+    master_id = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%S") + "-" + uuid.uuid4().hex[:12]
+    generations = os.path.join(store, "generations")
+    os.makedirs(generations, exist_ok=True)
+    for stale in os.listdir(generations):
+        stale_path = os.path.join(generations, stale)
+        if stale.startswith(".building-") and os.path.isdir(stale_path):
+            shutil.rmtree(stale_path)
+    staging = os.path.join(generations, ".building-" + master_id)
+    final = os.path.join(generations, master_id)
+    os.mkdir(staging, mode=0o700)
+    published = False
+    try:
+        portable = capture_portable_payload(source_root, staging, source_release, variant, FILES_ONLY_SKIP_PREFIXES)
+        validate_portable_manifest(portable)
+        try:
+            release_recheck = capture_master_release(current_release, source_release, check_root)
+        except ReleaseError as exc:
+            raise VerificationError(f"release record changed or became stale during capture: {exc}") from exc
+        if release_recheck != release_link:
+            raise VerificationError("source release record changed during capture; no master was published")
+        manifest = {
+            "schema_version": SCHEMA,
+            "application": APP,
+            "tool_version": VERSION,
+            "kind": FILES_ONLY_KIND,
+            "master_id": master_id,
+            "created_at": utc_now(),
+            "release": release_link,
+            "source": {"kind": FILES_ONLY_KIND, "root_at_capture": str(source_root), "variant": variant},
+            "portable": portable,
+        }
+        validate_manifest(manifest)
+        manifest_raw = json_data(manifest)
+        atomic_write(os.path.join(staging, "manifest.json"), manifest_raw, 0o400)
+        atomic_write(os.path.join(staging, "manifest.sha256"), (sha256_bytes(manifest_raw) + "  manifest.json\n").encode(), 0o400)
+        fsync_directory(staging)
+        # The saved files may include private settings: owner-only, read-only.
+        for base, directories, files in os.walk(staging):
+            for name in files:
+                os.chmod(os.path.join(base, name), 0o400)
+            for name in directories:
+                os.chmod(os.path.join(base, name), 0o500)
+        atomic_replace(staging, final)
+        os.chmod(final, 0o500)
+        fsync_directory(generations)
+        atomic_write(os.path.join(store, "current"), (master_id + "\n").encode(), 0o600)
+        published = True
+        say("")
+        say(f"SAVED MASTER VERIFIED: {master_id}")
+        say(f"Kit release: {release_link['release_id']}")
+        say(f"Files-only master ({variant}): {portable['file_count']} files, {portable['payload_bytes']} bytes, every file read back.")
+        say("It makes complete bootable drives with the Portable tools copy. Exact whole-device clones need a full master.")
+        say("The master is read-only and owner-only (folder 0500, files 0400) because it may contain private data.")
+        return 0
+    finally:
+        if not published and os.path.isdir(staging):
+            for base, directories, files in os.walk(staging):
+                for name in directories + files:
+                    try:
+                        os.chmod(os.path.join(base, name), 0o700)
+                    except OSError:
+                        pass
+            shutil.rmtree(staging, ignore_errors=True)
+
+
+KS_PAYLOAD_PATH = "ventoy/script/secure-linux.ks"
+KS_PAYLOAD_BEGIN = b"base64 -d > /tmp/secure-linux.tar.gz <<'SL_TGZ_END'\n"
+KS_PAYLOAD_END = b"\nSL_TGZ_END\n"
+MASTER_LINUX_TREE = "linux-setup/linux"
+
+
+def kit_update_module():
+    """The shared 'local copy plus anything newer' rules live in secure-linux-kit-update, beside this tool."""
+    import importlib.machinery
+    import importlib.util
+    path = Path(__file__).resolve().parent / "secure-linux-kit-update"
+    if not path.is_file():
+        raise CreatorError("secure-linux-kit-update is missing beside this tool; the master cannot be updated")
+    loader = importlib.machinery.SourceFileLoader("secure_linux_kit_update", str(path))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    sys.dont_write_bytecode = True
+    loader.exec_module(module)
+    return module
+
+
+def repack_installer_payload(ks_path, from_tree, kit_update, work):
+    """Update the Linux files packed inside the installer script; every other byte of the script stays as it was."""
+    raw = ks_path.read_bytes()
+    if raw.count(KS_PAYLOAD_BEGIN) != 1:
+        raise CreatorError("the installer script on this master has no single packed Secure Linux block; it was left unchanged")
+    start = raw.index(KS_PAYLOAD_BEGIN) + len(KS_PAYLOAD_BEGIN)
+    end = raw.find(KS_PAYLOAD_END, start)
+    if end < 0:
+        raise CreatorError("the installer script's packed Secure Linux block has no end marker; it was left unchanged")
+    try:
+        archive_bytes = base64.b64decode(raw[start:end], validate=False)
+    except ValueError as exc:
+        raise CreatorError("the installer script's packed Secure Linux block is not valid base64") from exc
+    tree = Path(work) / "installer-payload"
+    tree.mkdir()
+    root = tree.resolve()
+    try:
+        with tarfile.open(fileobj=io.BytesIO(archive_bytes), mode="r:gz") as archive:
+            for member in archive.getmembers():
+                name = member.name[2:] if member.name.startswith("./") else member.name
+                if name in ("", "."):
+                    continue
+                pure = Path(*name.split("/"))
+                if member.name.startswith("/") or ".." in name.split("/") or "\\" in name:
+                    raise CreatorError("the installer script's packed block contains an unsafe path")
+                target = tree / pure
+                if root not in target.resolve().parents:
+                    raise CreatorError("the installer script's packed block contains an unsafe path")
+                if member.isdir():
+                    target.mkdir(parents=True, exist_ok=True)
+                elif member.isfile():
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    handle = archive.extractfile(member)
+                    target.write_bytes(handle.read() if handle else b"")
+                else:
+                    raise CreatorError("the installer script's packed block contains a link or special file")
+    except (tarfile.TarError, OSError, EOFError) as exc:
+        raise CreatorError(f"the installer script's packed block could not be read: {exc}") from exc
+    changed, removed, _ = kit_update.sync_from_tree(Path(from_tree), tree)
+    packed = io.BytesIO()
+    with gzip.GzipFile(fileobj=packed, mode="wb", mtime=0) as zipped:
+        with tarfile.open(fileobj=zipped, mode="w", format=tarfile.GNU_FORMAT) as archive:
+            for path in sorted(tree.rglob("*")):
+                relative = path.relative_to(tree).as_posix()
+                info = tarfile.TarInfo(relative)
+                info.mtime = 0
+                info.uname = info.gname = "root"
+                if path.is_dir():
+                    info.type = tarfile.DIRTYPE
+                    info.mode = 0o755
+                    archive.addfile(info)
+                    continue
+                data = path.read_bytes()
+                info.size = len(data)
+                info.mode = 0o755 if (relative.endswith(".sh") or relative.startswith("bin/")) else 0o644
+                archive.addfile(info, io.BytesIO(data))
+    encoded = base64.b64encode(packed.getvalue())
+    wrapped = b"\n".join(encoded[index:index + 76] for index in range(0, len(encoded), 76))
+    temporary = ks_path.with_name(ks_path.name + ".sync-new")
+    temporary.write_bytes(raw[:start] + wrapped + raw[end:])
+    os.replace(temporary, ks_path)       # a new file: the previous generation's copy is never written to
+    return changed, removed
+
+
+def sync_master(args):
+    """Bring the saved master up to the release this computer already runs, changing only what differs.
+
+    The newer files come from this computer's own Secure Linux folder (already checked against the published
+    file list when it was updated), so this works with no internet. The result is a new generation that shares
+    every unchanged file with the previous one; the previous generation stays intact to go back to.
+    """
+    store, old_id, old_root, manifest = read_manifest(args.store, getattr(args, "master_id", None))
+    portable = manifest.get("portable")
+    if not portable:
+        raise CreatorError("this saved master holds no file tree; save a new master from a finished USB")
+    from_tree = Path(args.from_tree).expanduser().resolve()
+    current_release = from_tree / "release.json"
+    try:
+        current, _ = read_json(current_release)
+    except ReleaseError as exc:
+        raise CreatorError(f"this computer's Secure Linux release record cannot be read: {exc}") from exc
+    if manifest["release"].get("release_id") == current.get("release_id") and not master_problems(manifest, current_release):
+        say(f"MASTER ALREADY CURRENT: {manifest['release']['release_id']}")
+        return 0
+    kit_update = kit_update_module()
+    old_payload = Path(old_root) / "payload"
+    master_id = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%S") + "-" + uuid.uuid4().hex[:12]
+    generations = os.path.join(store, "generations")
+    for stale in os.listdir(generations):
+        stale_path = os.path.join(generations, stale)
+        if stale.startswith(".building-") and os.path.isdir(stale_path):
+            writable_tree_for_removal(stale_path)
+            shutil.rmtree(stale_path)
+    staging = os.path.join(generations, ".building-" + master_id)
+    final = os.path.join(generations, master_id)
+    os.mkdir(staging, mode=0o700)
+    published = False
+    work = tempfile.mkdtemp(prefix="sl-master-sync-")
+    try:
+        payload = Path(staging) / "payload"
+        old_entries = {entry["path"]: entry for entry in portable["files"]}
+        for relative, entry in old_entries.items():
+            source = old_payload / relative
+            size, digest = hash_file(source, entry["size"])
+            if size != entry["size"] or digest != entry["sha256"]:
+                raise VerificationError(f"saved master file failed SHA-256, so the master was not updated: {relative}")
+            destination = payload / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                os.link(source, destination)       # shared with the previous generation: no time, no space
+            except OSError:
+                shutil.copyfile(source, destination)
+        linux_tree = payload / MASTER_LINUX_TREE
+        try:
+            # Only the files that are about to change get a private copy; a shared file is never written through.
+            to_replace, to_remove = kit_update.sync_plan(from_tree, linux_tree)
+            for relative in to_replace + to_remove + ["release.json", ".kit-update.json", ".kit-update-files.json", None]:
+                target = payload / KS_PAYLOAD_PATH if relative is None else linux_tree.joinpath(*relative.split("/"))
+                if target.is_file():
+                    private_copy(target, old_root)
+            changed, removed, release_id = kit_update.sync_from_tree(from_tree, linux_tree)
+            ks_path = payload / KS_PAYLOAD_PATH
+            ks_changed = ks_removed = 0
+            if ks_path.is_file():
+                ks_changed, ks_removed = repack_installer_payload(ks_path, from_tree, kit_update, work)
+        except kit_update.Keep as exc:
+            raise CreatorError(f"the master was not updated: {exc}") from exc
+        files = []
+        total = 0
+        for relative, path, size in source_file_entries(payload):
+            previous = old_entries.get(relative)
+            if previous and os.path.samefile(path, old_payload / relative):
+                entry = dict(previous)
+            else:
+                _, digest = hash_file(path, size)
+                entry = {"path": relative, "size": size, "sha256": digest}
+            files.append(entry)
+            total += entry["size"]
+        release_relative = portable["source_release_path"]
+        try:
+            release_link = capture_master_release(current_release, payload / release_relative, None)
+        except ReleaseError as exc:
+            raise VerificationError(f"the updated master does not match this computer's release: {exc}") from exc
+        new_portable = dict(portable)
+        new_portable.update({
+            "file_count": len(files),
+            "payload_bytes": total,
+            "files": files,
+            "source_release_sha256": release_link["source_release_sha256"],
+        })
+        new_manifest = {
+            "schema_version": SCHEMA,
+            "application": APP,
+            "tool_version": VERSION,
+            "kind": FILES_ONLY_KIND,
+            "master_id": master_id,
+            "created_at": utc_now(),
+            "release": release_link,
+            "source": {"kind": FILES_ONLY_KIND, "updated_from_master": old_id,
+                       "variant": portable.get("captured_variant", "full")},
+            "portable": new_portable,
+        }
+        validate_manifest(new_manifest)
+        manifest_raw = json_data(new_manifest)
+        atomic_write(os.path.join(staging, "manifest.json"), manifest_raw, 0o400)
+        atomic_write(os.path.join(staging, "manifest.sha256"), (sha256_bytes(manifest_raw) + "  manifest.json\n").encode(), 0o400)
+        fsync_directory(staging)
+        for base, directories, names in os.walk(staging):
+            for name in names:
+                os.chmod(os.path.join(base, name), 0o400)
+            for name in directories:
+                os.chmod(os.path.join(base, name), 0o500)
+        atomic_replace(staging, final)
+        os.chmod(final, 0o500)
+        fsync_directory(generations)
+        atomic_write(os.path.join(store, "current"), (master_id + "\n").encode(), 0o600)
+        published = True
+        say("")
+        say(f"MASTER UPDATED AND VERIFIED: {master_id}")
+        say(f"Kit release: {release_id} (was {manifest['release']['release_id']})")
+        say(f"Changed: {changed} Linux file(s), {removed} removed; installer script's packed files: {ks_changed} changed, {ks_removed} removed.")
+        say(f"Every other file is shared with the previous master ({old_id}), which is kept to go back to.")
+        return 0
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+        if not published and os.path.isdir(staging):
+            writable_tree_for_removal(staging)
+            shutil.rmtree(staging, ignore_errors=True)
+            # A shared file carries one set of permissions for both generations: put the kept one back to read-only.
+            for base, _, names in os.walk(old_root):
+                for name in names:
+                    try:
+                        os.chmod(os.path.join(base, name), 0o400)
+                    except OSError:
+                        pass
+
+
+def private_copy(path, old_root):
+    """Replace a file shared with the previous generation by this generation's own writable copy."""
+    data = Path(path).read_bytes()
+    try:
+        os.unlink(path)
+    except PermissionError:
+        # Some filesystems refuse to remove a read-only name. The permission is shared with the kept
+        # generation's file, so it is put straight back to read-only there.
+        os.chmod(path, 0o600)
+        os.unlink(path)
+        for base, _, names in os.walk(old_root):
+            for name in names:
+                kept = os.path.join(base, name)
+                if os.stat(kept).st_mode & 0o200:
+                    os.chmod(kept, 0o400)
+    Path(path).write_bytes(data)
+
+
+def writable_tree_for_removal(path):
+    """Unpublished staging only: its folders and files must be writable before they can be removed."""
+    for base, directories, names in os.walk(path):
+        for name in directories:
+            try:
+                os.chmod(os.path.join(base, name), 0o700)
+            except OSError:
+                pass
+        for name in names:
+            try:
+                os.chmod(os.path.join(base, name), 0o600)
+            except OSError:
+                pass
+    try:
+        os.chmod(path, 0o700)
+    except OSError:
+        pass
+
+
 def create_master(args):
+    if getattr(args, "files_only", False):
+        return create_files_master(args)
     source_release = getattr(args, "source_release", None)
     if not source_release and not args.non_interactive:
         source_release = input("Finished USB's linux-setup/linux/release.json path: ").strip()
@@ -1084,7 +1505,7 @@ def save_state(path, state):
 
 
 def refusal_reason(devices, target, manifest):
-    if identity(target) == manifest["source"]["identity"]:
+    if identity(target) == manifest["source"].get("identity"):
         return "the destination is the original source USB; overwriting the finished source is forbidden"
     if target["size"] < manifest["image"]["raw_size_bytes"]:
         return f"destination capacity {target['size']} is smaller than master {manifest['image']['raw_size_bytes']}"
@@ -1158,7 +1579,9 @@ def retry_guidance():
 
 
 def clone_master(args):
-    store, master_id, root, manifest = load_master(args.store, args.master_id, payload=True, current_release=args.current_release)
+    store, master_id, root, manifest = load_master(args.store, args.master_id, payload=False, current_release=args.current_release)
+    require_image(manifest, "an exact whole-device clone")
+    verify_master_payload(root, manifest)
     devices = Devices(args.mock_devices)
     rows = devices.scan()
     target = choose_device(rows, args.target, "target", args.non_interactive)
@@ -1333,7 +1756,7 @@ def portable_measurements(manifest, variant="full"):
         "ventoy_partition_overhead_bytes": PORTABLE_VENTOY_OVERHEAD,
         "filesystem_overhead_bytes": filesystem,
         "safety_margin_bytes": safety,
-        "exact_clone_minimum_bytes": manifest["image"]["raw_size_bytes"],
+        "exact_clone_minimum_bytes": None if is_files_only(manifest) else manifest["image"]["raw_size_bytes"],
         "portable_copy_minimum_bytes": subtotal + safety,
         "required_destination_bytes": subtotal + safety,
         "portable_file_count": len(files),
@@ -1491,7 +1914,7 @@ def validate_ventoy_installer(value, mock):
 
 
 def portable_refusal_reason(target, manifest, minimum):
-    if identity(target) == manifest["source"]["identity"]:
+    if identity(target) == manifest["source"].get("identity"):
         return "the destination is the original source USB; overwriting the finished source is forbidden"
     if target["size"] < minimum:
         return (
@@ -1615,6 +2038,11 @@ def portable_copy(args):
     )
     portable = manifest["portable"]
     variant = args.variant
+    if variant == "full" and portable.get("captured_variant") == "online-only":
+        raise CreatorError(
+            "this saved master was kept without the offline app collection, so it makes the online-only drive; "
+            "choose the online-only copy, or save a full master from a drive that has the collection"
+        )
     files = variant_files(portable, variant)
     measurements = portable_measurements(manifest, variant)
     _, installer_command, installer_hashes = validate_ventoy_installer(args.ventoy_installer, bool(args.mock_devices))
@@ -1709,7 +2137,7 @@ def portable_copy(args):
         "application": APP,
         "mode": "portable-tools-copy",
         "master_id": master_id,
-        "master_raw_sha256": manifest["image"]["raw_sha256"],
+        "master_raw_sha256": master_fingerprint(manifest),
         "portable_tree_sha256": sha256_bytes(json_data(files)),
         "variant": variant,
         "storage": storage_plan,
@@ -1876,6 +2304,7 @@ def verify_target(args):
     target_id = require_unambiguous(rows, target)
     if devices.mock:
         mock_regular_file(target)
+    require_image(manifest, "checking a drive as an exact clone")
     if target["size"] < manifest["image"]["raw_size_bytes"]:
         raise VerificationError("target is smaller than the master and cannot be a complete clone")
     _, state_path = state_location(args, master_id, target_id)
@@ -2029,9 +2458,23 @@ def build_parser():
         help="finished USB file-tree root (for example D:\\); captures every file for Portable tools copy",
     )
     create.add_argument("--chunk-size", type=parse_size, default=DEFAULT_CHUNK)
+    create.add_argument(
+        "--files-only", action="store_true",
+        help="save the finished USB's files only (no whole-device image): needs room for the files, not the drive",
+    )
+    create.add_argument("--variant", choices=VARIANTS, default="full",
+                        help="with --files-only: online-only leaves the offline app collection out of the saved master")
     create.add_argument("--non-interactive", action="store_true")
     add_current_release(create)
     add_mock(create)
+    sync = sub.add_parser(
+        "sync-master",
+        help="bring the saved master up to the release this computer already runs, changing only what differs (works offline)",
+    )
+    sync.add_argument("--store", required=True)
+    sync.add_argument("--master-id", help="update from a retained generation instead of current")
+    sync.add_argument("--from-tree", required=True,
+                      help="this computer's Secure Linux folder (normally /usr/local/lib/secure-linux)")
     clone = sub.add_parser("clone", help="exact whole-device clone with full verification and safe resume")
     add_store(clone)
     clone.add_argument("--target", help="explicit destination whole-drive path")
@@ -2094,11 +2537,14 @@ def main(argv=None):
             else:
                 show_devices(rows)
             return 0
-        if (args.command in ("create", "clone", "portable", "verify") and not args.mock_devices
+        files_only_create = args.command == "create" and getattr(args, "files_only", False)   # reads files, never a raw drive
+        if (args.command in ("create", "clone", "portable", "verify") and not files_only_create and not args.mock_devices
                 and hasattr(os, "geteuid") and os.geteuid() != 0):
             raise CreatorError("administrator rights are required for raw USB access; rerun with sudo, or use the app launcher")
         if args.command == "create":
             return create_master(args)
+        if args.command == "sync-master":
+            return sync_master(args)
         if args.command == "clone":
             try:
                 return clone_master(args)

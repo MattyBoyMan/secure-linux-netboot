@@ -1,0 +1,13 @@
+[Unit]
+Description=Secure Linux: look again for other Secure Linux computers at home every few hours
+
+[Timer]
+# The list of computers is used for one day at most (secure-linux-kit-update), so it is refreshed well
+# before that: soon after start-up, then every 4 hours.
+OnBootSec=3min
+OnUnitActiveSec=4h
+RandomizedDelaySec=10min
+Unit=secure-linux-kit-share-network.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,655 @@
+#!/bin/bash
+# secure-linux-remote-access: reach your home computer from anywhere, with your own private WireGuard door.
+#
+#   secure-linux-remote-access                      a simple menu
+#   secure-linux-remote-access status               is it set up and on, and which devices can reach home
+#   secure-linux-remote-access explain              what this does, in plain words (changes nothing)
+#   secure-linux-remote-access router-steps         the one rule to add on your home router
+#   secure-linux-remote-access setup --address NAME-OR-IP [--port N] [--yes]
+#                                                   switch it on (NAME-OR-IP = your home's internet address)
+#   secure-linux-remote-access add NAME --phone     add a phone: shows its QR code once, to scan in the WireGuard app
+#   secure-linux-remote-access add NAME --computer [--out FOLDER]
+#                                                   add a laptop: saves home-NAME.conf; on the laptop run
+#                                                   secure-linux-vpn wireguard import home-NAME.conf
+#   secure-linux-remote-access list                 the devices that can reach home
+#   secure-linux-remote-access remove NAME          that device can no longer reach home (its key stops working now)
+#   secure-linux-remote-access off | on             close or reopen the door (your devices are kept)
+#   secure-linux-remote-access forget [--yes]       remove everything: keys, devices and the open port
+#
+# It is OFF until you set it up: before that nothing listens and no port is open. No outside company is involved.
+# The keys are made on this computer and kept in files only the system can read. A phone's key is shown once,
+# inside its QR code; a laptop's key is only in the file made for it. Nothing else ever shows a key.
+# Devices you add reach this computer at its home address (the same addresses you open at home), nothing else.
+# Run this on the Secure Linux computer that stays at home (the one with your home-server apps), never on unRAID.
+set -u
+export LC_ALL=C
+
+P=${SL_REMOTE_PREFIX:-}                      # tests only: a fake root folder for /etc, /var and /usr/local
+ETC=$P/etc/secure-linux/remote-access        # private: keys, settings, devices (only the system can read it)
+PUBDIR=$P/var/lib/secure-linux/remote-access # not secret: on/off, port, device names (for "status" without a password)
+LOG=$P/var/log/secure-linux/remote-access.log
+IFACE=sl-home
+WGDIR=$P/etc/wireguard
+WGCONF=$WGDIR/$IFACE.conf
+UNIT=wg-quick@$IFACE.service
+GUARD=$ETC/guard.nft                         # devices reach this computer only (nftables, made at setup)
+ZONE=home
+DEFAULT_PORT=51820
+SHIELD=$P/usr/local/bin/secure-linux-attack-shield
+OFFLINE=$P/usr/local/bin/secure-linux-offline-bundle   # by full path: the password box may leave /usr/local/bin out
+SELF=/usr/local/bin/secure-linux-remote-access; [ -x "$SELF" ] || SELF=$(readlink -f "$0")   # polkit names /usr/local/bin
+RUNME=$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")
+
+say() { printf '%s\n' "$*"; }
+stop() { say "$*"; say "Nothing was changed."; exit 1; }   # before any change
+fail() { say "$*"; exit 1; }                               # after a change: the message says what is left
+usage() { sed -n '2,23p' "$RUNME" | sed 's/^# \{0,1\}//'; }
+log() { # never a key, never the home's internet address
+  mkdir -p "${LOG%/*}" 2>/dev/null || return 0
+  ( umask 077; printf '%s %s\n' "$(date '+%F %T')" "$*" >> "$LOG" ) 2>/dev/null
+  return 0
+}
+need_root() { [ -n "$P" ] || [ "$(id -u)" -eq 0 ] || exec pkexec "$SELF" "$@"; }
+YES=0
+ask() { # ask "Question?"  -> 0 for yes. --yes answers yes; no answer (no keyboard) means no.
+  local a=""
+  [ "$YES" = 1 ] && return 0
+  printf '%s [y/N] ' "$1"
+  IFS= read -r a || a=""
+  a=${a%$'\r'}
+  case "$a" in [Yy]|[Yy][Ee][Ss]) return 0 ;; *) return 1 ;; esac
+}
+kv_get() { # kv_get FILE KEY: the value of KEY= (the file is read, never run)
+  local line
+  [ -r "$1" ] || return 1
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in "$2="*) printf '%s' "${line#*=}"; return 0 ;; esac
+  done < "$1"
+  return 1
+}
+
+# ---------------------------------------------------------------- checks on what a person types
+valid_name() { [[ ${1:-} =~ ^[a-z0-9][a-z0-9-]{0,9}$ ]]; }    # home-NAME must stay a valid network name (15 letters)
+valid_port() { [[ ${1:-} =~ ^[0-9]{4,5}$ ]] && [ "$1" -ge 1024 ] && [ "$1" -le 65535 ]; }
+valid_key() { [[ ${1:-} =~ ^[A-Za-z0-9+/]{42}[AEIMQUYcgkosw048]=$ ]]; }   # 32 bytes, base64 (what wg makes)
+ip4_ok() { [[ ${1:-} =~ ^(0|[1-9][0-9]{0,2})\.(0|[1-9][0-9]{0,2})\.(0|[1-9][0-9]{0,2})\.(0|[1-9][0-9]{0,2})$ ]] || return 1
+  local o; for o in "${BASH_REMATCH[@]:1}"; do [ "$o" -le 255 ] || return 1; done; return 0; }
+ip4_int() { local IFS=.; set -- $1; printf '%s' $(( ($1 << 24) + ($2 << 16) + ($3 << 8) + $4 )); }
+not_internet_ip4() { # home, shared-by-provider, loopback, link-local, multicast and other special ranges
+  local a; a=$(ip4_int "$1")
+  local r
+  for r in 0.0.0.0/8 10.0.0.0/8 100.64.0.0/10 127.0.0.0/8 169.254.0.0/16 172.16.0.0/12 192.168.0.0/16 224.0.0.0/3; do
+    in_net "$a" "${r%/*}" "${r#*/}" && return 0
+  done
+  return 1
+}
+in_net() { # in_net ADDR-INT NET PREFIX
+  local n m; n=$(ip4_int "$2"); [ "$3" -eq 0 ] && return 0
+  m=$(( (0xFFFFFFFF << (32 - $3)) & 0xFFFFFFFF ))
+  [ $(( $1 & m )) -eq $(( n & m )) ]
+}
+# check_address ADDRESS: 0 = usable, 2 = a home-only or shared address (no port can be opened), 1 = not an address
+check_address() {
+  local a=${1:-} lab
+  [ -n "$a" ] && [ ${#a} -le 253 ] || return 1
+  if ip4_ok "$a"; then not_internet_ip4 "$a" && return 2; return 0; fi
+  case "$a" in *:*)
+    [[ $a =~ ^[0-9A-Fa-f:]{2,39}$ ]] || return 1
+    case "$(printf '%s' "$a" | tr 'A-F' 'a-f')" in ::|::1|fe[89ab]*|fc*|fd*|ff*) return 2 ;; esac
+    return 0 ;;
+  esac
+  [[ $a =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+$ ]] || return 1
+  lab=${a##*.}
+  [[ $lab =~ ^[0-9]+$ ]] && return 1                                # a broken number, not a name
+  case "$(printf '%s' "$a" | tr 'A-Z' 'a-z')" in *.local|*.lan|*.home|*.home.arpa|*.internal|*.localdomain|localhost*) return 2 ;; esac
+  return 0
+}
+endpoint_of() { case "$1" in *:*) printf '[%s]:%s' "$1" "$2" ;; *) printf '%s:%s' "$1" "$2" ;; esac; }
+
+# ---------------------------------------------------------------- this computer on the home network
+home_route() { ip -4 route get 1.1.1.1 2>/dev/null | head -n 1; }   # asks the computer's own table; sends nothing
+home_address() {
+  local a; a=$(home_route | sed -n 's/.* src \([0-9.]*\).*/\1/p')
+  ip4_ok "$a" || return 1
+  in_net "$(ip4_int "$a")" 10.0.0.0 8 || in_net "$(ip4_int "$a")" 172.16.0.0 12 || in_net "$(ip4_int "$a")" 192.168.0.0 16 || return 1
+  printf '%s' "$a"
+}
+home_device() { home_route | sed -n 's/.* dev \([^ ]*\).*/\1/p'; }
+pick_net() { # a /24 for the private tunnel that no network on this computer uses yet -> prints "a.b.c"
+  local used c n
+  used=$( { ip -4 route show 2>/dev/null; ip -4 -o addr show 2>/dev/null; } | grep -oE '[0-9]{1,3}(\.[0-9]{1,3}){3}(/[0-9]{1,2})?')
+  for c in 10.211.77 10.163.54 172.29.211 192.168.239; do
+    local clash=0 u net pre
+    for u in $used; do
+      net=${u%/*}; pre=32; [ "$u" != "$net" ] && pre=${u#*/}
+      ip4_ok "$net" || continue
+      [ "$pre" -ge 8 ] || continue                    # very wide routes (a VPN's catch-all) are not a network here
+      [ "$pre" -lt 24 ] || pre=24
+      in_net "$(ip4_int "$c.0")" "$net" "$pre" && { clash=1; break; }
+    done
+    [ $clash = 0 ] && { printf '%s' "$c"; return 0; }
+  done
+  return 1
+}
+
+# ---------------------------------------------------------------- private files
+private_dirs() { ( umask 077; mkdir -p "$ETC/devices" "$WGDIR" ) && chmod 700 "$ETC" "$ETC/devices" "$WGDIR"; }
+secret_write() { # secret_write FILE < content: made under umask 077 in a private folder, moved into place, 0600
+  local f=$1 tmp
+  tmp=$(umask 077; mktemp "${f%/*}/.new.XXXXXX") || return 1
+  if ( umask 077; cat > "$tmp" ) && mv -f "$tmp" "$f" && chmod 600 "$f"; then return 0; fi
+  rm -f "$tmp"; return 1
+}
+public_write() { # public_write FILE < content (nothing secret: on/off, port, device names)
+  local f=$1 tmp
+  mkdir -p "${f%/*}" && chmod 755 "${f%/*}" || return 1
+  tmp=$(mktemp "${f%/*}/.new.XXXXXX") || return 1
+  if cat > "$tmp" && chmod 644 "$tmp" && mv -f "$tmp" "$f"; then return 0; fi
+  rm -f "$tmp"; return 1
+}
+set_up() { [ -f "$ETC/settings" ] && [ -f "$ETC/server.key" ]; }
+load() {
+  set_up || stop "Reach home from anywhere is not set up yet. Start with: secure-linux-remote-access setup"
+  ENDPOINT=$(kv_get "$ETC/settings" ENDPOINT) PORT=$(kv_get "$ETC/settings" PORT) NET=$(kv_get "$ETC/settings" NET) \
+    HOME_IP=$(kv_get "$ETC/settings" HOME_IP)
+  SKEY=$(cat "$ETC/server.key" 2>/dev/null)
+  SPUB=$(kv_get "$ETC/settings" SERVER_PUBLIC)
+  valid_key "$SKEY" && valid_key "$SPUB" && valid_port "$PORT" && ip4_ok "$NET.1" && ip4_ok "$HOME_IP" \
+    || fail "The saved settings are damaged. Start again with: secure-linux-remote-access forget, then setup."
+}
+devices() { local f; for f in "$ETC"/devices/*; do [ -f "$f" ] && valid_name "${f##*/}" && printf '%s\n' "${f##*/}"; done; }
+
+# The wg-quick file (has the private key; written only with secret_write) and the same without the
+# wg-quick lines, for telling the running door about a change.
+peers() {
+  local n f k i s
+  for n in $(devices); do
+    f=$ETC/devices/$n
+    k=$(kv_get "$f" PUBLIC) i=$(kv_get "$f" IP) s=$(kv_get "$f" PRESHARED)
+    valid_key "$k" && valid_key "$s" && ip4_ok "$i" || continue
+    printf '\n# %s (%s)\n[Peer]\nPublicKey = %s\nPresharedKey = %s\nAllowedIPs = %s/32\n' "$n" "$(kv_get "$f" KIND)" "$k" "$s" "$i"
+  done
+}
+server_conf() {
+  printf '# Made by secure-linux-remote-access. Do not change it by hand: use that command.\n'
+  printf '[Interface]\nAddress = %s.1/24\nListenPort = %s\nPrivateKey = %s\n' "$NET" "$PORT" "$SKEY"
+  printf 'PostUp = nft -f %s\nPostDown = nft delete table inet sl_home_guard || true\n' "$GUARD"
+  peers
+}
+guard_rules() { # nothing a device sends is passed on to other home devices; this computer's own apps (also the ones
+                # in containers, which the computer hands on itself) keep working. Safe to load again and again.
+  cat <<EOF
+# Made by secure-linux-remote-access: devices that reach home get this computer only.
+table inet sl_home_guard
+delete table inet sl_home_guard
+table inet sl_home_guard {
+  chain forward {
+    type filter hook forward priority -5; policy accept;
+    iifname "$IFACE" ct status dnat accept
+    iifname "$IFACE" drop
+  }
+}
+EOF
+}
+wg_conf() { printf '[Interface]\nListenPort = %s\nPrivateKey = %s\n' "$PORT" "$SKEY"; peers; }
+write_server_conf() { # always with the guard: if nft is missing the door does not start (it never opens unguarded)
+  private_dirs || return 1
+  guard_rules | secret_write "$GUARD" || return 1
+  server_conf | secret_write "$WGCONF"
+}
+live() { wg show "$IFACE" public-key >/dev/null 2>&1; }
+live_sync() { # tell the running door (if it runs) about the new list of devices; the key goes through a pipe only
+  live || return 0
+  wg syncconf "$IFACE" <(wg_conf)
+}
+live_has() { live && wg show "$IFACE" peers 2>/dev/null | grep -qxF "$1"; }
+write_public() {
+  { printf 'SETUP=yes\nPORT=%s\nHOME_IP=%s\n' "$PORT" "$HOME_IP"; } | public_write "$PUBDIR/status"
+  { local n; for n in $(devices); do
+      printf '%s %s %s\n' "$n" "$(kv_get "$ETC/devices/$n" KIND)" "$(kv_get "$ETC/devices/$n" ADDED)"; done; } \
+    | public_write "$PUBDIR/devices"
+}
+lock() { # one change at a time
+  command -v flock >/dev/null 2>&1 || return 0
+  exec 9>"$ETC/.lock" || return 0
+  flock -w 30 9 || stop "Another change to reach home from anywhere is still running. Try again in a minute."
+}
+
+# ---------------------------------------------------------------- firewall: one UDP port, home zone only
+fw() { if firewall-cmd --state >/dev/null 2>&1; then firewall-cmd --permanent "$@"; else firewall-offline-cmd "$@"; fi; }
+fw_reload() { firewall-cmd --state >/dev/null 2>&1 && firewall-cmd --reload >/dev/null 2>&1; return 0; }
+fw_open() { # the door's port and the door itself in the home zone; never the public (away) zone
+  command -v firewall-cmd >/dev/null 2>&1 || { say "Note: no firewall program was found on this computer."; return 0; }
+  fw --zone=$ZONE --query-port="$1/udp" >/dev/null 2>&1 || fw --zone=$ZONE --add-port="$1/udp" >/dev/null 2>&1 || return 1
+  fw --zone=$ZONE --query-interface=$IFACE >/dev/null 2>&1 || fw --zone=$ZONE --add-interface=$IFACE >/dev/null 2>&1 || return 1
+  fw_reload
+}
+fw_close_port() {
+  command -v firewall-cmd >/dev/null 2>&1 || return 0
+  fw --zone=$ZONE --query-port="$1/udp" >/dev/null 2>&1 && fw --zone=$ZONE --remove-port="$1/udp" >/dev/null 2>&1
+  fw_reload
+}
+fw_forget() {
+  command -v firewall-cmd >/dev/null 2>&1 || return 0
+  fw --zone=$ZONE --query-interface=$IFACE >/dev/null 2>&1 && fw --zone=$ZONE --remove-interface=$IFACE >/dev/null 2>&1
+  fw_reload
+}
+zone_ok() { # the home network must count as home (secure-linux-zone), else the port stays shut
+  local dev z
+  command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1 || return 0
+  dev=$(home_device); [ -n "$dev" ] || return 0
+  z=$(firewall-cmd --get-zone-of-interface="$dev" 2>/dev/null) || z=""
+  case "$z" in ""|"no zone") z=$(firewall-cmd --get-default-zone 2>/dev/null) || z="" ;; esac
+  [ -z "$z" ] || [ "$z" = "$ZONE" ]   # unknown (not allowed to ask): no warning
+}
+
+# ---------------------------------------------------------------- programs (installed only after a yes)
+is_atomic() { [ -e "$P/run/ostree-booted" ] || [ "$(cat "$P/etc/secure-linux/profile" 2>/dev/null)" = atomic ]; }
+install_pkgs() { # online first, then the checked copy on the Secure Linux drive
+  local ob=$OFFLINE
+  if dnf -y install "$@" >/dev/null 2>&1; then return 0; fi
+  say "The download did not work. Trying the copy on the Secure Linux drive."
+  [ -x "$ob" ] || ob=$(command -v secure-linux-offline-bundle 2>/dev/null) || return 1
+  "$ob" install \
+    --profile "fedora-$(cat "$P/etc/secure-linux/profile" 2>/dev/null || echo full)" --arch "$(uname -m)" \
+    --kind system --packages "$@" >/dev/null 2>&1
+}
+ensure_tools() {
+  local miss=""
+  { command -v wg >/dev/null 2>&1 && command -v wg-quick >/dev/null 2>&1; } || miss="wireguard-tools"
+  command -v qrencode >/dev/null 2>&1 || miss="${miss:+$miss }qrencode"
+  command -v nft >/dev/null 2>&1 || miss="${miss:+$miss }nftables"
+  [ -z "$miss" ] && return 0
+  say "Some small free programs from Fedora are needed first (WireGuard's tools, the QR code maker, the firewall guard): $miss."
+  ask "Install them now?" || stop "Fine. Run setup again when you want it."
+  if is_atomic; then
+    rpm-ostree install --idempotent $miss >/dev/null 2>&1 \
+      || stop "They could not be added (no internet?). Try again when you are online."
+    say "They are added. Restart the computer, then run: ${AFTER_RESTART:-secure-linux-remote-access setup --address ${ADDRESS:-YOUR-HOME-ADDRESS}}"
+    exit 0
+  fi
+  install_pkgs $miss || stop "They could not be installed (no internet?). Try again when you are online."
+  { command -v wg >/dev/null 2>&1 && command -v wg-quick >/dev/null 2>&1 && command -v qrencode >/dev/null 2>&1 \
+    && command -v nft >/dev/null 2>&1; } \
+    || stop "The programs are still missing after installing. Try again later."
+}
+
+# ---------------------------------------------------------------- words
+explain() {
+  cat <<'EOF'
+Reach home from anywhere (your own private door, no outside company)
+
+When you are away, your phone or laptop can open the apps on this home computer (photos, files, Home Assistant)
+as if you were at home. It uses WireGuard, a small, well-checked and free way to make a private link.
+
+- It stays OFF until you set it up. Before that, nothing listens and no port is open.
+- Every phone or laptop gets its own key. The keys are made on this computer. A phone's key is shown once, inside
+  its QR code. A laptop's key is only in the file made for it.
+- A stranger who tries the door gets no answer at all: only devices you added can connect.
+- Lost a phone? Remove it here and its key stops working at once. Nothing else changes.
+- Devices reach only this computer, at the same addresses you use at home. The rest of your home network stays closed.
+- Your router needs ONE rule (one port, for this computer). See: secure-linux-remote-access router-steps
+
+Start with: secure-linux-remote-access setup --address YOUR-HOME-INTERNET-ADDRESS
+EOF
+}
+router_steps() { # router_steps PORT HOME_IP
+  cat <<EOF
+On your home router (its page usually opens at the address printed on the router's label):
+  1. Give this computer a fixed home address. Look for "DHCP reservation", "Address reservation" or
+     "Always use this address", and pick this computer (home address $2).
+  2. Forward ONE port to it. Look for "Port forwarding", "Virtual server" or "NAT", and add:
+     protocol UDP, port $1 (outside and inside the same), to $2.
+  3. Save. Nothing else needs opening. Leave "UPnP" off: this one rule is all it needs.
+Your home's internet address is on the router's status page ("Internet", "WAN" or "Public IP").
+If it starts with 100.64 to 100.127, 10., 172.16 to 172.31 or 192.168., your internet provider shares one address
+between many homes and no port can be opened. Then use Meshnet instead (secure-linux-vpn home), or ask your provider
+for a "public IPv4 address".
+If your home's internet address changes now and then, many routers offer a free "dynamic DNS" name. Use that name:
+  secure-linux-remote-access setup --address THE-NAME
+EOF
+}
+shield_hint() { # the Attack Shield (CrowdSec): recommended on this computer, never switched on from here
+  [ -x "$SHIELD" ] || return 0
+  if [ "$("$SHIELD" status --short 2>/dev/null)" = on ]; then
+    say "The Attack Shield is on: addresses known for attacking are blocked before they reach the door."
+  else
+    say ""
+    "$SHIELD" suggest 2>/dev/null
+  fi
+  return 0
+}
+
+# ---------------------------------------------------------------- commands
+cmd_setup() {
+  local address="" port="" arg changed=0 fresh=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --address) address=${2:-}; shift ;;
+      --port) port=${2:-}; shift ;;
+      --yes) YES=1 ;;
+      *) stop "Unknown option '$1'. See: secure-linux-remote-access --help" ;;
+    esac
+    shift
+  done
+  ADDRESS=$address
+  [ -z "$port" ] || valid_port "$port" || stop "The port must be a number from 1024 to 65535."
+  if [ -n "$address" ]; then   # checked before the password box
+    check_address "$address"; arg=$?
+    [ $arg = 2 ] && stop "'$address' is a home-only or shared address, so nobody can reach it from outside. Use your home's internet address (router status page), or Meshnet: secure-linux-vpn home"
+    [ $arg = 0 ] || stop "'$address' does not look like an internet address or name. Example: 203.0.113.7 or myhome.example.net"
+  fi
+  local args=(setup); [ -n "$address" ] && args+=(--address "$address"); [ -n "$port" ] && args+=(--port "$port")
+  [ "$YES" = 1 ] && args+=(--yes)
+  need_root "${args[@]}"
+  if set_up; then
+    load
+    if [ -z "$address" ] && [ -z "$port" ]; then
+      AFTER_RESTART="secure-linux-remote-access setup"
+      ensure_tools                              # puts back a program that went missing (asks first)
+      say "Reach home from anywhere is already set up (port $PORT)."
+      say "To change your home's internet address: secure-linux-remote-access setup --address NEW-ADDRESS"
+      return 0
+    fi
+  else
+    fresh=1
+    [ -n "$address" ] || stop "Tell it your home's internet address (or name), for example: secure-linux-remote-access setup --address 203.0.113.7
+You find it on your router's status page (\"Internet\", \"WAN\" or \"Public IP\")."
+  fi
+  local hip; hip=$(home_address) \
+    || stop "This computer is not on a home network right now. Connect it at home (Wi-Fi or cable), then try again."
+  zone_ok || stop "This computer does not treat this network as your home network yet, so the door would stay shut.
+First run: secure-linux-zone set-home   then run this again."
+  if [ $fresh = 1 ]; then
+    explain
+    say ""
+    ask "Set up reach home from anywhere on this computer now?" || stop "Fine."
+  fi
+  ensure_tools
+  private_dirs || fail "Could not make the private folder for the keys."
+  lock
+  if [ $fresh = 1 ]; then
+    NET=$(pick_net) || stop "Every private address range this tool can use is already taken on this computer."
+    local k pub
+    k=$(umask 077; wg genkey) && valid_key "$k" || stop "The WireGuard key could not be made."
+    pub=$(printf '%s\n' "$k" | wg pubkey) && valid_key "$pub" || stop "The WireGuard key could not be made."
+    printf '%s\n' "$k" | secret_write "$ETC/server.key" || stop "The key could not be saved."
+    k=""
+    SPUB=$pub; ENDPOINT=$address; PORT=${port:-$DEFAULT_PORT}
+  else
+    [ -n "$address" ] && [ "$address" != "$ENDPOINT" ] && { ENDPOINT=$address; changed=1; }
+    if [ -n "$port" ] && [ "$port" != "$PORT" ]; then
+      fw_close_port "$PORT"; PORT=$port; changed=1
+    fi
+  fi
+  [ $fresh = 0 ] && [ "$hip" != "$HOME_IP" ] && changed=1
+  HOME_IP=$hip
+  printf 'ENDPOINT=%s\nPORT=%s\nNET=%s\nHOME_IP=%s\nSERVER_PUBLIC=%s\n' "$ENDPOINT" "$PORT" "$NET" "$HOME_IP" "$SPUB" \
+    | secret_write "$ETC/settings" || fail "The settings could not be saved."
+  load
+  write_server_conf || fail "The WireGuard settings could not be written."
+  fw_open "$PORT" || fail "The firewall did not accept the change. Turn it off again with: secure-linux-remote-access off"
+  systemctl enable "$UNIT" >/dev/null 2>&1
+  if systemctl is-active --quiet "$UNIT" 2>/dev/null; then systemctl restart "$UNIT" >/dev/null 2>&1
+  else systemctl start "$UNIT" >/dev/null 2>&1; fi
+  write_public
+  log "setup: port $PORT"
+  systemctl is-active --quiet "$UNIT" 2>/dev/null \
+    || fail "The door did not start. Nothing can reach home yet. Look again later with: secure-linux-remote-access status"
+  say ""
+  say "Reach home from anywhere is ON (port $PORT, UDP)."
+  [ $changed = 1 ] && say "Devices you added before still use the old addresses or port: remove each one and add it again."
+  say ""
+  router_steps "$PORT" "$HOME_IP"
+  say ""
+  say "Next, add your phone:   secure-linux-remote-access add PHONE-NAME --phone"
+  say "or a laptop:            secure-linux-remote-access add LAPTOP-NAME --computer"
+  shield_hint
+}
+
+client_conf() { # client_conf PRIVATE IP PRESHARED (printed into a pipe or a private file only, never on screen)
+  printf '[Interface]\nPrivateKey = %s\nAddress = %s/32\n\n[Peer]\nPublicKey = %s\nPresharedKey = %s\nEndpoint = %s\nAllowedIPs = %s.1/32, %s/32\n' \
+    "$1" "$2" "$SPUB" "$3" "$(endpoint_of "$ENDPOINT" "$PORT")" "$NET" "$HOME_IP"
+}
+person_home() {
+  local u=${PKEXEC_UID:-${SUDO_UID:-}} h=""
+  case "$u" in ''|*[!0-9]*) ;; *) h=$(getent passwd "$u" 2>/dev/null | cut -d: -f6) ;; esac
+  printf '%s' "${h:-$HOME}"
+}
+deliver_file() { # deliver_file PATH < content: a NEW private file (never over an existing file or link), as the person
+  local path=$1 u=${PKEXEC_UID:-${SUDO_UID:-}} who=""
+  [ -e "$path" ] || [ -L "$path" ] && return 3
+  case "$u" in ''|0|*[!0-9]*) ;; *) who=$(getent passwd "$u" 2>/dev/null | cut -d: -f1) ;; esac
+  if [ "$(id -u)" -eq 0 ] && [ -n "$who" ] && command -v runuser >/dev/null 2>&1; then
+    [[ $who =~ ^[a-z_][a-z0-9_-]*$ ]] || return 1
+    runuser -u "$who" -- /bin/bash -c 'set -C; umask 077; cat > "$1" && chmod 600 "$1"' _ "$path"
+  else
+    ( set -C; umask 077; cat > "$path" ) && chmod 600 "$path"
+  fi
+}
+drop_device() { # drop_device NAME: take it out of the list and out of the running door, and prove it is gone
+  local n=$1 k wrote=0
+  k=$(kv_get "$ETC/devices/$n" PUBLIC)
+  rm -f "$ETC/devices/$n"
+  write_server_conf && wrote=1
+  write_public
+  if live; then
+    valid_key "$k" && wg set "$IFACE" peer "$k" remove >/dev/null 2>&1
+    [ $wrote = 1 ] && live_sync >/dev/null 2>&1
+    if valid_key "$k" && live_has "$k"; then
+      [ $wrote = 1 ] && systemctl restart "$UNIT" >/dev/null 2>&1
+      if live_has "$k"; then systemctl stop "$UNIT" >/dev/null 2>&1; return 2; fi
+    fi
+  fi
+  [ $wrote = 1 ] || { systemctl stop "$UNIT" >/dev/null 2>&1; return 2; }   # the saved file still names it: stay shut
+  return 0
+}
+undo_add() { # undo_add NAME MESSAGE
+  drop_device "$1" || say "To be safe the door is switched OFF now. Switch it on again with: secure-linux-remote-access on"
+  fail "$2"
+}
+cmd_add() {
+  local name="" kind="" out=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --phone) kind=phone ;;
+      --computer|--laptop) kind=computer ;;
+      --out) out=${2:-}; shift ;;
+      -*) stop "Unknown option '$1'. See: secure-linux-remote-access --help" ;;
+      *) [ -z "$name" ] && name=$1 || stop "Give one name only." ;;
+    esac
+    shift
+  done
+  valid_name "$name" || stop "Give the device a short name: up to 10 small letters, numbers or dashes (for example: anna-phone)."
+  [ -n "$kind" ] || stop "Say what it is: secure-linux-remote-access add $name --phone   (or --computer for a laptop)"
+  if [ "$kind" = computer ]; then   # the folder is made exact before the password box (afterwards the folder and HOME change)
+    [ -n "$out" ] || out=$(person_home)
+    out=$(cd "$out" 2>/dev/null && pwd -P) || stop "That folder does not exist."
+    need_root add "$name" --computer --out "$out"
+  else
+    need_root add "$name" --phone
+  fi
+  load
+  [[ $out != *$'\n'* ]] || stop "That folder name cannot be used."
+  [ -f "$ETC/devices/$name" ] && stop "A device called '$name' is already added. Pick another name, or remove it first."
+  [ "$kind" = phone ] && ! command -v qrencode >/dev/null 2>&1 && stop "The QR code maker is missing. Run: secure-linux-remote-access setup --yes"
+  local file=""
+  if [ "$kind" = computer ]; then
+    file=$out/home-$name.conf
+    { [ -e "$file" ] || [ -L "$file" ]; } && stop "There is already a file called $file. Move it away first."
+  fi
+  lock
+  [ -f "$ETC/devices/$name" ] && stop "A device called '$name' was just added in another window. Pick another name, or remove it first."
+  local i ip="" used
+  used=$(for n in $(devices); do kv_get "$ETC/devices/$n" IP; echo; done)
+  for ((i = 2; i <= 254; i++)); do printf '%s\n' "$used" | grep -qxF "$NET.$i" || { ip=$NET.$i; break; }; done
+  [ -n "$ip" ] || stop "This door already has the most devices it can hold. Remove one first."
+  local k pub psk
+  k=$(umask 077; wg genkey) && valid_key "$k" || stop "The key could not be made."
+  pub=$(printf '%s\n' "$k" | wg pubkey) && valid_key "$pub" || stop "The key could not be made."
+  psk=$(umask 077; wg genpsk) && valid_key "$psk" || stop "The key could not be made."
+  printf 'KIND=%s\nIP=%s\nPUBLIC=%s\nPRESHARED=%s\nADDED=%s\n' "$kind" "$ip" "$pub" "$psk" "$(date +%F)" \
+    | secret_write "$ETC/devices/$name" || stop "The device could not be saved."
+  if ! write_server_conf || ! live_sync >/dev/null 2>&1; then
+    k=""; undo_add "$name" "The device could not be added to the door. It was taken out again; nothing can use it."
+  fi
+  if [ "$kind" = phone ]; then
+    say "Scan this QR code in the free WireGuard app on '$name' (\"+\", then \"Scan from QR code\"). It is shown only once."
+    if ! client_conf "$k" "$ip" "$psk" | qrencode -t ansiutf8 -m 2; then
+      k=""; undo_add "$name" "The QR code could not be shown, so '$name' was taken out again. Try again: secure-linux-remote-access add $name --phone"
+    fi
+    k=""
+    say "When the app shows the new connection, switch it on when you are away from home."
+    say "Lost or replaced this phone? Run: secure-linux-remote-access remove $name"
+  else
+    if ! client_conf "$k" "$ip" "$psk" | deliver_file "$file"; then
+      k=""; undo_add "$name" "The file for '$name' could not be saved in $out, so '$name' was taken out again."
+    fi
+    k=""
+    say "Saved the file for '$name': $file  (it holds the laptop's key: keep it private)."
+    say "1. Copy it to the laptop (for example on a USB stick), then delete it from the stick and from here."
+    say "2. On the laptop run: secure-linux-vpn wireguard import home-$name.conf"
+    say "3. Away from home, switch it on: secure-linux-vpn wireguard on home-$name"
+  fi
+  write_public
+  log "added $name ($kind)"
+  live || say "Note: the door is off right now. Switch it on with: secure-linux-remote-access on"
+}
+cmd_remove() {
+  local name=${1:-}
+  valid_name "$name" || stop "Which device? See the names with: secure-linux-remote-access list"
+  need_root remove "$name"
+  load
+  [ -f "$ETC/devices/$name" ] || stop "No device called '$name'. See the names with: secure-linux-remote-access list"
+  lock
+  drop_device "$name"
+  case $? in
+    0) log "removed $name"; say "'$name' can no longer reach home. Its key stopped working just now." ;;
+    2) log "removed $name; door stopped"
+       fail "'$name' is removed, but the running door did not let go of it, so the door is now OFF to be safe. Switch it on again with: secure-linux-remote-access on" ;;
+    *) fail "'$name' could not be removed completely. To be safe, run: secure-linux-remote-access off" ;;
+  esac
+}
+cmd_list() {
+  if [ ! -f "$PUBDIR/status" ]; then say "Reach home from anywhere is not set up."; return 0; fi
+  if [ ! -s "$PUBDIR/devices" ]; then say "No devices yet. Add one: secure-linux-remote-access add NAME --phone"; return 0; fi
+  say "Devices that can reach home:"
+  local n k d
+  while read -r n k d; do valid_name "$n" && say "  $n ($k, added $d)"; done < "$PUBDIR/devices"
+}
+cmd_status() {
+  if [ ! -f "$PUBDIR/status" ]; then
+    say "Reach home from anywhere: not set up (OFF; nothing listens, no port is open)."
+    say "To learn more: secure-linux-remote-access explain"
+    return 0
+  fi
+  local port hip now
+  port=$(kv_get "$PUBDIR/status" PORT); hip=$(kv_get "$PUBDIR/status" HOME_IP)
+  if systemctl is-active --quiet "$UNIT" 2>/dev/null; then say "Reach home from anywhere: ON (port $port, UDP)."
+  else say "Reach home from anywhere: OFF (devices are kept). Switch it on with: secure-linux-remote-access on"; fi
+  cmd_list | sed 's/^/  /'
+  now=$(home_address 2>/dev/null)
+  if [ -n "$now" ] && [ "$now" != "$hip" ]; then
+    say "  WARNING: this computer's home address changed (was $hip, now $now). Give it a fixed address on your router"
+    say "  (see: secure-linux-remote-access router-steps), then run: secure-linux-remote-access setup --address YOUR-HOME-ADDRESS"
+  fi
+  zone_ok || say "  WARNING: this network does not count as home, so the door is shut. Run: secure-linux-zone set-home"
+  return 0
+}
+cmd_on() {
+  need_root on
+  load
+  fw_open "$PORT" || fail "The firewall did not accept the change."
+  systemctl enable "$UNIT" >/dev/null 2>&1; systemctl start "$UNIT" >/dev/null 2>&1
+  systemctl is-active --quiet "$UNIT" 2>/dev/null || fail "The door did not start. Try again later, or restart the computer."
+  log "on"
+  say "Reach home from anywhere is ON again (port $PORT, UDP)."
+  shield_hint
+}
+cmd_off() {
+  need_root off
+  load
+  systemctl disable --now "$UNIT" >/dev/null 2>&1
+  fw_close_port "$PORT"
+  log "off"
+  if systemctl is-active --quiet "$UNIT" 2>/dev/null; then fail "The door did not stop. Restart the computer to be sure."; fi
+  say "Reach home from anywhere is OFF: nothing listens and the port is closed. Your devices are kept: secure-linux-remote-access on"
+}
+cmd_forget() {
+  case "${1:-}" in "") ;; --yes) YES=1 ;; *) stop "Unknown option '$1'. See: secure-linux-remote-access --help" ;; esac
+  need_root forget ${1:+"$1"}
+  if ! set_up && [ ! -f "$PUBDIR/status" ] && [ ! -f "$WGCONF" ]; then say "Nothing is set up, so there is nothing to remove."; return 0; fi
+  if [ "$YES" != 1 ]; then
+    say "This removes reach home from anywhere completely: the keys, every device and the open port."
+    say "Every phone and laptop you added stops working. Type yes to remove it all:"
+    local a=""; IFS= read -r a || a=""; a=${a%$'\r'}
+    [ "$a" = yes ] || stop "Kept as it is."
+  fi
+  local port; port=$(kv_get "$ETC/settings" PORT 2>/dev/null) || port=$(kv_get "$PUBDIR/status" PORT 2>/dev/null) || port=""
+  systemctl disable --now "$UNIT" >/dev/null 2>&1
+  valid_port "$port" && fw_close_port "$port"
+  fw_forget
+  rm -f "$WGCONF"
+  rm -rf "$ETC" "$PUBDIR"
+  log "forget: everything removed"
+  say "Reach home from anywhere is removed: no keys, no devices, no open port."
+  say "On your router you can now delete the port rule you added for it."
+}
+menu() {
+  local c n
+  while true; do
+    say ""
+    cmd_status
+    say ""
+    if [ ! -f "$PUBDIR/status" ]; then
+      say "  1  What is this? (read first)"
+      say "  2  Set it up"
+      say "  0  Close"
+      printf 'Your choice: '; IFS= read -r c || return 0; c=${c%$'\r'}
+      case "$c" in
+        1) explain ;;
+        2) printf "Your home's internet address or name (from the router's status page): "; IFS= read -r n || n=""
+           "$RUNME" setup --address "${n%$'\r'}" ;;
+        0|q|'') return 0 ;;
+        *) say "Please type a number from the list." ;;
+      esac
+    else
+      say "  1  Add a phone (QR code)"
+      say "  2  Add a laptop or another computer (file)"
+      say "  3  Remove a device"
+      say "  4  Router steps"
+      say "  5  Turn it off      6  Turn it on"
+      say "  7  Remove everything"
+      say "  0  Close"
+      printf 'Your choice: '; IFS= read -r c || return 0; c=${c%$'\r'}
+      case "$c" in
+        1|2|3) printf 'Device name (up to 10 small letters, numbers or dashes): '; IFS= read -r n || n=""; n=${n%$'\r'}
+               case "$c" in 1) "$RUNME" add "$n" --phone ;; 2) "$RUNME" add "$n" --computer ;; 3) "$RUNME" remove "$n" ;; esac ;;
+        4) router_steps "$(kv_get "$PUBDIR/status" PORT)" "$(kv_get "$PUBDIR/status" HOME_IP)" ;;
+        5) "$RUNME" off ;;
+        6) "$RUNME" on ;;
+        7) "$RUNME" forget ;;
+        0|q|'') return 0 ;;
+        *) say "Please type a number from the list." ;;
+      esac
+    fi
+  done
+}
+
+case "${1:-}" in
+  -h|--help|help) usage ;;
+  "") menu ;;
+  status) cmd_status ;;
+  list) cmd_list ;;
+  explain) explain ;;
+  router-steps)
+    if [ -f "$PUBDIR/status" ]; then router_steps "$(kv_get "$PUBDIR/status" PORT)" "$(kv_get "$PUBDIR/status" HOME_IP)"
+    else router_steps "$DEFAULT_PORT" "$(home_address 2>/dev/null || echo THIS-COMPUTER)"; fi ;;
+  setup) shift; cmd_setup "$@" ;;
+  add) shift; cmd_add "$@" ;;
+  remove) shift; cmd_remove "$@" ;;
+  on) cmd_on ;;
+  off) cmd_off ;;
+  forget) shift; cmd_forget "$@" ;;
+  *) say "Unknown command '$1'."; usage; exit 2 ;;
+esac

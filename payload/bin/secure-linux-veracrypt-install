@@ -1,0 +1,150 @@
+#!/bin/bash
+# secure-linux-veracrypt-install: adds VeraCrypt (encrypted containers that also open on other computers).
+#
+#   secure-linux-veracrypt-install install [--yes]   download the official VeraCrypt package, check it, install it
+#   secure-linux-veracrypt-install status            is it installed?
+#   secure-linux-veracrypt-install remove [--yes]    take it away (your encrypted containers are never touched)
+#   secure-linux-veracrypt-install when              VeraCrypt, Cryptomator or the disk lock: which one when?
+#
+# VeraCrypt is free (Apache License 2.0 and the TrueCrypt License 3.0 together). It is NOT in Fedora's own
+# package list, so this helper fetches the package the VeraCrypt team publishes for Fedora:
+#   https://github.com/veracrypt/VeraCrypt/releases  (version 1.26.31, Fedora 43 and 44, Intel/AMD only)
+# The package is used only if (1) its SHA-256 fingerprint equals the one fixed in this helper and (2) when gpg is
+# present, its signature is valid for the VeraCrypt team's key 5069 A233 D55A 0EEB 174A 5FC3 821A CD02 680D 16DE
+# (a copy of that key ships with the kit). If either check fails the file is deleted and nothing is installed.
+# With no internet it uses a copy kept on the Secure Linux drive, after the same checks.
+set -u
+export LC_ALL=C
+P=${SL_VERACRYPT_PREFIX:-}                 # tests only: a fake root folder; also switches the test pin hook on
+VERSION=1.26.31
+BASEURL=https://github.com/veracrypt/VeraCrypt/releases/download/VeraCrypt_$VERSION
+KEY_FPR=5069A233D55A0EEB174A5FC3821ACD02680D16DE
+SELF=$(readlink -f "$0" 2>/dev/null || echo "$0")
+HERE=$(dirname "$SELF")
+SL_ROOT=${SL_ROOT:-/usr/local/lib/secure-linux}
+say() { printf '%s\n' "$*"; }
+die() { say "$*"; exit 1; }
+have() { [ "$1" = gpg ] && [ -n "$P" ] && [ -n "${SL_VERACRYPT_NO_GPG:-}" ] && return 1; command -v "$1" >/dev/null 2>&1; }   # (the gpg switch works only in the tests' fake root)
+usage() { sed -n '2,15p' "$SELF" | sed 's/^# \{0,1\}//'; }
+need_root() { [ -n "$P" ] || [ "$(id -u)" -eq 0 ] || exec pkexec "$SELF" "$@"; }
+
+# SHA-256 of the published packages (from veracrypt-1.26.31-sha256sum.txt, and recomputed here on 2026-11-14).
+pin_for() {
+  case "$1" in
+    43) echo f779c0c48880c45c2f1431d8117b34af0c3b65fec72db2c4e29b598f075481e5 ;;
+    44) echo fc93cbdac29c994e05262f0aed962341dee482c16dfa7e859dea25d637a5a73a ;;
+    *) return 1 ;;
+  esac
+}
+fedora_ver() { sed -n 's/^VERSION_ID=//p' "${SL_VERACRYPT_OSREL:-$P/etc/os-release}" 2>/dev/null | tr -d '"' | head -1; }
+cpu() { local a=${SL_VERACRYPT_ARCH:-$(uname -m)}; case "$a" in x86_64|amd64) echo x86_64 ;; *) echo "$a" ;; esac; }
+keyfile() {
+  local d f
+  for d in ${SL_VERACRYPT_KEYDIR:+"$SL_VERACRYPT_KEYDIR"} "$HERE/../share/veracrypt" "$SL_ROOT/share/veracrypt" /usr/local/lib/secure-linux/share/veracrypt; do
+    f=$d/VeraCrypt_PGP_public_key.asc; [ -f "$f" ] && { printf '%s' "$f"; return 0; }
+  done
+  return 1
+}
+
+when_text() {
+  cat <<'EOF'
+Which lock should I use?
+  - Your whole computer's disk is already locked when you set up Secure Linux (LUKS). Nothing more to do.
+  - Cryptomator (already installed) is the easiest for files you keep in a cloud folder or on a USB stick: it
+    locks each file separately, so syncing still works.
+  - VeraCrypt is for one big locked box (a "container" file, or a whole USB stick) that you also want to open on
+    Windows, macOS or another Linux computer. Choose it when you must share a locked box with someone who does
+    not use Cryptomator. It is a bit more work than Cryptomator.
+EOF
+}
+
+cmd_status() {
+  if rpm -q veracrypt >/dev/null 2>&1; then say "VeraCrypt is installed: $(rpm -q veracrypt 2>/dev/null)"
+  else say "VeraCrypt is not installed. Add it with: secure-linux-veracrypt-install install"; fi
+}
+
+fetch_checked() { # fetch_checked FEDORA_VER DIR -> leaves DIR/veracrypt.rpm only if every check passed
+  local ver=$1 dir=$2 pin got name dd url key gnup
+  pin=$(pin_for "$ver") || return 2
+  [ -n "$P" ] && pin=${SL_VERACRYPT_TEST_PIN:-$pin}
+  name=veracrypt-$VERSION-Fedora-$ver-x86_64.rpm
+  url=$BASEURL/$name
+  if ! curl -fsSL --proto '=https' --tlsv1.2 --max-time 600 -o "$dir/veracrypt.rpm" "$url" 2>/dev/null; then
+    rm -f "$dir/veracrypt.rpm"
+    for dd in ${SL_VERACRYPT_DRIVE_DIR:+"$SL_VERACRYPT_DRIVE_DIR"} "$P/var/cache/secure-linux/offline/veracrypt" "$P"/run/media/*/*/linux-setup/offline/veracrypt; do
+      if [ -f "$dd/$name" ]; then
+        say "No internet: using the copy kept on the Secure Linux drive."
+        cp "$dd/$name" "$dir/veracrypt.rpm"
+        [ -f "$dd/$name.sig" ] && cp "$dd/$name.sig" "$dir/veracrypt.rpm.sig"
+        break
+      fi
+    done
+    [ -s "$dir/veracrypt.rpm" ] || return 3
+  else
+    curl -fsSL --proto '=https' --tlsv1.2 --max-time 60 -o "$dir/veracrypt.rpm.sig" "$url.sig" 2>/dev/null || rm -f "$dir/veracrypt.rpm.sig"
+  fi
+  got=$(sha256sum "$dir/veracrypt.rpm" | awk '{print $1}')
+  if [ "$got" != "$pin" ]; then rm -f "$dir/veracrypt.rpm" "$dir/veracrypt.rpm.sig"; return 4; fi
+  if have gpg; then
+    key=$(keyfile) || { rm -f "$dir/veracrypt.rpm"; return 5; }
+    gnup=$dir/gnupg; mkdir -p "$gnup"; chmod 700 "$gnup"
+    GNUPGHOME=$gnup gpg --batch --quiet --import "$key" >/dev/null 2>&1
+    if ! GNUPGHOME=$gnup gpg --batch --with-colons --list-keys 2>/dev/null | grep -q "^fpr:::::::::$KEY_FPR:"; then rm -f "$dir/veracrypt.rpm"; return 5; fi
+    [ -s "$dir/veracrypt.rpm.sig" ] || { rm -f "$dir/veracrypt.rpm"; return 6; }
+    if ! GNUPGHOME=$gnup gpg --batch --status-fd 1 --verify "$dir/veracrypt.rpm.sig" "$dir/veracrypt.rpm" 2>/dev/null | grep -q "^\[GNUPG:\] VALIDSIG $KEY_FPR "; then
+      rm -f "$dir/veracrypt.rpm" "$dir/veracrypt.rpm.sig"; return 6
+    fi
+    VERIFIED_BY="checksum and signature"
+  else
+    VERIFIED_BY="checksum only (gpg is not installed)"
+  fi
+  return 0
+}
+
+cmd_install() {
+  local yes=0; [ "${1:-}" = --yes ] && yes=1
+  [ -e "$P/run/ostree-booted" ] && die "This computer type (atomic) cannot add VeraCrypt this way. Nothing was changed."
+  have dnf || die "The package tool (dnf) was not found. Nothing was changed."
+  [ "$(cpu)" = x86_64 ] || die "VeraCrypt's Fedora package exists only for Intel and AMD computers. Nothing was changed."
+  local ver; ver=$(fedora_ver)
+  pin_for "$ver" >/dev/null || die "VeraCrypt's package has not been checked for Fedora ${ver:-?} yet, so it is not installed. Nothing was changed."
+  say "VeraCrypt is free but not part of Fedora's own package list. This downloads the package the VeraCrypt team publishes"
+  say "(about 12 MB), checks its fingerprint and signature, and only then installs it."
+  if [ $yes -ne 1 ]; then local a=""; printf 'Install VeraCrypt? [y/N] '; read -r a || a=""; case "$a" in [Yy]|[Yy][Ee][Ss]) ;; *) say "Not installed. Nothing was changed."; return 0 ;; esac; fi
+  need_root install --yes
+  if rpm -q veracrypt >/dev/null 2>&1; then say "VeraCrypt is already installed."; return 0; fi
+  local tmp rc; tmp=$(mktemp -d "${TMPDIR:-/tmp}/sl-veracrypt.XXXXXX") || die "No temporary space. Nothing was changed."
+  trap "rm -rf '$tmp'" EXIT
+  VERIFIED_BY=""
+  fetch_checked "$ver" "$tmp"; rc=$?
+  case $rc in
+    0) ;;
+    3) die "Could not download it (no internet and no copy on the drive). Nothing was changed." ;;
+    4) die "The downloaded file does NOT match the fingerprint this helper expects, so it was deleted and NOT installed. Nothing was changed." ;;
+    5) die "The kit's copy of the VeraCrypt team's key is missing or is not the expected key. Nothing was installed." ;;
+    6) die "The package's signature is missing or not valid for the VeraCrypt team's key, so it was deleted and NOT installed. Nothing was changed." ;;
+    *) die "VeraCrypt could not be fetched. Nothing was changed." ;;
+  esac
+  local kf; kf=$(keyfile) && rpm --import "$kf" >/dev/null 2>&1
+  dnf -y install "$tmp/veracrypt.rpm" >/dev/null 2>&1 || die "The install did not finish. Nothing else was changed."
+  say "VeraCrypt is installed (checked by $VERIFIED_BY). Open it from the apps menu."
+  say "Which lock to use when: secure-linux-veracrypt-install when"
+}
+
+cmd_remove() {
+  local yes=0; [ "${1:-}" = --yes ] && yes=1
+  rpm -q veracrypt >/dev/null 2>&1 || { say "VeraCrypt is not installed."; return 0; }
+  if [ $yes -ne 1 ]; then local a=""; printf 'Remove VeraCrypt? Your encrypted containers are not touched. [y/N] '; read -r a || a=""; case "$a" in [Yy]|[Yy][Ee][Ss]) ;; *) say "Left as it is."; return 0 ;; esac; fi
+  need_root remove --yes
+  dnf -y remove veracrypt >/dev/null 2>&1 || die "It could not be removed."
+  say "VeraCrypt is removed. Your encrypted containers were not touched."
+}
+
+case "${1:-}" in
+  ""|-h|--help|help) usage ;;
+  install) shift; cmd_install "$@" ;;
+  status) cmd_status ;;
+  remove) shift; cmd_remove "$@" ;;
+  when) when_text ;;
+  *) usage; exit 2 ;;
+esac

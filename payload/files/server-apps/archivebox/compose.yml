@@ -1,0 +1,45 @@
+# ArchiveBox for Secure Linux: saves copies of web pages you care about, so you can read them later even if the
+# page is changed or removed. Home network only. One recipe file: the x-secure-linux block below is read by
+# secure-linux-server-apps, which fills in the SL_* values.
+# Image pinned by version AND digest (checked on Docker Hub, 2026-11-16): official archivebox/archivebox 0.9.77
+# (the same image as their "latest" tag on that day). Licence: MIT.
+# The image starts as the administrator inside the container only to fix folder rights, then runs ArchiveBox and its
+# browser as your own account (PUID/PGID), as the project's own docker_entrypoint.sh does.
+# Privacy: sending the addresses you save to Archive.org is switched OFF, and nobody can read or add pages without
+# signing in. (ArchiveBox 0.9.77's own default is PERMISSIONS=public, which lets anyone on the home network read every
+# saved page without signing in: checked in archivebox/config/common.py, so this recipe sets it to private.)
+# The first person to open it makes the first account in the page: do that yourself straight away.
+x-secure-linux:
+  title: ArchiveBox (save web pages)
+  about: Saves copies of web pages for later, so they cannot vanish. Home network only.
+  port: 8142
+  lan_only: yes
+  data_dirs: data
+  user_dirs: data
+  backup_include: data
+  min_free_gb: 5
+  idea: X1
+services:
+  archivebox:
+    image: docker.io/archivebox/archivebox:0.9.77@sha256:f63170551ec48d7aa087c71e2d093156dbf4b4ed8680e2f97f22483e3bc71e55
+    restart: unless-stopped
+    ports:
+      - "${SL_BIND:?home address missing}:${SL_PORT:?port missing}:5797"
+    volumes:
+      - "${SL_DATA:?data folder missing}/data:/data:Z"
+    environment:
+      TZ: "${SL_TZ:-UTC}"
+      PUID: "${SL_UID:?user missing}"
+      PGID: "${SL_GID:?group missing}"
+      BASE_URL: "http://${SL_BIND:?home address missing}:${SL_PORT:?port missing}"
+      PERMISSIONS: "private"
+      PUBLIC_INDEX: "False"
+      PUBLIC_ADD_VIEW: "False"
+      ARCHIVEDOTORG_ENABLED: "False"
+    shm_size: 1gb
+    pids_limit: 2048
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - NET_RAW
+      - MKNOD

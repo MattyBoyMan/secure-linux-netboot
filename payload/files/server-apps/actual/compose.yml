@@ -1,0 +1,59 @@
+# Actual Budget for Secure Linux: a private household budget. Home network only.
+# Started only by secure-linux-server-apps, which fills in the SL_* values from this computer (see app.conf).
+# Images pinned by version AND digest (checked on Docker Hub, 2026-11-16): actualbudget/actual-server 26.11.0 and the
+# official caddy 2.11.9-alpine. Licences: Actual MIT, Caddy Apache-2.0 (both free to use).
+# Actual only works fully over https when opened from another device, so the same small "https" helper as Vaultwarden
+# sits in front of it with its own home certificate (the same one-line settings as Vaultwarden's helper, on port 8452,
+# with default_sni so browsers that open a number address still get the home certificate). Actual itself has no port of
+# its own and no way out to the internet: bank connections are not used (bring in your bank's file instead).
+# Both run as your own account.
+# The first person to open it sets the server password: do that yourself straight away.
+services:
+  actual:
+    image: docker.io/actualbudget/actual-server:26.11.0@sha256:06cf186569cf58d93e12659ff1a517b65b5b0ebee7050a3991d4bd8a1d398da6
+    restart: unless-stopped
+    user: "${SL_UID:?user missing}:${SL_GID:?group missing}"
+    networks:
+      - backend
+    volumes:
+      - "${SL_DATA:?data folder missing}/data:/data:Z"
+    environment:
+      TZ: "${SL_TZ:-UTC}"
+      ACTUAL_PORT: "5006"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+  https:
+    image: docker.io/library/caddy:2.11.9-alpine@sha256:003a97808e781aa9f7e75cc2f43d34d461099031faf5e20faefb9f61126836f0
+    restart: unless-stopped
+    user: "${SL_UID:?user missing}:${SL_GID:?group missing}"
+    depends_on:
+      - actual
+    command:
+      - /bin/sh
+      - -c
+      - 'printf ''%s'' ''{"admin":{"disabled":true},"apps":{"http":{"servers":{"home":{"listen":[":8452"],"protocols":["h1","h2"],"routes":[{"match":[{"host":["${SL_BIND:?home address missing}"]}],"handle":[{"handler":"reverse_proxy","upstreams":[{"dial":"actual:5006"}]}],"terminal":true}],"tls_connection_policies":[{"default_sni":"${SL_BIND:?home address missing}"}]}}},"tls":{"automation":{"policies":[{"subjects":["${SL_BIND:?home address missing}"],"issuers":[{"module":"internal"}]}]}},"pki":{"certificate_authorities":{"local":{"install_trust":false}}}}}'' > /config/caddy.json && exec caddy run --config /config/caddy.json'
+    networks:
+      - backend
+      - frontend
+    ports:
+      - "${SL_BIND:?home address missing}:${SL_PORT:?port missing}:80"
+      - "${SL_BIND:?home address missing}:8452:8452"
+    volumes:
+      - "${SL_DATA:?data folder missing}/certs:/data:Z"
+      - "${SL_DATA:?data folder missing}/certs-config:/config:Z"
+    environment:
+      TZ: "${SL_TZ:-UTC}"
+    sysctls:
+      net.ipv4.ip_unprivileged_port_start: 0
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+networks:
+  backend:
+    internal: true
+  frontend: {}

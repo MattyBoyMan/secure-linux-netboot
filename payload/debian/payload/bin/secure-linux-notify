@@ -30,6 +30,11 @@ if notify-send --help 2>&1 | grep -q -- '--action' && notify-send --help 2>&1 | 
 
 send() {   # send TITLE BODY [urgency]
   local title=$1 body=$2 urg=${3:-normal}
+  # Phone alerts (secure-linux-ntfy), only if the owner turned them on: it does nothing otherwise. It runs in the
+  # background with its own short time limit, so a slow or missing phone server never delays the desktop notice.
+  if command -v secure-linux-ntfy >/dev/null 2>&1; then
+    ( secure-linux-ntfy send "$title" "$body" "$urg" >/dev/null 2>&1 & ) >/dev/null 2>&1
+  fi
   if [ -n "$ACTIONS" ]; then
     (
       r=$(timeout 900 notify-send -a "Secure Linux" -i security-high -u "$urg" \

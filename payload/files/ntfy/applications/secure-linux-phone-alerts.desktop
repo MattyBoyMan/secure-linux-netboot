@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Phone alerts
+GenericName=Send this computer's alerts to your phone
+Comment=Turn on or off alerts on your phone for backups, updates and Wi-Fi. Off until you turn it on.
+Exec=/usr/local/bin/secure-linux-ntfy menu
+Icon=phone
+Terminal=true
+Categories=System;Network;
+Keywords=phone;alerts;notifications;ntfy;
+StartupNotify=false

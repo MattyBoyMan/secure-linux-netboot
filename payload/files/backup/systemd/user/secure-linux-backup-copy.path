@@ -1,0 +1,12 @@
+[Unit]
+Description=Secure Linux: notice when your backup drive is plugged in (switched on only when you add a drive copy)
+
+[Path]
+# USB drives appear here when they are plugged in. secure-linux-backup then checks whether it is YOUR backup drive
+# (by the backup store's own id, never by the drive's name) and makes or offers this month's copy.
+PathChanged=/run/media/%u
+PathChanged=/media/%u
+Unit=secure-linux-backup-copy.service
+
+[Install]
+WantedBy=paths.target

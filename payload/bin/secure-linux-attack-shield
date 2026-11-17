@@ -1,0 +1,550 @@
+#!/bin/bash
+# secure-linux-attack-shield: the shared attacker blocklist (CrowdSec) made simple and safe.
+#
+#   secure-linux-attack-shield status [--short]   is it on? (short: not-set-up|off|on|down|panic)
+#   secure-linux-attack-shield explain [MODE]     what is shared, in plain words (no changes)
+#   secure-linux-attack-shield setup [--mode receive|local|share] [--yes]
+#                                                 switch it on, after you have read what is shared and said yes
+#   secure-linux-attack-shield on | off           start or stop blocking (keeps the program installed)
+#   secure-linux-attack-shield panic-off          remove EVERY block at once, right now (nothing is uninstalled)
+#   secure-linux-attack-shield why-blocked ADDRESS  is this address blocked, and why?
+#   secure-linux-attack-shield unblock ADDRESS    let this address through again, for good
+#   secure-linux-attack-shield allow ADDRESS      never block this address or range (for example a friend's home)
+#   secure-linux-attack-shield remove [--yes]     take it away completely (no service is left behind)
+#   secure-linux-attack-shield suggest            the short text to show where "reach home from anywhere" is switched on
+#
+# It is OFF until you ask for it. Nothing is installed and nothing is sent anywhere before you say yes.
+# The three settings (you choose; the middle one is the default because it shares the least and still protects you):
+#   receive  you get the shared blocklist; nothing about attacks on YOUR computer is sent out   (default)
+#   local    nothing at all is shared and no list is received; only attacks seen on this computer are blocked
+#   share    you also report attackers, so you get the biggest list and help other people
+# Reuses CrowdSec (MIT licence, https://github.com/crowdsecurity/crowdsec) and its firewall helper for nftables
+# (MIT, https://github.com/crowdsecurity/cs-firewall-bouncer), installed from CrowdSec's own package repository.
+# It adds its own nftables tables ("crowdsec", "crowdsec6"); it never changes firewalld, fail2ban or OpenSnitch.
+# Your home network, this computer and whoever is connected to it right now are never blocked.
+set -u
+export LC_ALL=C
+P=${SL_SHIELD_PREFIX:-}                 # tests only: a fake root folder for /etc, /var and /run
+STATE=$P/var/lib/secure-linux/attack-shield
+CSETC=$P/etc/crowdsec
+REPOF=$P/etc/yum.repos.d/crowdsec_crowdsec.repo
+UNITDIR=$P/etc/systemd/system
+ALLOWLIST=secure-linux-owner
+SVC_ENGINE=crowdsec.service
+SVC_BOUNCER=crowdsec-firewall-bouncer.service
+TIMER=secure-linux-attack-shield-refresh.timer
+RSVC=secure-linux-attack-shield-refresh.service
+# Signing keys of CrowdSec's package repository. They are SHIPPED INSIDE THE KIT (share/crowdsec-keys, see its
+# README.txt for where they came from) and pinned here by the SHA-256 of the file AND the full key fingerprint.
+# Nothing is downloaded to decide which key to trust: the keys are checked and given to the package system BEFORE
+# the first package command, and the package source names only these checked copies.
+#   file                            SHA-256 of the file                                               fingerprint
+KEY_PINS="crowdsec-rpm-archive.asc f660f2924c969b319864569f0ad5f9f97adc4bd75e28a5cbf9ea4cf2bf55c676 9082D8CACBBEB0DAB218BAB04C3D386C3CDF0DB4
+crowdsec-packagecloud-repo.asc cd5729fe6f95d29efc48f1cfe63e0d4a3088506cf99f3cf74b572c4b70429980 6A89E3C2303A901A889971D3376ED5326E93CD0C"
+KEYIDS="3cdf0db4 6e93cd0c"              # the same two keys as rpm names them (last 8 hex of each fingerprint)
+RPMKEYS=$P/etc/pki/rpm-gpg              # where the checked copies are kept for the package system
+# Home and private ranges that are never blocked (loopback, home networks, link-local, phone/VPN meshes).
+SAFE_RANGES="127.0.0.0/8 ::1/128 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 169.254.0.0/16 100.64.0.0/10 fe80::/10 fc00::/7"
+
+say() { printf '%s\n' "$*"; }
+die() { say "$*"; exit 1; }
+have() { command -v "$1" >/dev/null 2>&1; }
+SELF=$(readlink -f "$0" 2>/dev/null || echo "$0")
+HERE=$(dirname "$SELF")
+SL_ROOT=${SL_ROOT:-/usr/local/lib/secure-linux}
+usage() { sed -n '2,24p' "$SELF" | sed 's/^# \{0,1\}//'; }
+need_root() { [ -n "$P" ] || [ "$(id -u)" -eq 0 ] || exec pkexec "$SELF" "$@"; }
+st_get() { sed -n "s/^$1=//p" "$STATE/state" 2>/dev/null | tail -1; }
+st_set() { mkdir -p "$STATE"; touch "$STATE/state"; sed -i "/^$1=/d" "$STATE/state"; printf '%s=%s\n' "$1" "$2" >> "$STATE/state"; chmod 0644 "$STATE/state"; }
+
+valid_addr() { # IPv4, IPv6 or either with /prefix; nothing else is ever passed on to another program
+  local a=${1%%/*} pre="" o
+  [ "$1" != "$a" ] && pre=${1#*/}
+  case "$pre" in *[!0-9]*) return 1 ;; esac
+  if printf '%s' "$a" | grep -Eq '^[0-9]{1,3}(\.[0-9]{1,3}){3}$'; then
+    for o in ${a//./ }; do [ "$o" -le 255 ] || return 1; done
+    [ -z "$pre" ] || [ "$pre" -le 32 ] || return 1
+    return 0
+  fi
+  if printf '%s' "$a" | grep -Eq '^[0-9a-fA-F:]+$' && [ "$(printf '%s' "$a" | tr -cd ':' | wc -c)" -ge 2 ]; then
+    [ -z "$pre" ] || [ "$pre" -le 128 ] || return 1
+    return 0
+  fi
+  return 1
+}
+
+# ---------------------------------------------------------------- the words people read
+explain() {
+  local m=${1:-receive}
+  case "$m" in receive|local|share) ;; *) die "Unknown setting '$m'. Choose receive, local or share." ;; esac
+  cat <<'EOF'
+
+ATTACK SHIELD - what it is
+  Strangers on the internet constantly try to guess passwords and break into other people's computers.
+  CrowdSec watches this computer's own logs for that. It also (optionally) downloads a list of addresses
+  that are attacking other people right now. A small helper then blocks those addresses.
+  This matters most once you can reach your home computers from anywhere.
+
+What stays safe whatever you choose
+  - Your home network, this computer and anyone connected to it right now are never blocked.
+  - "secure-linux-attack-shield panic-off" removes every block at once. "unblock ADDRESS" lets one address back in.
+  - It does not change your firewall settings, fail2ban or the app firewall.
+  - It costs nothing. The programs are free (MIT licence).
+EOF
+  case "$m" in
+    receive) cat <<'EOF'
+
+THE SETTING YOU HAVE CHOSEN: receive (the default)
+  What leaves this computer:
+    - A one-time sign-up of this computer with CrowdSec's server, so it may download the list. CrowdSec makes up
+      a random computer name and password for this. It is not linked to your name or an account.
+    - The list of detection rules this computer uses (needed to pick the right list for it).
+    - Your internet address, like any website you visit (the server sees it when this computer asks for the list).
+    - Downloads of detection rules and program updates from CrowdSec's own servers.
+  What does NOT leave this computer:
+    - Nothing about attacks on this computer: no attacker addresses, no log lines, no times.
+    - No usage statistics about the helper programs.
+  Cost of sharing less: CrowdSec gives people who send nothing back a shorter list (about 3,000 addresses
+  instead of about 15,000, according to its own pages).
+EOF
+    ;;
+    local) cat <<'EOF'
+
+THE SETTING YOU HAVE CHOSEN: local
+  What leaves this computer:
+    - Only downloads of detection rules and program updates from CrowdSec's own servers.
+    - Your internet address, like any download.
+  Nothing is sent about you or about attacks, and no shared list is received. Only attackers that this
+  computer sees itself (for example, many wrong passwords on the remote login) are blocked, for a while.
+EOF
+    ;;
+    share) cat <<'EOF'
+
+THE SETTING YOU HAVE CHOSEN: share
+  What leaves this computer:
+    - The sign-up and rule list described under "receive".
+    - For each attack seen on this computer: the attacker's address (with its country if known), the name and
+      version of the detection rule that fired, the time, and this computer's random CrowdSec name.
+      No passwords, no log lines, no names, no files.
+  In return you get the biggest shared list (about 15,000 addresses, according to CrowdSec).
+EOF
+    ;;
+  esac
+  cat <<'EOF'
+
+Until you say yes, nothing is installed and nothing is sent. You can switch it off or take it away at any time.
+EOF
+}
+
+suggest() {
+  cat <<'EOF'
+Reaching home from anywhere puts a door on the internet that strangers can knock on.
+The Attack Shield blocks addresses that are attacking other people right now. It is free and is OFF until you choose it.
+To read what it shares and decide: secure-linux-attack-shield explain
+To switch it on: secure-linux-attack-shield setup
+EOF
+}
+
+# ---------------------------------------------------------------- state
+active() { systemctl is-active --quiet "$1" 2>/dev/null; }
+status_word() {
+  [ -f "$STATE/state" ] || { echo not-set-up; return; }
+  [ "$(st_get panic)" = yes ] && { echo panic; return; }
+  [ "$(st_get enabled)" = yes ] || { echo off; return; }
+  if active "$SVC_ENGINE" && active "$SVC_BOUNCER"; then echo on; else echo down; fi
+}
+cmd_status() {
+  local w; w=$(status_word)
+  [ "${1:-}" = --short ] && { echo "$w"; return 0; }
+  case "$w" in
+    not-set-up) say "The Attack Shield is OFF. It has never been switched on, so nothing is installed and nothing is shared."
+                say "To read what it shares and decide: secure-linux-attack-shield explain" ;;
+    off) say "The Attack Shield is OFF (set up earlier, switched off). Nothing is being blocked. Switch on again: secure-linux-attack-shield on" ;;
+    panic) say "The Attack Shield was stopped with panic-off. Nothing is being blocked. Switch on again: secure-linux-attack-shield on" ;;
+    down) say "The Attack Shield should be on but is not running. Try: secure-linux-attack-shield on. To stop blocking everything: secure-linux-attack-shield panic-off" ;;
+    on) say "The Attack Shield is ON ($(st_get mode) setting). Your home network and this computer are never blocked." ;;
+  esac
+  if [ "$w" != not-set-up ]; then
+    case "$(st_get mode)" in
+      receive) say "  Sharing: you get the shared blocklist; nothing about attacks on this computer is sent." ;;
+      local) say "  Sharing: nothing is shared and no shared list is received." ;;
+      share) say "  Sharing: attackers seen on this computer are reported, and you get the biggest list." ;;
+    esac
+  fi
+  have firewall-cmd && firewall-cmd --state >/dev/null 2>&1 && say "  Your firewall (firewalld) is running and was not changed."
+  return 0
+}
+
+# ---------------------------------------------------------------- allow-list (the owner is never blocked)
+current_peers() { # addresses of whoever is connected to this computer right now (SSH sessions, VPN peers)
+  if [ -n "${SL_SHIELD_PEERS+x}" ]; then printf '%s\n' $SL_SHIELD_PEERS; return 0; fi
+  {
+    [ -n "${SSH_CONNECTION:-}" ] && echo "${SSH_CONNECTION%% *}"
+    ss -Htn state established '( sport = :22 )' 2>/dev/null | awk '{print $NF}'
+    have wg && wg show all endpoints 2>/dev/null | awk '{print $NF}'
+  } | sed 's/:[0-9]*$//; s/^\[//; s/\]$//' | sort -u
+}
+refresh_allow() { # create the allow-list and fill it; the shield refuses to block until this is proven
+  local r a n=0
+  cscli allowlists create "$ALLOWLIST" -d "Secure Linux: the home network and the owner are never blocked" >/dev/null 2>&1
+  for r in $SAFE_RANGES; do cscli allowlists add "$ALLOWLIST" "$r" -d "home and private ranges" >/dev/null 2>&1; done
+  for a in $(current_peers); do
+    valid_addr "$a" || continue
+    cscli allowlists add "$ALLOWLIST" "$a" -e 168h -d "connected when the shield was started" >/dev/null 2>&1 && n=$((n + 1))
+  done
+  return 0
+}
+allow_proven() { # every safe range and every current peer must be listed before blocking starts
+  local out r a
+  out=$(cscli allowlists inspect "$ALLOWLIST" -o json 2>/dev/null) || return 1
+  for r in $SAFE_RANGES; do printf '%s' "$out" | grep -qF "$r" || return 1; done
+  for a in $(current_peers); do valid_addr "$a" || continue; printf '%s' "$out" | grep -qF "$a" || return 1; done
+  return 0
+}
+
+# ---------------------------------------------------------------- panic-off (must work even when things are broken)
+do_panic_off() {
+  systemctl stop "$SVC_BOUNCER" >/dev/null 2>&1
+  systemctl disable "$SVC_BOUNCER" >/dev/null 2>&1
+  nft delete table ip crowdsec >/dev/null 2>&1
+  nft delete table ip6 crowdsec6 >/dev/null 2>&1
+  have cscli && cscli decisions delete --all >/dev/null 2>&1
+  [ -d "$STATE" ] && { st_set panic yes; st_set enabled no; }
+  return 0
+}
+cmd_panic_off() {
+  need_root panic-off
+  do_panic_off
+  say "Every block is removed and the blocking helper is stopped. Nothing is uninstalled."
+  say "Switch on again later with: secure-linux-attack-shield on"
+}
+
+# ---------------------------------------------------------------- config pieces
+write_local_config() { # config.yaml.local is merged over CrowdSec's own config.yaml (documented by CrowdSec)
+  local mode=$1
+  mkdir -p "$CSETC"
+  case "$mode" in
+    receive) cat > "$CSETC/config.yaml.local" <<'EOF'
+# Written by secure-linux-attack-shield (setting: receive). Receive the shared list, send nothing about attacks.
+api:
+  server:
+    online_client:
+      sharing: false
+      pull:
+        community: true
+        blocklists: false
+    disable_usage_metrics_export: true
+EOF
+    ;;
+    share) cat > "$CSETC/config.yaml.local" <<'EOF'
+# Written by secure-linux-attack-shield (setting: share). Report attackers and receive the biggest list.
+api:
+  server:
+    online_client:
+      sharing: true
+      pull:
+        community: true
+        blocklists: false
+    disable_usage_metrics_export: true
+EOF
+    ;;
+    local) cat > "$CSETC/config.yaml.local" <<'EOF'
+# Written by secure-linux-attack-shield (setting: local). Nothing is shared or received.
+api:
+  server:
+    online_client:
+      sharing: false
+      pull:
+        community: false
+        blocklists: false
+    disable_usage_metrics_export: true
+EOF
+    # An empty credentials file makes the package skip its automatic sign-up with CrowdSec's server.
+    if [ ! -e "$CSETC/online_api_credentials.yaml" ]; then ( umask 077; : > "$CSETC/online_api_credentials.yaml" ); fi
+    ;;
+  esac
+  chmod 0600 "$CSETC/config.yaml.local" 2>/dev/null
+}
+disable_central_api() { # local setting: comment out the online_client block of config.yaml (CrowdSec's own documented way)
+  local f=$CSETC/config.yaml tmp
+  [ -f "$f" ] || return 0
+  tmp=$f.sl-new
+  awk '
+    /^[ ]{4}online_client:/ { skip = 1; print "#" $0; next }
+    skip && /^[ ]{5,}/ { print "#" $0; next }
+    skip && /^[[:space:]]*$/ { print; next }
+    { skip = 0; print }
+  ' "$f" > "$tmp" && cat "$tmp" > "$f"
+  rm -f "$tmp"
+}
+# ---------------------------------------------------------------- the package source's keys (checked before any install)
+key_dir() { # the kit's own copy of CrowdSec's keys (the pins above decide whether they are trusted, not the folder)
+  local d
+  for d in ${SL_SHIELD_KEYDIR:+"$SL_SHIELD_KEYDIR"} "$HERE/../share/crowdsec-keys" "$SL_ROOT/share/crowdsec-keys" \
+           /usr/local/lib/secure-linux/share/crowdsec-keys; do
+    [ -d "$d" ] && { printf '%s' "$d"; return 0; }
+  done
+  return 1
+}
+key_fpr() { # key_fpr FILE -> the first (primary) fingerprint in the file; empty when gpg cannot read it
+  local g out
+  g=$(mktemp -d 2>/dev/null) || return 0
+  out=$(GNUPGHOME=$g gpg --batch --quiet --with-colons --show-keys "$1" 2>/dev/null | awk -F: '$1 == "fpr" {print $10; exit}')
+  rm -rf "$g"
+  printf '%s' "$out"
+}
+keys_install() { # check every pinned key file, keep checked copies in $RPMKEYS and give them to rpm. 1 = refused
+  local dir name sum fpr got
+  dir=$(key_dir) || return 1
+  while read -r name sum fpr; do
+    [ -f "$dir/$name" ] || return 1
+    got=$(sha256sum "$dir/$name" 2>/dev/null | awk '{print $1}')
+    [ "$got" = "$sum" ] || return 1
+    if have gpg; then [ "$(key_fpr "$dir/$name")" = "$fpr" ] || return 1; fi
+    mkdir -p "$RPMKEYS" || return 1
+    cat "$dir/$name" > "$RPMKEYS/RPM-GPG-KEY-secure-linux-$name" || return 1
+    got=$(sha256sum "$RPMKEYS/RPM-GPG-KEY-secure-linux-$name" 2>/dev/null | awk '{print $1}')
+    [ "$got" = "$sum" ] || return 1
+    chmod 0644 "$RPMKEYS/RPM-GPG-KEY-secure-linux-$name"
+  done <<<"$KEY_PINS"
+  while read -r name sum fpr; do
+    rpm --import "$RPMKEYS/RPM-GPG-KEY-secure-linux-$name" >/dev/null 2>&1 || return 1
+  done <<<"$KEY_PINS"
+  return 0
+}
+refuse_source() { # a refused key: the package source must not stay behind for later system updates
+  local name sum fpr
+  rm -f "$REPOF"
+  while read -r name sum fpr; do rm -f "$RPMKEYS/RPM-GPG-KEY-secure-linux-$name"; done <<<"$KEY_PINS"
+}
+write_repo() { # the package source names ONLY the checked key copies on this computer (never a download address)
+  mkdir -p "$(dirname "$REPOF")"
+  cat > "$REPOF" <<EOF
+[crowdsec_crowdsec]
+name=crowdsec_crowdsec
+baseurl=https://packagecloud.io/crowdsec/crowdsec/rpm_any/rpm_any/\$basearch
+repo_gpgcheck=1
+gpgcheck=1
+enabled=1
+gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-secure-linux-crowdsec-rpm-archive.asc
+       file:///etc/pki/rpm-gpg/RPM-GPG-KEY-secure-linux-crowdsec-packagecloud-repo.asc
+sslverify=1
+sslcacert=/etc/pki/tls/certs/ca-bundle.crt
+metadata_expire=3600
+EOF
+}
+set_api_key() { # set_api_key FILE KEY: written with shell built-ins only, so the key never shows in the process list
+  local f=$1 key=$2 line out="" found=0
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in api_key:*) line="api_key: $key"; found=1 ;; esac
+    out+="$line"$'\n'
+  done < "$f"
+  [ $found -eq 1 ] || return 1
+  printf '%s' "$out" > "$f"
+}
+write_units() {
+  mkdir -p "$UNITDIR"
+  cat > "$UNITDIR/$RSVC" <<EOF
+[Unit]
+Description=Secure Linux Attack Shield: keep the home allow-list up to date
+ConditionPathExists=/var/lib/secure-linux/attack-shield/state
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/secure-linux-attack-shield refresh-allow
+EOF
+  cat > "$UNITDIR/$TIMER" <<EOF
+[Unit]
+Description=Secure Linux Attack Shield: allow-list refresh (every 10 minutes)
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=10min
+
+[Install]
+WantedBy=timers.target
+EOF
+}
+install_pkgs() { # online first, then the verified copy on the Secure Linux drive
+  if dnf -y install "$@" >/dev/null 2>&1; then return 0; fi
+  say "The download did not work. Trying the copy on the Secure Linux drive."
+  have secure-linux-offline-bundle && secure-linux-offline-bundle install --profile "fedora-$(cat "$P/etc/secure-linux/profile" 2>/dev/null || echo full)" --arch "$(uname -m)" --kind system --packages "$@" >/dev/null 2>&1
+}
+keys_ok() { local k; for k in $KEYIDS; do rpm -q "gpg-pubkey-$k" >/dev/null 2>&1 && return 0; done; return 1; }   # after the install: one more look
+
+# ---------------------------------------------------------------- setup
+cmd_setup() {
+  local mode=receive yes=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --mode) shift; mode=${1:-}; ;;
+      --yes) yes=1 ;;
+      *) die "Unknown option '$1'. See: secure-linux-attack-shield --help" ;;
+    esac
+    shift
+  done
+  case "$mode" in receive|local|share) ;; *) die "Unknown setting '$mode'. Choose receive, local or share. Nothing was changed." ;; esac
+  explain "$mode"
+  if [ $yes -ne 1 ]; then
+    local a=""
+    printf '\nSwitch the Attack Shield on with the "%s" setting? [y/N] ' "$mode"
+    read -r a || a=""
+    case "$a" in [Yy]|[Yy][Ee][Ss]) ;; *) say; say "Not switched on. Nothing was installed and nothing was sent."; return 0 ;; esac
+  fi
+  need_root setup --mode "$mode" --yes
+  [ -e "$P/run/ostree-booted" ] && die "This computer type (atomic) cannot add the Attack Shield this way. Nothing was changed."
+  have dnf || die "The package tool (dnf) was not found. Nothing was changed."
+  key_dir >/dev/null || die "CrowdSec's signing keys are missing from Secure Linux's own files, so nothing can be checked. Run Secure Linux repair from the Status window. Nothing was changed."
+  mkdir -p "$STATE"; chmod 0755 "$STATE"
+  { echo "agreed=$(date -u +%Y-%m-%dT%H:%M:%SZ)"; echo "mode=$mode"; } > "$STATE/consent"
+  st_set mode "$mode"; st_set enabled no; st_set panic no
+  if [ -e "$CSETC/config.yaml" ] || [ -x "$P/usr/bin/cscli" ]; then st_set installed_by_shield no; else st_set installed_by_shield yes; fi
+
+  say; say "Step 1 of 5: adding CrowdSec's package source (checked by signature)."
+  if ! keys_install; then
+    refuse_source
+    say "CrowdSec's signing keys kept in Secure Linux's own files are not the ones expected, so nothing was installed. Run Secure Linux repair from the Status window. To tidy up: secure-linux-attack-shield remove"
+    return 1
+  fi
+  write_repo
+  write_local_config "$mode"
+  systemctl mask "$SVC_ENGINE" "$SVC_BOUNCER" >/dev/null 2>&1   # nothing may start before the safety list exists
+
+  say "Step 2 of 5: installing CrowdSec."
+  install_pkgs crowdsec || { say "CrowdSec could not be installed. Nothing is blocking. To tidy up: secure-linux-attack-shield remove"; return 1; }
+  keys_ok || { refuse_source; say "The package source's signing key is not the one expected. Stopping. To tidy up: secure-linux-attack-shield remove"; return 1; }
+  [ "$mode" = local ] && disable_central_api
+  systemctl unmask "$SVC_ENGINE" >/dev/null 2>&1
+  systemctl enable --now "$SVC_ENGINE" >/dev/null 2>&1 || { say "CrowdSec did not start. Nothing is blocking."; return 1; }
+
+  say "Step 3 of 5: making sure you can never be blocked (home network and who is connected now)."
+  refresh_allow
+  allow_proven || { say "The safety list could not be confirmed, so blocking was NOT started. Nothing is blocking. Tidy up: secure-linux-attack-shield remove"; return 1; }
+
+  say "Step 4 of 5: installing the blocking helper (nftables)."
+  install_pkgs crowdsec-firewall-bouncer-nftables || { say "The blocking helper could not be installed. Nothing is blocking."; return 1; }
+  if ! grep -Eq '^api_key: *[A-Za-z0-9]{8,}' "$CSETC/bouncers/crowdsec-firewall-bouncer.yaml" 2>/dev/null; then
+    local key; key=$(cscli bouncers add secure-linux-firewall-bouncer -o raw 2>/dev/null | tail -1)
+    [ -n "$key" ] && [ -f "$CSETC/bouncers/crowdsec-firewall-bouncer.yaml" ] && \
+      set_api_key "$CSETC/bouncers/crowdsec-firewall-bouncer.yaml" "$key"
+  fi
+  systemctl unmask "$SVC_BOUNCER" >/dev/null 2>&1
+
+  say "Step 5 of 5: switching on."
+  write_units
+  systemctl daemon-reload >/dev/null 2>&1
+  systemctl enable --now "$SVC_BOUNCER" >/dev/null 2>&1 || { say "The blocking helper did not start. Nothing is blocking."; return 1; }
+  systemctl enable --now "$TIMER" >/dev/null 2>&1
+  st_set enabled yes; st_set panic no
+  say
+  say "The Attack Shield is ON ($mode setting)."
+  say "  See if an address is blocked:  secure-linux-attack-shield why-blocked ADDRESS"
+  say "  Let an address through:        secure-linux-attack-shield unblock ADDRESS"
+  say "  Stop every block right now:    secure-linux-attack-shield panic-off"
+}
+
+cmd_on() {
+  need_root on
+  [ -f "$STATE/state" ] || die "The Attack Shield has not been set up. To read what it shares and decide: secure-linux-attack-shield explain"
+  [ -x "$P/usr/bin/cscli" ] || have cscli || die "CrowdSec is not installed. Run: secure-linux-attack-shield setup"
+  systemctl unmask "$SVC_ENGINE" "$SVC_BOUNCER" >/dev/null 2>&1
+  systemctl enable --now "$SVC_ENGINE" >/dev/null 2>&1 || die "CrowdSec did not start. Nothing is blocking."
+  refresh_allow
+  allow_proven || die "The safety list could not be confirmed, so blocking was NOT started."
+  systemctl enable --now "$SVC_BOUNCER" >/dev/null 2>&1 || die "The blocking helper did not start. Nothing is blocking."
+  systemctl enable --now "$TIMER" >/dev/null 2>&1
+  st_set enabled yes; st_set panic no
+  say "The Attack Shield is ON ($(st_get mode) setting)."
+}
+cmd_off() {
+  need_root off
+  [ -f "$STATE/state" ] || { say "The Attack Shield is already off (never set up)."; return 0; }
+  do_panic_off
+  systemctl disable --now "$SVC_ENGINE" >/dev/null 2>&1
+  systemctl disable --now "$TIMER" >/dev/null 2>&1
+  st_set panic no; st_set enabled no
+  say "The Attack Shield is OFF. Nothing is blocked and nothing is shared. Switch on again: secure-linux-attack-shield on"
+}
+
+cmd_why() {
+  local a=${1:-}
+  [ -n "$a" ] && valid_addr "$a" || die "Give one address, for example: secure-linux-attack-shield why-blocked 203.0.113.9"
+  need_root why-blocked "$a"
+  [ -f "$STATE/state" ] || { say "The Attack Shield is off, so it is not blocking $a."; return 0; }
+  local dec al origin scen
+  al=$(cscli allowlists check "$a" 2>&1)
+  if printf '%s' "$al" | grep -qi 'allowlisted\|is in'; then say "$a is on the never-block list (home network, this computer or someone connected). It is not blocked."; fi
+  dec=$(cscli decisions list -a -i "$a" --no-simu -o json 2>/dev/null)
+  case "$dec" in ''|null|'[]') say "CrowdSec has no block on $a. If something still cannot connect, the cause is somewhere else (for example the firewall or the other computer)."; return 0 ;; esac
+  origin=$(printf '%s' "$dec" | grep -o '"origin": *"[^"]*"' | head -1 | sed 's/.*: *"//; s/"$//')
+  scen=$(printf '%s' "$dec" | grep -o '"scenario": *"[^"]*"' | head -1 | sed 's/.*: *"//; s/"$//')
+  say "$a is blocked."
+  case "$origin" in
+    CAPI) say "  Why: it is on the shared community list of addresses that are attacking other people right now." ;;
+    crowdsec) say "  Why: this computer saw it attacking (${scen:-repeated bad behaviour})." ;;
+    cscli) say "  Why: someone added it by hand." ;;
+    *) say "  Why: ${origin:-unknown source}${scen:+ ($scen)}." ;;
+  esac
+  say "  To let it through for good: secure-linux-attack-shield unblock $a"
+}
+cmd_unblock() {
+  local a=${1:-}
+  [ -n "$a" ] && valid_addr "$a" || die "Give one address, for example: secure-linux-attack-shield unblock 203.0.113.9"
+  need_root unblock "$a"
+  [ -f "$STATE/state" ] || { say "The Attack Shield is off, so $a is not blocked by it."; return 0; }
+  cscli decisions delete -i "$a" >/dev/null 2>&1
+  cscli allowlists add "$ALLOWLIST" "$a" -d "unblocked by the owner" >/dev/null 2>&1
+  case "$a" in *:*) nft delete element ip6 crowdsec6 crowdsec6-blacklists "{ ${a%%/*} }" >/dev/null 2>&1 ;; *) nft delete element ip crowdsec crowdsec-blacklists "{ ${a%%/*} }" >/dev/null 2>&1 ;; esac
+  say "$a is let through now and will not be blocked again."
+}
+cmd_allow() {
+  local a=${1:-}
+  [ -n "$a" ] && valid_addr "$a" || die "Give one address or range, for example: secure-linux-attack-shield allow 203.0.113.0/24"
+  need_root allow "$a"
+  [ -f "$STATE/state" ] || die "The Attack Shield is off. Nothing to allow."
+  cscli allowlists add "$ALLOWLIST" "$a" -d "added by the owner" >/dev/null 2>&1 || die "Could not add $a."
+  say "$a will never be blocked."
+}
+cmd_refresh() { need_root refresh-allow; [ "$(st_get enabled)" = yes ] && refresh_allow; return 0; }
+
+cmd_remove() {
+  local yes=0; [ "${1:-}" = --yes ] && yes=1
+  need_root remove "$@"
+  if [ $yes -ne 1 ]; then
+    local a=""; printf 'Take the Attack Shield away completely? [y/N] '; read -r a || a=""
+    case "$a" in [Yy]|[Yy][Ee][Ss]) ;; *) say "Left as it is."; return 0 ;; esac
+  fi
+  do_panic_off
+  systemctl disable --now "$TIMER" >/dev/null 2>&1
+  systemctl disable --now "$SVC_ENGINE" >/dev/null 2>&1
+  if have dnf; then dnf -y remove crowdsec-firewall-bouncer-nftables crowdsec >/dev/null 2>&1; fi
+  rm -f "$UNITDIR/$TIMER" "$UNITDIR/$RSVC"
+  refuse_source                                   # the package source and the shield's copies of its keys
+  systemctl unmask "$SVC_ENGINE" "$SVC_BOUNCER" >/dev/null 2>&1
+  systemctl daemon-reload >/dev/null 2>&1
+  if [ "$(st_get installed_by_shield)" = yes ]; then
+    rm -rf "$CSETC" "$P/var/lib/crowdsec"
+    local k; for k in $KEYIDS; do rpm -e --allmatches "gpg-pubkey-$k" >/dev/null 2>&1; done   # the shield added these keys
+  else
+    rm -f "$CSETC/config.yaml.local"
+  fi
+  rm -rf "$STATE"
+  say "The Attack Shield is gone. Nothing is blocked, nothing is shared, and no service is left running."
+}
+
+case "${1:-}" in
+  ""|-h|--help|help) usage ;;
+  status) shift; cmd_status "$@" ;;
+  explain) shift; explain "${1:-receive}" ;;
+  suggest) suggest ;;
+  setup) shift; cmd_setup "$@" ;;
+  on) cmd_on ;;
+  off) cmd_off ;;
+  panic-off) cmd_panic_off ;;
+  why-blocked) shift; cmd_why "${1:-}" ;;
+  unblock) shift; cmd_unblock "${1:-}" ;;
+  allow) shift; cmd_allow "${1:-}" ;;
+  refresh-allow) cmd_refresh ;;
+  remove) shift; cmd_remove "$@" ;;
+  *) usage; exit 2 ;;
+esac

@@ -84,10 +84,20 @@ HOSTN=$(hostname 2>/dev/null); FULLN=$(getent passwd "$FOR_USER" | cut -d: -f5 |
 SECRETS=$(mktemp)
 {
   echo "$FOR_USER"; echo "$HOME_DIR"; echo "$HOSTN"; echo "${HOSTN%%.*}"; echo "$FULLN"
-  sl_user; sl_build_get HOME_WIFI_SSID; sl_build_get SL_FULLNAME
+  sl_user; echo; sl_build_get HOME_WIFI_SSID; echo; sl_build_get SL_FULLNAME; echo
   have nmcli && nmcli -t -f NAME connection show 2>/dev/null
   have nmcli && nmcli -t -f SSID device wifi list --rescan no 2>/dev/null
-} | sed 's/\\:/:/g' | awk 'length($0) >= 3' | sort -u > "$SECRETS"
+} | sed 's/\\:/:/g' | awk 'length($0) >= 3' > "$SECRETS"
+# The home server (private settings on the owner's drive): server name, shared folder and its sub-folders, account,
+# workgroup and the kit-copy folder. Names of 2 characters (for example D$) are blanked too; each part on its own line.
+_diag_home_host=$(sl_build_get HOME_SHARE_PATH | tr '\\' '/' | sed 's#^/*##; s#/.*##')
+{
+  sl_build_get HOME_SHARE_PATH | tr '\\/' '\n\n'; echo
+  case $_diag_home_host in *.*[!0-9.]*|*[!0-9.]*.*) echo "${_diag_home_host%%.*}" ;; esac   # short name of a full server name
+  sl_build_get HOME_SHARE_USER; echo; sl_build_get HOME_SHARE_DOMAIN; echo
+  sl_build_get HOME_SHARE_UPDATES | tr '\\/' '\n\n'; echo
+} | tr -d '\r' | awk 'length($0) >= 2' >> "$SECRETS"
+sort -u -o "$SECRETS" "$SECRETS"
 redact() {   # redact FILE
   local f=$1 s tmp sval='[^ ,;]+'
   tmp=$(mktemp)
@@ -139,7 +149,8 @@ This zip helps someone work out what's wrong with this computer. It contains:
 
 What is NOT in it: no passwords, no Wi-Fi keys, no personal files, no browser data.
 Blanked out: your user name and full name, the computer name, Wi-Fi network names,
-hardware (MAC) addresses, serial numbers, e-mail addresses and IP addresses.
+your home server's name and shared folder, hardware (MAC) addresses, serial numbers,
+e-mail addresses and IP addresses.
 You can open every file and read it before sending it.
 EOF
 

@@ -1,0 +1,951 @@
+#!/usr/bin/env python3
+"""secure-linux-kit-share: share this computer's Secure Linux updates with the other Secure Linux computers at
+home, so they can update even when the internet is down.
+
+  secure-linux-kit-share start      turn sharing on (asks for your password)
+  secure-linux-kit-share stop       turn sharing off (asks for your password)
+  secure-linux-kit-share status     show whether sharing is on and how many computers at home share with you
+
+Run by the computer itself (you never need these):
+  secure-linux-kit-share serve      the sharing service (secure-linux-kit-share.service)
+  secure-linux-kit-share find       look for other Secure Linux computers at home and remember the ones that
+                                    check out (/run/secure-linux/kit-peers.json, read by secure-linux-kit-update)
+  secure-linux-kit-share network    called when the network changes and every few hours: starts or stops
+                                    sharing and looks again
+
+What is shared, read-only: this computer's signed release record, its signed file list, its signed channel
+record (stable or testing), its signed release history and the files that list names, each one only while its
+bytes still match the signed list. Nothing else on this computer can be asked for. Sharing happens only on
+the home network (never in a cafe or at work), stops by itself when the computer leaves home, and is refused
+while signed releases are not set up (bridge mode). Another computer never trusts a shared file blindly: it
+checks every file against the official signature, exactly like a download from the internet.
+
+A computer is shared with only while it has a signed channel record for the release it holds, so a computer
+on the testing channel can never pass a test release off as a finished one. Looking for computers lists only
+those whose release record and channel record carry a valid official signature; the channel written down is
+the one in that signed record, never what the other computer claims.
+"""
+from __future__ import annotations
+
+import concurrent.futures
+import datetime
+import hashlib
+import http.client
+import http.server
+import importlib.machinery
+import ipaddress
+import json
+import os
+from pathlib import Path, PurePosixPath
+import re
+import shutil
+import socket
+import socketserver
+import subprocess
+import sys
+import threading
+import time
+import types
+
+PORT = 47361                                   # the sharing service listens here (home network only)
+SYSTEM_TREE = "/usr/local/lib/secure-linux"    # this computer's own Secure Linux files
+LOCATION_DEFAULT = "/run/secure-linux/location"        # home|away|offline (the network dispatcher)
+PEERS_DEFAULT = "/run/secure-linux/kit-peers.json"     # C7
+ON_FLAG_DEFAULT = "/etc/secure-linux/kit-share-on"     # the person turned sharing on
+# P30 snippet C: the Debian install files, the Flipper files and the network-install files that this computer
+# keeps up to date next to its saved USB master (secure-linux-kit-update --set, one folder per set)
+SETS_DEFAULT = "/var/lib/secure-linux/usb-master/.refresh-sets"
+SELF = "/usr/local/bin/secure-linux-kit-share"         # the path the password prompt (polkit) names
+SERVICE = "secure-linux-kit-share.service"
+KEYS_FOLDER = "secure-linux-release-keys"
+
+# The published repository's names (C1, C14, C15) and where secure-linux-kit-update keeps those exact bytes
+# in this computer's folder after a checked update.
+RELEASE = "release.json"
+KEPT = {
+    "release.json.sig": ".kit-update-release.json.sig",
+    "payload-files.json": ".kit-update-published-files.json",
+    "payload-files.json.sig": ".kit-update-published-files.json.sig",
+    "channel.json": ".kit-update-channel.json",
+    "channel.json.sig": ".kit-update-channel.json.sig",
+    "history/releases.jsonl": ".kit-update-history.jsonl",
+    "history/releases.jsonl.sig": ".kit-update-history.jsonl.sig",
+}
+CHANNELS = ("stable", "testing")
+MAX_RECORD = 65536
+MAX_SIGNATURE = 65536
+MAX_LIST = 2 * 1024 * 1024
+MAX_HISTORY = 16 * 1024 * 1024
+MAX_FILE = 8 * 1024 * 1024
+MAX_FILES = 20000
+LIMITS = {"release.json": MAX_RECORD, "release.json.sig": MAX_SIGNATURE, "payload-files.json": MAX_LIST,
+          "payload-files.json.sig": MAX_SIGNATURE, "channel.json": MAX_RECORD, "channel.json.sig": MAX_SIGNATURE,
+          "history/releases.jsonl": MAX_HISTORY, "history/releases.jsonl.sig": MAX_SIGNATURE}
+HASH_RE = re.compile(r"^[0-9a-f]{64}$")
+RELEASE_ID_RE = re.compile(r"^secure-linux-([0-9]{4})\.([0-9]{2})\.([0-9]{2})-[0-9a-f]{16}$")
+RANGE_RE = re.compile(r"^bytes=([0-9]{0,15})-([0-9]{0,15})$")
+REQUEST_TIMEOUT = 30          # seconds a neighbour may take to send its request
+MAX_CONNECTIONS = 16          # answered at the same time; more are turned away (they ask again later)
+SLOT_WAIT = 0.5               # seconds a new neighbour may wait for a free slot (check C2 F12)
+CHECK_SECONDS = 2.0           # how often the service checks that this computer is still at home
+PROBE_TIMEOUT = 0.7           # seconds to wait for a computer on the home network to answer
+FETCH_TIMEOUT = 8
+MAX_HOSTS = 1024              # never look further than this many addresses
+PROBE_WORKERS = 48
+
+# Exit codes (the service is not restarted for 3, 4 and 5: it would only refuse again)
+OK, PROBLEM, USAGE, BRIDGE, NOT_HOME, NOTHING = 0, 1, 2, 3, 4, 5
+EXIT_MOVED = 75               # the home network address changed: the service starts again on the new one
+
+TEST = os.environ.get("SL_KIT_SHARE_TEST") == "1"   # loopback addresses and stand-in commands, tests only
+
+
+def say(text: str) -> None:
+    print(text, flush=True)
+
+
+class NotShared(Exception):
+    """Why this computer does not share, in plain words, with the exit code."""
+
+    def __init__(self, message: str, code: int = NOTHING):
+        super().__init__(message)
+        self.code = code
+
+
+# ------------------------------------------------------------------ settings and places
+def tree_path(given: str | None) -> Path:
+    return Path(given or os.environ.get("SL_KIT_SHARE_TREE") or SYSTEM_TREE)
+
+
+def location() -> str:
+    path = Path(os.environ.get("SL_KIT_SHARE_LOCATION") or LOCATION_DEFAULT)
+    try:
+        return path.read_text(encoding="utf-8", errors="replace").strip().lower()
+    except OSError:
+        return "offline"
+
+
+def at_home() -> bool:
+    return location() == "home"
+
+
+def peers_path() -> Path:
+    return Path(os.environ.get("SL_KIT_PEERS") or PEERS_DEFAULT)
+
+
+def on_flag() -> Path:
+    return Path(os.environ.get("SL_KIT_SHARE_ON") or ON_FLAG_DEFAULT)
+
+
+def sets_root() -> Path:
+    given = os.environ.get("SL_KIT_SHARE_SETS") if TEST else None
+    return Path(given or SETS_DEFAULT)
+
+
+# Where each set is published (the same fixed places as secure-linux-kit-update's SET_PREFIX; never from a list)
+SET_PREFIX = {"debian": "payload/debian/", "flipper": "flipper/", "netboot": ""}
+
+
+def port() -> int:
+    value = os.environ.get("SL_KIT_SHARE_PORT", "")
+    if value.isdigit() and 0 <= int(value) <= 65535 and (TEST or int(value) >= 1024):
+        return int(value)
+    return PORT
+
+
+def keys_folder(tree: Path) -> Path:
+    """The release keys come from this computer's own folder, never from a neighbour (same rule as kit-update)."""
+    keys = tree / "share" / KEYS_FOLDER
+    if not keys.is_dir():
+        keys = Path(__file__).resolve().parent.parent / "share" / KEYS_FOLDER
+    return keys
+
+
+def load_checker(keys: Path):
+    """secure-linux-release-verify (beside this tool), or None while signing is not set up (bridge mode)."""
+    verifier = Path(__file__).resolve().with_name("secure-linux-release-verify")
+    if not verifier.is_file():
+        if keys.is_dir() and any(keys.glob("*.asc")):
+            raise NotShared("the release signature checker is missing on this computer", BRIDGE)
+        return None
+    loader = importlib.machinery.SourceFileLoader("sl_release_verify", str(verifier))
+    checker = types.ModuleType(loader.name)
+    checker.__file__ = str(verifier)
+    loader.exec_module(checker)
+    return checker if checker.signing_configured(keys) else None
+
+
+BRIDGE_TEXT = ("Signed releases are not set up in this Secure Linux yet, so updates are not shared with other "
+               "computers. Each computer gets its updates from the internet as before.")
+
+
+# Home networks (RFC 1918) and link-local addresses. Not Python's wider is_private, which also counts the
+# documentation and benchmark ranges and other special addresses.
+HOME_NETWORKS = tuple(ipaddress.ip_network(net) for net in
+                      ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16"))
+
+
+def is_home_address(address: str) -> bool:
+    """A home-network (private) or link-local IPv4 address; loopback only in tests."""
+    try:
+        ip = ipaddress.ip_address(address)
+    except ValueError:
+        return False
+    if ip.version != 4:
+        return False
+    if ip.is_loopback:
+        return TEST
+    return any(ip in network for network in HOME_NETWORKS)
+
+
+# Never the home network: VPN tunnels, container and virtual-machine bridges, loopback.
+VIRTUAL_PREFIXES = ("lo", "wg", "tun", "tap", "nordlynx", "proton", "cloudflarewarp", "tailscale", "zt", "docker",
+                    "veth", "virbr", "vnet", "br-", "podman", "cni", "flannel")
+
+
+def physical_interfaces() -> list[str]:
+    """Wi-Fi and wired network cards that are up (the same connections the network dispatcher uses to decide
+    "home"); never a VPN tunnel, a bridge or loopback."""
+    given = os.environ.get("SL_KIT_SHARE_SYSFS") if TEST else None
+    root = Path(given or "/sys/class/net")
+    try:
+        names = sorted(entry.name for entry in root.iterdir())
+    except OSError:
+        return []
+    found = []
+    for name in names:
+        if name.lower().startswith(VIRTUAL_PREFIXES):
+            continue
+        folder = root / name
+        try:
+            kind = (folder / "type").read_text(encoding="utf-8", errors="replace").strip()
+            state = (folder / "operstate").read_text(encoding="utf-8", errors="replace").strip()
+        except OSError:
+            continue
+        if kind == "1" and state == "up" and (folder / "device").exists():     # 1 = Ethernet or Wi-Fi card
+            found.append(name)
+    return found
+
+
+def interface_addresses(name: str) -> list[ipaddress.IPv4Interface]:
+    """The IPv4 addresses (with their network size) of one network card, from `ip -4 -o addr show dev NAME`."""
+    program = os.environ.get("SL_KIT_SHARE_IP") if TEST else None
+    command = [sys.executable, program] if program else ["ip"]
+    try:
+        out = subprocess.run([*command, "-4", "-o", "addr", "show", "dev", name], capture_output=True, text=True,
+                             timeout=10).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    found = []
+    for match in re.finditer(r"\binet ([0-9.]+/[0-9]{1,2})\b", out):
+        try:
+            found.append(ipaddress.IPv4Interface(match.group(1)))
+        except ValueError:
+            continue
+    return found
+
+
+def home_network() -> tuple[str, ipaddress.IPv4Network | None]:
+    """This computer's own address on the home network and the part of that network to ask, taken from its
+    Wi-Fi or wired card only: with a VPN switched on, the internet goes through the tunnel, but the home network
+    is still on the card (and the VPN's network is never asked)."""
+    if TEST and os.environ.get("SL_KIT_SHARE_BIND"):
+        return os.environ["SL_KIT_SHARE_BIND"], None
+    for name in physical_interfaces():
+        for item in interface_addresses(name):
+            address = str(item.ip)
+            if not item.ip.is_loopback and is_home_address(address):
+                network = item.network
+                if network.prefixlen < 24:                  # a big network: only the 254 addresses around this one
+                    network = ipaddress.ip_network(f"{address}/24", strict=False)
+                return address, network
+    return "", None
+
+
+def home_address() -> str:
+    """This computer's own address on the home network, or ""."""
+    return home_network()[0]
+
+
+# ------------------------------------------------------------------ what this computer can share
+def read_plain(path: Path, limit: int) -> bytes | None:
+    """A regular file that is not a link, at most `limit` bytes; None when it is not there."""
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise NotShared(f"{path.name} could not be read ({type(exc).__name__})") from exc
+    if not os.path.isfile(path) or os.path.islink(path):
+        raise NotShared(f"{path.name} is not a plain file")
+    if info.st_size > limit:
+        raise NotShared(f"{path.name} is larger than allowed")
+    try:
+        with open(path, "rb") as handle:
+            data = handle.read(limit + 1)
+    except OSError as exc:
+        raise NotShared(f"{path.name} could not be read ({type(exc).__name__})") from exc
+    if len(data) > limit:
+        raise NotShared(f"{path.name} is larger than allowed")
+    return data
+
+
+def safe_name(value: object) -> bool:
+    """A file name from the signed list that can only point inside this computer's Secure Linux folder."""
+    if not isinstance(value, str) or not value or len(value) > 400:
+        return False
+    if any(ord(ch) < 33 or ord(ch) == 127 for ch in value) or any(ch in value for ch in "\\%?#"):
+        return False
+    pure = PurePosixPath(value)
+    return not pure.is_absolute() and value == pure.as_posix() and all(
+        part not in ("", ".", "..") for part in pure.parts) and not value.startswith(".kit-update")
+
+
+def fingerprint(tree: Path) -> tuple:
+    """Changes whenever an update changes what this computer would share."""
+    found = []
+    for name in (RELEASE, *KEPT.values()):
+        try:
+            info = os.lstat(tree / name)
+            found.append((name, info.st_mtime_ns, info.st_size, info.st_ino))
+        except OSError:
+            found.append((name, None))
+    return tuple(found)
+
+
+class Snapshot:
+    """The checked state of this computer's release: the bytes of the published names, and the file list."""
+
+    def __init__(self, tree: Path):
+        self.tree = tree
+        self.stamp = fingerprint(tree)
+        keys = keys_folder(tree)
+        checker = load_checker(keys)
+        if checker is None:
+            raise NotShared(BRIDGE_TEXT, BRIDGE)
+        self.published: dict[str, bytes] = {}
+        record = read_plain(tree / RELEASE, MAX_RECORD)
+        if record is None:
+            raise NotShared("this computer has no release record")
+        self.published[RELEASE] = record
+        for name, kept in KEPT.items():
+            data = read_plain(tree / kept, LIMITS[name])
+            if data is not None:
+                self.published[name] = data
+        get = self.published.get
+        if get("payload-files.json") is None or get("release.json.sig") is None \
+                or get("payload-files.json.sig") is None:
+            raise NotShared("this computer has not installed a signed update yet, so it has nothing checked to "
+                            "share. It starts sharing after its next update.")
+        verdict = checker.verify_release(record, get("release.json.sig"), get("payload-files.json"),
+                                         get("payload-files.json.sig"), keys, source="this computer's release")
+        if verdict.state != "verified":
+            raise NotShared(f"this computer's own release did not pass the signature check: {verdict.message}")
+        self.release_id = verdict.release_id
+        # C14 (P17 finding F1, closed here for every computer that shares): never share a release without its
+        # signed channel record, and the channel shared is the one that record names.
+        if get("channel.json") is None or get("channel.json.sig") is None:
+            raise NotShared("this computer has no signed channel record for its release yet, so it does not share "
+                            "it. It starts sharing after its next update.")
+        self.channel = channel_of(checker, keys, get("channel.json"), get("channel.json.sig"), self.release_id)
+        history, history_sig = get("history/releases.jsonl"), get("history/releases.jsonl.sig")
+        if history is not None or history_sig is not None:
+            good = history is not None and checker.verify_detached(
+                history, history_sig, keys, label="history/releases.jsonl").state == "verified"
+            if not good or last_release(history) != self.release_id:
+                raise NotShared("this computer's kept release history did not pass the signature check")
+        try:
+            listed = json.loads(get("payload-files.json").decode("utf-8"))
+            files = listed["files"]
+            if not isinstance(files, dict) or len(files) > MAX_FILES:
+                raise ValueError("unexpected files")
+        except (UnicodeDecodeError, ValueError, KeyError, TypeError) as exc:
+            raise NotShared("this computer's signed file list is not readable") from exc
+        self.files = {name: digest for name, digest in files.items()
+                      if safe_name(name) and isinstance(digest, str) and HASH_RE.match(digest)}
+        # P30 snippet C: the signed lists of the sets (inside the same signed file list; older lists have none)
+        self.sets: dict[str, dict[str, str]] = {}
+        sets = listed.get("sets") if isinstance(listed, dict) else None
+        for set_name in SET_PREFIX:
+            entry = sets.get(set_name) if isinstance(sets, dict) else None
+            listed_files = entry.get("files") if isinstance(entry, dict) else None
+            if isinstance(listed_files, dict) and len(listed_files) <= MAX_FILES:
+                self.sets[set_name] = {name: digest for name, digest in listed_files.items()
+                                       if safe_name(name) and isinstance(digest, str) and HASH_RE.match(digest)}
+
+    def payload(self, name: str) -> bytes | None:
+        """The bytes of one listed file, only while they match the signed list; never through a link."""
+        return plain_listed(self.tree, name, self.files.get(name))
+
+    def set_file(self, published: str) -> bytes | None:
+        """P30 snippet C: one file of a set at its published place (payload/debian/..., flipper/..., or the
+        network-install files at the top), from the folder this computer keeps for that set, only while its
+        bytes match the set's signed list. Never through a link."""
+        for set_name, prefix in SET_PREFIX.items():
+            if prefix and not published.startswith(prefix):
+                continue
+            relative = published[len(prefix):]
+            digest = self.sets.get(set_name, {}).get(relative)
+            if digest is not None:
+                root = sets_root()
+                if root.is_symlink() or (root / set_name).is_symlink():
+                    return None
+                return plain_listed(root / set_name, relative, digest)
+        return None
+
+
+def plain_listed(folder: Path, name: str, digest: str | None) -> bytes | None:
+    """A listed file below `folder`: a plain file reached without any link, whose bytes match `digest`."""
+    if digest is None:
+        return None
+    path = folder
+    for part in PurePosixPath(name).parts:
+        path = path / part
+        if path.is_symlink():
+            return None
+    try:
+        data = read_plain(path, MAX_FILE)
+    except NotShared:
+        return None
+    if data is None or hashlib.sha256(data).hexdigest() != digest:
+        return None
+    return data
+
+
+def channel_of(checker, keys: Path, raw: bytes, signature: bytes | None, release_id: str) -> str:
+    """The channel a valid, signed channel record names for exactly this release (C14)."""
+    verdict = checker.verify_detached(raw, signature, keys, label="channel.json")
+    if verdict.state != "verified":
+        raise NotShared(f"the channel record did not pass the signature check: {verdict.message}")
+    try:
+        record = json.loads(raw.decode("utf-8"))
+        said = record["channel"]
+        if record["schema_version"] != 1 or said not in CHANNELS or not isinstance(record["release_id"], str):
+            raise ValueError("unexpected values")
+        datetime.datetime.fromisoformat(str(record["created_at"]))
+    except (UnicodeDecodeError, ValueError, KeyError, TypeError) as exc:
+        raise NotShared("the channel record is not in the expected form") from exc
+    if record["release_id"] != release_id:
+        raise NotShared("the channel record belongs to a different release")
+    return said
+
+
+def last_release(history: bytes | None) -> str:
+    try:
+        lines = (history or b"").decode("utf-8").splitlines()
+        return str(json.loads(lines[-1])["release_id"]) if lines else ""
+    except (UnicodeDecodeError, ValueError, KeyError, TypeError, IndexError):
+        return ""
+
+
+# ------------------------------------------------------------------ the sharing service
+class Share:
+    """What the service shares right now; checked again whenever an update changes the folder."""
+
+    def __init__(self, tree: Path):
+        self.tree = tree
+        self.lock = threading.Lock()
+        self.snapshot: Snapshot | None = Snapshot(tree)
+        self.problem = ""
+
+    def current(self) -> Snapshot | None:
+        with self.lock:
+            if self.snapshot is None or self.snapshot.stamp != fingerprint(self.tree):
+                try:
+                    self.snapshot = Snapshot(self.tree)
+                    self.problem = ""
+                except NotShared as exc:       # an update is being installed, or something is wrong: share nothing
+                    self.snapshot = None
+                    self.problem = str(exc)
+            return self.snapshot
+
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    server_version = "SecureLinuxKitShare"
+    sys_version = ""
+    protocol_version = "HTTP/1.0"
+    timeout = REQUEST_TIMEOUT
+    error_content_type = "text/plain; charset=utf-8"
+    error_message_format = "%(code)d %(message)s\n"
+
+    def log_message(self, *args) -> None:   # no addresses or file names in the logs
+        pass
+
+    def do_HEAD(self) -> None:   # noqa: N802
+        self.answer(body=False)
+
+    def do_GET(self) -> None:   # noqa: N802
+        self.answer(body=True)
+
+    def answer(self, body: bool) -> None:
+        server: ShareServer = self.server   # type: ignore[assignment]
+        if not is_home_address(self.client_address[0]):
+            self.send_error(403, "Only computers on this home network")
+            return
+        if not at_home():
+            self.send_error(503, "Not at home")
+            server.leave("away")
+            return
+        data = self.lookup(server.share.current(), self.path)
+        if data is None:
+            self.send_error(404, "Not shared")
+            return
+        self.send_bytes(data, body)
+
+    @staticmethod
+    def lookup(snapshot: Snapshot | None, raw_path: str) -> bytes | None:
+        """Exactly the published names and the listed files; any other path, any encoding trick: nothing."""
+        if snapshot is None or not raw_path.startswith("/") or len(raw_path) > 512:
+            return None
+        if any(token in raw_path for token in ("%", "\\", "?", "#", "//", "/./", "/../")) or \
+                raw_path.endswith(("/.", "/..")):
+            return None
+        name = raw_path[1:]
+        if name == RELEASE or name in KEPT:
+            return snapshot.published.get(name)
+        if name.startswith("payload/"):
+            found = snapshot.payload(name[len("payload/"):])
+            if found is not None:
+                return found
+        return snapshot.set_file(name)                 # P30 snippet C: --set works from another computer
+
+    def send_bytes(self, data: bytes, body: bool) -> None:
+        size = len(data)
+        tag = '"' + hashlib.sha256(data).hexdigest() + '"'
+        start, end = 0, size - 1
+        partial = False
+        wanted = self.headers.get("Range")
+        if_range = self.headers.get("If-Range")
+        if wanted is not None and (if_range is None or if_range.strip() == tag):
+            match = RANGE_RE.match(wanted.strip())
+            if match and (match.group(1) or match.group(2)):
+                first, last = match.group(1), match.group(2)
+                if first:
+                    start = int(first)
+                    end = min(int(last), size - 1) if last else size - 1
+                    if last and int(last) < start:
+                        start, end = 0, size - 1          # not a valid range: the whole file (RFC 9110)
+                    elif start >= size:
+                        self.unsatisfiable(size)
+                        return
+                    else:
+                        partial = True
+                else:
+                    count = int(last)
+                    if count == 0 or size == 0:
+                        self.unsatisfiable(size)
+                        return
+                    start, end, partial = max(0, size - count), size - 1, True
+        self.send_response(206 if partial else 200)
+        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("Accept-Ranges", "bytes")
+        self.send_header("ETag", tag)
+        self.send_header("Cache-Control", "no-store")
+        if partial:
+            self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+        self.send_header("Content-Length", str(end - start + 1 if size else 0))
+        self.end_headers()
+        if body and size:
+            self.wfile.write(data[start:end + 1])
+
+    def unsatisfiable(self, size: int) -> None:
+        self.send_response(416)
+        self.send_header("Content-Range", f"bytes */{size}")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+
+class ShareServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
+    daemon_threads = True
+    block_on_close = False        # check C2 F12: leaving home never waits for a slow neighbour
+    allow_reuse_address = False
+
+    def __init__(self, address: tuple[str, int], share: Share):
+        super().__init__(address, Handler)
+        self.share = share
+        self.slots = threading.BoundedSemaphore(MAX_CONNECTIONS)
+        self.reason = ""
+        self.stopping = threading.Event()
+
+    def process_request(self, request, client_address):
+        # check C2 F12: with every slot taken (slow or stuck neighbours), a new one is turned away at once and
+        # asks again later; the service itself never waits, so it still stops at once when leaving home.
+        if not self.slots.acquire(timeout=SLOT_WAIT):
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except Exception:
+            self.slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self.slots.release()
+
+    def handle_error(self, request, client_address) -> None:
+        pass                                 # a neighbour that hangs up: no address or trace in the logs
+
+    def leave(self, reason: str) -> None:
+        if not self.stopping.is_set():
+            self.reason = reason
+            self.stopping.set()
+            threading.Thread(target=self.shutdown, daemon=True).start()
+
+
+def serve(tree: Path) -> int:
+    if not at_home():
+        say("KIT SHARE: not sharing - this computer is not on its home network. Sharing starts by itself at home.")
+        return NOT_HOME
+    try:
+        share = Share(tree)
+    except NotShared as exc:
+        say(f"KIT SHARE: not sharing - {exc}")
+        return exc.code
+    address = home_address()
+    if not address:
+        say("KIT SHARE: not sharing - this computer has no address on a home network right now.")
+        return NOT_HOME
+    try:
+        server = ShareServer((address, port()), share)
+    except OSError as exc:
+        say(f"KIT SHARE: not sharing - the sharing port could not be opened ({type(exc).__name__}).")
+        return PROBLEM
+    snapshot = share.snapshot
+    say(f"KIT SHARE: sharing {snapshot.release_id} ({snapshot.channel}) with the other Secure Linux computers at "
+        f"home on port {server.server_address[1]}.")
+
+    def watch() -> None:
+        pause = float(os.environ.get("SL_KIT_SHARE_CHECK_SECONDS") or CHECK_SECONDS) if TEST else CHECK_SECONDS
+        while not server.stopping.wait(pause):
+            if not at_home():
+                server.leave("away")
+            elif not (TEST and os.environ.get("SL_KIT_SHARE_BIND")) and home_address() != address:
+                server.leave("moved")
+
+    threading.Thread(target=watch, daemon=True).start()
+    try:
+        server.serve_forever(poll_interval=0.5)
+    finally:
+        server.server_close()
+    if server.reason == "moved":
+        say("KIT SHARE: the home network address changed - sharing starts again on the new one.")
+        return EXIT_MOVED
+    say("KIT SHARE: this computer left its home network - sharing stopped.")
+    return OK
+
+
+# ------------------------------------------------------------------ finding other computers (C7)
+def candidates() -> list[tuple[str, int]]:
+    """The addresses to ask: the home network around this computer (its own network, at most the 254 addresses
+    around it), computers seen lately first. Never the VPN's network."""
+    if TEST and os.environ.get("SL_KIT_SHARE_HOSTS"):
+        found = []
+        for item in os.environ["SL_KIT_SHARE_HOSTS"].split(","):
+            host, _, number = item.strip().rpartition(":")
+            if host and number.isdigit():
+                found.append((host, int(number)))
+        return found
+    own, network = home_network()
+    if not own or network is None:
+        return []
+    ordered: list[str] = []
+    try:
+        with open("/proc/net/arp", encoding="utf-8", errors="replace") as handle:   # computers seen lately
+            for line in handle.read(262144).splitlines()[1:]:
+                fields = line.split()
+                if fields and is_home_address(fields[0]) and ipaddress.ip_address(fields[0]) in network:
+                    ordered.append(fields[0])
+    except OSError:
+        pass
+    ordered += [str(host) for host in network.hosts()]
+    seen: set[str] = {own}
+    result = []
+    for host in ordered:
+        if host not in seen:
+            seen.add(host)
+            result.append((host, port()))
+        if len(result) >= MAX_HOSTS:
+            break
+    return result
+
+
+def fetch(host: str, number: int, name: str, limit: int) -> bytes | None:
+    """One published name from a neighbour: 200 and at most `limit` bytes, or None. Never follows a redirect."""
+    connection = http.client.HTTPConnection(host, number, timeout=FETCH_TIMEOUT)
+    try:
+        connection.request("GET", "/" + name, headers={"User-Agent": "SecureLinuxKitShare"})
+        reply = connection.getresponse()
+        if reply.status != 200:
+            return None
+        data = reply.read(limit + 1)
+        return data if len(data) <= limit else None
+    except (OSError, http.client.HTTPException):
+        return None
+    finally:
+        connection.close()
+
+
+def check_peer(host: str, number: int, checker, keys: Path) -> dict | None:
+    """A neighbour is listed only when its release record and its channel record carry a valid official
+    signature and name the same release. The channel listed is the one in the signed record."""
+    try:
+        with socket.create_connection((host, number), timeout=PROBE_TIMEOUT):
+            pass
+    except OSError:
+        return None
+    record = fetch(host, number, RELEASE, MAX_RECORD)
+    record_sig = fetch(host, number, "release.json.sig", MAX_SIGNATURE)
+    channel_raw = fetch(host, number, "channel.json", MAX_RECORD)
+    channel_sig = fetch(host, number, "channel.json.sig", MAX_SIGNATURE)
+    if None in (record, record_sig, channel_raw, channel_sig):
+        return None
+    try:
+        verdict = checker.verify_release(record, record_sig, None, None, keys, source="a neighbour's release")
+        if verdict.state != "verified":
+            return None
+        channel = channel_of(checker, keys, channel_raw, channel_sig, verdict.release_id)
+    except Exception:                     # anything odd about a neighbour: it is simply not listed
+        return None
+    return {"url": f"http://{host}:{number}/", "channel": channel, "release_id": verdict.release_id}
+
+
+def release_order(release_id: str) -> tuple:
+    match = RELEASE_ID_RE.match(release_id)
+    return tuple(int(part) for part in match.groups()) if match else (0, 0, 0)
+
+
+def write_peers(peers: list[dict]) -> None:
+    """C7, written whole and swapped in with one rename; never through a link."""
+    path = peers_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.is_symlink() or path.parent.is_symlink():
+        raise OSError("the list of computers is a link")
+    data = (json.dumps({"schema": 1, "peers": peers}, indent=2) + "\n").encode("utf-8")
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
+    handle = os.open(temporary, flags, 0o644)
+    try:
+        os.write(handle, data)
+        os.fsync(handle)
+    finally:
+        os.close(handle)
+    os.replace(temporary, path)
+
+
+def forget_peers() -> None:
+    path = peers_path()
+    try:
+        if path.is_symlink() or path.exists():
+            path.unlink()
+    except OSError:
+        pass
+
+
+def online_allowed(tree: Path) -> bool:
+    """check C2 F9: secure-linux-kit-update's own rule for "Never check online" (online=no), read by the tool
+    beside this one. With it off, kit-update never asks another computer, so none is looked for either (no
+    sweep of the home network). When the rule cannot be read, nobody is looked for (never on a guess)."""
+    tool = Path(__file__).resolve().with_name("secure-linux-kit-update")
+    if not tool.is_file():
+        return True                       # no update tool here: its default (online) stands
+    try:
+        loader = importlib.machinery.SourceFileLoader("sl_kit_update_settings", str(tool))
+        module = types.ModuleType(loader.name)
+        module.__file__ = str(tool)
+        loader.exec_module(module)
+        return bool(module.online_allowed(tree))
+    except Exception:                     # noqa: BLE001 (any problem: do not look)
+        return False
+
+
+def find(tree: Path) -> int:
+    if at_home() and not online_allowed(tree):
+        forget_peers()
+        say("KIT SHARE: not looking for other computers - updates are set to never check online.")
+        return OK
+    if not at_home():
+        forget_peers()                    # computers from the home network are never asked anywhere else
+        say("KIT SHARE: not looking for other computers - this computer is not on its home network.")
+        return OK
+    keys = keys_folder(tree)
+    try:
+        checker = load_checker(keys)
+    except NotShared as exc:
+        forget_peers()
+        say(f"KIT SHARE: not looking for other computers - {exc}.")
+        return PROBLEM
+    if checker is None:
+        forget_peers()
+        say(f"KIT SHARE: {BRIDGE_TEXT}")
+        return OK
+    hosts = candidates()
+    found: list[dict] = []
+    if hosts:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(PROBE_WORKERS, len(hosts))) as pool:
+            for peer in pool.map(lambda item: check_peer(item[0], item[1], checker, keys), hosts):
+                if peer:
+                    found.append(peer)
+    found.sort(key=lambda peer: release_order(peer["release_id"]), reverse=True)    # newest release first
+    seen_at = datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0).isoformat()
+    peers = [{"url": peer["url"], "seen_at": seen_at, "channel": peer["channel"]} for peer in found]
+    if not at_home():                     # left home while looking
+        forget_peers()
+        return OK
+    try:
+        write_peers(peers)
+    except OSError as exc:
+        say(f"KIT SHARE: the list of computers could not be saved ({type(exc).__name__}).")
+        return PROBLEM
+    if peers:
+        say(f"KIT SHARE: found {len(peers)} other Secure Linux computer(s) at home that share updates.")
+    else:
+        say("KIT SHARE: no other Secure Linux computer at home shares updates right now.")
+    return OK
+
+
+# ------------------------------------------------------------------ start, stop, status, network
+def systemctl(*args: str) -> int:
+    program = os.environ.get("SL_KIT_SHARE_SYSTEMCTL") if TEST else None
+    command = [program] if program else ["systemctl"]
+    if program and program.endswith(".py"):
+        command = [sys.executable, program]
+    try:
+        return subprocess.run([*command, *args], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                              timeout=60).returncode
+    except (OSError, subprocess.SubprocessError):
+        return 1
+
+
+def firewall(add: bool) -> int:
+    """The sharing port, in the home zone only and only until the service stops (never saved)."""
+    if TEST or not shutil.which("firewall-cmd"):
+        return OK
+    try:
+        if subprocess.run(["firewall-cmd", "--state"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                          timeout=30).returncode != 0:
+            return OK
+        subprocess.run(["firewall-cmd", "--zone=home", ("--add-port" if add else "--remove-port") + f"={PORT}/tcp"],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return OK
+
+
+def is_root() -> bool:
+    return TEST or (hasattr(os, "geteuid") and os.geteuid() == 0)
+
+
+def as_root(command: str) -> None:
+    """Ask for the password once (polkit names exactly this tool and this command)."""
+    if is_root():
+        return
+    program = SELF if os.access(SELF, os.X_OK) else str(Path(__file__).resolve())
+    try:
+        os.execvp("pkexec", ["pkexec", program, command])
+    except OSError:
+        say("This needs your password, but the password helper (pkexec) is missing. Nothing was changed.")
+        sys.exit(PROBLEM)
+
+
+def start(tree: Path) -> int:
+    try:
+        Snapshot(tree)
+    except NotShared as exc:
+        say(f"Sharing updates was not turned on: {exc}" if exc.code != BRIDGE else BRIDGE_TEXT)
+        return exc.code
+    as_root("start")
+    flag = on_flag()
+    flag.parent.mkdir(parents=True, exist_ok=True)
+    flag.write_text("on\n", encoding="utf-8")
+    say("Sharing updates is on. Other Secure Linux computers at home can now get updates from this one, even "
+        "when the internet is down. They still check every file against the official signature.")
+    if at_home():
+        systemctl("start", SERVICE)
+    else:
+        say("This computer is not on its home network now, so sharing starts by itself when it is.")
+    return OK
+
+
+def stop() -> int:
+    as_root("stop")
+    try:
+        on_flag().unlink()
+    except FileNotFoundError:
+        pass
+    systemctl("stop", SERVICE)
+    say("Sharing updates is off. This computer no longer shares its updates. It can still get updates from "
+        "other computers at home that share theirs.")
+    return OK
+
+
+def network(tree: Path) -> int:
+    """The network changed (or a few hours passed): share only at home, and look again."""
+    if at_home():
+        if on_flag().is_file():
+            firewall(True)          # again: a firewall reload drops the port the service opened (runtime only)
+            systemctl("start", SERVICE)
+    else:
+        systemctl("stop", SERVICE)
+        firewall(False)
+    return find(tree)
+
+
+def status(tree: Path) -> int:
+    turned_on = on_flag().is_file()
+    say(f"Sharing updates with other computers at home: {'on' if turned_on else 'off'}.")
+    try:
+        snapshot = Snapshot(tree)
+        say(f"This computer can share {snapshot.release_id} (channel: {snapshot.channel}).")
+    except NotShared as exc:
+        say(BRIDGE_TEXT if exc.code == BRIDGE else f"This computer cannot share right now: {exc}")
+    say("This computer is on its home network." if at_home() else
+        "This computer is not on its home network, so nothing is shared and no other computer is asked.")
+    count = 0
+    try:
+        data = json.loads(peers_path().read_text(encoding="utf-8"))
+        count = len(data.get("peers") or []) if isinstance(data, dict) else 0
+    except (OSError, ValueError):
+        pass
+    say(f"Other Secure Linux computers at home that share updates: {count}.")
+    return OK
+
+
+# ------------------------------------------------------------------ command line
+def main(argv: list[str]) -> int:
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        say(__doc__.strip())
+        return OK if argv else USAGE
+    command, rest = argv[0], argv[1:]
+    tree = None
+    if rest[:1] == ["--tree"] and len(rest) == 2:
+        tree, rest = rest[1], []
+    if rest:
+        say(f"Unknown words after '{command}'. Try: secure-linux-kit-share --help")
+        return USAGE
+    folder = tree_path(tree)
+    if command == "start":
+        return start(folder)
+    if command == "stop":
+        return stop()
+    if command == "status":
+        return status(folder)
+    if command == "serve":
+        return serve(folder)
+    if command == "find":
+        return find(folder)
+    if command == "network":
+        return network(folder)
+    if command in ("firewall-open", "firewall-close"):
+        return firewall(command == "firewall-open")
+    say(f"Unknown command '{command}'. Try: secure-linux-kit-share --help")
+    return USAGE
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except KeyboardInterrupt:
+        sys.exit(PROBLEM)

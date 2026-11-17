@@ -1,0 +1,43 @@
+# Secure Linux (devices): let the person who is logged in use maker boards, 3D printers and USB radio sticks without a
+# password and without joining the dialout group. TAG+="uaccess" gives access to the person sitting at this computer
+# only, only while the device is plugged in. Installed to /etc/udev/rules.d/ by steps/53-device-extras.sh.
+# Covered: Arduino-type boards, Raspberry Pi Pico (also in boot mode), ESP32 boards, common serial chips, Prusa printers,
+# STM32 boards in boot mode (0483:df11) and RTL-SDR radio sticks (0bda:2832 and 0bda:2838).
+# Arduino
+ACTION!="remove", SUBSYSTEM=="usb", ATTR{idVendor}=="2341", TAG+="uaccess"
+ACTION!="remove", SUBSYSTEM=="tty", SUBSYSTEMS=="usb", ATTRS{idVendor}=="2341", TAG+="uaccess"
+# Arduino (dog hunter)
+ACTION!="remove", SUBSYSTEM=="usb", ATTR{idVendor}=="2a03", TAG+="uaccess"
+ACTION!="remove", SUBSYSTEM=="tty", SUBSYSTEMS=="usb", ATTRS{idVendor}=="2a03", TAG+="uaccess"
+# SparkFun
+ACTION!="remove", SUBSYSTEM=="usb", ATTR{idVendor}=="1b4f", TAG+="uaccess"
+ACTION!="remove", SUBSYSTEM=="tty", SUBSYSTEMS=="usb", ATTRS{idVendor}=="1b4f", TAG+="uaccess"
+# Adafruit
+ACTION!="remove", SUBSYSTEM=="usb", ATTR{idVendor}=="239a", TAG+="uaccess"
+ACTION!="remove", SUBSYSTEM=="tty", SUBSYSTEMS=="usb", ATTRS{idVendor}=="239a", TAG+="uaccess"
+# Raspberry Pi (Pico and its boot mode)
+ACTION!="remove", SUBSYSTEM=="usb", ATTR{idVendor}=="2e8a", TAG+="uaccess"
+ACTION!="remove", SUBSYSTEM=="tty", SUBSYSTEMS=="usb", ATTRS{idVendor}=="2e8a", TAG+="uaccess"
+# Espressif (ESP32)
+ACTION!="remove", SUBSYSTEM=="usb", ATTR{idVendor}=="303a", TAG+="uaccess"
+ACTION!="remove", SUBSYSTEM=="tty", SUBSYSTEMS=="usb", ATTRS{idVendor}=="303a", TAG+="uaccess"
+# WCH CH340 serial chip, common on cheap boards and 3D printers
+ACTION!="remove", SUBSYSTEM=="usb", ATTR{idVendor}=="1a86", TAG+="uaccess"
+ACTION!="remove", SUBSYSTEM=="tty", SUBSYSTEMS=="usb", ATTRS{idVendor}=="1a86", TAG+="uaccess"
+# Silicon Labs CP210x serial chip
+ACTION!="remove", SUBSYSTEM=="usb", ATTR{idVendor}=="10c4", TAG+="uaccess"
+ACTION!="remove", SUBSYSTEM=="tty", SUBSYSTEMS=="usb", ATTRS{idVendor}=="10c4", TAG+="uaccess"
+# FTDI serial chip
+ACTION!="remove", SUBSYSTEM=="usb", ATTR{idVendor}=="0403", TAG+="uaccess"
+ACTION!="remove", SUBSYSTEM=="tty", SUBSYSTEMS=="usb", ATTRS{idVendor}=="0403", TAG+="uaccess"
+# Teensy and similar
+ACTION!="remove", SUBSYSTEM=="usb", ATTR{idVendor}=="16c0", TAG+="uaccess"
+ACTION!="remove", SUBSYSTEM=="tty", SUBSYSTEMS=="usb", ATTRS{idVendor}=="16c0", TAG+="uaccess"
+# Prusa 3D printers
+ACTION!="remove", SUBSYSTEM=="usb", ATTR{idVendor}=="2c99", TAG+="uaccess"
+ACTION!="remove", SUBSYSTEM=="tty", SUBSYSTEMS=="usb", ATTRS{idVendor}=="2c99", TAG+="uaccess"
+# STM32 boot mode
+ACTION!="remove", SUBSYSTEM=="usb", ATTR{idVendor}=="0483", ATTR{idProduct}=="df11", TAG+="uaccess"
+# RTL-SDR radio sticks
+ACTION!="remove", SUBSYSTEM=="usb", ATTR{idVendor}=="0bda", ATTR{idProduct}=="2832", TAG+="uaccess"
+ACTION!="remove", SUBSYSTEM=="usb", ATTR{idVendor}=="0bda", ATTR{idProduct}=="2838", TAG+="uaccess"

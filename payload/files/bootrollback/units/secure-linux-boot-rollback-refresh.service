@@ -1,0 +1,12 @@
+# Secure Linux boot rollback: rebuilds the "Go back to an earlier day" boot menu list.
+# Installed only by `secure-linux-boot-rollback on`; removed by `off`. Never touches the normal start entries.
+[Unit]
+Description=Secure Linux: keep the "go back to an earlier day" boot menu up to date
+ConditionPathExists=/boot/secure-linux-rollback/state
+ConditionKernelCommandLine=!rd.securelinux.rollback
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/secure-linux-boot-rollback refresh --quiet
+Nice=10
+IOSchedulingClass=idle

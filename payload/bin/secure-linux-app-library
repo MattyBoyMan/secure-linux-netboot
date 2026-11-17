@@ -1,0 +1,352 @@
+#!/bin/bash
+# secure-linux-app-library: optional apps from the App Library (a small list of apps, installed only when online).
+#   secure-linux-app-library list             show the apps offered on this computer and which ones are chosen
+#   secure-linux-app-library choose           open the Optional apps window (pick apps, see sizes, save)
+#   secure-linux-app-library install NAME     install one app from the list now (asks for your password once)
+#   secure-linux-app-library run              install the chosen apps (used by setup and repair)
+#   secure-linux-app-library retry            install apps that were waiting for internet (used by a timer)
+#   secure-linux-app-library save NAME...     save which apps are chosen (used by the Optional apps window)
+#   secure-linux-app-library size [NAME...]   how much disk space the apps need (default: what setup installs)
+#   secure-linux-app-library check            check the app list files for mistakes
+# Online, an app is fetched from the internet. With no internet it is installed from the verified copy on the Secure
+# Linux drive when the drive has one; otherwise it waits and is installed on its own when the internet is back.
+# An app that needs internet and finds none is never an error: it waits and is installed later, on its own.
+# A Python app (pipx) is installed only at the fixed version in its checked list (share/pipx-pins/NAME.txt): pip then
+# refuses any other version and any file whose SHA-256 is not on the list, and never builds code while installing.
+set -u
+export LC_ALL=C
+SL_ROOT=${SL_ROOT:-/usr/local/lib/secure-linux}
+# shellcheck source=../lib/common.sh
+. "$SL_ROOT/lib/common.sh"
+
+case "${1:-}" in -h|--help) sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;; esac
+
+SELF=/usr/local/bin/secure-linux-app-library; [ -x "$SELF" ] || SELF=$(readlink -f "$0")   # polkit names /usr/local/bin
+HERE=$(dirname "$(readlink -f "$0")")
+LIBPY=""
+for _d in "$HERE/../lib" "$SL_ROOT/lib" /usr/local/lib/secure-linux/lib; do
+  [ -r "$_d/app_library.py" ] && { LIBPY=$_d/app_library.py; break; }
+done
+APPS_DIR=$SL_ROOT/setup-data/apps.d
+[ -d "$APPS_DIR" ] || APPS_DIR=/usr/local/lib/secure-linux/setup-data/apps.d
+CHOICES=$SL_ETC/app-library.list
+RETRY=$SL_STATE/app-library-retry
+PIPX_HOME_DIR=/opt/secure-linux/pipx
+PIPX_BIN_DIR=/usr/local/bin
+
+[ -n "$LIBPY" ] || { echo "The App Library's list reader is missing. Run 'Repair setup' from Secure Linux Status." >&2; exit 1; }
+command -v python3 >/dev/null 2>&1 || { echo "Python 3 is needed for the App Library." >&2; exit 1; }
+py() { python3 "$LIBPY" "$@"; }
+
+_profile() { if sl_is_atomic; then echo atomic; else sl_profile; fi; }
+AL_ONLINE=""
+_al_online() {   # asked once per run
+  if [ -z "$AL_ONLINE" ]; then if sl_online; then AL_ONLINE=yes; else AL_ONLINE=no; fi; fi
+  [ "$AL_ONLINE" = yes ]
+}
+
+# ---------------------------------------------------------------- the waiting list (apps that need internet first)
+_al_mark()   { mkdir -p "$SL_STATE"; grep -qxF -e "$1" "$RETRY" 2>/dev/null || printf '%s\n' "$1" >> "$RETRY"; chmod 644 "$RETRY" 2>/dev/null; return 0; }
+_al_unmark() {
+  [ -f "$RETRY" ] || return 0
+  grep -vxF -e "$1" "$RETRY" > "$RETRY.new" 2>/dev/null
+  if [ -s "$RETRY.new" ]; then mv -f "$RETRY.new" "$RETRY"; else rm -f "$RETRY.new" "$RETRY"; fi
+  return 0
+}
+
+# ---------------------------------------------------------------- is it installed / install it
+_al_installed() {   # _al_installed KIND ID
+  case $1 in
+    flatpak) command -v flatpak >/dev/null 2>&1 && flatpak info --system "$2" >/dev/null 2>&1 ;;
+    rpm)     rpm -q "$2" >/dev/null 2>&1 || rpm -q --whatprovides "$2" >/dev/null 2>&1 ;;
+    pipx)    command -v pipx >/dev/null 2>&1 &&
+             PIPX_HOME=$PIPX_HOME_DIR PIPX_BIN_DIR=$PIPX_BIN_DIR pipx list --short 2>/dev/null | awk '{print $1}' | grep -qxF -e "$2" ;;
+    *) return 1 ;;
+  esac
+}
+_al_pin() {   # _al_pin ID -> prints the checked version list for a pipx app. 0 found, 1 none, 2 there but not right
+  local d f ver
+  for d in "$HERE/../share/pipx-pins" "$SL_ROOT/share/pipx-pins" /usr/local/lib/secure-linux/share/pipx-pins; do
+    f=$d/$1.txt
+    [ -f "$f" ] || continue
+    ver=$(sed -n "s/^# app: $1==\([A-Za-z0-9._+!-]*\)\$/\1/p" "$f" | head -1)
+    [ -n "$ver" ] || return 2
+    grep -qxE "$1==$ver( --hash=sha256:[0-9a-f]{64})+" "$f" || return 2
+    if grep -v '^#' "$f" | grep -v '^[[:space:]]*$' | grep -qvxE '[A-Za-z0-9._-]+==[^ ]+( --hash=sha256:[0-9a-f]{64})+'; then return 2; fi
+    printf '%s\n' "$f"; return 0
+  done
+  return 1
+}
+
+_al_shared_pip() {   # _al_shared_pip LIST   pipx's own "shared" pip, made from the checked list before a checked install
+  # pipx keeps one shared Python folder for all its apps. When it makes that folder it fetches the newest pip from the
+  # internet with no fixed version, which pip itself refuses while every file must match the list
+  # (PIP_REQUIRE_HASHES=1), so a checked app never installed on a fresh pipx. Here the shared folder is made first:
+  # a plain Python folder (its starting pip comes with this computer's own Python, nothing downloaded) is moved to the
+  # pip version on the checked list, every file checked by its SHA-256. pipx then finds its shared pip ready and fresh
+  # and fetches nothing itself. If pipx cannot say where that folder is, nothing is done here: pipx then stops by
+  # itself with pip's hash error, so nothing unchecked is ever installed.
+  local pin=$1 shared py req rc=0
+  shared=$(PIPX_HOME=$PIPX_HOME_DIR PIPX_BIN_DIR=$PIPX_BIN_DIR pipx environment --value PIPX_SHARED_LIBS 2>/dev/null | tail -n 1)
+  py=$(PIPX_HOME=$PIPX_HOME_DIR PIPX_BIN_DIR=$PIPX_BIN_DIR pipx environment --value PIPX_DEFAULT_PYTHON 2>/dev/null | tail -n 1)
+  case $shared in /*) ;; *) return 1 ;; esac
+  case $py in /*) ;; *) py=$(command -v python3) || return 1 ;; esac
+  req=$(mktemp) || return 1
+  if ! grep -E '^pip==[^ ]+( --hash=sha256:[0-9a-f]{64})+$' "$pin" > "$req"; then rm -f "$req"; return 1; fi
+  if ! "$shared/bin/python" -c 'import pip' >/dev/null 2>&1; then
+    "$py" -m venv --clear "$shared" >/dev/null 2>&1 || rc=1
+  fi
+  if [ "$rc" -eq 0 ]; then
+    env -u PIP_CONSTRAINT PIP_REQUIRE_HASHES=1 PIP_ONLY_BINARY=:all: PIP_NO_INPUT=1 \
+      "$shared/bin/python" -m pip install --quiet --disable-pip-version-check --no-deps --require-hashes -r "$req" || rc=1
+  fi
+  rm -f "$req"
+  [ "$rc" -eq 0 ] && touch "$shared/bin/pip"   # pipx refreshes its shared pip only when this file is 30 days old
+  return "$rc"
+}
+
+_al_install_one() {   # _al_install_one KIND ID   one install attempt; never writes a line to the failure list
+  local kind=$1 id=$2 scratch rc=0 pin prc
+  scratch=$(mktemp) || return 1
+  case $kind in
+    flatpak) SL_FAILS=$scratch sl_flatpak_install "$id" || rc=$? ;;
+    rpm)     SL_FAILS=$scratch sl_dnf_install "$id" || rc=$? ;;
+    pipx)
+      if ! command -v pipx >/dev/null 2>&1; then SL_FAILS=$scratch sl_dnf_install pipx || true; fi
+      pin=$(_al_pin "$id"); prc=$?
+      if [ "$prc" -eq 2 ]; then
+        echo "The checked version list for $id in Secure Linux's own files is damaged, so it was not installed. Run 'Repair setup' from Secure Linux Status."
+        rc=1
+      elif ! command -v pipx >/dev/null 2>&1; then rc=1
+      elif [ "$prc" -eq 0 ]; then
+        echo ">> pipx install $id (the fixed version in its checked list; every file is checked by its SHA-256)"
+        _al_shared_pip "$pin" || echo "   (pipx's shared part could not be prepared from the checked list; pipx stops if it needs anything unchecked)"
+        PIP_CONSTRAINT=$pin PIP_REQUIRE_HASHES=1 PIP_ONLY_BINARY=:all: PIP_NO_INPUT=1           PIPX_HOME=$PIPX_HOME_DIR PIPX_BIN_DIR=$PIPX_BIN_DIR pipx install "$id" || rc=$?
+      else
+        echo ">> pipx install $id"
+        PIP_ONLY_BINARY=:all: PIP_NO_INPUT=1 PIPX_HOME=$PIPX_HOME_DIR PIPX_BIN_DIR=$PIPX_BIN_DIR pipx install "$id" || rc=$?
+      fi ;;
+    *) rc=1 ;;
+  esac
+  rm -f "$scratch"
+  [ "$rc" -eq 0 ] && _al_installed "$kind" "$id"
+}
+
+_al_from_bundle() {   # _al_from_bundle KIND ID   offline: install from the verified copy on the drive, if the drive has one
+  local bk scratch rc=0
+  case $1 in flatpak) bk=flatpak ;; rpm) bk=system ;; *) return 1 ;; esac
+  scratch=$(mktemp) || return 1
+  SL_FAILS=$scratch sl_offline_bundle_install "$bk" "$(sl_arch)" "$2" >/dev/null 2>&1 || rc=$?
+  rm -f "$scratch"
+  [ "$rc" -eq 0 ] && _al_installed "$1" "$2"
+}
+
+# _al_handle KIND ID TITLE   returns 0 installed (or already there), 1 could not install now (will retry),
+#                            3 waiting for internet, 4 this computer can not use it (deliberate skip)
+_al_handle() {
+  local kind=$1 id=$2 title=$3
+  # serverapp and kittool rows are only listed here: setup, retry and "install" never try to add them as packages.
+  case $kind in serverapp|kittool) _al_unmark "$id"; return 4 ;; esac
+  if _al_installed "$kind" "$id"; then sl_unskip_app "$id"; _al_unmark "$id"; return 0; fi
+  case $kind in
+    rpm|pipx)
+      if declare -F sl_distro >/dev/null && [ "$kind" = rpm ]; then
+        sl_skip_app "$id" "$title comes as a Fedora package and this computer does not use Fedora packages"; _al_unmark "$id"; return 4
+      fi
+      if sl_is_atomic; then
+        sl_skip_app "$id" "$title can't be added to this type of system (it is a Fedora package or a Python tool)"; _al_unmark "$id"; return 4
+      fi ;;
+    flatpak)
+      if sl_is_arm && ! sl_flatpak_has_build "$id"; then
+        sl_skip_app "$id" "Flathub has no version of this app for Apple Silicon (ARM) computers"; _al_unmark "$id"; return 4
+      fi ;;
+  esac
+  if ! _al_online; then
+    if _al_from_bundle "$kind" "$id"; then
+      sl_unskip_app "$id"; _al_unmark "$id"; echo "$title is installed from the copy on the Secure Linux drive."; return 0
+    fi
+    sl_skip_app "$id" "Will install when this computer is online"
+    _al_mark "$id"; return 3
+  fi
+  echo "Installing $title ..."
+  if _al_install_one "$kind" "$id"; then
+    sl_unskip_app "$id"; _al_unmark "$id"; echo "$title is installed."; return 0
+  fi
+  sl_skip_app "$id" "Could not be installed just now. Secure Linux will try again later"
+  _al_mark "$id"; return 1
+}
+
+_free_mb() { df -Pm "$SL_STATE" 2>/dev/null | awk 'NR==2 {print $4+0}'; }
+
+_al_lock() {   # one install job at a time (setup, the timer and a person asking can overlap)
+  command -v flock >/dev/null 2>&1 || return 0
+  mkdir -p "$SL_STATE" 2>/dev/null
+  exec 9>"$SL_STATE/app-library.lock" && flock -w 1800 9
+}
+
+_need_root() {   # _need_root ARGS...   re-run this tool with the administrator password when not root
+  [ "$(id -u)" -eq 0 ] && return 0
+  exec pkexec "$SELF" "$@"
+}
+
+_only_root() {   # run and retry belong to setup and the timer; a person asks for one app with: install NAME
+  [ "$(id -u)" -eq 0 ] && return 0
+  echo "This part is run by setup and by a timer. To add one app yourself, use: secure-linux-app-library install NAME" >&2
+  exit 1
+}
+
+# ---------------------------------------------------------------- commands
+cmd_check() {
+  local out rc=0
+  out=$(py validate --apps-dir "$APPS_DIR") || rc=$?
+  printf '%s\n' "$out" | while IFS=$'\t' read -r a b; do
+    case $a in PROBLEM) echo "Problem: $b" ;; ROWS) echo "$b apps in the list." ;; esac
+  done
+  [ $rc -eq 0 ] && echo "The app list has no mistakes." || echo "The app list has mistakes (shown above)."
+  return $rc
+}
+
+cmd_list() {
+  local state id kind title desc size mb mark
+  py list --apps-dir "$APPS_DIR" --profile "$(_profile)" --arch "$(sl_arch)" --choices "$CHOICES" |
+  while IFS=$'\t' read -r state id kind title desc size mb; do
+    [ "$state" = on ] && mark='[x]' || mark='[ ]'
+    printf '%s %-32s %-9s %s\n      %s\n' "$mark" "$id" "$size" "$title" "$desc"
+  done
+}
+
+cmd_run() {   # install what is chosen for this computer. Never fails setup: waiting or skipped apps are not errors.
+  local action id kind title size reason plan rc
+  _al_lock
+  plan=$(py plan --apps-dir "$APPS_DIR" --profile "$(_profile)" --arch "$(sl_arch)" --choices "$CHOICES") || {
+    echo "The App Library list could not be read. The optional apps are skipped this time."; return 0; }
+  while IFS=$'\t' read -r action id kind title size reason; do
+    [ -n "$id" ] || continue
+    if [ "$action" = skip ]; then sl_skip_app "$id" "$reason"; _al_unmark "$id"; continue; fi
+    _al_handle "$kind" "$id" "$title"; rc=$?
+    [ $rc -ne 0 ] && echo "  ($title: not installed yet)"
+  done <<< "$plan"
+  if [ -s "$RETRY" ]; then echo "Some optional apps are waiting for internet. They install on their own when it is back."; fi
+  return 0
+}
+
+cmd_retry() {
+  local id row kind title
+  [ -s "$RETRY" ] || { echo "No apps are waiting."; return 0; }
+  _al_online || { echo "Still no internet. The apps keep waiting."; return 0; }
+  _al_lock
+  while IFS= read -r id; do
+    [ -n "$id" ] || continue
+    py check-id -- "$id" 2>/dev/null || { _al_unmark "$id"; continue; }
+    row=$(py show --apps-dir "$APPS_DIR" --id "$id") || { _al_unmark "$id"; continue; }   # no longer in the list
+    IFS=$'\t' read -r _ kind title _ <<< "$row"
+    _al_handle "$kind" "$id" "$title" || true
+  done < <(cat "$RETRY")
+  return 0
+}
+
+cmd_install() {
+  local id=${1:-} row kind title desc size profiles dflt arch rc free
+  if [ -z "$id" ]; then echo "Say which app to install, for example: secure-linux-app-library install borgbackup" >&2; return 2; fi
+  if ! py check-id -- "$id" 2>/dev/null; then
+    echo "That is not a name the App Library can install. Run 'secure-linux-app-library list' to see the apps." >&2; return 2
+  fi
+  if ! row=$(py show --apps-dir "$APPS_DIR" --id "$id"); then
+    echo "There is no app called '$id' in the App Library. Run 'secure-linux-app-library list' to see the apps." >&2; return 2
+  fi
+  IFS=$'\t' read -r _ kind title desc size profiles dflt arch <<< "$row"
+  case $kind in
+    serverapp) echo "$title is a home-server app. Set it up from the Home-server apps window, or with: secure-linux-server-apps install $id"; return 0 ;;
+    kittool)   echo "$title is already on this computer. Open it from the app launcher; it sets itself up the first time you open it."; return 0 ;;
+  esac
+  if [ "$arch" = x86_64 ] && [ "$(sl_arch)" != x86_64 ]; then
+    echo "$title only has a version for Intel and AMD computers, so it can't be installed on this one." >&2; return 4
+  fi
+  free=$(_free_mb)
+  if [ -n "$free" ] && [ "$free" -lt "$size" ]; then
+    echo "$title needs about $size MB and this computer has only $free MB free. Free some space first (Secure Linux Status can help), then try again." >&2
+    return 5
+  fi
+  _need_root install "$id"
+  _al_lock
+  echo "Installing $title (about $size MB). This can take a few minutes."
+  _al_handle "$kind" "$id" "$title"; rc=$?
+  case $rc in
+    0) echo "$title is ready to use." ;;
+    3) echo "This computer is not online right now. $title will be installed on its own when the internet is back." >&2 ;;
+    4) echo "$title can't be installed on this computer." >&2 ;;
+    *) echo "$title could not be installed just now. Secure Linux will try again later; nothing else was changed." >&2 ;;
+  esac
+  return $rc
+}
+
+cmd_size() {   # size [NAME...]
+  local out rc=0 a b c d
+  out=$(py size --apps-dir "$APPS_DIR" --profile "$(_profile)" --arch "$(sl_arch)" --choices "$CHOICES" ${1+--ids "$@"}) || rc=$?
+  [ $rc -eq 0 ] || { echo "One of those names is not in the App Library list." >&2; return 2; }
+  while IFS=$'\t' read -r a b c d; do
+    case $a in
+      APP) printf '  %-34s about %s MB\n' "$c" "$d" ;;
+      TOTAL_MB) printf 'Together: about %s MB (%s GB)\n' "$b" "$(awk -v m="$b" 'BEGIN {printf "%.1f", m/1024}')" ;;
+    esac
+  done <<< "$out"
+}
+
+cmd_save() {   # save NAME...   exactly these apps are chosen (of the ones offered here)
+  local id
+  for id in "$@"; do
+    py check-id -- "$id" 2>/dev/null || { echo "That is not an app name this list can use." >&2; return 2; }
+  done
+  _need_root save "$@"
+  mkdir -p "$SL_ETC"
+  py save --apps-dir "$APPS_DIR" --profile "$(_profile)" --arch "$(sl_arch)" --choices "$CHOICES" --ids "$@" || return 2
+  echo "Your choices are saved. They are used next time setup or repair runs, or when you ask for one app to be installed now."
+}
+
+cmd_choose() {
+  local lines state id kind title desc size mb args=() picked=() ans n=0 ids=() states=() rc
+  lines=$(py list --apps-dir "$APPS_DIR" --profile "$(_profile)" --arch "$(sl_arch)" --choices "$CHOICES") || return 1
+  [ -n "$lines" ] || { echo "There are no optional apps for this computer yet."; return 0; }
+  if [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ] && command -v zenity >/dev/null 2>&1 && [ -z "${SL_APPLIB_TEXT:-}" ]; then
+    while IFS=$'\t' read -r state id kind title desc size mb; do
+      [ "$state" = on ] && args+=(TRUE) || args+=(FALSE)
+      args+=("$id" "$title" "$desc" "$size")
+    done <<< "$lines"
+    ans=$(zenity --list --checklist --title="Optional apps" \
+      --text="Tick the extra apps you want. Each one is installed only when this computer is online. Nothing here is needed for the computer to work." \
+      --column="Install" --column="id" --column="App" --column="What it does" --column="Size" \
+      --hide-column=2 --print-column=2 --separator=$'\n' --width=900 --height=560 --ok-label="Save my choices" \
+      "${args[@]}" 2>/dev/null)
+    rc=$?
+    [ $rc -eq 0 ] || { echo "Nothing was changed."; return 0; }
+    while IFS= read -r id; do [ -n "$id" ] && picked+=("$id"); done <<< "$ans"
+  else
+    while IFS=$'\t' read -r state id kind title desc size mb; do
+      n=$((n + 1)); ids+=("$id"); states+=("$state")
+      printf '%2d. [%s] %s (%s)\n      %s\n' "$n" "$([ "$state" = on ] && echo x || echo ' ')" "$title" "$size" "$desc"
+    done <<< "$lines"
+    echo
+    echo "Type the numbers of the apps you want, with spaces between, then press Enter."
+    echo "Press Enter alone to keep your choices as they are."
+    IFS= read -r ans || ans=""
+    [ -n "${ans// /}" ] || { echo "Nothing was changed."; return 0; }
+    for id in $ans; do
+      case $id in ''|*[!0-9]*) echo "'$id' is not a number from the list." >&2; return 2 ;; esac
+      if [ "$id" -lt 1 ] || [ "$id" -gt "$n" ]; then echo "$id is not on the list." >&2; return 2; fi
+      picked+=("${ids[$((id - 1))]}")
+    done
+  fi
+  cmd_save ${picked[@]+"${picked[@]}"}
+}
+
+case "${1:-}" in
+  list)    cmd_list ;;
+  choose)  cmd_choose ;;
+  install) shift; cmd_install "${1:-}" ;;
+  run)     _only_root; cmd_run ;;
+  retry)   _only_root; cmd_retry ;;
+  save)    shift; cmd_save "$@" ;;
+  size)    shift; cmd_size "$@" ;;
+  check)   cmd_check ;;
+  ""|*)    echo "Usage: secure-linux-app-library list | choose | install NAME | run | retry | save NAME... | size [NAME...] | check" >&2; exit 2 ;;
+esac

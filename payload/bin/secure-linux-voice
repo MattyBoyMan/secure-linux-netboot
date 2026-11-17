@@ -1,0 +1,725 @@
+#!/usr/bin/env python3
+"""secure-linux-voice: talk to your private AI and hear it answer. Everything runs on this computer.
+
+  secure-linux-voice            talk: press Enter, speak, press Enter again. The AI answers out loud.
+  secure-linux-voice talk       same as above
+  secure-linux-voice ask TEXT   type a question instead of speaking; the answer is read out loud
+  secure-linux-voice say TEXT   read some text out loud (no AI)
+  secure-linux-voice setup      get what is missing (asks you first, each download is asked about once)
+  secure-linux-voice status     show what is ready and what is missing (add --json for a machine-readable list)
+  secure-linux-voice remove     delete the voice files this tool downloaded (asks first)
+  secure-linux-voice --explain  say in plain words what is stored and what leaves this computer
+  options: --yes (answer "yes" to the download questions), --no-speak (show the answer, do not read it out),
+           --model NAME (which Ollama model to ask), --pause (wait for Enter before closing a window), --help
+
+What is used, all free:
+  - Listening: Whisper "tiny.en" through the pipx package whisper-ctranslate2 0.5.9 (about 75 MB of model).
+  - Thinking: your own Ollama on this computer (127.0.0.1). No cloud account.
+  - Speaking: Piper, voice en_GB-alba-medium, through the pipx package piper-tts 1.8.0 (about 63 MB of voice).
+  The two pipx packages are installed only at these fixed versions, from the checked version list in Secure Linux's
+  own files (share/pipx-pins): pip refuses any other version and any file whose SHA-256 is not on the list.
+  - Microphone and speakers: arecord and aplay from the Fedora package alsa-utils.
+Your recording is kept in a private temporary folder only until it has been turned into text, then deleted.
+Exit code: 0 = ok, 1 = something is missing or failed (the message says what to do), 2 = wrong use.
+"""
+import hashlib
+import json
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import urllib.error
+import urllib.parse
+import urllib.request
+
+VERSION = 1
+FEDORA_PACKAGES = ["alsa-utils"]                   # arecord (microphone) and aplay (speakers)
+PIPX_PACKAGES = {"whisper-ctranslate2": "whisper-ctranslate2", "piper-tts": "piper-tts"}
+PIPX_VERSIONS = {"whisper-ctranslate2": "0.5.9", "piper-tts": "1.8.0"}     # must match share/pipx-pins/<name>.txt
+_HERE = os.path.dirname(os.path.realpath(__file__))
+PIN_DIRS = [os.path.join(_HERE, "..", "share", "pipx-pins"),
+            os.path.join(os.environ.get("SL_ROOT") or "/usr/local/lib/secure-linux", "share", "pipx-pins"),
+            "/usr/local/lib/secure-linux/share/pipx-pins"]
+PIPX_SIZE_TEXT = "about 250 MB"                    # approximate: Python libraries for speech
+
+HF = "https://huggingface.co"
+# Each model file: name on disk, download address, exact size in bytes, SHA-256. Every address names one fixed
+# commit of the model's page (never the moving "main"), and every file has its SHA-256 (checked 2026-11-17).
+STT_NAME = "tiny.en"
+STT_REV = "0d3d19a32d3338f10357c0889762bd8d64bbdeba"           # Systran/faster-whisper-tiny.en
+STT_BASE = HF + "/Systran/faster-whisper-tiny.en/resolve/" + STT_REV + "/"
+STT_FILES = [
+    ("config.json", STT_BASE + "config.json", 2317, "14b1b421a90349bc551b881461426b561a874049cb9e4c4864f2ca384f6a7cc5"),
+    ("vocabulary.txt", STT_BASE + "vocabulary.txt", 422309,
+     "ff77588746d3a2595d32ab5b69ffd7b95ce2441ac57533cb66fc3eb575a115cf"),
+    ("tokenizer.json", STT_BASE + "tokenizer.json", 2128466,
+     "929c5252409436dce1b38a75d1abbcb5e132d170d8e324e4e04ed915fa2d22df"),
+    ("model.bin", STT_BASE + "model.bin", 75537502,
+     "1a5afae06a4db91c975c9a9d78be5cc110ee4ea022ad57d55492e4550e936b2a"),
+]
+VOICE_NAME = "en_GB-alba-medium"
+VOICE_REV = "e9ab671f2a0e50a701b34361136ba3e6a3a9eb0c"         # rhasspy/piper-voices
+VOICE_BASE = HF + "/rhasspy/piper-voices/resolve/" + VOICE_REV + "/en/en_GB/alba/medium/"
+VOICE_FILES = [
+    (VOICE_NAME + ".onnx", VOICE_BASE + "en_GB-alba-medium.onnx", 63221984,
+     "1f9da809b6da1ef4190bb5dd6cce4f4af803274539e9cf9e0693085150bac3d7"),
+    (VOICE_NAME + ".onnx.json", VOICE_BASE + "en_GB-alba-medium.onnx.json", 5471,
+     "6214603a0dd60e9dcd05502e23ef07fbe3d9af36d3189c8cc3eb129e1a099d6f"),
+]
+MODEL_SIZE_TEXT = {"speech": "about 75 MB", "voice": "about 63 MB"}
+
+OLLAMA_DEFAULT = "http://127.0.0.1:11434"
+MAX_RECORD_SECONDS = 60
+SYSTEM_PROMPT = ("You are Matt, a friendly, calm and professional helper on the Secure Linux computer. "
+                 "You are being read out loud, so answer in plain spoken English: short sentences, no lists, "
+                 "no markdown, no code blocks. Keep it under four sentences unless asked for more. "
+                 "You can only talk. You never run commands or change anything on the computer. "
+                 "If someone needs something done, explain the steps simply and let them do it.")
+
+EXPLAIN = """What this does, in plain words:
+  1. You press Enter and speak. The microphone recording goes into a private temporary folder that only you can open.
+  2. Whisper (running here, not online) turns your voice into text. The recording is then deleted. It is never kept.
+  3. The text goes to Ollama, the AI running on THIS computer (address 127.0.0.1). It never goes to the internet.
+  4. The answer is spoken by Piper, also running here. The spoken file is deleted afterwards.
+  5. Nothing is saved: no recordings, no chat log. When you close the window the conversation is gone.
+Downloads happen only after you say yes, one thing at a time: two small Python programs (pipx), the listening
+model (about 75 MB) and the voice (about 63 MB). They come from PyPI and Hugging Face. Each file is checked
+against a fixed version and fingerprint kept in Secure Linux's own files, and they are kept in your own folder (""" + "~/.local/share/secure-linux/voice" + """).
+The AI here can only talk. It cannot run commands or change your computer.
+Nothing here costs money and there is no account."""
+
+
+# ---------------------------------------------------------------- plain helpers
+def home_dir():
+    """Where this tool keeps what it downloads. A test may set SL_VOICE_HOME to a throw-away folder."""
+    override = os.environ.get("SL_VOICE_HOME")
+    if override:
+        return override
+    base = os.environ.get("XDG_DATA_HOME") or os.path.join(os.path.expanduser("~"), ".local", "share")
+    return os.path.join(base, "secure-linux", "voice")
+
+
+def models_dir(kind):
+    return os.path.join(home_dir(), "models", kind)
+
+
+def pipx_env():
+    env = dict(os.environ)
+    env["PIPX_HOME"] = os.path.join(home_dir(), "pipx")
+    env["PIPX_BIN_DIR"] = os.path.join(home_dir(), "bin")
+    return env
+
+
+def pin_file(pkg):
+    """The checked version list for one pipx package (share/pipx-pins/<name>.txt), or None when there is none."""
+    want = "# app: %s==%s" % (pkg, PIPX_VERSIONS.get(pkg, ""))
+    for folder in PIN_DIRS:
+        path = os.path.join(folder, pkg + ".txt")
+        try:
+            with open(path, encoding="utf-8") as fh:
+                lines = fh.read().splitlines()
+        except OSError:
+            continue
+        body = [line for line in lines if line.strip() and not line.startswith("#")]
+        if want in lines and body and all(re.search(r"^[A-Za-z0-9._-]+==\S+( --hash=sha256:[0-9a-f]{64})+$", line)
+                                          for line in body):
+            return os.path.abspath(path)
+        return None                     # a list that is there but not right is never replaced by another one
+    return None
+
+
+bootstrap_run = subprocess.run     # runs the steps that prepare pipx's shared pip (kept apart from the install itself)
+
+
+def prepare_shared_pip(pipx, pin, env):
+    """Make pipx's own "shared" pip from the checked list before a checked install.
+
+    pipx keeps one shared Python folder for its apps. When it makes that folder it fetches the newest pip from the
+    internet with no fixed version, which pip refuses while every file must match the list (PIP_REQUIRE_HASHES=1),
+    so the two speech programs never installed on a fresh pipx. Here the folder is made first: a plain Python folder
+    (its starting pip comes with this computer's own Python, nothing downloaded) is moved to the pip version on the
+    checked list, every file checked by its SHA-256. pipx then finds its shared pip ready and fetches nothing itself.
+    Returns False when pipx cannot say where that folder is: pipx then stops by itself with pip's hash error, so
+    nothing unchecked is ever installed."""
+    def ask(name):
+        try:
+            res = bootstrap_run([pipx, "environment", "--value", name], env=env, capture_output=True, text=True,
+                                timeout=120)
+        except (OSError, subprocess.SubprocessError):
+            return ""
+        lines = (res.stdout or "").strip().splitlines()
+        return lines[-1].strip() if res.returncode == 0 and lines else ""
+
+    shared = ask("PIPX_SHARED_LIBS")
+    python = ask("PIPX_DEFAULT_PYTHON") or shutil.which("python3") or ""
+    if not all(p.startswith("/") or os.path.isabs(p) for p in (shared, python)):    # a full path, never a guess
+        return False
+    try:
+        with open(pin, encoding="utf-8") as fh:
+            want = [line for line in fh.read().splitlines()
+                    if re.search(r"^pip==\S+( --hash=sha256:[0-9a-f]{64})+$", line)]
+    except OSError:
+        return False
+    if len(want) != 1:
+        return False
+    clean = {k: v for k, v in env.items() if k != "PIP_CONSTRAINT"}
+    clean.update({"PIP_REQUIRE_HASHES": "1", "PIP_ONLY_BINARY": ":all:", "PIP_NO_INPUT": "1"})
+    shared_python = os.path.join(shared, "bin", "python")
+    try:
+        if not (os.path.isfile(shared_python)
+                and bootstrap_run([shared_python, "-c", "import pip"], env=clean, capture_output=True).returncode == 0):
+            if bootstrap_run([python, "-m", "venv", "--clear", shared], env=clean, capture_output=True).returncode != 0:
+                return False
+        fd, req = tempfile.mkstemp(prefix="shared-pip-", suffix=".txt")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(want[0] + "\n")
+            rc = bootstrap_run([shared_python, "-m", "pip", "install", "--quiet", "--disable-pip-version-check",
+                                "--no-deps", "--require-hashes", "-r", req], env=clean).returncode
+        finally:
+            os.unlink(req)
+        if rc != 0:
+            return False
+        os.utime(os.path.join(shared, "bin", "pip"))     # pipx refreshes its shared pip only when this is 30 days old
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return True
+
+
+def pinned_pipx_env(pin):
+    """pipx with pip held to the checked list: that exact version, every file by its SHA-256, ready-made files only."""
+    env = pipx_env()
+    env.update({"PIP_CONSTRAINT": pin, "PIP_REQUIRE_HASHES": "1", "PIP_ONLY_BINARY": ":all:", "PIP_NO_INPUT": "1"})
+    return env
+
+
+def say(text=""):
+    print(text, flush=True)
+
+
+def loopback_url(url):
+    """Only an address on THIS computer is ever used for the AI. Anything else falls back to the default."""
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme == "http" and parsed.hostname in ("127.0.0.1", "localhost", "::1"):
+        return url.rstrip("/")
+    return OLLAMA_DEFAULT
+
+
+def ollama_url():
+    return loopback_url(os.environ.get("SL_VOICE_OLLAMA", OLLAMA_DEFAULT))
+
+
+def model_base_ok(url):
+    """Model files come from https (or, for a test only, a loopback http address)."""
+    parsed = urllib.parse.urlparse(url)
+    return parsed.scheme == "https" or (parsed.scheme == "http" and parsed.hostname in ("127.0.0.1", "localhost", "::1"))
+
+
+def rewrite_download(url):
+    """A test may point downloads at a made-up local server: SL_VOICE_DOWNLOAD_BASE replaces https://huggingface.co."""
+    base = os.environ.get("SL_VOICE_DOWNLOAD_BASE")
+    if base and url.startswith(HF) and model_base_ok(base) and urllib.parse.urlparse(base).scheme == "http":
+        return base.rstrip("/") + url[len(HF):]
+    return url
+
+
+def find_tool(name):
+    """Find a command: this tool's own pipx folder first, then the normal PATH."""
+    own = os.path.join(home_dir(), "bin", name)
+    if os.path.isfile(own) and os.access(own, os.X_OK):
+        return own
+    return shutil.which(name)
+
+
+def run(cmd, **kw):
+    """Run a command (a test replaces this)."""
+    return subprocess.run(cmd, **kw)
+
+
+def file_sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def file_ok(path, size, sha):
+    try:
+        if os.path.getsize(path) != size:
+            return False
+    except OSError:
+        return False
+    return (not sha) or file_sha256(path) == sha
+
+
+def files_ready(kind, files):
+    return all(file_ok(os.path.join(models_dir(kind), n), s, h) for n, _u, s, h in files)
+
+
+# ---------------------------------------------------------------- what is ready
+def check_fedora_package(name):
+    if shutil.which("rpm") is None:
+        return shutil.which("arecord") is not None if name == "alsa-utils" else False
+    try:
+        return run(["rpm", "-q", name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+    except OSError:
+        return False
+
+
+def get_status():
+    """A list of (key, ok, what-it-is, how-to-fix) lines, in the order a beginner needs them."""
+    out = []
+    audio_ok = bool(find_tool("arecord") and find_tool("aplay"))
+    out.append(("audio", audio_ok, "Microphone and speaker programs (alsa-utils)",
+                "Run: sudo dnf install alsa-utils"))
+    pipx_ok = find_tool("pipx") is not None
+    out.append(("pipx", pipx_ok, "pipx (installs the two speech programs)", "Run: sudo dnf install pipx"))
+    out.append(("listener", find_tool("whisper-ctranslate2") is not None,
+                "Listening program (whisper-ctranslate2)", "Run: secure-linux-voice setup"))
+    out.append(("speaker", find_tool("piper") is not None or os.path.isfile(piper_python()),
+                "Speaking program (piper-tts)", "Run: secure-linux-voice setup"))
+    out.append(("speech-model", files_ready("whisper-" + STT_NAME, STT_FILES),
+                "Listening model " + STT_NAME + " (" + MODEL_SIZE_TEXT["speech"] + ")", "Run: secure-linux-voice setup"))
+    out.append(("voice", files_ready("piper-" + VOICE_NAME, VOICE_FILES),
+                "Voice " + VOICE_NAME + " (" + MODEL_SIZE_TEXT["voice"] + ")", "Run: secure-linux-voice setup"))
+    models = ollama_models()
+    out.append(("ai", bool(models), "A private AI model in Ollama",
+                "Run: secure-linux-ai download   (or: ollama pull llama3.2:3b)"))
+    return out
+
+
+def piper_python():
+    return os.path.join(home_dir(), "pipx", "venvs", "piper-tts", "bin", "python")
+
+
+# ---------------------------------------------------------------- Ollama (this computer only)
+def http_json(url, payload=None, timeout=120):
+    data = None if payload is None else json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:  # nosec: loopback only, see loopback_url()
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def ollama_models():
+    try:
+        data = http_json(ollama_url() + "/api/tags", timeout=4)
+    except (OSError, ValueError, urllib.error.URLError):
+        return []
+    return [m.get("name", "") for m in data.get("models", []) if m.get("name")]
+
+
+def pick_model(models, wanted=None):
+    """The wanted model if it exists; else a general one (not a coding model, not an embedding model); else any."""
+    if wanted:
+        return wanted if wanted in models else None
+    chatty = [m for m in models if not re.search(r"coder|code|embed|nomic|bge", m, re.I)]
+    for pool in (chatty, models):
+        if pool:
+            return sorted(pool)[0]
+    return None
+
+
+def ask_ollama(history, model):
+    """Send the conversation to Ollama on this computer; return the reply text."""
+    payload = {"model": model, "stream": False, "messages": [{"role": "system", "content": SYSTEM_PROMPT}] + history}
+    data = http_json(ollama_url() + "/api/chat", payload, timeout=600)
+    return (data.get("message") or {}).get("content", "").strip()
+
+
+def clean_for_speech(text):
+    """Take out marks that sound odd when read out loud."""
+    text = re.sub(r"```.*?```", " ", text, flags=re.S)
+    text = re.sub(r"[*_`#>~|]+", "", text)
+    text = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+# ---------------------------------------------------------------- downloads (asked first)
+def ask_yes(question, assume_yes):
+    if assume_yes:
+        say(question + " yes (you used --yes)")
+        return True
+    if not sys.stdin or not sys.stdin.isatty():
+        say(question + " no (no one to ask; run this in a window, or add --yes)")
+        return False
+    try:
+        return input(question + " [y/N] ").strip().lower() in ("y", "yes")
+    except EOFError:
+        return False
+
+
+def download_file(url, dest, size, sha):
+    """Download to a temporary name, check size and fingerprint, then move into place."""
+    url = rewrite_download(url)
+    if not model_base_ok(url):
+        raise RuntimeError("refusing a download address that is not https")
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    tmp = dest + ".part"
+    h = hashlib.sha256()
+    total = 0
+    with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "secure-linux-voice"}), timeout=60) as r, \
+            open(tmp, "wb") as fh:
+        for chunk in iter(lambda: r.read(1 << 20), b""):
+            fh.write(chunk)
+            h.update(chunk)
+            total += len(chunk)
+    if total != size or (sha and h.hexdigest() != sha):
+        os.remove(tmp)
+        raise RuntimeError("the downloaded file %s did not match its expected size or fingerprint, so it was thrown away"
+                           % os.path.basename(dest))
+    os.replace(tmp, dest)
+
+
+def get_model(kind, label, files, assume_yes):
+    if files_ready(kind, files):
+        return True
+    if not ask_yes("Download the %s (%s) to your own folder?" % (label, MODEL_SIZE_TEXT[
+            "speech" if kind.startswith("whisper") else "voice"]), assume_yes):
+        return False
+    try:
+        for name, url, size, sha in files:
+            dest = os.path.join(models_dir(kind), name)
+            if not file_ok(dest, size, sha):
+                say("Downloading %s ..." % name)
+                download_file(url, dest, size, sha)
+    except (OSError, RuntimeError, urllib.error.URLError) as exc:
+        say("Could not finish that download (%s). Check the internet and run setup again; it carries on from here." % exc)
+        return False
+    return True
+
+
+def install_pipx_packages(assume_yes):
+    missing = []
+    if find_tool("whisper-ctranslate2") is None:
+        missing.append("whisper-ctranslate2")
+    if find_tool("piper") is None and not os.path.isfile(piper_python()):
+        missing.append("piper-tts")
+    if not missing:
+        return True
+    pipx = find_tool("pipx")
+    if pipx is None:
+        say("pipx is not installed. In a window, run:  sudo dnf install pipx   then run setup again.")
+        return False
+    pins = {pkg: pin_file(pkg) for pkg in missing}
+    unchecked = [pkg for pkg, pin in pins.items() if pin is None]
+    if unchecked:
+        say("The checked version list for %s is missing from Secure Linux's own files, so nothing was installed. "
+            "Run Secure Linux repair from the Status window, then run setup again." % " and ".join(unchecked))
+        return False
+    if not ask_yes("Install %s with pipx (%s, free, into your own folder)?" % (" and ".join(missing), PIPX_SIZE_TEXT),
+                   assume_yes):
+        return False
+    os.makedirs(os.path.join(home_dir(), "bin"), exist_ok=True)
+    for pkg in missing:
+        say("Installing %s ..." % pkg)
+        if not prepare_shared_pip(pipx, pins[pkg], pinned_pipx_env(pins[pkg])):
+            say("(pipx's shared part could not be prepared from the checked list; pipx stops if it needs anything "
+                "unchecked.)")
+        try:
+            rc = run([pipx, "install", PIPX_PACKAGES[pkg]], env=pinned_pipx_env(pins[pkg])).returncode
+        except OSError as exc:
+            say("Could not start pipx (%s)." % exc)
+            return False
+        if rc != 0:
+            say("pipx could not install %s. Check the internet and run setup again." % pkg)
+            return False
+    return True
+
+
+def cmd_setup(args):
+    ok = True
+    for key, good, label, fix in get_status():
+        if key == "audio" and not good:
+            say("Missing: %s. %s" % (label, fix))
+            ok = False
+        if key == "ai" and not good:
+            say("Note: %s was not found. %s" % (label, fix))
+    ok = install_pipx_packages(args["yes"]) and ok
+    ok = get_model("whisper-" + STT_NAME, "listening model", STT_FILES, args["yes"]) and ok
+    ok = get_model("piper-" + VOICE_NAME, "voice " + VOICE_NAME, VOICE_FILES, args["yes"]) and ok
+    say("Everything is ready." if ok and all(g for k, g, _l, _f in get_status() if k != "ai")
+        else "Not everything is ready yet. Run: secure-linux-voice status")
+    return 0 if ok else 1
+
+
+def cmd_status(args):
+    rows = get_status()
+    if args["json"]:
+        say(json.dumps({"version": VERSION, "ready": all(r[1] for r in rows),
+                        "items": [{"key": k, "ok": bool(g), "what": w, "fix": "" if g else f} for k, g, w, f in rows]},
+                       indent=1))
+    else:
+        for _k, good, what, fix in rows:
+            say("%s  %s%s" % ("ready  " if good else "MISSING", what, "" if good else "  -> " + fix))
+    return 0 if all(r[1] for r in rows) else 1
+
+
+def cmd_remove(args):
+    base = home_dir()
+    if not os.path.isdir(base):
+        say("Nothing to remove.")
+        return 0
+    if not ask_yes("Delete the voice files this tool downloaded (%s)?" % base, args["yes"]):
+        say("Nothing was deleted.")
+        return 0
+    shutil.rmtree(base, ignore_errors=True)
+    say("Deleted. Your own files and your AI models in Ollama were not touched.")
+    return 0
+
+
+# ---------------------------------------------------------------- listening and speaking
+def private_tmp():
+    """A temporary folder only this user can open."""
+    path = tempfile.mkdtemp(prefix="sl-voice-")
+    os.chmod(path, 0o700)
+    return path
+
+
+def record(wav_path, wait_for_stop):
+    """Record from the microphone until wait_for_stop() returns. Returns True if a recording exists."""
+    arecord = find_tool("arecord")
+    cmd = [arecord, "-q", "-f", "S16_LE", "-r", "16000", "-c", "1", "-d", str(MAX_RECORD_SECONDS), wav_path]
+    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        wait_for_stop()
+    finally:
+        if proc.poll() is None:
+            try:
+                proc.send_signal(signal.SIGINT)      # lets arecord finish the file properly
+            except (OSError, ValueError):
+                proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+    return os.path.isfile(wav_path) and os.path.getsize(wav_path) > 44
+
+
+def transcribe(wav_path, workdir):
+    """Turn a recording into text with Whisper, running here."""
+    tool = find_tool("whisper-ctranslate2")
+    cmd = [tool, wav_path, "--model", STT_NAME, "--model_directory", models_dir("whisper-" + STT_NAME),
+           "--local_files_only", "True", "--language", "en", "--output_format", "txt", "--output_dir", workdir,
+           "--verbose", "False"]
+    res = run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if res.returncode != 0:
+        raise RuntimeError("the listening program stopped")
+    txt = os.path.join(workdir, os.path.splitext(os.path.basename(wav_path))[0] + ".txt")
+    try:
+        with open(txt, "r", encoding="utf-8") as fh:
+            return fh.read().strip()
+    except OSError:
+        return ""
+
+
+def speak(text, workdir):
+    """Say text out loud with Piper, running here. Returns True when it was spoken."""
+    text = clean_for_speech(text)
+    if not text:
+        return True
+    wav = os.path.join(workdir, "reply.wav")
+    model = os.path.join(models_dir("piper-" + VOICE_NAME), VOICE_NAME + ".onnx")
+    piper = find_tool("piper")
+    cmd = [piper] if piper else [piper_python(), "-m", "piper"]
+    res = run(cmd + ["-m", model, "-f", wav, "--", text], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if res.returncode != 0 or not os.path.isfile(wav):
+        return False
+    aplay = find_tool("aplay")
+    if aplay is None:
+        return False
+    res = run([aplay, "-q", wav], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        os.remove(wav)
+    except OSError:
+        pass
+    return res.returncode == 0
+
+
+def need_ready(keys):
+    """Return a plain message listing what is missing from keys, or '' when all is ready."""
+    bad = [(w, f) for k, g, w, f in get_status() if k in keys and not g]
+    if not bad:
+        return ""
+    return "Not ready yet:\n" + "\n".join("  - %s. %s" % b for b in bad) + "\nTip: secure-linux-voice setup"
+
+
+def converse(model, spoken, user_text, history, workdir, no_speak):
+    history.append({"role": "user", "content": user_text})
+    reply = ask_ollama(history, model)
+    if not reply:
+        say("The AI gave no answer. Try asking again.")
+        history.pop()
+        return
+    history.append({"role": "assistant", "content": reply})
+    say("Matt: " + reply)
+    if not no_speak and not speak(reply, workdir):
+        say("(I could not read that out loud. Run: secure-linux-voice status)")
+
+
+def cmd_say(args):
+    msg = need_ready(["audio", "speaker", "voice"])
+    if msg:
+        say(msg)
+        return 1
+    work = private_tmp()
+    try:
+        return 0 if speak(" ".join(args["rest"]), work) else 1
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def cmd_ask(args):
+    text = " ".join(args["rest"]).strip()
+    if not text:
+        say("Type your question after the word ask, for example: secure-linux-voice ask \"How do I back up my photos?\"")
+        return 2
+    needs = ["ai"] + ([] if args["no_speak"] else ["audio", "speaker", "voice"])
+    msg = need_ready(needs)
+    if msg:
+        say(msg)
+        return 1
+    model = pick_model(ollama_models(), args["model"])
+    if not model:
+        say("That AI model is not installed. Run: ollama list")
+        return 1
+    work = private_tmp()
+    try:
+        converse(model, None, text, [], work, args["no_speak"])
+    except (OSError, ValueError, urllib.error.URLError) as exc:
+        say("The AI on this computer did not answer (%s). Is Ollama running? Try: systemctl status ollama" % exc)
+        return 1
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+    return 0
+
+
+def read_line(prompt):
+    try:
+        return input(prompt)
+    except EOFError:
+        return None
+
+
+def cmd_talk(args):
+    msg = need_ready(["audio", "listener", "speech-model", "ai"] + ([] if args["no_speak"] else ["speaker", "voice"]))
+    if msg:
+        say(msg)
+        return 1
+    model = pick_model(ollama_models(), args["model"])
+    if not model:
+        say("That AI model is not installed. Run: ollama list")
+        return 1
+    say("Talking to %s on this computer. Nothing is saved or sent anywhere." % model)
+    say("Press Enter, speak, then press Enter again when you have finished. Type q and press Enter to stop.")
+    history = []
+    work = private_tmp()
+    try:
+        while True:
+            first = read_line("\n[Enter = start talking, q = quit] ")
+            if first is None or first.strip().lower() in ("q", "quit", "exit"):
+                break
+            wav = os.path.join(work, "me.wav")
+            say("Listening... press Enter when you have finished.")
+            got = record(wav, lambda: read_line(""))
+            if not got:
+                say("I did not hear anything. Check your microphone and try again.")
+                continue
+            try:
+                heard = transcribe(wav, work)
+            except (OSError, RuntimeError) as exc:
+                say("I could not turn that into words (%s). Try again." % exc)
+                continue
+            finally:
+                for leftover in (wav, os.path.join(work, "me.txt")):
+                    try:
+                        os.remove(leftover)       # the recording never stays on disk
+                    except OSError:
+                        pass
+            if not heard:
+                say("I did not catch any words. Try again, a little closer to the microphone.")
+                continue
+            say("You: " + heard)
+            try:
+                converse(model, None, heard, history, work, args["no_speak"])
+            except (OSError, ValueError, urllib.error.URLError) as exc:
+                say("The AI on this computer did not answer (%s). Is Ollama running? Try: systemctl status ollama" % exc)
+    except KeyboardInterrupt:
+        say("")
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+    return 0
+
+
+# ---------------------------------------------------------------- command line
+def parse(argv):
+    args = {"cmd": None, "rest": [], "yes": False, "json": False, "no_speak": False, "model": None, "pause": False,
+            "help": False, "explain": False}
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a in ("-h", "--help"):
+            args["help"] = True
+        elif a == "--explain":
+            args["explain"] = True
+        elif a in ("--yes", "-y"):
+            args["yes"] = True
+        elif a == "--json":
+            args["json"] = True
+        elif a == "--no-speak":
+            args["no_speak"] = True
+        elif a == "--pause":
+            args["pause"] = True
+        elif a == "--model":
+            i += 1
+            if i >= len(argv):
+                return None
+            args["model"] = argv[i]
+        elif a.startswith("--model="):
+            args["model"] = a.split("=", 1)[1]
+        elif a.startswith("-") and a != "-":
+            return None
+        elif args["cmd"] is None:
+            args["cmd"] = a
+        else:
+            args["rest"].append(a)
+        i += 1
+    return args
+
+
+COMMANDS = {"talk": cmd_talk, "ask": cmd_ask, "say": cmd_say, "setup": cmd_setup, "status": cmd_status,
+            "remove": cmd_remove}
+
+
+def main(argv=None):
+    argv = sys.argv[1:] if argv is None else argv
+    args = parse(argv)
+    if args is None:
+        say("That option is not known. Run: secure-linux-voice --help")
+        return 2
+    if args["help"]:
+        say(__doc__.strip())
+        return 0
+    if args["explain"]:
+        say(EXPLAIN)
+        return 0
+    cmd = args["cmd"] or "talk"
+    if cmd not in COMMANDS:
+        say("I do not know \"%s\". Run: secure-linux-voice --help" % cmd)
+        return 2
+    try:
+        rc = COMMANDS[cmd](args)
+    finally:
+        if args["pause"] and sys.stdin and sys.stdin.isatty():
+            try:
+                input("\nPress Enter to close this window.")
+            except EOFError:
+                pass
+    return rc
+
+
+if __name__ == "__main__":
+    sys.exit(main())

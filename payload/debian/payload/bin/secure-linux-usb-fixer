@@ -23,6 +23,13 @@ CONFIRM_TARGET=""
 CONFIRM_ERASE=""
 CONFIRM_REPAIR=""
 SKIP_IMAGE=0
+DRIVE_ROOT=""
+REF_LIST=""
+MASTER_DIR=""
+MASTER_STORE=""
+MASTER_ID=""
+KIT_DIR=""
+SOURCE_DIR=""
 
 RC_SAFETY=1
 RC_OPERATION=2
@@ -85,6 +92,20 @@ Secure Linux USB Fixer - look first, save an image, then choose what happens
       explicit --skip-image is allowed when another backup already exists.
       Two exact, different confirmations are always required.
 
+  secure-linux-usb-fixer check-drive --device /dev/sdX [--drive-root /mount/point]
+      (--master-store DIR [--master-id ID] | --master-dir DIR | --release-list payload-files.json
+       [--source-dir DIR] | --kit-dir DIR)
+      Compare the files on a built Secure Linux drive with the release file list or the
+      saved master and list exactly which files are missing or damaged. Read-only.
+      Files that belong to this drive only (its settings, Wi-Fi list, start file and
+      saved changes) are listed in their own section and never compared as kit files.
+  secure-linux-usb-fixer repair-drive ... --confirm-target 'TARGET /dev/sdX SERIAL'
+      Same, then copy back ONLY those files from the saved master or installed kit and
+      verify each by SHA-256. Never partitions or formats. Refuses any disk that is not a
+      removable USB disk, and any folder that is not a built Secure Linux drive.
+      Never writes a file that belongs to this drive only, and refuses when the drive and
+      the master or kit are from different or unknown releases.
+
 Filesystems: fat32, exfat, ntfs, ext4, ext3, ext2, xfs and btrfs, when their
 real formatters are installed. FAT32 works on disks larger than 32 GiB (up to
 2 TiB here for compatibility), but ONE FILE MUST BE NO LARGER THAN
@@ -136,7 +157,21 @@ while [ "$#" -gt 0 ]; do
     --confirm-repair) need_option_value "$@"; CONFIRM_REPAIR=$2; shift ;;
     --confirm-repair=*) CONFIRM_REPAIR=${1#*=} ;;
     --skip-image) SKIP_IMAGE=1 ;;
-    diagnose|image|recover|repair|format|capabilities|guide)
+    --drive-root) need_option_value "$@"; DRIVE_ROOT=$2; shift ;;
+    --drive-root=*) DRIVE_ROOT=${1#*=} ;;
+    --release-list) need_option_value "$@"; REF_LIST=$2; shift ;;
+    --release-list=*) REF_LIST=${1#*=} ;;
+    --master-dir) need_option_value "$@"; MASTER_DIR=$2; shift ;;
+    --master-dir=*) MASTER_DIR=${1#*=} ;;
+    --master-store) need_option_value "$@"; MASTER_STORE=$2; shift ;;
+    --master-store=*) MASTER_STORE=${1#*=} ;;
+    --master-id) need_option_value "$@"; MASTER_ID=$2; shift ;;
+    --master-id=*) MASTER_ID=${1#*=} ;;
+    --kit-dir) need_option_value "$@"; KIT_DIR=$2; shift ;;
+    --kit-dir=*) KIT_DIR=${1#*=} ;;
+    --source-dir) need_option_value "$@"; SOURCE_DIR=$2; shift ;;
+    --source-dir=*) SOURCE_DIR=${1#*=} ;;
+    diagnose|image|recover|repair|format|capabilities|guide|check-drive|repair-drive)
       [ "$ACTION" = guide ] || { say "Only one action may be chosen." >&2; exit "$RC_USAGE"; }
       ACTION=$1 ;;
     *) say "Unknown option or action: $1 (try --help)" >&2; exit "$RC_USAGE" ;;
@@ -906,6 +941,761 @@ capabilities_action() {
   say "Missing tools are reported as unavailable capabilities, never as successful work."
 }
 
+DRIVE_PY=$(cat <<'SLF_PYEOF'
+import hashlib, json, os, re, stat, sys
+
+HASH = re.compile(r"^[0-9a-f]{64}$")
+RELEASE = re.compile(r"^secure-linux-[0-9]{4}\.[0-9]{2}\.[0-9]{2}-[0-9a-f]{16}$")
+E = os.environ.get
+MODE = E("SLF_MODE", "check")
+# Where the drive builders put the kit's linux tree on a drive (make-usb.ps1: Copy-Normalised $stage
+# linux-setup\linux; the Linux creator copies the same finished files). File lists of the linux tree
+# (payload-files.json, .kit-update-files.json) are relative to this folder on such a drive.
+REAL_TREE = "linux-setup/linux"
+DRIVE_LIST = "linux-setup/SECURE-LINUX-DRIVE-FILES.json"      # contract C3, written by the drive builder
+PATTERN_FILE = "setup-data/drive-per-drive-files.txt"         # contract C3, inside a linux tree
+# Files written for ONE drive and ONE person only. Repair never writes, renames or deletes them and never
+# takes them from a master or kit. This is C3's first content plus the other per-person files the drive
+# builders write; it always applies, also when the drive or the reference brings its own list.
+BUILTIN_PER_DRIVE = (
+    "ventoy/script/secure-linux.ks",          # make-usb.ps1: the person's account, Wi-Fi and packed build.conf
+    "ventoy/ventoy.json",                     # make-usb.ps1 Write-VentoyConfig: this drive's menu
+    "linux-setup/linux/build.conf",           # make-usb.ps1: the person's choices
+    "linux-setup/kit/linux/build.conf",
+    "linux-setup/wifi-networks.txt",          # make-usb.ps1: saved Wi-Fi networks
+    "linux-setup/private/**",
+    "SECURE-LINUX-DRIVE-PASSPORT.*",
+    "linux-setup/SECURE-LINUX-DRIVE-FILES.json",
+    "CHECK-THIS-DRIVE.sh",
+    "*.enc1",
+    "linux-setup/backups.txt",                # make-usb.ps1: this person's backup records
+    "linux-setup/setup.conf",                 # make-usb.ps1: Setup-App choices
+    "linux-setup/scan/**",                    # make-usb.ps1: Setup-App scan exports
+    "linux-setup/recovery/**",                # secure-linux-usb-creator FILES_ONLY_SKIP_PREFIXES
+)
+# Saved-changes (persistence) files of a live drive: never read in full, never written.
+BUILTIN_PERSISTENCE = ("persistence/**", "**/*persistence*.dat", "**/*persistence*.img")
+MAX_LIST_BYTES = 64 << 20
+
+
+def say(text=""):
+    print(text, flush=True)
+
+
+def stop(code, text):
+    say(text)
+    sys.exit(code)
+
+
+TRACE = E("SL_USBFIXER_TRACE", "") if E("SL_USBFIXER_TEST_MODE", "0") == "1" else ""
+
+
+def trace(kind, what):
+    if TRACE:
+        with open(TRACE, "a", encoding="utf-8") as f:
+            f.write(kind + " " + what + "\n")
+
+
+def hash_fd(fd):
+    h = hashlib.sha256()
+    for chunk in iter(lambda: os.read(fd, 1 << 20), b""):
+        h.update(chunk)
+    return h.hexdigest()
+
+
+def sha(path):
+    trace("hash", path)
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def safe(rel):
+    if not isinstance(rel, str) or not rel or "\\" in rel or "\x00" in rel:
+        return False
+    parts = rel.split("/")
+    return not rel.startswith("/") and all(p not in ("", ".", "..") for p in parts)
+
+
+def glob_re(pattern):
+    """One glob of C3: '*' stays inside a folder, '**/' is any number of folders, no '/' = any folder."""
+    if "/" not in pattern:
+        pattern = "**/" + pattern
+    i, out = 0, []
+    while i < len(pattern):
+        if pattern.startswith("**/", i):
+            out.append("(?:[^/]+/)*")
+            i += 3
+        elif pattern.startswith("**", i):
+            out.append(".*")
+            i += 2
+        elif pattern[i] == "*":
+            out.append("[^/]*")
+            i += 1
+        elif pattern[i] == "?":
+            out.append("[^/]")
+            i += 1
+        else:
+            out.append(re.escape(pattern[i]))
+            i += 1
+    # Drives are usually FAT/exFAT, where case does not matter: match without case so nothing slips past.
+    return re.compile("".join(out) + r"\Z", re.I | re.S)
+
+
+def safe_glob(pattern):
+    return bool(pattern) and "\\" not in pattern and "\x00" not in pattern and not pattern.startswith("/") \
+        and all(p not in ("", ".", "..") for p in pattern.split("/"))
+
+
+def read_json(path):
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def regular_file(path):
+    try:
+        return stat.S_ISREG(os.lstat(path).st_mode)
+    except OSError:
+        return False
+
+
+def drive_layout(root):
+    """'real' = the layout the drive builders make; 'flat' = release files at the top (older test layout)."""
+    if not os.path.isfile(os.path.join(root, "ventoy", "ventoy.json")):
+        return None
+    names = ("release.json", ".kit-update-files.json", "setup.sh")
+    if any(os.path.isfile(os.path.join(root, *REAL_TREE.split("/"), n)) for n in names):
+        return "real"
+    if any(os.path.isfile(os.path.join(root, n)) for n in names):
+        return "flat"
+    return None
+
+
+def release_of(path):
+    try:
+        value = read_json(path).get("release_id")
+    except (OSError, ValueError, AttributeError):
+        return None
+    return value if isinstance(value, str) and RELEASE.match(value) else None
+
+
+KEPT_SIGNATURES = (".kit-update-release.json.sig", ".kit-update-published-files.json",
+                   ".kit-update-published-files.json.sig")
+
+
+def clean_list(files):
+    if not isinstance(files, dict) or not files:
+        return None
+    for rel, digest in files.items():
+        if not safe(rel) or not isinstance(digest, str) or not HASH.match(digest):
+            return None
+    return files
+
+
+def admin_only(path):
+    stop(11, "The saved master in " + path + " can only be read by an administrator. Run this again as an "
+             "administrator. Nothing was changed.")
+
+
+def load_reference(layout):
+    """Returns (entries drive path -> (source path, sha256, size or None), good-copy folder or None,
+    release id or None, name)."""
+    master_dir = E("SLF_MASTER_DIR", "")
+    store = E("SLF_MASTER_STORE", "")
+    kit = E("SLF_KIT_DIR", "")
+    listfile = E("SLF_LIST", "")
+    source = E("SLF_SOURCE_DIR", "")
+    files = None
+    sizes = {}
+    release = None
+    name = ""
+    tree_list = False
+    release_paths = []
+    if store and not master_dir:
+        mid = E("SLF_MASTER_ID", "")
+        if not mid:
+            try:
+                with open(os.path.join(store, "current"), encoding="ascii") as f:
+                    mid = f.read().strip()
+            except PermissionError:
+                admin_only(store)
+            except OSError:
+                stop(11, "I could not find which saved master to use in " + store + ".")
+        if not re.match(r"^[A-Za-z0-9._-]+$", mid):
+            stop(11, "That saved master name is not valid.")
+        master_dir = os.path.join(store, "generations", mid)
+    if master_dir:
+        try:
+            manifest = read_json(os.path.join(master_dir, "manifest.json"))
+            portable = manifest["portable"]
+            entries = portable["files"]
+            files = {e["path"]: e["sha256"] for e in entries}
+            sizes = {e["path"]: e.get("size") for e in entries if isinstance(e.get("size"), int)}
+        except PermissionError:
+            admin_only(master_dir)
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
+            stop(11, "The saved master has no readable file list, so I cannot check against it.")
+        name = "the saved master"
+        info = manifest.get("release") if isinstance(manifest, dict) else None
+        if isinstance(info, dict) and RELEASE.match(str(info.get("release_id"))):
+            release = info["release_id"]
+        if isinstance(portable, dict) and safe(portable.get("source_release_path")):
+            release_paths.append(portable["source_release_path"])
+        if not source and os.path.isdir(os.path.join(master_dir, "payload")):
+            source = os.path.join(master_dir, "payload")
+    if listfile:
+        try:
+            m = read_json(listfile)
+        except (OSError, ValueError):
+            stop(11, "I could not read the release file list " + listfile + ".")
+        if not isinstance(m, dict) or m.get("schema_version") != 1:
+            stop(11, "The release file list is in a form this version does not understand.")
+        files = m.get("files")
+        sizes = {}
+        release = m.get("release_id") if RELEASE.match(str(m.get("release_id"))) else None
+        name = "the release file list"
+        tree_list = True
+    elif files is None and kit:
+        for cand in ("payload-files.json", ".kit-update-files.json"):
+            p = os.path.join(kit, cand)
+            if os.path.isfile(p):
+                try:
+                    m = read_json(p)
+                    files = m["files"]
+                    release = m.get("release_id") if RELEASE.match(str(m.get("release_id"))) else None
+                except (OSError, ValueError, KeyError, TypeError, AttributeError):
+                    stop(11, "The installed kit's file list is not readable.")
+                name = "the installed kit"
+                tree_list = True
+                # I5 H1: the kept release signatures are in no file list, so a repaired drive would lose them
+                # (and could no longer be proven). Each one the kit holds as a plain file is added, with its hash.
+                if isinstance(files, dict):
+                    files = dict(files)
+                    for kept in KEPT_SIGNATURES:
+                        q = os.path.join(kit, kept)
+                        if kept not in files and os.path.isfile(q) and not os.path.islink(q):
+                            files[kept] = sha(q)
+                break
+    if files is None:
+        stop(11, "I have nothing to check the drive against. Give me a saved master, or the release file list "
+                 "(payload-files.json), or an installed kit folder.")
+    files = clean_list(files)
+    if files is None:
+        stop(11, "The file list is empty or contains a file name I do not accept, so I will not use it.")
+    if not source and kit:
+        source = kit
+    if release is None and source:
+        for rel in release_paths + [REAL_TREE + "/release.json", "release.json"]:
+            release = release_of(os.path.join(source, *rel.split("/")))
+            if release:
+                break
+    # A list of the linux tree is checked where the drive builders put that tree on the drive.
+    prefix = REAL_TREE + "/" if tree_list and layout == "real" else ""
+    entries = {prefix + rel: (rel, digest, sizes.get(rel)) for rel, digest in files.items()}
+    return entries, (source or None), release, name
+
+
+def read_patterns(path):
+    """Globs from a drive-per-drive-files.txt: one per line, '#' starts a comment. Returns (per_drive, persistence)."""
+    try:
+        if not regular_file(path) or os.path.getsize(path) > MAX_LIST_BYTES:
+            return None
+        with open(path, encoding="utf-8") as f:
+            lines = f.read().splitlines()
+    except (OSError, ValueError):
+        return None
+    globs, persist = [], []
+    for line in lines:
+        line = line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        g = line.split()[0]
+        if safe_glob(g):
+            globs.append(g)
+            if "persist" in g.lower():
+                persist.append(g)
+    return globs, persist
+
+
+def read_drive_list(root):
+    """The drive's own list (C3). Returns (list or None, note)."""
+    p = os.path.join(root, *DRIVE_LIST.split("/"))
+    if not os.path.lexists(p):
+        return None, ""
+    bad = (None, "This drive's own file list could not be read, so I used the list of personal files I carry.")
+    try:
+        if not regular_file(p) or os.path.getsize(p) > MAX_LIST_BYTES:
+            return bad
+        m = read_json(p)
+    except (OSError, ValueError):
+        return bad
+    if not isinstance(m, dict) or m.get("schema") != 1:
+        return bad
+    out = {}
+    for key in ("shared", "per_drive"):
+        part = m.get(key)
+        if not isinstance(part, dict):
+            return bad
+        clean = {}
+        for rel, info in part.items():
+            if not safe(rel) or not isinstance(info, dict) or not HASH.match(str(info.get("sha256"))):
+                return bad
+            size = info.get("size")
+            if not isinstance(size, int) or isinstance(size, bool) or size < 0:
+                return bad
+            clean[rel] = (info["sha256"], size)
+        out[key] = clean
+    return out, ""
+
+
+def ventoy_persistence(root):
+    """Saved-changes files named in this drive's ventoy.json (its 'persistence' entries)."""
+    found = set()
+    p = os.path.join(root, "ventoy", "ventoy.json")
+    try:
+        if not regular_file(p) or os.path.getsize(p) > MAX_LIST_BYTES:
+            return found
+        m = read_json(p)
+    except (OSError, ValueError):
+        return found
+    if not isinstance(m, dict):
+        return found
+    for key, value in m.items():
+        if not str(key).startswith("persistence") or not isinstance(value, list):
+            continue
+        for item in value:
+            backends = item.get("backend") if isinstance(item, dict) else None
+            for b in (backends if isinstance(backends, list) else [backends]):
+                if isinstance(b, str) and safe(b.lstrip("/")):
+                    found.add(b.lstrip("/"))
+    return found
+
+
+class Rules:
+    def __init__(self, root, source):
+        self.root = root
+        self.drive_list, self.note = read_drive_list(root)
+        globs, persist = list(BUILTIN_PER_DRIVE), list(BUILTIN_PERSISTENCE)
+        self.origin = "the list of personal files I carry"
+        own = E("SLF_SELF_DIR", "")
+        cands = [os.path.join(source, *REAL_TREE.split("/"), *PATTERN_FILE.split("/")),
+                 os.path.join(source, "linux", *PATTERN_FILE.split("/")),
+                 os.path.join(source, *PATTERN_FILE.split("/"))] if source else []
+        own_list = os.path.join(own, "..", *PATTERN_FILE.split("/")) if own else None
+        if own_list:
+            cands.append(own_list)
+        for cand in cands:
+            found = read_patterns(cand)
+            if found is not None:
+                globs += found[0]
+                persist += found[1]
+                # The list that ships beside this tool is still "the list I carry": no folder path for a beginner.
+                if cand != own_list:
+                    self.origin = "the list of per-drive files in " + cand
+                break
+        if self.drive_list is not None:
+            self.origin = "this drive's own file list"
+        self.persist_paths = sorted(ventoy_persistence(root))
+        self.persist_lower = {p.lower() for p in self.persist_paths}
+        self.globs = [glob_re(g) for g in globs + persist]
+        self.persist = [glob_re(g) for g in persist]
+
+    def persistence(self, rel):
+        return rel.lower() in self.persist_lower or any(r.match(rel) for r in self.persist)
+
+    def per_drive(self, rel):
+        if self.persistence(rel) or any(r.match(rel) for r in self.globs):
+            return True
+        return self.drive_list is not None and rel in self.drive_list["per_drive"]
+
+
+def inside_real(root, rel):
+    """True when every folder on the way to the file is a real folder on this drive (no links out)."""
+    cur = root
+    for part in rel.split("/")[:-1]:
+        cur = os.path.join(cur, part)
+        if os.path.islink(cur) or (os.path.exists(cur) and not os.path.isdir(cur)):
+            return False
+    return True
+
+
+def scan(root, files):
+    ok, missing, damaged = [], [], []
+    for rel in sorted(files):
+        p = os.path.join(root, *rel.split("/"))
+        if os.path.islink(p) or not inside_real(root, rel):
+            damaged.append(rel)
+        elif not os.path.lexists(p):
+            missing.append(rel)
+        elif not os.path.isfile(p):
+            damaged.append(rel)
+        else:
+            try:
+                good = sha(p) == files[rel]
+            except OSError:
+                good = False
+            (ok if good else damaged).append(rel)
+    return ok, missing, damaged
+
+
+def scan_own(root, expect, rules):
+    """Per-drive files: compared, never written. Saved-changes files: name and size only."""
+    ok, missing, damaged, kept = [], [], [], []
+    for rel in sorted(expect):
+        digest, size = expect[rel]
+        p = os.path.join(root, *rel.split("/"))
+        try:
+            st = os.lstat(p)
+        except FileNotFoundError:
+            missing.append(rel)
+            continue
+        except OSError:
+            damaged.append(rel)
+            continue
+        if not stat.S_ISREG(st.st_mode) or not inside_real(root, rel):
+            damaged.append(rel)
+        elif rules.persistence(rel):
+            trace("size", p)
+            (kept if size is None or st.st_size == size else damaged).append(rel)
+        elif size is not None and st.st_size != size:
+            damaged.append(rel)
+        else:
+            try:
+                good = digest is not None and sha(p) == digest
+            except OSError:
+                good = False
+            (ok if good else damaged).append(rel)
+    return ok, missing, damaged, kept
+
+
+def human(n):
+    for unit in ("bytes", "KB", "MB", "GB", "TB"):
+        if n < 1024 or unit == "TB":
+            return ("%d %s" % (n, unit)) if unit == "bytes" else ("%.1f %s" % (n, unit))
+        n /= 1024.0
+
+
+def copy_into(src, fd):
+    with open(src, "rb") as a:
+        for chunk in iter(lambda: a.read(1 << 20), b""):
+            view = memoryview(chunk)
+            while view:
+                view = view[os.write(fd, view):]
+    os.fsync(fd)
+
+
+NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+NEW_FILE = os.O_WRONLY | os.O_CREAT | os.O_EXCL | NOFOLLOW | getattr(os, "O_BINARY", 0) | getattr(os, "O_CLOEXEC", 0)
+DIR_OPEN = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+USE_DIR_FD = bool(NOFOLLOW) and hasattr(os, "O_DIRECTORY") and all(
+    f in os.supports_dir_fd for f in (os.open, os.stat, os.unlink, os.mkdir, os.replace))
+
+
+def write_with_dir_fd(root, rel, src, want, mode):
+    """POSIX: walk the folders by handle, never following a link, then write a brand-new temporary file."""
+    parts = rel.split("/")
+    name, tmp = parts[-1], "." + parts[-1] + ".repair-tmp"
+    dfd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_CLOEXEC", 0))
+    fd = -1
+    made = False
+    try:
+        for part in parts[:-1]:
+            try:
+                nfd = os.open(part, DIR_OPEN, dir_fd=dfd)
+            except FileNotFoundError:
+                os.mkdir(part, 0o755, dir_fd=dfd)
+                nfd = os.open(part, DIR_OPEN, dir_fd=dfd)
+            os.close(dfd)
+            dfd = nfd
+        try:
+            st = os.stat(tmp, dir_fd=dfd, follow_symlinks=False)
+        except FileNotFoundError:
+            st = None
+        if st is not None:
+            if stat.S_ISDIR(st.st_mode):
+                return "a folder is sitting where its temporary copy goes"
+            os.unlink(tmp, dir_fd=dfd)
+        fd = os.open(tmp, NEW_FILE, 0o600, dir_fd=dfd)
+        made = True
+        copy_into(src, fd)
+        try:
+            os.fchmod(fd, mode)
+        except OSError:
+            pass                      # FAT and exFAT drives keep no permissions; the copy itself is what counts
+        os.close(fd)
+        fd = -1
+        os.replace(tmp, name, src_dir_fd=dfd, dst_dir_fd=dfd)
+        made = False
+        try:
+            os.fsync(dfd)
+        except OSError:
+            pass
+        rfd = os.open(name, os.O_RDONLY | NOFOLLOW | getattr(os, "O_CLOEXEC", 0), dir_fd=dfd)
+        try:
+            trace("hash", os.path.join(root, *parts))
+            if hash_fd(rfd) != want:
+                return "the new copy did not match its fingerprint"
+        finally:
+            os.close(rfd)
+        return None
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        if made:
+            try:
+                os.unlink(tmp, dir_fd=dfd)
+            except OSError:
+                pass
+        os.close(dfd)
+
+
+def write_by_path(root, rel, src, want, mode):
+    """Systems without folder handles: the temporary name is cleared first and then created new (O_EXCL), so a
+    link or a second name planted there is never written through."""
+    dest = os.path.join(root, *rel.split("/"))
+    tmp = os.path.join(os.path.dirname(dest), "." + os.path.basename(dest) + ".repair-tmp")
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    if not inside_real(root, rel):
+        return "its folder on the drive is not an ordinary folder"
+    if os.path.lexists(tmp):
+        if os.path.isdir(tmp) and not os.path.islink(tmp):
+            return "a folder is sitting where its temporary copy goes"
+        os.unlink(tmp)
+    fd = os.open(tmp, NEW_FILE, 0o600)
+    try:
+        try:
+            copy_into(src, fd)
+            try:
+                os.chmod(fd, mode)
+            except (OSError, NotImplementedError, TypeError):
+                pass
+        finally:
+            os.close(fd)
+        os.replace(tmp, dest)
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    if sha(dest) != want:
+        return "the new copy did not match its fingerprint"
+    return None
+
+
+def repair_one(root, source, rel, src_rel, want, rules):
+    if rules.per_drive(rel):
+        # Never reached through main(), kept as a last guard: a per-drive file is never written.
+        return "This file belongs to this drive only. Re-make the drive to fix it."
+    if not source:
+        return "I have no saved copy to take it from"
+    src = os.path.join(source, *src_rel.split("/"))
+    if os.path.islink(src) or not os.path.isfile(src):
+        return "the saved copy does not have this file"
+    try:
+        if sha(src) != want:
+            return "the saved copy of this file is damaged too"
+    except OSError:
+        return "the saved copy could not be read"
+    if not inside_real(root, rel):
+        return "its folder on the drive is not an ordinary folder"
+    dest = os.path.join(root, *rel.split("/"))
+    if os.path.isdir(dest) and not os.path.islink(dest):
+        return "a folder is sitting where this file belongs"
+    try:
+        mode = os.stat(src).st_mode & 0o777
+        trace("write", rel)
+        if USE_DIR_FD:
+            return write_with_dir_fd(root, rel, src, want, mode)
+        return write_by_path(root, rel, src, want, mode)
+    except OSError as exc:
+        return "it could not be written (" + (exc.strerror or "write error") + ")"
+
+
+SENTENCE = "This file belongs to this drive only. Re-make the drive to fix it."
+
+
+def report_own(own, expect, rules, name):
+    ok, missing, damaged, kept = own
+    if not expect:
+        return
+    say("Files that belong to this drive only: %d checked, %d missing, %d damaged. Repair never changes these."
+        % (len(expect), len(missing), len(damaged)))
+    say("  Which files belong to this drive only comes from " + rules.origin + ".")
+    if rules.drive_list is None:
+        say("  This drive has no file list of its own, so I compared these with " + name + ". If the drive was "
+            "made for someone else, a difference here is expected.")
+    for rel in missing:
+        say("  missing (this drive only): " + rel + " - " + SENTENCE)
+    for rel in damaged:
+        say("  damaged (this drive only): " + rel + " - " + SENTENCE)
+    for rel in kept:
+        try:
+            size = human(os.lstat(rel_path(rules.root, rel)).st_size)
+        except OSError:
+            size = "unknown size"
+        say("  kept as it is (saved changes; only its name and size were checked): " + rel + " (" + size + ")")
+
+
+def rel_path(root, rel):
+    return os.path.join(root, *rel.split("/"))
+
+
+def main():
+    roots = [r for r in E("SLF_ROOTS", "").split("\n") if r]
+    root, layout = None, None
+    for r in roots:
+        layout = drive_layout(r)
+        if layout:
+            root = r
+            break
+    if root is None:
+        stop(10, "This is not a Secure Linux drive that I recognise, so I will not touch it. "
+                 "A Secure Linux drive has a ventoy folder and a release file on it.")
+    entries, source, release, name = load_reference(layout)
+    drive_release = release_of(os.path.join(root, *(REAL_TREE.split("/") if layout == "real" else []), "release.json"))
+    say("Drive folder: " + root)
+    say("Checking against " + name + (" (" + release + ")" if release else "") + ".")
+    if release and drive_release and release != drive_release:
+        stop(12, "This drive is from a different release (" + drive_release + ") than the one I am checking against ("
+                 + release + "). Please update the drive instead; mixing the two could break it. Nothing was changed.")
+    if not release or not drive_release:
+        stop(12, "I cannot tell which release " + ("this drive" if not drive_release else name) + " is from, so I "
+                 "will not compare the two; mixing releases could break the drive. Nothing was changed.")
+    rules = Rules(root, source)
+    if rules.note:
+        say(rules.note)
+    dlist = rules.drive_list
+    files, wanted, skipped = {}, {}, 0
+    expect = {}
+    for rel, (src_rel, digest, size) in entries.items():
+        if rules.per_drive(rel):
+            if dlist is None:
+                expect[rel] = (digest, size)
+        elif dlist is not None and rel not in dlist["shared"]:
+            skipped += 1
+        else:
+            files[rel] = digest
+            wanted[rel] = src_rel
+    if dlist is not None:
+        expect = dict(dlist["per_drive"])
+        for rel, info in dlist["shared"].items():
+            if rules.per_drive(rel) and rel not in expect:
+                expect[rel] = info
+    known = {k.lower() for k in expect}
+    for rel in rules.persist_paths:
+        if rel.lower() not in known and os.path.lexists(rel_path(root, rel)):
+            expect[rel] = (None, None)
+    ok, missing, damaged = scan(root, files)
+    own = scan_own(root, expect, rules)
+    say("Checked %d files: %d fine, %d missing, %d damaged." % (len(files), len(ok), len(missing), len(damaged)))
+    for rel in missing:
+        say("  missing: " + rel)
+    for rel in damaged:
+        say("  damaged: " + rel)
+    if skipped:
+        say("%d file(s) of %s are not part of this drive (its own file list leaves them out), so they were not checked."
+            % (skipped, name))
+    report_own(own, expect, rules, name)
+    own_bad = len(own[1]) + len(own[2])
+    if not missing and not damaged and not own_bad:
+        say("This drive is complete. Every file matches. Nothing needed repairing.")
+        return 0
+    if not missing and not damaged:
+        say("Repair cannot copy anything back here: only files that belong to this drive need fixing. "
+            "Re-make the drive to fix them. Nothing was changed.")
+        return 3
+    if MODE != "repair":
+        say("Run Repair to copy back only these %d files. The rest of the drive is left alone." % (len(missing) + len(damaged)))
+        if own_bad:
+            say("Repair never changes the files that belong to this drive only. Re-make the drive to fix those.")
+        return 2
+    fixed, failed = 0, 0
+    for rel in missing + damaged:
+        if dlist is not None and dlist["shared"][rel][0] != files[rel]:
+            why = "this drive's own file list expects a different version of it"
+        else:
+            why = repair_one(root, source, rel, wanted[rel], files[rel], rules)
+        if why is None:
+            fixed += 1
+            say("  repaired and checked: " + rel)
+        else:
+            failed += 1
+            say("  could NOT repair: " + rel + " - " + why)
+    ok2, missing2, damaged2 = scan(root, files)
+    own2 = scan_own(root, expect, rules)
+    say("Checked again: %d fine, %d missing, %d damaged." % (len(ok2), len(missing2), len(damaged2)))
+    if missing2 or damaged2:
+        say("Some files are still not right. The drive was not re-partitioned or formatted. "
+            "Try a newer saved master, or rebuild the drive.")
+        return 2
+    if own2[1] or own2[2]:
+        say("Copied back and checked %d file(s) by SHA-256. The files that belong to this drive only were not "
+            "changed and still need the drive to be re-made." % fixed)
+        return 2
+    say("REPAIR COMPLETE: %d file(s) copied back and checked by SHA-256. Nothing else on the drive was changed." % fixed)
+    return 0
+
+
+sys.exit(main())
+SLF_PYEOF
+)
+# ---------------------------------------------------------------------------
+# Check / repair the FILES of an existing Secure Linux drive. Nothing here partitions, formats or
+# images: only the files that are missing or damaged are copied back from a saved master or the
+# installed kit, and each one is verified by SHA-256 afterwards.
+drive_files_tool() {
+  local py=${SL_USBFIXER_PYTHON:-python3} mode=$1 roots=$2
+  have "$py" || { say "Python 3 is needed for this and was not found. Nothing was changed." >&2; return "$RC_OPERATION"; }
+  SLF_MODE=$mode SLF_ROOTS=$roots SLF_LIST=$REF_LIST SLF_MASTER_DIR=$MASTER_DIR SLF_MASTER_STORE=$MASTER_STORE \
+    SLF_MASTER_ID=$MASTER_ID SLF_KIT_DIR=$KIT_DIR SLF_SOURCE_DIR=$SOURCE_DIR \
+    SLF_SELF_DIR="$(dirname "$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")")" "$py" -I -c "$DRIVE_PY"
+}
+drive_roots() {
+  local mp roots=""
+  if [ -n "$DRIVE_ROOT" ]; then
+    while read -r mp; do
+      [ -n "$mp" ] && [ "$(readlink -f "$mp" 2>/dev/null || printf '%s' "$mp")" = "$(readlink -f "$DRIVE_ROOT" 2>/dev/null || printf '%s' "$DRIVE_ROOT")" ] && { printf '%s\n' "$mp"; return 0; }
+    done < <(mountpoints_for_target)
+    return 1
+  fi
+  while read -r mp; do [ -n "$mp" ] && roots+="$mp"$'\n'; done < <(mountpoints_for_target)
+  [ -n "$roots" ] || return 1
+  printf '%s' "$roots"
+}
+drive_action() {
+  local roots rc answer expected mode=$1
+  roots=$(drive_roots) || {
+    say "I could not find this drive's files. Open the drive so it appears in your Files app, then try again." >&2
+    say "Nothing was changed." >&2; return "$RC_SAFETY"; }
+  [ -n "$KIT_DIR" ] || [ -n "$REF_LIST" ] || [ -n "$MASTER_DIR" ] || [ -n "$MASTER_STORE" ] || {
+    KIT_DIR=${SL_ROOT:-/usr/local/lib/secure-linux}; }
+  drive_files_tool check "$roots"; rc=$?
+  case "$rc" in
+    0) return 0 ;;
+    2) [ "$mode" = repair ] || return "$RC_OPERATION" ;;
+    3|11) return "$RC_OPERATION" ;;
+    *) return "$RC_SAFETY" ;;
+  esac
+  expected="TARGET $DEVICE $D_ID"
+  if [ "$NONINTERACTIVE" = 1 ]; then
+    [ "$CONFIRM_TARGET" = "$expected" ] || { say "Confirmation missing or wrong. Use --confirm-target '$expected'. Nothing was changed." >&2; return "$RC_SAFETY"; }
+  else
+    say "Only the files listed above will be copied. Nothing is erased or formatted."
+    say "To go ahead, type exactly '$expected'"
+    read -rp "> " answer || { say "No confirmation received. Nothing was changed." >&2; return "$RC_SAFETY"; }
+    [ "$answer" = "$expected" ] || { say "That did not match. Nothing was changed." >&2; return "$RC_SAFETY"; }
+  fi
+  assert_same_disk || return "$RC_SAFETY"
+  roots=$(drive_roots) || { say "The drive is no longer available. Nothing further was written." >&2; return "$RC_SAFETY"; }
+  drive_files_tool repair "$roots"; rc=$?
+  [ "$rc" = 0 ] && return 0
+  [ "$rc" = 2 ] && return "$RC_OPERATION"
+  return "$RC_SAFETY"
+}
+
 guide_menu() {
   local answer
   cat <<'EOF'
@@ -922,11 +1712,12 @@ EOF
   say "  4) Repair a filesystem on a disposable image copy"
   say "  5) Erase and reformat a USB disk"
   say "  6) Show available tools and limitations"
+  say "  7) Check or repair the files on a Secure Linux drive (nothing is erased)"
   say "  0) Quit"
   read -rp "What would you like to do? " answer || { say "No answer received. Nothing was changed."; return "$RC_SAFETY"; }
   case "$answer" in
     1) ACTION=diagnose ;; 2) ACTION=image ;; 3) ACTION=recover ;; 4) ACTION=repair ;; 5) ACTION=format ;;
-    6) ACTION=capabilities ;; 0) ACTION=quit ;; *) say "That was not a menu choice. Nothing was changed." >&2; return "$RC_USAGE" ;;
+    6) ACTION=capabilities ;; 7) ACTION=repair-drive ;; 0) ACTION=quit ;; *) say "That was not a menu choice. Nothing was changed." >&2; return "$RC_USAGE" ;;
   esac
 }
 
@@ -941,6 +1732,8 @@ case "$ACTION" in
   recover) recover_action; exit "$?" ;;
   repair)
     require_admin || exit "$?"; prepare_selected_device || exit "$?"; repair_action; exit "$?" ;;
+  check-drive) prepare_selected_device || exit "$?"; drive_action check; exit "$?" ;;
+  repair-drive) prepare_selected_device || exit "$?"; drive_action repair; exit "$?" ;;
   format)
     require_admin || exit "$?"; prepare_selected_device || exit "$?"; format_action; exit "$?" ;;
   *) say "Unknown action." >&2; exit "$RC_USAGE" ;;

@@ -1,0 +1,283 @@
+#!/usr/bin/env python3
+"""secure-linux-which-app: "What should I use for ...?"  Say what you want to do and get one good, free app.
+
+  secure-linux-which-app edit photos         suggest an app for a task (any words you like)
+  secure-linux-which-app photoshop           also works with the name of an app you used before
+  secure-linux-which-app --ask               ask what you want to do (used by the menu entry)
+  secure-linux-which-app --list              show every task this helper knows
+  secure-linux-which-app --help              this page
+
+It reads two lists that come with Secure Linux: setup-data/task-apps.tsv (tasks and apps) and
+setup-data/app-equivalents.tsv (which app replaces which old app, whether it fits this computer, and how to get it).
+It only reads them. It installs nothing by itself and needs no internet and no password.
+Exit code: 0 = an app was suggested, 1 = nothing fits (try --list), 2 = wrong use.
+"""
+import csv
+import os
+import re
+import subprocess
+import sys
+
+
+def etc_dir():
+    return os.environ.get("SL_ETC", "/etc/secure-linux")
+
+
+def home():
+    return os.environ.get("HOME") or os.environ.get("USERPROFILE") or os.path.expanduser("~")
+
+
+def profile():
+    try:
+        with open(os.path.join(etc_dir(), "profile"), encoding="utf-8") as fh:
+            value = fh.read().strip()
+    except OSError:
+        return "full"
+    return value if value in ("full", "lite") else "full"
+
+
+def data_dirs():
+    here = os.path.dirname(os.path.realpath(__file__))
+    found = []
+    if os.environ.get("SL_WHICHAPP_DATA"):
+        found.append(os.environ["SL_WHICHAPP_DATA"])
+    found.append(os.path.join(os.environ.get("SL_ROOT", "/usr/local/lib/secure-linux"), "setup-data"))
+    found.append(os.path.join(here, "..", "setup-data"))
+    return found
+
+
+def data_file(name):
+    for folder in data_dirs():
+        path = os.path.join(folder, name)
+        if os.path.isfile(path):
+            return path
+    return None
+
+
+def read_tsv(name):
+    path = data_file(name)
+    rows = []
+    if not path:
+        return rows
+    with open(path, encoding="utf-8", newline="") as fh:
+        for ln in fh:
+            ln = ln.rstrip("\r\n")
+            if not ln.strip() or ln.lstrip().startswith("#"):
+                continue
+            rows.append(ln.split("\t"))
+    return rows
+
+
+def stem(word):
+    if len(word) > 5 and word.endswith("ing"):
+        word = word[:-3]
+    elif len(word) > 4 and word.endswith("ies"):
+        word = word[:-3] + "y"
+    elif len(word) > 4 and word.endswith("ed"):
+        word = word[:-2]
+    elif len(word) > 3 and word.endswith("s") and not word.endswith("ss"):
+        word = word[:-1]
+    return word
+
+
+def tokens(text):
+    """Lower-case words with a light stem (photos -> photo, editing -> edit). Small words stay: a phrase such as
+    "back up" has to match exactly."""
+    return [stem(w) for w in re.findall(r"[a-z0-9]+", (text or "").lower())]
+
+
+def load_tasks():
+    tasks = []
+    for r in read_tsv("task-apps.tsv"):
+        if len(r) < 7:
+            continue
+        tasks.append({"id": r[0], "keywords": [k.strip() for k in r[1].split(",") if k.strip()], "title": r[2],
+                      "app": r[3], "linux_id": r[4], "pkg_type": r[5], "tip": r[6]})
+    return tasks
+
+
+def load_equivalents():
+    rows = []
+    for r in read_tsv("app-equivalents.tsv"):
+        r = r + [""] * (10 - len(r))
+        rows.append({"pattern": r[0], "linux_id": r[1], "pkg_type": r[2], "category": r[3], "one_liner": r[4],
+                     "debian_pkg": r[7], "state": r[8], "profiles": r[9] or "all"})
+    return rows
+
+
+def equivalent_for(linux_id, eq_rows):
+    for row in eq_rows:
+        if row["linux_id"] == linux_id:
+            return row
+    return None
+
+
+def score_task(task, query_tokens):
+    qset = set(query_tokens)
+    best = 0
+    total = 0
+    for phrase in task["keywords"]:
+        ptoks = tokens(phrase)
+        if ptoks and all(t in qset for t in ptoks):
+            points = 2 * len(ptoks)
+            total += points
+            best = max(best, points)
+    atoks = tokens(task["app"])
+    if atoks and all(t in qset for t in atoks):
+        total += 6
+    return total
+
+
+def find(query):
+    """Candidates, best first: [{'score', 'app', 'linux_id', 'pkg_type', 'text', 'why'}]. One per distinct app."""
+    qt = tokens(query)
+    eq_rows = load_equivalents()
+    cands = []
+    for task in load_tasks():
+        s = score_task(task, qt)
+        if s >= 2:
+            cands.append({"score": s, "app": task["app"], "linux_id": task["linux_id"], "pkg_type": task["pkg_type"],
+                          "text": task["tip"], "title": task["title"], "why": "task"})
+    lowered = " " + " ".join(re.findall(r"[a-z0-9]+", query.lower())) + " "
+    for row in eq_rows:
+        pat = " " + " ".join(re.findall(r"[a-z0-9]+", row["pattern"].lower())) + " "
+        if len(pat.strip()) < 4 or pat not in lowered:
+            continue
+        name = row["linux_id"].rsplit(".", 1)[-1] if row["linux_id"] else "built in"
+        cands.append({"score": 20 + len(pat), "app": name, "linux_id": row["linux_id"], "pkg_type": row["pkg_type"],
+                      "text": row["one_liner"], "title": "Instead of " + row["pattern"], "why": "old-app"})
+    # the same app may come from a task row and from an old-app row: keep the best, and name it from the task list
+    tasks = load_tasks()
+    seen = {}
+    for c in sorted(cands, key=lambda c: -c["score"]):
+        key = c["linux_id"] or c["text"]
+        if key in seen:
+            continue
+        if c["why"] == "old-app":
+            # name the app the way the task list does: the name the one-line description starts with
+            named = [t["app"] for t in tasks if t["linux_id"] == c["linux_id"] and c["text"].startswith(t["app"])]
+            if named:
+                c["app"] = max(named, key=len)
+        seen[key] = c
+    out = list(seen.values())
+    out.sort(key=lambda c: -c["score"])
+    return out
+
+
+def installed(cand):
+    """True / False when we can tell, None when we cannot."""
+    if cand["pkg_type"] == "builtin":
+        return True
+    dirs = os.environ.get("SL_FLATPAK_DIRS")
+    folders = dirs.split(os.pathsep) if dirs else ["/var/lib/flatpak/app",
+                                                    os.path.join(home(), ".local", "share", "flatpak", "app")]
+    if cand["pkg_type"] == "flatpak":
+        if any(os.path.isdir(os.path.join(f, cand["linux_id"])) for f in folders):
+            return True
+        return False if any(os.path.isdir(f) for f in folders) else None
+    if cand["pkg_type"] == "rpm" and cand["linux_id"]:
+        try:
+            return subprocess.run(["rpm", "-q", cand["linux_id"]], stdout=subprocess.DEVNULL,
+                                  stderr=subprocess.DEVNULL, timeout=20).returncode == 0
+        except (OSError, subprocess.SubprocessError):
+            return None
+    return None
+
+
+def how_to_get(cand, eq):
+    state = eq["state"] if eq else ""
+    have = installed(cand)
+    if cand["pkg_type"] == "builtin":
+        return "It is already on this computer. Find it in the menu."
+    if have:
+        return "It is already on this computer. Find it in the menu."
+    if state == "installed" and have is None:
+        return "It normally comes with this computer. Look for it in the menu."
+    lines = ["It is free. To get it, open 'Install Apps & Fill In Missing Software' in the menu, or run: "
+             "secure-linux-migrate page apps-you-used"]
+    if cand["pkg_type"] == "flatpak" and cand["linux_id"]:
+        lines.append("In a terminal you can also type: flatpak install flathub %s" % cand["linux_id"])
+    return " ".join(lines[:1]) + ("\n  " + lines[1] if len(lines) > 1 else "")
+
+
+def fits_profile(eq, prof):
+    if not eq or eq["profiles"] in ("", "all"):
+        return True
+    return eq["profiles"] == prof
+
+
+def answer(query):
+    cands = find(query)
+    prof = profile()
+    eq_rows = load_equivalents()
+    usable, skipped = [], []
+    for c in cands:
+        eq = equivalent_for(c["linux_id"], eq_rows) if c["linux_id"] and c["linux_id"] != "-" else None
+        (usable if fits_profile(eq, prof) else skipped).append((c, eq))
+    if not usable and not skipped:
+        return None
+    out = []
+    if usable:
+        c, eq = usable[0]
+        out.append('For "%s" I suggest: %s' % (query.strip(), c["app"]))
+        out.append("  %s" % c["text"])
+        out.append("  %s" % how_to_get(c, eq))
+        others = ["%s" % o["app"] for o, _ in usable[1:3]]
+        if others:
+            out.append("Also worth a look: %s" % ", ".join(others))
+    else:
+        c, _ = skipped[0]
+        out.append('For "%s" the usual choice is %s, but it is not offered on the Lite version of Secure Linux.'
+                   % (query.strip(), c["app"]))
+        out.append("  Ask for another idea with different words, or use the Full version on a stronger computer.")
+    if skipped and usable:
+        out.append("Not offered on this version of Secure Linux: %s" % ", ".join(s["app"] for s, _ in skipped[:2]))
+    return "\n".join(out)
+
+
+def list_tasks():
+    for task in load_tasks():
+        print("%-42s %s" % (task["title"], task["app"]))
+
+
+def main(argv):
+    args = argv[1:]
+    if args and args[0] in ("-h", "--help"):
+        print(__doc__.strip())
+        return 0
+    if args and args[0] == "--list":
+        list_tasks()
+        return 0
+    pause = False
+    if args and args[0] == "--ask":
+        try:
+            query = input("What do you want to do? (for example: edit photos) ").strip()
+        except EOFError:
+            return 2
+        pause = True
+    else:
+        query = " ".join(args).strip()
+    if not query:
+        print("Tell me what you want to do, for example: secure-linux-which-app edit photos", file=sys.stderr)
+        return 2
+    if query.startswith("-"):
+        print("Unknown option: %s (see --help)" % query.split()[0], file=sys.stderr)
+        return 2
+    text = answer(query)
+    code = 0
+    if text is None:
+        print('I do not have a suggestion for "%s" yet.' % query)
+        print("Try different words, or run: secure-linux-which-app --list")
+        code = 1
+    else:
+        print(text)
+    if pause:
+        try:
+            input("\nPress Enter to close. ")
+        except EOFError:
+            pass
+    return code
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

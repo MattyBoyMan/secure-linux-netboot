@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "releases": [
+    {
+      "version": "2026.11.13",
+      "title": "Updates only fetch what changed",
+      "notes": [
+        "The kit now uses the copy you already have first, and only downloads files that are new or different.",
+        "Updates are checked against a published list of files, so a damaged download is spotted before it is used.",
+        "Nothing is changed on your computer until the whole update has been downloaded and checked."
+      ]
+    },
+    {
+      "version": "2026.11.14",
+      "title": "A short note about what changed",
+      "notes": [
+        "After an update you now see a short note in plain words: which release you had, which one you have now, and how many files changed.",
+        "The note works without internet, because it is stored with the kit.",
+        "You can read it again any time: open a terminal and type secure-linux-whats-new."
+      ]
+    }
+  ]
+}

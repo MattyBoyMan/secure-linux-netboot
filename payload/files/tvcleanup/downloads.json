@@ -1,0 +1,45 @@
+{
+  "format": 1,
+  "written": "2026-11-14",
+  "how_to_read": "The kit only installs a file whose SHA-256 matches one of these lines. 'verified_by' says how that hash was checked on 2026-11-14.",
+  "stock_launcher": {
+    "packages_to_turn_off": ["com.google.android.apps.tv.launcherx", "com.google.android.tungsten.setupwraith"],
+    "source": "https://github.com/ohernandezdev/android-tv-tune/blob/main/docs/launcher.md (one source, one TV: the setup wizard package must also be turned off or it takes over the Home button)"
+  },
+  "launcher": {
+    "name": "FLauncher",
+    "package": "me.efesser.flauncher",
+    "version": "0.18.0",
+    "licence": "GPL-3.0",
+    "project": "https://gitlab.com/flauncher/flauncher",
+    "release_commit": "4930cd738a5ab32967953fe8b12790bc4b452872",
+    "download_name": "flauncher.apk",
+    "files": {
+      "any": {"url": "https://gitlab.com/flauncher/flauncher/-/releases/0.18.0/downloads/flauncher-0.18.0.apk",
+              "sha256": "376fc528c880cdf7c7c04b2d3708c69f911144498218babb6300808b772af32e", "size": 26729298,
+              "verified_by": "downloaded and hashed by the kit builder"}
+    }
+  },
+  "youtube": {
+    "name": "SmartTube (stable)",
+    "package": "org.smarttube.stable",
+    "version": "32.71",
+    "tag": "32.71s",
+    "licence": "MIT",
+    "project": "https://github.com/yuliskov/SmartTube",
+    "release_commit": "1d4d9b27a6fd24c2cdb3f03fb6dd2278961111f3",
+    "download_name": "smarttube.apk",
+    "notice": "The SmartTube author says that in the past his computer was infected and a few builds may have been affected (see the top of https://github.com/yuliskov/SmartTube). That is why this kit only installs a file whose fingerprint matches the one written down here.",
+    "files": {
+      "arm64-v8a": {"url": "https://github.com/yuliskov/SmartTube/releases/download/32.71s/SmartTube_stable_32.71_arm64-v8a.apk",
+                    "sha256": "6a799a129015e772d231440f4e3ad919f643164a0fdeb76ecb202bf3afb3db52", "size": 26731385,
+                    "verified_by": "downloaded and hashed by the kit builder; matches the GitHub release digest"},
+      "armeabi-v7a": {"url": "https://github.com/yuliskov/SmartTube/releases/download/32.71s/SmartTube_stable_32.71_armeabi-v7a.apk",
+                      "sha256": "288e8caaa11417f6b64d2a7f906cead85c0b8a9bb5904753d7cb4f79d117d023", "size": 25517725,
+                      "verified_by": "downloaded and hashed by the kit builder; matches the GitHub release digest"},
+      "universal": {"url": "https://github.com/yuliskov/SmartTube/releases/download/32.71s/SmartTube_stable_32.71_universal.apk",
+                    "sha256": "6d1819b88ed7b03a61fac0b58d3e14197fab9eb7d42905bd93913da58f1adc2b", "size": 35393792,
+                    "verified_by": "downloaded and hashed by the kit builder; matches the GitHub release digest"}
+    }
+  }
+}

@@ -1,0 +1,24 @@
+# Jellyfin for Secure Linux: your own private streaming for films, shows and music. Home network only.
+# Started only by secure-linux-server-apps, which fills in the SL_* values from this computer (see app.conf).
+# Image pinned by version AND digest (checked on Docker Hub, 2026-11-16): the official jellyfin/jellyfin 12.4.20261026-211555.
+# Runs as your own account (not as the administrator). Your media folder is mounted READ-ONLY.
+# No hardware video help (graphics card) is passed in, so the picture is converted by the processor when needed.
+# The first person to open it makes the first account: do that yourself straight away (nothing is sent anywhere).
+services:
+  jellyfin:
+    image: docker.io/jellyfin/jellyfin:12.4.20261026-211555@sha256:fea863d0cd9ec445985d9c75fc6ed64e38a1d2766cf0c250a33d553f4fc1b771
+    restart: unless-stopped
+    user: "${SL_UID:?user missing}:${SL_GID:?group missing}"
+    ports:
+      - "${SL_BIND:?home address missing}:${SL_PORT:?port missing}:8096"
+    volumes:
+      - "${SL_DATA:?data folder missing}/config:/config:Z"
+      - "${SL_DATA:?data folder missing}/cache:/cache:Z"
+      - "${SL_DATA:?data folder missing}/media:/media:ro,z"
+    environment:
+      TZ: "${SL_TZ:-UTC}"
+      JELLYFIN_PublishedServerUrl: "http://${SL_BIND:?home address missing}:${SL_PORT:?port missing}"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL

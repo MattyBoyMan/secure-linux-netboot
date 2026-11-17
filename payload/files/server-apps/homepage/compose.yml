@@ -1,0 +1,26 @@
+# Homepage for Secure Linux: one start page with buttons for your home apps. Home network only.
+# Started only by secure-linux-server-apps, which fills in the SL_* values from this computer (see app.conf).
+# Image pinned by version AND digest (checked on ghcr.io, 2026-11-16): the official ghcr.io/gethomepage/homepage v2.8.0.
+# Licence: GPL-3.0 (free to use).
+# The image starts as the administrator inside the container ONLY to give its folders to you, then runs as your own
+# account (PUID/PGID, the project's own docker-entrypoint.sh uses su-exec for this).
+# Safety: it gets NO access to the container engine (no docker.sock), so it can only show what you list in its files.
+# It answers only to this computer's own home address (HOMEPAGE_ALLOWED_HOSTS).
+services:
+  homepage:
+    image: ghcr.io/gethomepage/homepage:v2.8.0@sha256:019d8f063a7299e7c1c51ee4a70b692291809af3244894fbec2c2ac7d1f71b18
+    restart: unless-stopped
+    ports:
+      - "${SL_BIND:?home address missing}:${SL_PORT:?port missing}:3000"
+    volumes:
+      - "${SL_DATA:?data folder missing}/config:/app/config:Z"
+    environment:
+      TZ: "${SL_TZ:-UTC}"
+      PUID: "${SL_UID:?user missing}"
+      PGID: "${SL_GID:?group missing}"
+      HOMEPAGE_ALLOWED_HOSTS: "${SL_BIND:?home address missing}:${SL_PORT:?port missing},${SL_HOSTNAME:-localhost}.local:${SL_PORT:?port missing}"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - NET_RAW
+      - MKNOD

@@ -1,0 +1,10 @@
+[Unit]
+Description=Secure Linux: check every home backup block by block and test-restore a few files
+# A full check reads all backups: wait until the computer is plugged in
+ConditionACPower=true
+
+[Service]
+Type=oneshot
+Nice=19
+IOSchedulingClass=idle
+ExecStart=/usr/local/bin/secure-linux-backup check --scheduled

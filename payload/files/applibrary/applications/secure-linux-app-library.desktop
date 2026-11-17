@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Optional apps
+GenericName=Extra apps you can add
+Comment=Pick extra apps to add. They install only when this computer is online.
+Exec=/usr/local/bin/secure-linux-app-library choose
+Icon=system-software-install
+Terminal=false
+Categories=System;Settings;
+Keywords=apps;optional;extra;install;library;
+StartupNotify=true

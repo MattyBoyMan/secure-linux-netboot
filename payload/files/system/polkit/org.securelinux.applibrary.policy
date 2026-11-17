@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<!-- Secure Linux App Library: password prompts for adding one optional app and for saving which apps are chosen.
+     Installed by steps/00-early.sh to /usr/share/polkit-1/actions/. Each action is tied to the program path and to
+     its first word (install or save), so the prompt says exactly what is being asked. -->
+<policyconfig>
+  <vendor>The Complete Secure Linux Package</vendor>
+  <action id="org.securelinux.applibrary.install">
+    <description>Add one optional app</description>
+    <message>Secure Linux needs your password to add one app from its list of optional apps (it comes from the internet and only that app is added)</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/bin/secure-linux-app-library</annotate>
+    <annotate key="org.freedesktop.policykit.exec.argv1">install</annotate>
+  </action>
+  <action id="org.securelinux.applibrary.save">
+    <description>Save which optional apps you want</description>
+    <message>Secure Linux needs your password to save which optional apps you want on this computer (nothing is installed by this step)</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/bin/secure-linux-app-library</annotate>
+    <annotate key="org.freedesktop.policykit.exec.argv1">save</annotate>
+  </action>
+</policyconfig>

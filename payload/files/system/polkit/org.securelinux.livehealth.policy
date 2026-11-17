@@ -1,0 +1,75 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<!-- Secure Linux live health graphs: password prompts for the few steps that change the computer.
+     Installed by steps/00-early.sh to /usr/share/polkit-1/actions/. Each action is tied to the program path and to
+     its first word, so the prompt says exactly what is being asked. -->
+<policyconfig>
+  <vendor>The Complete Secure Linux Package</vendor>
+  <action id="org.securelinux.livehealth.setup">
+    <description>Install live health graphs</description>
+    <message>Secure Linux needs your password to add the live health graphs (this computer only, nothing is sent to anyone). You have just read what it does and said yes</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/bin/secure-linux-live-health</annotate>
+    <annotate key="org.freedesktop.policykit.exec.argv1">setup</annotate>
+  </action>
+  <action id="org.securelinux.livehealth.on">
+    <description>Start live health graphs</description>
+    <message>Secure Linux needs your password to start the live health graphs</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/bin/secure-linux-live-health</annotate>
+    <annotate key="org.freedesktop.policykit.exec.argv1">on</annotate>
+  </action>
+  <action id="org.securelinux.livehealth.off">
+    <description>Stop live health graphs</description>
+    <message>Secure Linux needs your password to stop the live health graphs and close them to the network</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/bin/secure-linux-live-health</annotate>
+    <annotate key="org.freedesktop.policykit.exec.argv1">off</annotate>
+  </action>
+  <action id="org.securelinux.livehealth.network">
+    <description>Show graphs on the home network</description>
+    <message>Secure Linux needs your password to open or close the live health graphs for your home network (never the internet)</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/bin/secure-linux-live-health</annotate>
+    <annotate key="org.freedesktop.policykit.exec.argv1">network</annotate>
+  </action>
+  <action id="org.securelinux.livehealth.others">
+    <description>Change the list of other computers</description>
+    <message>Secure Linux needs your password to change the list of other home computers whose graphs you open from here</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/bin/secure-linux-live-health</annotate>
+    <annotate key="org.freedesktop.policykit.exec.argv1">others</annotate>
+  </action>
+  <action id="org.securelinux.livehealth.remove">
+    <description>Take live health away</description>
+    <message>Secure Linux needs your password to take the live health graphs away completely</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/bin/secure-linux-live-health</annotate>
+    <annotate key="org.freedesktop.policykit.exec.argv1">remove</annotate>
+  </action>
+</policyconfig>

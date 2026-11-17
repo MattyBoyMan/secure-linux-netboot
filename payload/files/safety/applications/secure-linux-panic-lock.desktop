@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Panic Lock
+GenericName=Lock this computer now
+Comment=Lock the screen at once, close the home server folder and clear copied text
+Exec=/usr/local/bin/secure-linux-panic-lock
+Icon=system-lock-screen
+Terminal=false
+Categories=Utility;Security;
+Keywords=panic;lock;emergency;quick;privacy;
+X-KDE-Shortcuts=Meta+Ctrl+L

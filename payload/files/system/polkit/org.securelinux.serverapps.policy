@@ -1,0 +1,97 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<!-- Secure Linux home-server apps (Nextcloud, Paperless-ngx and more): one password prompt per kind of change.
+     Installed by steps/00-early.sh to /usr/share/polkit-1/actions/. Each action is tied to the program path and to
+     its first word, so the prompt says exactly what is being asked. -->
+<policyconfig>
+  <vendor>The Complete Secure Linux Package</vendor>
+  <action id="org.securelinux.serverapps.install">
+    <description>Set up a home-server app</description>
+    <message>Secure Linux needs your password to set up a home-server app on this computer (for your home network only)</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/bin/secure-linux-server-apps</annotate>
+    <annotate key="org.freedesktop.policykit.exec.argv1">install</annotate>
+  </action>
+  <action id="org.securelinux.serverapps.start">
+    <description>Switch on a home-server app</description>
+    <message>Secure Linux needs your password to switch on a home-server app</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/bin/secure-linux-server-apps</annotate>
+    <annotate key="org.freedesktop.policykit.exec.argv1">start</annotate>
+  </action>
+  <action id="org.securelinux.serverapps.stop">
+    <description>Switch off a home-server app</description>
+    <message>Secure Linux needs your password to switch off a home-server app (its data is kept)</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/bin/secure-linux-server-apps</annotate>
+    <annotate key="org.freedesktop.policykit.exec.argv1">stop</annotate>
+  </action>
+  <action id="org.securelinux.serverapps.status">
+    <description>Check the home-server apps</description>
+    <message>Secure Linux needs your password to check whether your home-server apps are running</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/bin/secure-linux-server-apps</annotate>
+    <annotate key="org.freedesktop.policykit.exec.argv1">status</annotate>
+  </action>
+  <action id="org.securelinux.serverapps.login">
+    <description>Show the first sign-in of a home-server app</description>
+    <message>Secure Linux needs your password to show the sign-in name and password made for a home-server app</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/bin/secure-linux-server-apps</annotate>
+    <annotate key="org.freedesktop.policykit.exec.argv1">login</annotate>
+  </action>
+  <action id="org.securelinux.serverapps.update">
+    <description>Update a home-server app</description>
+    <message>Secure Linux needs your password to back up a home-server app and move it to the version this kit has checked</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/bin/secure-linux-server-apps</annotate>
+    <annotate key="org.freedesktop.policykit.exec.argv1">update</annotate>
+  </action>
+  <action id="org.securelinux.serverapps.backup">
+    <description>Back up a home-server app</description>
+    <message>Secure Linux needs your password to copy everything a home-server app keeps into one private file</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/bin/secure-linux-server-apps</annotate>
+    <annotate key="org.freedesktop.policykit.exec.argv1">backup</annotate>
+  </action>
+  <action id="org.securelinux.serverapps.remove">
+    <description>Remove a home-server app</description>
+    <message>Secure Linux needs your password to remove a home-server app (its data is kept unless you confirm twice)</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/bin/secure-linux-server-apps</annotate>
+    <annotate key="org.freedesktop.policykit.exec.argv1">remove</annotate>
+  </action>
+</policyconfig>

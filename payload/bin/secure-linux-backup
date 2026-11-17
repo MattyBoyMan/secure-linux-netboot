@@ -1,0 +1,1735 @@
+#!/bin/bash
+# secure-linux-backup: optional, easy, encrypted backups of your home folder (BorgBackup). Off until you turn it on.
+#   secure-linux-backup [status]                     is it on, when was the last good backup, is anything wrong
+#   secure-linux-backup setup --to FOLDER [--name NAME] [--yes]
+#                                                    turn backups on (FOLDER: your home-server folder or a USB drive)
+#   secure-linux-backup setup --to FOLDER --existing [--computer NAME]
+#                                                    use backups made before (type the passphrase from your recovery sheet)
+#   secure-linux-backup run                          back up now, check the new backup, then tidy old backups
+#   secure-linux-backup check                        check every backup block by block, then test-restore a few files
+#   secure-linux-backup check-mode auto|full|quick   how each new backup is checked (auto: chosen for you every time)
+#   secure-linux-backup list                         list your backups (newest last)
+#   secure-linux-backup restore [--from BACKUP] [--to FOLDER] PATH...   get files or folders back (into a new folder)
+#   secure-linux-backup restore --everything [--from BACKUP] [--to FOLDER]
+#   secure-linux-backup recovery-sheet [--done|--path]   where your recovery sheet is / confirm you saved it
+#   secure-linux-backup repair [--yes]               fix the backup store after a check found damage (asks first)
+#   secure-linux-backup passphrase-again             type the passphrase from your recovery sheet again (keyring reset)
+#   secure-linux-backup off | on                     stop / restart the automatic backups (your backups are kept)
+#   secure-linux-backup deletion-checked             clear the alarm after backups disappeared (once you have looked)
+#   secure-linux-backup second setup --to FOLDER [--automatic] [--yes]
+#                                                    add a second copy on a USB drive (its own encrypted store)
+#   secure-linux-backup second run|check|list|restore|repair|recovery-sheet|status
+#                                                    the same commands for the copy on the USB drive
+#   secure-linux-backup second automatic on|off      make the drive copy by itself whenever the drive is plugged in
+#   secure-linux-backup second forget                stop making drive copies (the copy on the drive is kept)
+#   secure-linux-backup copies                       your 3 copies (the 3-2-1 rule) and the one next step
+#   secure-linux-backup install-borg [--yes]         add the free backup program (BorgBackup) when it is missing
+#   secure-linux-backup offer-home                   (run by the daily backup check) one gentle offer, once, for the
+#                                                    owner: backups to the home server once it is connected
+# Exit codes: 0 fine, 1 finished with warnings, 2 problem, 3 backup place not connected, 4 backups not set up,
+#             5 BorgBackup was added and the computer must restart once, 6 waiting for internet.
+# The passphrase is made on this computer and kept only in your keyring (or a private file only you can read).
+# It is never shown on screen or put in a log: it is only written on your recovery sheet.
+set -u
+umask 077
+unset BORG_PASSPHRASE BORG_PASSPHRASE_FD BORG_NEW_PASSPHRASE BORG_REPO BORG_PASSCOMMAND
+
+SELF=$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")
+CONF_DIR=$HOME/.config/secure-linux/backup
+MAIN_CONF=$CONF_DIR/config
+SECOND_CONF=$CONF_DIR/second-copy
+EXCL=$CONF_DIR/excludes
+MY_EXCL=$CONF_DIR/my-excludes
+STATE_DIR=$HOME/.local/state/secure-linux/home-backup
+LOG=$STATE_DIR/log
+SL_STATE=${SL_STATE:-/var/lib/secure-linux}
+ME=${USER:-$(id -un)}
+UALERTS=$SL_STATE/user-alerts/$ME
+MEDIA_ROOTS=${SL_MEDIA_ROOTS:-/run/media/$ME /media/$ME}   # where USB drives appear (the drive copy is found here by id)
+COMP_DEFAULT=zstd,10                     # strong compression; deduplication means only changed data is compressed
+SMALL_GB_DEFAULT=30                      # a home folder up to this size is always read back in full after a backup
+FULL_EVERY=604800                        # every backup store is read back in full at least once every 7 days
+COPY_EVERY_DAYS=30                       # the drive copy is due once a month
+KEEP=(--keep-last 3 --keep-daily 7 --keep-weekly 4 --keep-monthly 12)
+TIMERS=(secure-linux-backup.timer secure-linux-backup-verify.timer)
+COPY_UNIT=secure-linux-backup-copy.path  # notices when the backup drive is plugged in (only once a drive copy is added)
+SYSROOT=${SL_TEST_SYSROOT:-}             # tests (and only tests) redirect the system folders below
+SL_ETC=${SL_ETC:-/etc/secure-linux}
+SL_ROOT=${SL_ROOT:-/usr/local/lib/secure-linux}
+HS_WHERE=$SYSROOT/media/homeserver       # the home server's shared folder (Wave 0 H: secure-linux-home-share)
+HS_READY=$SL_ETC/home-share/ready        # exists once the owner has connected the home server
+HS_LOCATION=$SYSROOT/run/secure-linux/location   # home|away|offline, written by the network dispatcher
+OFFER_ALERT=home-backup-offer            # the one gentle "Turn on backups to your home server?" offer
+SIGNING_DIR=$HOME/.secure-linux-release-signing  # the release signing key: kept out of backups (it has its own USB copy)
+ARCH_RE='^home-[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}\.[0-9]{2}\.[0-9]{2}$'
+B_ERR="" B_NOSPACE=no TWO_COPIES=no HOME_BYTES="" CHK_MODE="" CHK_WHY="" NOT_OURS=no LOCK_HELD=no REPAIRING=no
+OLD_REPO="" OLD_DEST="" MAIN_REPO="" MAIN_DEST=""
+
+say() { printf '%s\n' "$*"; }
+kv_get() { sed -n "s/^$2=//p" "$1" 2>/dev/null | tail -n 1; }
+kv_set() {   # kv_set FILE KEY VALUE   (replaces the key; written through a temporary file)
+  local f=$1 k=$2 v tmp
+  v=$(printf '%s' "$3" | tr -d '\r\n')
+  mkdir -p "$(dirname "$f")" || return 1
+  tmp=$(mktemp "$f.XXXXXX") || return 1
+  { grep -v "^$k=" "$f" 2>/dev/null; printf '%s=%s\n' "$k" "$v"; } > "$tmp" && mv -f "$tmp" "$f"
+}
+st() { kv_get "$STATE" "$1"; }
+st_set() { mkdir -p "$PSTATE"; kv_set "$STATE" "$1" "$2"; }
+num() { [[ "${1:-}" =~ ^[0-9]+$ ]]; }
+now() { date +%s; }
+
+# ---------------------------------------------------------------- the recovery sheet is kept in memory when it can be
+# The sheet holds the passphrase in plain text. On Btrfs and SSDs a deleted file can still be read from the disk, so the
+# sheet goes into this person's own memory-only folder ($XDG_RUNTIME_DIR, a tmpfs) and is never written to the disk.
+# It is gone after a restart; Backups makes it again (from the keyring) when it is needed.
+_sheet_in_memory() {
+  local d=${XDG_RUNTIME_DIR:-}
+  [ -n "$d" ] && [ -d "$d" ] && [ -O "$d" ] && [ -w "$d" ] || return 1
+  [ "$(findmnt -no FSTYPE -T "$d" 2>/dev/null | head -n 1)" = tmpfs ]
+}
+
+# ---------------------------------------------------------------- the two backup places
+# "main" is the first place (home server or a drive). "second" is the optional copy on a USB drive: its own
+# encrypted store, its own settings, state, lock and alerts, so a problem with one never blocks or tidies the other.
+use_place() {
+  PLACE=$1
+  if [ "$PLACE" = second ]; then
+    CONF=$SECOND_CONF; PSTATE=$STATE_DIR/second; CMD="secure-linux-backup second"
+    ALERT_PROBLEM=home-backup-copy-problem
+    ALERT_TITLE="Your drive copy needs attention"
+    ALERT_TEXT="A check found a problem with the copy on your backup drive. Your other backups are not affected."
+    ALERT_HINT="Open Backups and choose Repair the drive copy (or type: secure-linux-backup second repair)."
+  else
+    CONF=$MAIN_CONF; PSTATE=$STATE_DIR; CMD="secure-linux-backup"
+    ALERT_PROBLEM=home-backup-problem
+    ALERT_TITLE="Your backups need attention"
+    ALERT_TEXT="A check found a problem with your backups. Your older backups were kept."
+    ALERT_HINT="Open Backups and choose Repair backups (or type: secure-linux-backup repair)."
+  fi
+  STATE=$PSTATE/state; SHEET=$PSTATE/recovery-sheet.txt; LOCKD=$PSTATE/lock; DISK_SHEET=$PSTATE/recovery-sheet.txt
+  if _sheet_in_memory; then
+    if [ "$PLACE" = second ]; then SHEET=$XDG_RUNTIME_DIR/secure-linux-backup/drive-copy-recovery-sheet.txt
+    else SHEET=$XDG_RUNTIME_DIR/secure-linux-backup/recovery-sheet.txt; fi
+  fi
+  REPO="" DEST="" NAME="" ID="" SECRET="" COMP="" ENABLED="" VERIFY="" SMALL_GB="" REPO_ID="" AUTO="" RELOC=no
+}
+use_place main
+
+_host() {
+  local h=${HOSTNAME:-}
+  [ -n "$h" ] || h=$(uname -n 2>/dev/null)
+  h=${h%%.*}; h=$(printf '%s' "$h" | tr -c 'A-Za-z0-9-' '-')
+  printf '%s' "${h:-computer}"
+}
+_when_epoch() { date -d "@$1" '+%a %d %b %Y, %H:%M' 2>/dev/null || printf '%s' "$1"; }
+_when_arch() {   # home-2026-11-14T10.02.33 -> Fri 14 Nov 2026, 10:02
+  local n=${1#home-} d t
+  n=${n%.checkpoint}; d=${n%%T*}; t=${n#*T}; t=${t//./:}
+  date -d "$d $t" '+%a %d %b %Y, %H:%M' 2>/dev/null || printf '%s' "$1"
+}
+_gb() { awk -v b="$1" 'BEGIN { if (b >= 1073741824) printf "%.1f GB", b / 1073741824; else if (b >= 1048576) printf "%.0f MB", b / 1048576; else printf "%.0f KB", b / 1024 }'; }
+
+load_conf() {
+  [ -f "$CONF" ] || return 1
+  REPO=$(kv_get "$CONF" repo); DEST=$(kv_get "$CONF" dest); NAME=$(kv_get "$CONF" name)
+  ID=$(kv_get "$CONF" id); SECRET=$(kv_get "$CONF" secret); COMP=$(kv_get "$CONF" compression)
+  ENABLED=$(kv_get "$CONF" enabled); VERIFY=$(kv_get "$CONF" verify_after); SMALL_GB=$(kv_get "$CONF" small_home_gb)
+  REPO_ID=$(kv_get "$CONF" repo_id); AUTO=$(kv_get "$CONF" automatic)
+  [[ "$COMP" =~ ^(zstd,[0-9]{1,2}|auto,zstd,[0-9]{1,2}|lz4)$ ]] || COMP=$COMP_DEFAULT
+  case "$VERIFY" in auto|full|quick) ;; *) VERIFY=auto ;; esac
+  [[ "$SMALL_GB" =~ ^[0-9]{1,5}$ ]] || SMALL_GB=$SMALL_GB_DEFAULT
+  [[ "$REPO_ID" =~ ^[0-9a-f]{16,128}$ ]] || REPO_ID=""
+  [ -n "$NAME" ] || NAME="your backup place"
+  [ -n "$REPO" ] && [[ "$ID" =~ ^[0-9a-f]{16}$ ]]
+}
+need_conf() {
+  load_conf && return 0
+  say "Home folder backups are not set up yet (they are optional)."
+  say "Turn them on in the Backups app, or type: secure-linux-backup setup --to FOLDER"
+  return 4
+}
+_atomic() { [ -e "$SYSROOT/run/ostree-booted" ] || [ "$(cat "$SL_ETC/profile" 2>/dev/null)" = atomic ]; }
+BORG_PENDING=$STATE_DIR/borg-added-restart-needed   # (atomic) BorgBackup was added; holds this start's boot id
+_boot_id() {
+  if [ -n "${SL_TEST_BOOT_ID:-}" ]; then printf '%s' "$SL_TEST_BOOT_ID"; return; fi
+  cat /proc/sys/kernel/random/boot_id 2>/dev/null || printf 'unknown'
+}
+_borg_pending() {   # BorgBackup was added to the system and the computer has not restarted since
+  [ -f "$BORG_PENDING" ] || return 1
+  [ "$(cat "$BORG_PENDING" 2>/dev/null)" = "$(_boot_id)" ] && return 0
+  rm -f "$BORG_PENDING"                     # restarted since: the note is old (and borg is still missing)
+  return 1
+}
+need_borg() {
+  command -v borg >/dev/null 2>&1 && return 0
+  say "The backup program (BorgBackup) is not installed on this computer yet. It is free."
+  if _borg_pending; then
+    say "It was added already: restart the computer once to finish, then try again."
+  elif _atomic; then
+    say "To add it, open Backups and click Turn on backups, or type:  secure-linux-backup install-borg"
+    say "It is added to the system once and needs one restart. (In a terminal you can also type:  sudo rpm-ostree install borgbackup   and then restart the computer.)"
+  else
+    say "To add it, open Backups and click Turn on backups, or type:  secure-linux-backup install-borg"
+    say "(It comes from the App Library. In a terminal you can also type:  sudo dnf install borgbackup)"
+  fi
+  return 2
+}
+_app_library() {
+  local a
+  a=$(dirname "$SELF")/secure-linux-app-library
+  [ -x "$a" ] || a=$(command -v secure-linux-app-library 2>/dev/null)
+  printf '%s' "$a"
+}
+cmd_install_borg() {   # add BorgBackup on request: from the App Library (C11), or once into the system on atomic
+  local yes=no answer al rc
+  [ "${1:-}" = --yes ] && yes=yes
+  if command -v borg >/dev/null 2>&1; then say "The backup program (BorgBackup) is already installed."; return 0; fi
+  if _borg_pending; then
+    say "BorgBackup was added already. Restart the computer once to finish, then open Backups again."
+    return 5
+  fi
+  if [ "$yes" != yes ]; then
+    [ -t 0 ] || { say "Add --yes to confirm (or use the Backups app)."; return 2; }
+    if _atomic; then say "BorgBackup is added to this computer's system once. The computer must restart once to finish."
+    else say "BorgBackup is added from the App Library (about 20 MB). You may be asked for your password."; fi
+    printf 'Type yes to add it: '
+    IFS= read -r answer || answer=""
+    [ "$answer" = yes ] || { say "Cancelled. Nothing was changed."; return 1; }
+  fi
+  mkdir -p "$STATE_DIR"
+  if _atomic; then
+    # The App Library does not change the system on atomic computers, so BorgBackup is layered once (asked first).
+    command -v rpm-ostree >/dev/null 2>&1 || { say "This computer cannot add system programs (rpm-ostree is missing). Nothing was changed."; return 2; }
+    say "Adding BorgBackup to this computer's system. This can take a few minutes. You may be asked for your password."
+    rpm-ostree install --idempotent borgbackup >> "$LOG" 2>&1; rc=$?
+    if [ $rc -ne 0 ]; then
+      say "BorgBackup could not be added just now (is this computer online?). Nothing was changed. Please try again later."
+      return 2
+    fi
+    printf '%s\n' "$(_boot_id)" > "$BORG_PENDING"
+    say "BorgBackup is added. Restart the computer once to finish. Then open Backups again and turn on backups."
+    return 5
+  fi
+  al=$(_app_library)
+  [ -n "$al" ] || { say "The App Library is missing on this computer, so BorgBackup cannot be added from here. Open Secure Linux Status and choose Repair setup."; return 2; }
+  say "Adding BorgBackup from the App Library. You may be asked for your password."
+  "$al" install borgbackup; rc=$?
+  case $rc in
+    0)
+      if command -v borg >/dev/null 2>&1; then say "BorgBackup is installed. You can turn on backups now."; return 0; fi
+      say "BorgBackup was installed but cannot be found yet. Close Backups, open it again, and try once more."
+      return 2 ;;
+    3) say "This computer is not online right now. BorgBackup is added on its own when the internet is back. Then turn on backups."; return 6 ;;
+    126|127) say "The password window was closed, so nothing was changed."; return 1 ;;
+    *) say "BorgBackup could not be added just now. Nothing else was changed. Please try again later."; return 2 ;;
+  esac
+}
+
+# ---------------------------------------------------------------- is the backup place there, and is it OUR store?
+_store_id() {   # the store's own id (written by borg into its config when the store was made)
+  sed -n 's/^[[:space:]]*id[[:space:]]*=[[:space:]]*\([0-9a-fA-F]\{16,128\}\)[[:space:]]*$/\1/p' "$1/config" 2>/dev/null |
+    head -n 1 | tr 'A-F' 'a-f'
+}
+_is_ours() {   # _is_ours STORE   is this the store these settings belong to? (by its id, never by a name or a path)
+  local got
+  [ -f "$1/config" ] && [ -r "$1/config" ] || return 1
+  got=$(_store_id "$1")
+  if [ -n "$REPO_ID" ]; then [ "$got" = "$REPO_ID" ]; return; fi
+  [ "$PLACE" = second ] && return 1          # a drive copy is only ever recognised by its id
+  # settings made before the id was remembered: remember the store found at the saved place now
+  [ -n "$got" ] && kv_set "$CONF" repo_id "$got" && REPO_ID=$got
+  return 0
+}
+_find_second() {   # the known backup drive may come back under another name: look for OUR store id on plugged-in drives
+  local root c d
+  local -a found=()
+  [ -n "$REPO_ID" ] || return 1
+  for root in $MEDIA_ROOTS; do
+    [ -d "$root" ] || continue
+    for c in "$root"/*/secure-linux-backup-*/config "$root"/*/*/secure-linux-backup-*/config \
+             "$root"/*/*/*/secure-linux-backup-*/config; do
+      [ -f "$c" ] || continue
+      d=$(cd "${c%/config}" 2>/dev/null && pwd -P) || continue
+      # only a store under its own name; a renamed copy (".old", ".away") is never written to
+      [[ "${d##*/}" =~ ^secure-linux-backup-[A-Za-z0-9-]+$ ]] || continue
+      [ "$(_store_id "$d")" = "$REPO_ID" ] || continue
+      case " ${found[*]:-} " in *" $d "*) continue ;; esac
+      found+=("$d")
+    done
+  done
+  if [ ${#found[@]} -gt 1 ]; then TWO_COPIES=yes; return 1; fi   # writing into a copy of a store can damage it
+  [ ${#found[@]} -eq 1 ] || return 1
+  d=${found[0]}
+  [ "$d" = "$REPO" ] && return 0
+  OLD_REPO=$REPO OLD_DEST=$DEST
+  REPO=$d DEST=${d%/*} RELOC=yes              # checked by id above, so borg may use it at its new place
+  kv_set "$CONF" repo "$REPO"; kv_set "$CONF" dest "$DEST"
+  return 0
+}
+connected() {
+  NOT_OURS=no TWO_COPIES=no
+  if [ -n "$REPO" ] && [ -f "$REPO/config" ]; then
+    _is_ours "$REPO" && return 0
+    NOT_OURS=yes
+  fi
+  [ "$PLACE" = second ] && _find_second && { NOT_OURS=no; return 0; }
+  [ "$TWO_COPIES" = yes ] && NOT_OURS=yes
+  return 1
+}
+_not_ours_words() {
+  if [ "$TWO_COPIES" = yes ]; then
+    printf '%s' "More than one copy of your drive copy's backup store is plugged in, so nothing was written (writing into a copy of a backup store can damage it). Unplug the extra drive, then try again."
+  elif [ "$PLACE" = second ]; then
+    printf '%s' "A different drive is plugged in, not the one your drive copy is on, so nothing was written to it. Plug in your own backup drive."
+  else
+    printf '%s' "The backups found at $NAME are not the ones this computer uses (a different backup store is there), so nothing was written to it."
+  fi
+}
+need_connected() {
+  connected && return 0
+  if [ "$NOT_OURS" = yes ]; then say "$(_not_ours_words)"; return 3; fi
+  say "$NAME is not connected right now, so nothing was changed."
+  if [ "$PLACE" = second ]; then say "Plug in your backup drive, then try again."
+  else say "Connect your home server or plug in your backup drive, then try again."; fi
+  return 3
+}
+
+# ---------------------------------------------------------------- the passphrase (never on screen, never in a log)
+_passfile() { printf '%s/passphrase-%s' "$CONF_DIR" "$1"; }
+_passcmd() {   # what borg runs to read the passphrase itself (so it is never in a command line or an environment)
+  case "$SECRET" in
+    keyring) printf 'secret-tool lookup service secure-linux-backup backup-id %s' "$ID" ;;
+    *) printf 'cat %q' "$(_passfile "$ID")" ;;
+  esac
+}
+_get_pass() {
+  case "$SECRET" in
+    keyring) secret-tool lookup service secure-linux-backup backup-id "$ID" 2>/dev/null ;;
+    *) cat "$(_passfile "$ID")" 2>/dev/null ;;
+  esac
+}
+_gen_pass() {   # 24 characters from 31 easy-to-read letters and digits (about 118 bits), in groups of 4
+  local raw
+  raw=$(LC_ALL=C tr -dc 'ABCDEFGHJKMNPQRSTUVWXYZ23456789' < /dev/urandom 2>/dev/null | head -c 24)
+  [ ${#raw} -eq 24 ] || return 1
+  printf '%s-%s-%s-%s-%s-%s' "${raw:0:4}" "${raw:4:4}" "${raw:8:4}" "${raw:12:4}" "${raw:16:4}" "${raw:20:4}"
+}
+_gen_id() { od -An -N8 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n'; }
+_store_secret() {   # _store_secret ID PASS   keyring first (checked by reading it back), else a private file
+  local id=$1 pass=$2 got f
+  if command -v secret-tool >/dev/null 2>&1 && [ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ]; then
+    if printf '%s' "$pass" | secret-tool store --label="Secure Linux home backup passphrase" \
+         service secure-linux-backup backup-id "$id" >/dev/null 2>&1; then
+      got=$(secret-tool lookup service secure-linux-backup backup-id "$id" 2>/dev/null)
+      [ "$got" = "$pass" ] && { SECRET=keyring; return 0; }
+      secret-tool clear service secure-linux-backup backup-id "$id" >/dev/null 2>&1
+    fi
+  fi
+  mkdir -p "$CONF_DIR" && chmod 700 "$CONF_DIR" 2>/dev/null
+  f=$(_passfile "$id")
+  printf '%s\n' "$pass" > "$f" || return 1
+  chmod 600 "$f" 2>/dev/null
+  SECRET=file
+}
+_forget_secret() {
+  case "$SECRET" in
+    keyring) secret-tool clear service secure-linux-backup backup-id "$ID" >/dev/null 2>&1 ;;
+    file) rm -f "$(_passfile "$ID")" ;;
+  esac
+  return 0
+}
+need_pass() {   # can the passphrase be read right now? (a locked keyring is the usual reason it cannot)
+  if [ -n "$(_get_pass)" ]; then _clear_alert home-backup-keyring; return 0; fi
+  st_set last_run_time "$(now)"
+  if [ "$SECRET" = keyring ]; then
+    st_set last_result keyring-locked
+    say "Your backups could not start: your keyring is locked, so the backup passphrase could not be read. Nothing was changed."
+    say "What to do: log out and log in again with your password (that unlocks the keyring), or open the \"Passwords and Keys\" app and unlock the \"Login\" keyring. Then open Backups and click Back up now."
+    say "If the keyring was reset and the passphrase is no longer in it, open Backups and choose \"Type my backup passphrase again\" (the passphrase is on your recovery sheet)."
+    _alert home-backup-keyring "Backups are waiting for your keyring" "Your keyring is locked, so your backup could not start. Nothing was lost." \
+      "Log out and log in again with your password (or unlock the Login keyring in Passwords and Keys), then open Backups and click Back up now."
+  else
+    st_set last_result passphrase-missing
+    say "Your backups could not start: the private file that holds the backup passphrase is missing. Nothing was changed."
+    say "What to do: open Backups, choose \"Type my backup passphrase again\" and type the passphrase from your recovery sheet."
+    _alert home-backup-keyring "Backups need your passphrase" "The file that holds your backup passphrase is missing, so your backup could not start." \
+      "Open Backups and choose Type my backup passphrase again (the passphrase is on your recovery sheet)."
+  fi
+  return 2
+}
+
+# ---------------------------------------------------------------- running borg
+_redact() {   # hide where the backups are kept (a home-server address or a drive's name never reaches screen or log)
+  local line p
+  while IFS= read -r line || [ -n "$line" ]; do
+    for p in "$REPO" "$OLD_REPO" "$MAIN_REPO" "$DEST" "$OLD_DEST" "$MAIN_DEST"; do
+      [ -n "$p" ] && line=${line//"$p"/[backup place]}
+    done
+    printf '%s\n' "$line"
+  done
+}
+_borg() {
+  BORG_PASSCOMMAND=$(_passcmd) BORG_RELOCATED_REPO_ACCESS_IS_OK=$RELOC BORG_UNKNOWN_UNENCRYPTED_REPO_ACCESS_IS_OK=no \
+    BORG_DISPLAY_PASSPHRASE=no borg "$@"
+}
+_b() {   # _b SUBCOMMAND ARGS...   run borg; its messages go (with the backup place hidden) to the log only
+  local err rc
+  mkdir -p "$STATE_DIR"
+  err=$(mktemp "$STATE_DIR/.borg-messages.XXXXXX") || return 2
+  _borg "$@" 2>"$err"; rc=$?
+  { printf '[%s] borg %s finished (exit %s)\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$1" "$rc"; _redact < "$err"; } >> "$LOG"
+  B_ERR=$(_redact < "$err" | tail -n 3)
+  B_NOSPACE=no
+  grep -qiE 'No space left on device|Insufficient free space|storage quota' "$err" 2>/dev/null && B_NOSPACE=yes
+  rm -f "$err"
+  return $rc
+}
+_archives() {   # finished backups, oldest first (interrupted ".checkpoint" pieces are left out)
+  local out
+  out=$(_b list --lock-wait 120 --short "$REPO") || return 2
+  printf '%s\n' "$out" | grep -E "$ARCH_RE" | sort
+  return 0
+}
+
+# ---------------------------------------------------------------- alerts (the Secure Linux notifier shows them)
+_alert() { [ -d "$UALERTS" ] && [ -w "$UALERTS" ] && printf '%s\n%s\n%s\n' "$2" "$3" "$4" > "$UALERTS/$1" && chmod 644 "$UALERTS/$1"; return 0; }
+_clear_alert() { rm -f "$UALERTS/$1" 2>/dev/null; return 0; }
+
+# ---------------------------------------------------------------- one run at a time (per backup place)
+_lock() {
+  local d=$LOCKD p
+  mkdir -p "$PSTATE"
+  if ! mkdir "$d" 2>/dev/null; then
+    p=$(cat "$d/pid" 2>/dev/null)
+    if [ -n "$p" ] && kill -0 "$p" 2>/dev/null; then
+      say "A backup or check is already running. Try again when it has finished."
+      return 1
+    fi
+    rm -rf "$d"; mkdir "$d" 2>/dev/null || { say "Could not start: another backup may be starting."; return 1; }
+  fi
+  echo $$ > "$d/pid"
+  LOCK_HELD=yes
+  trap "rm -rf $(printf '%q' "$d")" EXIT
+}
+_unlock() { [ "$LOCK_HELD" = yes ] && { rm -rf "$LOCKD"; trap - EXIT; LOCK_HELD=no; }; return 0; }
+
+# ---------------------------------------------------------------- where backups go
+_mnt() {   # _mnt FIELD PATH   the mount behind PATH; a systemd automount (the kit's home share) shows "autofs" first
+  local f=$1 p=$2 fs tgt v
+  fs=$(findmnt -no FSTYPE -T "$p" 2>/dev/null | head -n 1)
+  if [ "$fs" = autofs ]; then
+    tgt=$(findmnt -no TARGET -T "$p" 2>/dev/null | head -n 1)
+    v=$(findmnt -rno "$f,FSTYPE" --mountpoint "$tgt" 2>/dev/null | awk '$NF != "autofs" { sub(/ [^ ]*$/, ""); print }' | tail -n 1)
+    [ -n "$v" ] && { printf '%s\n' "$v"; return; }
+  fi
+  findmnt -no "$f" -T "$p" 2>/dev/null | head -n 1
+}
+_netfs() { case "$1" in cifs|smb3|smbfs|nfs|nfs4|fuse.sshfs|fuse.gvfsd-fuse|fuse.rclone|davfs|fuse.davfs) return 0 ;; esac; return 1; }
+_kind() {   # a friendly name for the backup place (its real address is never shown)
+  local fs
+  fs=$(_mnt FSTYPE "$1")
+  _netfs "$fs" && { echo "your home server"; return; }
+  case "$1" in
+    */gvfs/*) echo "your home server" ;;
+    /run/media/*|/media/*) echo "your backup drive" ;;
+    *) echo "your backup folder" ;;
+  esac
+}
+_disk() {   # the device a folder is on (Btrfs sub-volumes of one disk count as the same disk)
+  local s
+  s=$(_mnt SOURCE "$1")
+  s=${s%%\[*}
+  [ -n "$s" ] || s=dev:$(stat -c %d "$1" 2>/dev/null)
+  printf '%s' "$s"
+}
+_host_of() {   # _host_of MOUNT-SOURCE FOLDER   the server's name or address (used only to look up the route; never shown)
+  local src=$1 h=""
+  case "$src" in
+    //*) h=${src#//}; h=${h%%/*} ;;                      # cifs / smb: //server/share
+    \[*\]:*) h=${src#\[}; h=${h%%\]*} ;;                   # nfs with an IPv6 address: [addr]:/path
+    *@*:*) h=${src#*@}; h=${h%%:*} ;;                     # sshfs: user@server:path
+    *:*) h=${src%%:*} ;;                                  # nfs / sshfs: server:/path
+  esac
+  if [ -z "$h" ]; then case "$2" in *server=*) h=${2#*server=}; h=${h%%[,/]*} ;; esac; fi   # gvfs: .../smb-share:server=x,share=y
+  h=${h#\[}; h=${h%\]}; h=${h#*@}
+  printf '%s' "$h"
+}
+_route() {   # how this computer reaches the backup place: local | wired | wifi | vpn | unknown   (from real facts)
+  local fs src host ip="" dev t=""
+  fs=$(_mnt FSTYPE "$REPO")
+  if ! _netfs "$fs"; then case "$REPO" in */gvfs/*) ;; *) echo local; return ;; esac; fi
+  src=$(_mnt SOURCE "$REPO")
+  host=$(_host_of "$src" "$REPO")
+  [ -n "$host" ] || { echo unknown; return; }
+  if [[ "$host" =~ ^[0-9.]+$ ]] || [[ "$host" == *:* ]]; then ip=$host
+  else ip=$(getent ahosts "$host" 2>/dev/null | awk 'NR == 1 { print $1 }'); fi
+  [ -n "$ip" ] || { echo unknown; return; }
+  dev=$(ip route get "$ip" 2>/dev/null | sed -n 's/.* dev \([^ ]*\).*/\1/p' | head -n 1)
+  [ -n "$dev" ] || { echo unknown; return; }
+  [ "$dev" = lo ] && { echo local; return; }
+  if command -v nmcli >/dev/null 2>&1; then t=$(nmcli -g GENERAL.TYPE device show "$dev" 2>/dev/null | head -n 1); fi
+  if [ -z "$t" ]; then
+    if [ -d "/sys/class/net/$dev/wireless" ]; then t=wifi; elif [ -e "/sys/class/net/$dev/device" ]; then t=ethernet; fi
+  fi
+  case "$t" in
+    ethernet) echo wired ;;
+    wifi|802-11-wireless) echo wifi ;;
+    wireguard|tun|vpn|ip-tunnel|wireguard-tunnel) echo vpn ;;
+    *) echo unknown ;;
+  esac
+}
+_decide_check() {   # sets CHK_MODE (full|quick) and CHK_WHY (plain words) from the settings and real facts
+  local small size_txt
+  case "$VERIFY" in
+    full) CHK_MODE=full; CHK_WHY="you chose a full read-back after every backup"; return ;;
+    quick) CHK_MODE=quick; CHK_WHY="you chose quick checks"; return ;;
+  esac
+  small=$(( 10#$SMALL_GB * 1073741824 ))
+  if num "$HOME_BYTES" && [ "$HOME_BYTES" -le "$small" ]; then
+    CHK_MODE=full; CHK_WHY="your home folder is small ($(_gb "$HOME_BYTES"); every backup up to $SMALL_GB GB is read back in full)"
+    return
+  fi
+  if num "$HOME_BYTES"; then size_txt="your home folder is large ($(_gb "$HOME_BYTES"), more than $SMALL_GB GB)"
+  else size_txt="the size of your home folder could not be measured"; fi
+  case "$(_route)" in
+    local) CHK_MODE=full; CHK_WHY="$NAME is plugged into this computer (a fast, direct connection)" ;;
+    wired) CHK_MODE=full; CHK_WHY="$NAME is reached over a wired network connection" ;;
+    wifi)  CHK_MODE=quick; CHK_WHY="$NAME is reached over Wi-Fi and $size_txt" ;;
+    vpn)   CHK_MODE=quick; CHK_WHY="$NAME is reached through a VPN (its speed is unknown, so it is treated like Wi-Fi) and $size_txt" ;;
+    *)     CHK_MODE=quick; CHK_WHY="the connection to $NAME could not be identified as wired, so it is treated like Wi-Fi, and $size_txt" ;;
+  esac
+}
+_mode_words() {
+  case "$1" in
+    full) printf 'a full read-back of the new backup' ;;
+    quick) printf 'a quick check of the new backup' ;;
+    all) printf 'a full read-back of all backups, including the new one' ;;
+  esac
+}
+_timers() {   # _timers enable|disable
+  command -v systemctl >/dev/null 2>&1 || return 1
+  if [ "$1" = enable ]; then systemctl --user enable --now "${TIMERS[@]}" >/dev/null 2>&1
+  else systemctl --user disable --now "${TIMERS[@]}" >/dev/null 2>&1; fi
+}
+_copy_unit() {   # _copy_unit enable|disable   the "backup drive plugged in" watcher (drive copy only)
+  command -v systemctl >/dev/null 2>&1 || return 1
+  systemctl --user "$1" --now "$COPY_UNIT" >/dev/null 2>&1
+}
+_write_excludes() {   # caches, trash and re-downloadable files are left out; so are the backup's own secrets
+  mkdir -p "$CONF_DIR"
+  {
+    echo "# Secure Linux home backup: left out of every backup (made by secure-linux-backup; put your own in my-excludes)"
+    # sh: patterns: '*' never crosses a '/', so only the folders meant here are left out
+    printf '%s\n' "$HOME/.cache" "$HOME/.local/share/Trash" "sh:$HOME/.var/app/*/cache" "$HOME/.thumbnails" \
+      "$HOME/.local/share/containers" "$HOME/.local/share/flatpak" "$HOME/.local/share/gvfs-metadata" \
+      "$HOME/.local/share/Steam/steamapps" "$HOME/.var/app/com.valvesoftware.Steam/.local/share/Steam/steamapps" \
+      "sh:$CONF_DIR/passphrase-*" "$STATE_DIR"
+    # the release signing key never goes to the backup place (sign-release.sh asks for its own USB copy)
+    printf '%s\n' "$SIGNING_DIR"
+    [ -f "$MY_EXCL" ] && grep -v '^[[:space:]]*$' "$MY_EXCL"
+  } > "$EXCL"
+}
+
+# ---------------------------------------------------------------- recovery sheet
+_write_sheet() {
+  local pass key
+  pass=$(_get_pass) || return 1
+  [ -n "$pass" ] || return 1
+  key=$(_b key export --paper "$REPO") || key="(The spare key could not be added just now. Your passphrase is enough while the backups are healthy.)"
+  mkdir -p "$PSTATE" "$(dirname "$SHEET")" && chmod 700 "$(dirname "$SHEET")" 2>/dev/null
+  if [ "$PLACE" = second ]; then
+    cat > "$SHEET" <<EOF
+SECURE LINUX - DRIVE COPY RECOVERY SHEET
+Made: $(date '+%a %d %b %Y, %H:%M')    Computer: $(_host)    Copy kept on: $NAME
+
+Backup passphrase:   $pass
+
+This is the same passphrase as on your first recovery sheet: it opens your backups AND the copy on your
+backup drive. This sheet adds the drive copy's own spare key. Keep it with the first sheet, somewhere safe
+and private, away from this computer. Anyone who has this passphrase AND the drive can read your files.
+
+To get your files back if your home server is lost or broken:
+  1. Install Secure Linux on a computer and plug in your backup drive.
+  2. Open "Backups", choose "Use my existing backups", choose the drive and type the passphrase above.
+     (In a terminal: secure-linux-backup setup --to FOLDER-ON-THE-DRIVE --existing)
+  3. Choose "Get a file or folder back" or "Get everything back".
+
+Spare key of the drive copy (only needed if the drive store's own copy of the key is ever damaged):
+$key
+EOF
+  else
+    cat > "$SHEET" <<EOF
+SECURE LINUX - HOME BACKUP RECOVERY SHEET
+Made: $(date '+%a %d %b %Y, %H:%M')    Computer: $(_host)    Backups kept at: $NAME
+
+Backup passphrase:   $pass
+
+Keep this sheet somewhere safe and private, away from this computer - for example with your important papers.
+Anyone who has this passphrase AND your backups can read your files. Without it nobody can open
+the backups - not even you - so do not lose it.
+
+To get your files back on a new or repaired computer:
+  1. Install Secure Linux and connect your home server or plug in your backup drive.
+  2. Open "Backups", choose "Use my existing backups" and type the passphrase above.
+     (In a terminal: secure-linux-backup setup --to FOLDER --existing)
+  3. Choose "Get a file or folder back" or "Get everything back".
+
+Spare key (only needed if the backup store's own copy of the key is ever damaged):
+$key
+EOF
+  fi
+  chmod 600 "$SHEET" 2>/dev/null
+}
+
+# ---------------------------------------------------------------- weekly full check bookkeeping
+_full_base() {   # when the store was last read back in full and passed (or when it was set up)
+  local t
+  t=$(st last_full_check_ok_time)
+  num "$t" || { [ "$(st last_full_check_result)" = ok ] && t=$(st last_full_check_time); }
+  num "$t" || t=$(st created)
+  num "$t" || t=$(kv_get "$CONF" created)
+  num "$t" || t=0
+  printf '%s' "$t"
+}
+_full_overdue() { [ $(( $(now) - $(_full_base) )) -ge $FULL_EVERY ]; }
+_full_due() {   # should this run read back the whole store? (a failed check is tried again a week later, or after repair)
+  local lt
+  _full_overdue || return 1
+  lt=$(st last_full_check_time)
+  if [ "$(st last_full_check_result)" = failed ] && num "$lt" && [ $(( $(now) - lt )) -lt $FULL_EVERY ]; then return 1; fi
+  return 0
+}
+_last_full_words() {
+  local t
+  t=$(st last_full_check_ok_time)
+  num "$t" || { [ "$(st last_full_check_result)" = ok ] && t=$(st last_full_check_time); }
+  if num "$t"; then printf 'the last one was on %s' "$(_when_epoch "$t")"; else printf 'it has not been done yet'; fi
+}
+_full_result() {   # _full_result BORG-EXIT   remember the full check: returns 0 passed, 1 damage found, 2 could not finish
+  local t; t=$(now)
+  if [ "$1" -eq 0 ]; then
+    st_set last_full_check_result ok; st_set last_full_check_time "$t"; st_set last_full_check_ok_time "$t"; return 0
+  fi
+  if [ "$1" -ge 2 ] && ! connected; then
+    [ "$(st last_full_check_result)" = failed ] || st_set last_full_check_result unfinished
+    return 2
+  fi
+  st_set last_full_check_result failed; st_set last_full_check_time "$t"; return 1
+}
+_prune_block() {   # why old backups must not be tidied now (empty: tidying is allowed)
+  num "$(st deletion_alarm)" && { printf 'backups disappeared from the backup place without Secure Linux removing them'; return; }
+  [ "$(st last_full_check_result)" = failed ] && { printf 'the last full check found a problem (repair it first)'; return; }
+  _full_overdue && printf 'the weekly full read-back of all backups has not passed yet'
+  return 0
+}
+
+# ---------------------------------------------------------------- deletion alarm (ransomware, or someone on the server)
+# A store on a share this computer can write to can also be deleted from it. borg's append-only mode only protects a
+# store reached through "borg serve" on the server, so it cannot help here. Instead every run compares the backups in
+# the store with the ones this tool knew about; anything that vanished without our own tidying raises an alarm and
+# stops all tidying until the person has looked.
+_known() { printf '%s/known-backups' "$PSTATE"; }
+_deleted_alert() { if [ "$PLACE" = second ]; then printf 'home-backup-copy-deleted'; else printf 'home-backup-deleted'; fi; }
+_remember_backups() {   # _remember_backups NAMES   the backups that are there after our own tidying
+  mkdir -p "$PSTATE"; printf '%s\n' "$1" | grep -E "$ARCH_RE" > "$(_known)" 2>/dev/null; return 0
+}
+_deletion_check() {   # did backups vanish since the last run without Secure Linux removing them?
+  local kf names gone n
+  kf=$(_known); [ -s "$kf" ] || return 0
+  names=$(_archives) || return 0
+  gone=$(grep -vxF -f <(printf '%s\n' "$names") "$kf")
+  [ -n "$gone" ] || return 0
+  n=$(printf '%s\n' "$gone" | grep -c .)
+  st_set deletion_alarm "$(now)"; st_set deletion_count "$n"
+  _remember_backups "$names"
+  _alert "$(_deleted_alert)" "Backups were deleted" \
+    "$n of your backups disappeared from $NAME, but Secure Linux did not remove them. Something else deleted them - for example ransomware, or a person on the server." \
+    "Nothing more is tidied away until you have looked. Open Backups for what to do."
+  say "WARNING: $n of your backups disappeared from $NAME, but Secure Linux did not remove them."
+  say "Something else deleted them - for example ransomware, or a person on the server. Old backups are not tidied until you have looked."
+  say "If you deleted them yourself, type: $CMD deletion-checked   Otherwise keep this computer's files safe and get help."
+  return 0
+}
+_store_missing() {   # the home server is connected but our whole store is gone from it (wiped?)
+  local fs
+  [ -s "$(_known)" ] && [ -n "$REPO" ] && [ ! -e "$REPO" ] && [ -n "$DEST" ] && [ -d "$DEST" ] || return 1
+  fs=$(_mnt FSTYPE "$DEST")
+  _netfs "$fs" || return 1                        # only a mounted network share (a drive may simply be another drive)
+  [ "$(_disk "$DEST")" != "$(_disk "$HOME")" ]     # an unmounted share's folder sits on this computer's own disk
+}
+_store_missing_warn() {
+  _store_missing || return 0
+  _alert "$(_deleted_alert)" "Your backups are missing" \
+    "Your home server is connected, but the folder with your backups is no longer on it. If you did not remove it, something deleted it - for example ransomware." \
+    "Keep this computer's files safe, do not delete anything, and check the home server."
+  say "Note: the home server's share is connected, but the folder with your backups is no longer on it. If you did not remove it, something deleted it (for example ransomware). Keep this computer's files safe and check the server."
+  return 0
+}
+
+# ---------------------------------------------------------------- status
+_status_results() {   # the lines both places share: last backup, how it was checked, full check, test restore
+  local lg lr lt fc ft rt rtt n lm lw what=${1:-backup}
+  lg=$(st last_good_time); lr=$(st last_result); lt=$(st last_run_time)
+  case "$lr" in
+    failed) say "PROBLEM: the $what on $(_when_epoch "$lt") did not finish. Your earlier backups are untouched." ;;
+    place-full) say "PROBLEM: the $what on $(_when_epoch "$lt") did not finish because $NAME is full. Free some space there. Your earlier backups are untouched." ;;
+    check-failed) say "PROBLEM: the $what on $(_when_epoch "$lt") did not pass its check. Older backups were kept. $ALERT_HINT" ;;
+    check-unfinished) say "Last try: $(_when_epoch "$lt") - $NAME was disconnected before the check finished. Nothing was deleted; it is checked again next time." ;;
+    keyring-locked) say "PROBLEM: the $what on $(_when_epoch "$lt") could not start because your keyring was locked (it holds the backup passphrase). Log out and in again (or unlock the Login keyring), then choose Back up now." ;;
+    passphrase-missing) say "PROBLEM: the $what on $(_when_epoch "$lt") could not start because the passphrase file is missing. In Backups choose \"Type my backup passphrase again\"." ;;
+    not-connected) say "Last try: $(_when_epoch "$lt") - the backup place was not connected." ;;
+    warning) say "Note: the last $what could not read some files. The list is in $LOG" ;;
+  esac
+  lm=$(st last_check_mode); lw=$(st last_check_reason)
+  [ -n "$lm" ] && [ -n "$lw" ] && say "Check after the last $what: $(_mode_words "$lm"), because $lw."
+  fc=$(st last_full_check_result); ft=$(st last_full_check_time)
+  case "$fc" in
+    ok) say "Full check of all backups: $(_when_epoch "$ft") - no problems found." ;;
+    failed) say "PROBLEM: the full check on $(_when_epoch "$ft") found damage. $ALERT_HINT" ;;
+    unfinished) say "Full check of all backups: the last one could not finish because $NAME was disconnected. It runs again next time." ;;
+    *) say "Full check of all backups: not done yet (it runs every week)." ;;
+  esac
+  if [ "$fc" != failed ] && _full_overdue; then
+    say "The weekly full check is due: it runs with the next backup when $NAME is connected. Old backups are not tidied until it has passed."
+  fi
+  rt=$(st last_restore_test_result); rtt=$(st last_restore_test_time)
+  case "$rt" in
+    ok) say "Test restore: $(_when_epoch "$rtt") - sample files came back exactly right." ;;
+    failed) say "PROBLEM: the test restore on $(_when_epoch "$rtt") did not give the files back correctly. $ALERT_HINT" ;;
+  esac
+  n=$(st archives_count); [ -n "$n" ] && say "Backups kept: $n (older ones are thinned out: 7 daily, 4 weekly, 12 monthly)."
+  if num "$(st deletion_alarm)"; then
+    say "WARNING: on $(_when_epoch "$(st deletion_alarm)") $(st deletion_count) backups had disappeared from $NAME without Secure Linux removing them. Nothing is tidied until you have looked. If you deleted them yourself, type: $CMD deletion-checked"
+  fi
+  return 0
+}
+_copy_due() {   # is this month's drive copy due? (none for 30 days, or none yet a day after it was added)
+  local lg c t
+  t=$(now); lg=$(st last_good_time)
+  if num "$lg"; then [ $(( t - lg )) -ge $(( COPY_EVERY_DAYS * 86400 )) ]; return; fi
+  c=$(st created); num "$c" || c=$(kv_get "$CONF" created); num "$c" || return 0
+  [ $(( t - c )) -ge 86400 ]
+}
+_status_second() {   # (place: second)
+  local lg
+  if ! load_conf; then
+    say "Second copy on a USB drive: not added. Tip: a second copy on a USB drive, kept away from the computer, keeps your files safe even if your home server breaks. Open Backups and choose \"Add a second copy on a USB drive\"."
+    return 0
+  fi
+  if [ "$AUTO" = yes ]; then say "Second copy on $NAME: ON - made automatically when the drive is plugged in, and checked like your other backups."
+  else say "Second copy on $NAME: ON - when the drive is plugged in, Backups asks whether to make the copy."; fi
+  if connected; then say "Backup drive: plugged in."
+  elif [ "$NOT_OURS" = yes ]; then say "Backup drive: a different drive is plugged in at that place. It is not used."
+  else say "Backup drive: not plugged in (that is normal - keep it away from the computer between copies)."; fi
+  lg=$(st last_good_time)
+  if num "$lg"; then say "Last drive copy: $(_when_epoch "$lg") - checked after it was made, no problems found."
+  else say "Last drive copy: none made yet."; fi
+  if _copy_due; then
+    if [ "$AUTO" = yes ]; then say "Time for this month's drive copy: plug in your backup drive and the copy starts by itself."
+    else say "Time for this month's drive copy: plug in your backup drive and choose \"Make the drive copy now\" in Backups."; fi
+  fi
+  _status_results "drive copy"
+  if [ "$(st sheet_done)" = yes ]; then say "Recovery sheet for the drive copy: confirmed as printed or saved."
+  else say "REMINDER: save the recovery sheet for your drive copy. No recovery sheet has been confirmed for it yet. Type: secure-linux-backup second recovery-sheet"; fi
+  return 0
+}
+cmd_status() {
+  if ! load_conf; then
+    say "Home folder backups: OFF (optional)."
+    say "Turn them on in the Backups app, or type: secure-linux-backup setup --to FOLDER"
+    say "FOLDER is your home-server folder or a USB drive. Backups are encrypted, compressed and checked."
+    return 0
+  fi
+  local lg
+  if [ "$ENABLED" = yes ]; then say "Home folder backups: ON - every day to $NAME."
+  else say "Home folder backups: PAUSED. Your backups are kept. To restart them, type: secure-linux-backup on"; fi
+  if connected; then say "Backup place: connected."
+  elif [ "$NOT_OURS" = yes ]; then say "Backup place: a different backup store is there, not the one this computer uses. Nothing is written to it."
+  else say "Backup place: not connected right now. Backups run again when it is connected."; fi
+  lg=$(st last_good_time)
+  if [ -n "$lg" ]; then say "Last good backup: $(_when_epoch "$lg") - checked after it was made, no problems found."
+  else say "Last good backup: none yet. To make one now, type: secure-linux-backup run"; fi
+  case "$VERIFY" in
+    auto) say "How backups are checked: chosen automatically each time - a full read-back of the new backup, or a quick check when $NAME is reached over Wi-Fi and your home folder is larger than $SMALL_GB GB. All backups are read back in full every week either way." ;;
+    full) say "How backups are checked: a full read-back after every backup (your choice). All backups are read back in full every week too." ;;
+    quick) say "How backups are checked: a quick check after every backup (your choice). All backups are read back in full every week." ;;
+  esac
+  _status_results backup
+  if [ "$(st sheet_done)" = yes ]; then
+    say "Recovery sheet: confirmed as printed or saved. Keep it somewhere safe, away from this computer."
+  else
+    say "REMINDER: save your recovery sheet (print it, or put the passphrase in your password manager). No recovery sheet has been confirmed yet - without its passphrase nobody can open your backups, not even you. Type: secure-linux-backup recovery-sheet"
+  fi
+  ( use_place second; _status_second )
+  return 0
+}
+
+cmd_state() {   # machine-readable summary for the Backups window
+  local set=no con=no b
+  load_conf && set=yes && connected && con=yes
+  printf 'setup=%s\nenabled=%s\nconnected=%s\nsheet_done=%s\nlast_good_time=%s\nlast_result=%s\nverify_after=%s\ndeletion_alarm=%s\n' \
+    "$set" "${ENABLED:-no}" "$con" "$(st sheet_done)" "$(st last_good_time)" "$(st last_result)" "${VERIFY:-auto}" "$(st deletion_alarm)"
+  (
+    use_place second
+    s=no c=no a=no sd=""
+    if load_conf; then s=yes; connected && c=yes; [ "$AUTO" = yes ] && a=yes; sd=$(st sheet_done); fi
+    printf 'second=%s\nsecond_connected=%s\nsecond_automatic=%s\nsecond_sheet_done=%s\n' "$s" "$c" "$a" "$sd"
+  )
+  if command -v borg >/dev/null 2>&1; then b=yes; elif _borg_pending; then b=after-restart; else b=no; fi
+  printf 'borg=%s\natomic=%s\n' "$b" "$(_atomic && echo yes || echo no)"
+}
+
+# ---------------------------------------------------------------- setup
+cmd_setup() {
+  local to="" name="" yes=no existing=no samedisk=no computer="" dest home pass repo cands c answer
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --to|--name|--computer) [ $# -ge 2 ] || { say "Missing a value after $1."; return 2; }
+        case "$1" in --to) to=$2 ;; --name) name=$2 ;; --computer) computer=$2 ;; esac; shift 2 ;;
+      --yes) yes=yes; shift ;;
+      --existing) existing=yes; shift ;;
+      --allow-same-disk) samedisk=yes; shift ;;
+      *) say "Unknown choice: $1 (see: secure-linux-backup --help)"; return 2 ;;
+    esac
+  done
+  if load_conf && [ "$ENABLED" = yes ]; then
+    say "Backups are already on (to $NAME). To change where they go, first type: secure-linux-backup off"
+    return 2
+  fi
+  [ -n "$to" ] || { say "Choose where to keep your backups: secure-linux-backup setup --to FOLDER"; return 2; }
+  need_borg || return 2
+  [ -d "$to" ] || { say "That folder was not found. Connect your home server or plug in your backup drive, then try again."; return 3; }
+  dest=$(cd "$to" && pwd -P) || { say "That folder cannot be opened."; return 2; }
+  home=$(cd "$HOME" && pwd -P)
+  [ -w "$dest" ] || { say "You cannot save files in that folder. Choose a folder you can write to."; return 2; }
+  if [ "$dest" = "$home" ] || [ "$dest" = / ]; then
+    say "Choose a folder on your home server or a USB drive, not your home folder itself."; return 2
+  fi
+  if [ "$samedisk" = no ] && [ "$(_disk "$dest")" = "$(_disk "$home")" ]; then
+    say "That folder is on the same disk as your files. If this disk failed, you would lose both."
+    say "Choose your home-server folder or a USB drive instead."
+    return 2
+  fi
+  [ -n "$name" ] || name=$(_kind "$dest")
+  name=$(printf '%s' "$name" | tr -cd "A-Za-z0-9 ._'-" | cut -c1-40)
+  [ -n "$name" ] || name="your backup place"
+
+  if [ "$existing" = yes ]; then
+    repo=""
+    if [ -n "$computer" ]; then
+      computer=$(printf '%s' "$computer" | tr -c 'A-Za-z0-9-' '-')
+      [ -f "$dest/secure-linux-backup-$computer/config" ] && repo=$dest/secure-linux-backup-$computer
+    elif [ -f "$dest/secure-linux-backup-$(_host)/config" ]; then repo=$dest/secure-linux-backup-$(_host)
+    else
+      cands=()
+      for c in "$dest"/secure-linux-backup-*/config; do [ -f "$c" ] && cands+=("${c%/config}"); done
+      if [ ${#cands[@]} -eq 1 ]; then repo=${cands[0]}
+      elif [ ${#cands[@]} -gt 1 ]; then
+        say "Backups from more than one computer are there. Choose one with --computer NAME:"
+        for c in "${cands[@]}"; do say "  ${c##*/secure-linux-backup-}"; done
+        return 2
+      fi
+    fi
+    [ -n "$repo" ] || { say "No Secure Linux backups were found in that folder."; return 2; }
+  else
+    repo=$dest/secure-linux-backup-$(_host)
+    if [ -f "$repo/config" ]; then
+      say "There are already backups from this computer there. To use them, choose \"Use my existing backups\""
+      say "(or type: secure-linux-backup setup --to FOLDER --existing) and type the passphrase from your recovery sheet."
+      return 2
+    fi
+    if [ -e "$repo" ] && [ -n "$(ls -A "$repo" 2>/dev/null)" ]; then
+      say "A folder named ${repo##*/} is already there and is not a backup. Nothing was changed."
+      return 2
+    fi
+  fi
+
+  if [ "$yes" != yes ]; then
+    [ -t 0 ] || { say "Add --yes to confirm (or use the Backups app)."; return 2; }
+    say "Your home folder will be backed up every day to $name: encrypted, compressed, and checked after every backup."
+    printf 'Type yes to turn on backups: '
+    IFS= read -r answer || answer=""
+    [ "$answer" = yes ] || { say "Cancelled. Nothing was changed."; return 1; }
+  fi
+
+  if [ "$existing" = yes ]; then
+    [ -t 0 ] && printf 'Passphrase from your recovery sheet (hidden): ' >&2
+    IFS= read -r -s pass || pass=""
+    [ -t 0 ] && printf '\n' >&2
+    pass=$(printf '%s' "$pass" | tr -d '\r' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+    [ -n "$pass" ] || { say "No passphrase was typed. Nothing was changed."; return 2; }
+  else
+    pass=$(_gen_pass) || { say "Could not make a passphrase on this computer. Nothing was changed."; return 2; }
+  fi
+  ID=$(_gen_id); [[ "$ID" =~ ^[0-9a-f]{16}$ ]] || { say "Could not make an identifier. Nothing was changed."; return 2; }
+  REPO=$repo DEST=$dest NAME=$name
+  _store_secret "$ID" "$pass" || { say "Could not store the passphrase safely. Nothing was changed."; return 2; }
+  pass=""
+  mkdir -p "$STATE_DIR"
+
+  if [ "$existing" = yes ]; then
+    if ! _b list --lock-wait 120 --short "$REPO" >/dev/null; then
+      _forget_secret
+      say "That passphrase did not open the backups. Check your recovery sheet and try again. Nothing was changed."
+      return 2
+    fi
+  else
+    if ! _b init --encryption=repokey-blake2 "$REPO"; then
+      _forget_secret
+      [ -f "$REPO/config" ] || rmdir "$REPO" 2>/dev/null
+      say "The backup store could not be created there. Nothing was changed."
+      [ -n "$B_ERR" ] && say "Details: $B_ERR"
+      return 2
+    fi
+  fi
+
+  [ -f "$CONF" ] && cp -f "$CONF" "$CONF.previous"
+  rm -f "$CONF"
+  kv_set "$CONF" id "$ID"; kv_set "$CONF" repo "$REPO"; kv_set "$CONF" dest "$DEST"; kv_set "$CONF" name "$NAME"
+  kv_set "$CONF" secret "$SECRET"; kv_set "$CONF" compression "$COMP_DEFAULT"; kv_set "$CONF" verify_after auto
+  kv_set "$CONF" small_home_gb "$SMALL_GB_DEFAULT"; kv_set "$CONF" repo_id "$(_store_id "$REPO")"
+  kv_set "$CONF" created "$(now)"; kv_set "$CONF" enabled yes
+  rm -f "$STATE"
+  st_set created "$(now)"
+  _write_excludes
+  if [ "$existing" = yes ]; then
+    st_set sheet_done yes
+    _clear_alert "$OFFER_ALERT"
+    say "Your existing backups are connected. Backups are ON again, every day to $NAME."
+  else
+    st_set sheet_done no
+    _write_sheet || say "The recovery sheet could not be written just now. Type later: secure-linux-backup recovery-sheet"
+    say "Backups are ON. Your home folder will be backed up every day to $NAME - encrypted and compressed."
+    _clear_alert "$OFFER_ALERT"
+    say "Each backup is checked straight after it is made, and all backups are read back in full every week."
+  fi
+  if _timers enable; then say "Automatic daily backups are switched on."
+  else say "Automatic daily backups could not be switched on from here. You can back up any time with: secure-linux-backup run"; fi
+  if [ "$existing" != yes ]; then
+    say ""
+    say "IMPORTANT: save your recovery sheet now. Without its passphrase nobody can open these backups - not even you."
+    say "Your recovery sheet is here: $SHEET"
+    [ "$SHEET" != "$DISK_SHEET" ] && say "(It is kept in memory only, never saved on the disk, and is gone after a restart. To make it again, type: secure-linux-backup recovery-sheet)"
+    say "Print it (or copy the passphrase into your password manager) and keep it away from this computer, then type: secure-linux-backup recovery-sheet --done"
+  fi
+  say "To back up right now, type: secure-linux-backup run"
+  return 0
+}
+
+# ---------------------------------------------------------------- the second copy on a USB drive
+cmd_second_setup() {
+  local to="" yes=no auto=no samedisk=no dest home repo answer pass nm main_id_store attach=no
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --to) [ $# -ge 2 ] || { say "Missing a value after $1."; return 2; }; to=$2; shift 2 ;;
+      --automatic) auto=yes; shift ;;
+      --yes) yes=yes; shift ;;
+      --allow-same-disk) samedisk=yes; shift ;;
+      *) say "Unknown choice: $1 (see: secure-linux-backup --help)"; return 2 ;;
+    esac
+  done
+  use_place main
+  need_conf || return $?
+  MAIN_REPO=$REPO MAIN_DEST=$DEST
+  main_id_store=$REPO_ID; [ -n "$main_id_store" ] || main_id_store=$(_store_id "$REPO")
+  if [ -f "$SECOND_CONF" ]; then
+    say "A second copy is already set up. To use another drive, first type: secure-linux-backup second forget"
+    return 2
+  fi
+  [ -n "$to" ] || { say "Choose the USB drive for the second copy: secure-linux-backup second setup --to FOLDER"; return 2; }
+  need_borg || return 2
+  need_pass || return 2
+  [ -d "$to" ] || { say "That drive or folder was not found. Plug in your USB drive, then try again."; return 3; }
+  dest=$(cd "$to" && pwd -P) || { say "That folder cannot be opened."; return 2; }
+  home=$(cd "$HOME" && pwd -P)
+  [ -w "$dest" ] || { say "You cannot save files there. Choose a drive or folder you can write to."; return 2; }
+  if [ "$dest" = "$home" ] || [ "$dest" = / ]; then say "Choose your USB drive, not your home folder itself."; return 2; fi
+  if [ "$samedisk" = no ] && [ "$(_disk "$dest")" = "$(_disk "$home")" ]; then
+    say "That folder is on the same disk as your files. If this disk failed, you would lose both. Choose your USB drive."
+    return 2
+  fi
+  if [ "$samedisk" = no ] && [ -n "$MAIN_DEST" ] && [ "$(_disk "$dest")" = "$(_disk "$MAIN_DEST")" ]; then
+    say "That is where your first backups are kept. A second copy must be on a different drive, so that one broken disk never takes both. Choose your USB drive."
+    return 2
+  fi
+  repo=$dest/secure-linux-backup-$(_host)
+  if [ -f "$repo/config" ]; then
+    if [ -n "$main_id_store" ] && [ "$(_store_id "$repo")" = "$main_id_store" ]; then
+      say "That is the same backup store as your first backups, not a second copy. Choose your USB drive."
+      return 2
+    fi
+    attach=yes
+  elif [ -e "$repo" ] && [ -n "$(ls -A "$repo" 2>/dev/null)" ]; then
+    say "A folder named ${repo##*/} is already there and is not a backup. Nothing was changed."
+    return 2
+  fi
+  if [ "$(_kind "$dest")" = "your home server" ]; then nm="your second backup place"; else nm="your backup drive"; fi
+  if [ "$yes" != yes ]; then
+    [ -t 0 ] || { say "Add --yes to confirm (or use the Backups app)."; return 2; }
+    say "A second, separate encrypted copy of your home folder will be kept on $nm."
+    printf 'Type yes to add the drive copy: '
+    IFS= read -r answer || answer=""
+    [ "$answer" = yes ] || { say "Cancelled. Nothing was changed."; return 1; }
+  fi
+  pass=$(_get_pass)                         # one passphrase for all your backups: the same recovery sheet opens both
+  use_place second
+  MAIN_REPO=$MAIN_REPO MAIN_DEST=$MAIN_DEST
+  ID=$(_gen_id); [[ "$ID" =~ ^[0-9a-f]{16}$ ]] || { say "Could not make an identifier. Nothing was changed."; return 2; }
+  REPO=$repo DEST=$dest NAME=$nm
+  _store_secret "$ID" "$pass" || { say "Could not store the passphrase safely. Nothing was changed."; return 2; }
+  pass=""
+  if [ "$attach" = yes ]; then
+    if ! _b list --lock-wait 120 --short "$REPO" >/dev/null; then
+      _forget_secret
+      say "That drive already has backups from this computer, made with a different passphrase. Nothing was changed."
+      return 2
+    fi
+  elif ! _b init --encryption=repokey-blake2 "$REPO"; then
+    _forget_secret
+    [ -f "$REPO/config" ] || rmdir "$REPO" 2>/dev/null
+    say "The drive copy could not be created there. Nothing was changed."
+    [ -n "$B_ERR" ] && say "Details: $B_ERR"
+    return 2
+  fi
+  REPO_ID=$(_store_id "$REPO")
+  if [ -z "$REPO_ID" ]; then
+    _forget_secret
+    say "The drive copy's store could not be identified, so it cannot be recognised safely later. Nothing more was changed."
+    return 2
+  fi
+  rm -f "$CONF"
+  kv_set "$CONF" id "$ID"; kv_set "$CONF" repo "$REPO"; kv_set "$CONF" dest "$DEST"; kv_set "$CONF" name "$NAME"
+  kv_set "$CONF" secret "$SECRET"; kv_set "$CONF" compression "$COMP_DEFAULT"
+  kv_set "$CONF" verify_after "$(kv_get "$MAIN_CONF" verify_after)"; kv_set "$CONF" small_home_gb "$(kv_get "$MAIN_CONF" small_home_gb)"
+  kv_set "$CONF" repo_id "$REPO_ID"; kv_set "$CONF" automatic "$auto"
+  kv_set "$CONF" created "$(now)"; kv_set "$CONF" enabled yes
+  rm -f "$STATE"
+  st_set created "$(now)"; st_set sheet_done no
+  load_conf
+  _write_sheet || say "The recovery sheet for the drive copy could not be written just now. Type later: secure-linux-backup second recovery-sheet"
+  say "A second copy is added on $NAME: its own encrypted store, made straight from your home folder."
+  say "A problem with one copy never stops or tidies away the other."
+  if [ "$auto" = yes ]; then say "When this drive is plugged in, the copy is made automatically."
+  else say "When this drive is plugged in, Backups asks whether to make the copy."; fi
+  say "Once a month you get a gentle reminder to plug it in. Keep the drive away from the computer between copies."
+  _copy_unit enable || say "(The plugged-in check could not be switched on from here; the daily backup still looks for the drive.)"
+  say ""
+  say "IMPORTANT: save the recovery sheet for the drive copy now (it has the drive copy's spare key)."
+  say "It is here: $SHEET"
+  say "Print it and keep it with your first recovery sheet, away from this computer, then type: secure-linux-backup second recovery-sheet --done"
+  say "To make the drive copy right now, type: secure-linux-backup second run"
+  return 0
+}
+_offer() {   # the known drive is plugged in and the copy is due: ask the person (window, or a notification)
+  local gui
+  st_set last_offer_time "$(now)"
+  gui=$(dirname "$SELF")/secure-linux-backup-gui
+  [ -x "$gui" ] || gui=$(command -v secure-linux-backup-gui 2>/dev/null)
+  if [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ] && [ -n "$gui" ]; then
+    "$gui" --offer-copy >/dev/null 2>&1 < /dev/null
+    return 0
+  fi
+  if command -v notify-send >/dev/null 2>&1; then
+    notify-send -a "Secure Linux" -i drive-harddisk "Your backup drive is plugged in" \
+      "Open Backups and choose Make the drive copy now." >/dev/null 2>&1
+  fi
+  say "Your backup drive is plugged in. To make this month's copy, open Backups and choose Make the drive copy now (or type: secure-linux-backup second run)."
+  return 0
+}
+_second_act() {   # (place: second, drive plugged in) make the copy if automatic, or offer it; at most once a day
+  local lg lo t
+  t=$(now); lg=$(st last_good_time); lo=$(st last_offer_time)
+  if num "$lg" && [ $(( t - lg )) -lt 72000 ]; then return 0; fi
+  if [ "$AUTO" = yes ]; then
+    _may_try_today || return 0
+    need_borg || return 2
+    _lock || return 0
+    need_pass || return 2
+    say "Your backup drive is plugged in: making this month's drive copy."
+    _do_backup
+    return $?
+  fi
+  if num "$lg" && [ $(( t - lg )) -lt $(( 25 * 86400 )) ]; then return 0; fi
+  if num "$lo" && [ $(( t - lo )) -lt 72000 ]; then return 0; fi
+  _offer
+}
+_second_reminder() {   # (place: second) a gentle reminder: raised when the copy is due, quiet after two days, again a week later
+  local t raised lg when
+  t=$(now); raised=$(st reminder_time)
+  if _copy_due; then
+    if ! num "$raised" || [ $(( t - raised )) -ge $FULL_EVERY ]; then
+      lg=$(st last_good_time)
+      if num "$lg"; then when="was last made $(( (t - lg) / 86400 )) days ago"; else when="has not been made yet"; fi
+      _alert home-backup-copy-due "Time for this month's drive copy" "The second copy of your home folder on your backup drive $when." \
+        "Plug in your backup drive$([ "$AUTO" = yes ] && echo ': the copy starts by itself.' || echo ', then open Backups and click Make the drive copy now.')"
+      st_set reminder_time "$t"
+    elif [ $(( t - raised )) -ge 172800 ]; then
+      _clear_alert home-backup-copy-due
+    fi
+  else
+    _clear_alert home-backup-copy-due
+    [ -n "$raised" ] && st_set reminder_time ""
+  fi
+  return 0
+}
+_second_tick() {   # run in a subshell from the scheduled backup: the drive copy's part (never touches the main backups)
+  use_place second
+  MAIN_REPO=$1 MAIN_DEST=$2
+  load_conf || return 0
+  [ "$ENABLED" = yes ] || return 0
+  _second_reminder
+  connected || return 0
+  _second_act
+}
+cmd_plugged_in() {   # (place: second) started when a drive is plugged in: is it OUR drive? then copy or offer
+  local waited=0 wait=${SL_PLUG_WAIT:-20}
+  num "$wait" || wait=20
+  [ "$ENABLED" = yes ] || return 0
+  until connected; do                       # the drive's folder appears a moment before the drive is ready
+    [ "$waited" -ge "$wait" ] && return 0
+    sleep 2; waited=$((waited + 2))
+  done
+  _second_reminder
+  _second_act
+}
+cmd_second() {
+  local sub=${1:-status} mainon
+  [ $# -gt 0 ] && shift
+  case "$sub" in setup|add) cmd_second_setup "$@"; return ;; esac
+  use_place main
+  if ! load_conf; then
+    [ "$sub" = plugged-in ] && return 0
+    need_conf; return $?
+  fi
+  MAIN_REPO=$REPO MAIN_DEST=$DEST mainon=$ENABLED
+  use_place second
+  MAIN_REPO=$MAIN_REPO
+  if ! load_conf; then
+    [ "$sub" = plugged-in ] && return 0
+    [ "$sub" = status ] && { _status_second; return 0; }
+    say "No second copy is set up. To add one, open Backups and choose \"Add a second copy on a USB drive\" (or type: secure-linux-backup second setup --to FOLDER)."
+    return 4
+  fi
+  case "$sub" in
+    status) _status_second ;;
+    run|now) need_borg || return 2; _run_place no ;;
+    check) cmd_check "$@" ;;
+    repair) cmd_repair "$@" ;;
+    list) cmd_list ;;
+    restore) cmd_restore "$@" ;;
+    recovery-sheet) cmd_sheet "$@" ;;
+    passphrase-again) cmd_repass ;;
+    deletion-checked) cmd_deletion_checked ;;
+    plugged-in) [ "$mainon" = yes ] || return 0; cmd_plugged_in ;;
+    automatic)
+      case "${1:-}" in
+        on) kv_set "$CONF" automatic yes; say "The drive copy is now made automatically whenever your backup drive is plugged in." ;;
+        off) kv_set "$CONF" automatic no; say "When your backup drive is plugged in, Backups now asks before making the copy." ;;
+        *) say "Choose: secure-linux-backup second automatic on|off"; return 2 ;;
+      esac ;;
+    forget)
+      cp -f "$CONF" "$CONF.previous" 2>/dev/null
+      rm -f "$CONF"
+      _copy_unit disable
+      _clear_alert home-backup-copy-due; _clear_alert home-backup-copy-problem
+      say "Drive copies are no longer made. The copy already on the drive was kept, and so was its passphrase." ;;
+    *) say "Unknown command: second $sub (see: secure-linux-backup --help)"; return 2 ;;
+  esac
+}
+
+# ---------------------------------------------------------------- backup
+_restore_test() {   # _restore_test ARCHIVE   extract a few files to a scratch folder and compare their checksums
+  local arch=$1 lst picks=() c i idx sums tmp p want got result=ok
+  local -a cands=()
+  # the archive's file list goes to a private scratch file (a big home folder has a very long list)
+  lst=$(mktemp "$STATE_DIR/.restore-test-list.XXXXXX") || return 1
+  _b list --lock-wait 120 --format '{type}{TAB}{size}{TAB}{path}{NL}' "$REPO::$arch" > "$lst" || result=failed
+  if [ $result = ok ]; then
+    mapfile -t cands < <(awk -F'\t' '$1 == "-" && $2 > 0 && $2 <= 20971520 { print $3; if (++n >= 5000) exit }' "$lst")
+  fi
+  rm -f "$lst"
+  if [ $result = ok ]; then
+    c=${#cands[@]}
+    if [ "$c" -eq 0 ]; then
+      st_set last_restore_test_result skipped; st_set last_restore_test_time "$(now)"
+      return 0
+    fi
+    for i in 1 $(( (c + 1) / 2 )) "$c"; do
+      idx=$(( i - 1 )); p=${cands[$idx]}
+      case " ${picks[*]:-} " in *" $p "*) ;; *) picks+=("$p") ;; esac
+    done
+    sums=$(_b list --lock-wait 120 --format '{sha256}{TAB}{path}{NL}' "$REPO::$arch" "${picks[@]}") || result=failed
+  fi
+  if [ $result = ok ]; then
+    tmp=$(mktemp -d "${TMPDIR:-/tmp}/sl-restore-test.XXXXXX") || result=failed
+  fi
+  if [ $result = ok ]; then
+    ( cd "$tmp" && _b extract --lock-wait 120 "$REPO::$arch" "${picks[@]}" ) || result=failed
+    for p in "${picks[@]}"; do
+      want=$(printf '%s\n' "$sums" | P="$p" awk -F'\t' '$2 == ENVIRON["P"] { print $1; exit }')
+      got=$(sha256sum "$tmp/$p" 2>/dev/null | cut -d' ' -f1)
+      [ -n "$want" ] && [ "$want" = "$got" ] || result=failed
+    done
+    rm -rf "$tmp"
+  fi
+  st_set last_restore_test_result "$result"; st_set last_restore_test_time "$(now)"
+  [ $result = ok ]
+}
+
+_count_attempt() {
+  local d; d=$(date +%F)
+  local c; c=$(st attempt_count); num "$c" || c=0
+  if [ "$(st attempt_day)" = "$d" ]; then st_set attempt_count $(( 10#$c + 1 ))
+  else st_set attempt_day "$d"; st_set attempt_count 1; fi
+}
+_may_try_today() {   # scheduled tries are limited to 3 a day, so a failing store is never hammered every hour
+  local c
+  [ "$(st attempt_day)" = "$(date +%F)" ] || return 0
+  c=$(st attempt_count); num "$c" || return 0
+  [ "$c" -lt 3 ]
+}
+_good_today() {   # a good backup today (or in the last 12 hours) is enough for a scheduled run
+  local lg; lg=$(st last_good_time)
+  num "$lg" || return 1
+  [ $(( $(now) - lg )) -lt 43200 ] && return 0
+  [ "$(date -d "@$lg" +%F 2>/dev/null)" = "$(date +%F)" ]
+}
+
+_tidy() {   # _tidy ARCHIVE   remove old backups (only when allowed), then make sure ARCHIVE is still there
+  local arch=$1 block names warn=0
+  # Look again right before tidying: a backup and its check can take hours, and backups deleted in that time must
+  # raise the alarm (and stop the tidying) instead of being quietly taken into the list of known backups below.
+  _deletion_check
+  block=$(_prune_block)
+  if [ -n "$block" ]; then
+    say "Old backups were not tidied this time, because $block. Nothing was deleted."
+  elif ! _b prune --lock-wait 120 --glob-archives 'home-*' "${KEEP[@]}" "$REPO"; then
+    say "Note: old backups could not be tidied this time. Nothing was lost."
+    warn=1
+  else
+    _b compact --lock-wait 120 "$REPO" >/dev/null || true
+  fi
+  if ! names=$(_archives); then
+    say "Note: the list of backups could not be read after tidying. Nothing was lost."
+    rm -f "$(_known)"                       # not known now: it is read again next time (never a false alarm)
+    warn=1
+  elif ! printf '%s\n' "$names" | grep -qxF "$arch"; then
+    _remember_backups "$names"
+    st_set last_result failed
+    _alert "$ALERT_PROBLEM" "$ALERT_TITLE" "$ALERT_TEXT" "$ALERT_HINT"
+    say "PROBLEM: the new backup is missing from the list after tidying. $ALERT_HINT"
+    return 2
+  fi
+  [ -n "${names:-}" ] && { st_set archives_count "$(printf '%s\n' "$names" | grep -c .)"; _remember_backups "$names"; }
+  return $warn
+}
+
+_do_backup() {   # needs: conf loaded, borg present, lock held, backup place connected, passphrase readable
+  local arch rc vrc fr=0 warn=no jf full_now=no why t
+  _write_excludes
+  _deletion_check
+  arch="home-$(date +%Y-%m-%dT%H.%M.%S)"
+  _count_attempt
+  st_set last_run_time "$(now)"
+  say "Backing up your home folder to $NAME. The first backup can take a long time; later ones only save what changed."
+  jf=$(mktemp "$STATE_DIR/.create-stats.XXXXXX") || return 2
+  _b create --lock-wait 120 --compression "$COMP" --exclude-caches --one-file-system --exclude-from "$EXCL" \
+    --comment "Secure Linux home backup home=$HOME" --json "$REPO::$arch" "$HOME" > "$jf"
+  rc=$?
+  HOME_BYTES=$(grep -o '"original_size": *[0-9]*' "$jf" 2>/dev/null | head -n 1 | grep -o '[0-9]*$')
+  rm -f "$jf"
+  if [ $rc -ge 2 ]; then
+    if [ "$B_NOSPACE" = yes ]; then
+      st_set last_result place-full
+      say "The backup did not finish because $NAME is full. Your earlier backups are untouched."
+      say "Free some space there (or use a bigger drive), then choose Back up now."
+    else
+      st_set last_result failed
+      say "The backup did not finish. Your earlier backups are untouched."
+    fi
+    [ -n "$B_ERR" ] && say "Details: $B_ERR"
+    return 2
+  fi
+  if num "$HOME_BYTES"; then st_set home_size "$HOME_BYTES"; else HOME_BYTES=$(st home_size); fi
+  [ $rc -eq 1 ] && warn=yes
+  if [ "$REPAIRING" != yes ] && _full_due; then
+    full_now=yes
+    why="the weekly full read-back of all backups was due ($(_last_full_words))"
+    st_set last_check_mode all; st_set last_check_reason "$why"
+    say "Checking: $(_mode_words all), because $why. This reads all your backups, so it can take a while."
+    _b check --lock-wait 120 --verify-data "$REPO"; vrc=$?
+    _full_result $vrc; fr=$?
+  else
+    _decide_check
+    st_set last_check_mode "$CHK_MODE"; st_set last_check_reason "$CHK_WHY"
+    if [ "$CHK_MODE" = quick ]; then
+      say "Checking: $(_mode_words quick), because $CHK_WHY. All backups are still read back in full once a week ($(_last_full_words))."
+      _b check --lock-wait 120 --archives-only "$REPO::$arch"; vrc=$?
+    else
+      say "Checking: $(_mode_words full), because $CHK_WHY."
+      _b check --lock-wait 120 --archives-only --verify-data "$REPO::$arch"; vrc=$?
+    fi
+  fi
+  st_set last_check_time "$(now)"
+  if [ $vrc -ne 0 ]; then
+    if [ $vrc -ge 2 ] && { [ $fr -eq 2 ] || ! connected; }; then
+      st_set last_check_result unfinished; st_set last_result check-unfinished
+      say "The check could not finish because $NAME was disconnected. Nothing was deleted or tidied; it is checked again next time."
+      return 2
+    fi
+    st_set last_check_result failed; st_set last_result check-failed
+    _alert "$ALERT_PROBLEM" "$ALERT_TITLE" "$ALERT_TEXT" "$ALERT_HINT"
+    if [ $full_now = yes ]; then say "PROBLEM: the full read-back found damage in your backups. Nothing was deleted or tidied: all older backups were kept."
+    else say "PROBLEM: the new backup did not pass its check. Nothing was deleted or tidied: all older backups were kept."; fi
+    say "$ALERT_HINT"
+    return 2
+  fi
+  t=$(now)
+  st_set last_check_result ok
+  st_set last_good_archive "$arch"; st_set last_good_time "$t"
+  st_set last_result "$([ $warn = yes ] && echo warning || echo ok)"
+  if [ "$PLACE" = second ]; then _clear_alert home-backup-copy-due; st_set reminder_time ""; fi
+  # Tidy old backups only now that the newest one is proven good (and the weekly full check is up to date).
+  # --keep-last 3 always keeps it (and 2 more).
+  if [ "$REPAIRING" = yes ]; then
+    say "Old backups are tidied after the full check that follows."
+  else
+    _tidy "$arch"; rc=$?
+    [ $rc -ge 2 ] && return 2
+    [ $rc -eq 1 ] && warn=yes
+  fi
+  if _restore_test "$arch"; then
+    [ "$(st last_full_check_result)" = failed ] || _clear_alert "$ALERT_PROBLEM"
+  elif [ "$(st last_restore_test_result)" = failed ]; then
+    _alert "$ALERT_PROBLEM" "$ALERT_TITLE" "$ALERT_TEXT" "$ALERT_HINT"
+    say "PROBLEM: a test restore of a few files from the new backup did not match. $ALERT_HINT"
+    return 2
+  fi
+  if [ $warn = yes ]; then
+    say "Backup finished and checked: no problems found, but some files could not be read (the list is in $LOG)."
+    return 1
+  fi
+  say "Backup finished and checked: no problems found."
+  return 0
+}
+
+_do_full_check() {
+  local rc fr newest
+  _deletion_check
+  say "Checking every backup, block by block. This reads all of your backups, so it can take a long time."
+  _b check --lock-wait 120 --verify-data "$REPO"; rc=$?
+  _full_result $rc; fr=$?
+  if [ $fr -eq 2 ]; then
+    say "The full check could not finish because $NAME was disconnected. Nothing was changed; it runs again next time."
+    return 2
+  fi
+  if [ $fr -eq 1 ]; then
+    _alert "$ALERT_PROBLEM" "$ALERT_TITLE" "$ALERT_TEXT" "$ALERT_HINT"
+    say "PROBLEM: the check found damage in the backup store. Do not delete anything."
+    say "$ALERT_HINT"
+    return 2
+  fi
+  newest=$(_archives | tail -n 1)
+  if [ -n "$newest" ]; then
+    say "Test restore: getting a few files back to compare them..."
+    if ! _restore_test "$newest" && [ "$(st last_restore_test_result)" = failed ]; then
+      _alert "$ALERT_PROBLEM" "$ALERT_TITLE" "$ALERT_TEXT" "$ALERT_HINT"
+      say "PROBLEM: the test restore did not give the files back correctly. $ALERT_HINT"
+      return 2
+    fi
+  fi
+  [ "$(st last_check_result)" = failed ] || _clear_alert "$ALERT_PROBLEM"
+  say "All backups checked: no problems found."
+  return 0
+}
+
+_run_place() {   # _run_place yes|no (scheduled?)   one backup to the current place
+  local scheduled=$1
+  _lock || return 0
+  if ! connected; then
+    if [ "$scheduled" = yes ]; then   # a problem from an earlier try stays visible; hourly tries do not hide it
+      st_set last_try_time "$(now)"
+      case "$(st last_result)" in ''|ok|warning|not-connected) st_set last_result not-connected; st_set last_run_time "$(now)" ;; esac
+    else
+      st_set last_result not-connected; st_set last_run_time "$(now)"
+    fi
+    if [ "$NOT_OURS" = yes ]; then say "$(_not_ours_words)"
+    else say "$NAME is not connected right now, so no backup was made. It will run when it is connected again."; fi
+    _store_missing_warn
+    [ "$scheduled" = yes ] && return 0
+    return 3
+  fi
+  if [ "$scheduled" = yes ]; then
+    if _good_today; then say "A good backup was already made today; nothing to do."; return 0; fi
+    if ! _may_try_today; then say "Today's backup was already tried 3 times; it is tried again tomorrow."; return 0; fi
+  fi
+  need_pass || return 2
+  _do_backup
+}
+
+cmd_run() {
+  local scheduled=no rc
+  [ "${1:-}" = --scheduled ] && scheduled=yes
+  if [ $scheduled = yes ]; then
+    load_conf && [ "$ENABLED" = yes ] || { say "Home folder backups are off; nothing to do."; return 0; }
+  else
+    need_conf || return $?
+  fi
+  need_borg || return 2
+  _run_place $scheduled; rc=$?
+  if [ $scheduled = yes ]; then
+    _unlock                                 # the drive copy has its own lock: it never waits for the main backups
+    ( _second_tick "$REPO" "$DEST" )
+  fi
+  return $rc
+}
+
+cmd_check() {
+  local scheduled=no lo
+  [ "${1:-}" = --scheduled ] && scheduled=yes
+  if [ $scheduled = yes ]; then
+    load_conf && [ "$ENABLED" = yes ] || { say "Home folder backups are off; nothing to do."; return 0; }
+  else
+    need_conf || return $?
+  fi
+  need_borg || return 2
+  _lock || return 0
+  if ! connected; then
+    if [ "$NOT_OURS" = yes ]; then say "$(_not_ours_words)"
+    else say "$NAME is not connected right now, so the check will run when it is connected again."; fi
+    [ $scheduled = yes ] && return 0
+    return 3
+  fi
+  if [ $scheduled = yes ]; then
+    lo=$(st last_full_check_ok_time)
+    if num "$lo" && [ $(( $(now) - lo )) -lt 72000 ]; then say "All backups were already read back in full today; nothing to do."; return 0; fi
+  fi
+  need_pass || return 2
+  _do_full_check
+}
+
+cmd_repair() {
+  local yes=no answer rc
+  [ "${1:-}" = --yes ] && yes=yes
+  need_conf || return $?
+  need_borg || return 2
+  _lock || return 0
+  need_connected || return 3
+  need_pass || return 2
+  say "Repair fixes the backup store after a check found damage. Pieces of old backups that are damaged may be marked as lost."
+  say "Straight after the repair a fresh backup is made, so everything still on this computer is safe again."
+  if [ $yes != yes ]; then
+    [ -t 0 ] || { say "Add --yes to confirm (or use the Backups app)."; return 2; }
+    printf 'Type repair to continue: '
+    IFS= read -r answer || answer=""
+    [ "$answer" = repair ] || { say "Cancelled. Nothing was changed."; return 1; }
+  fi
+  export BORG_CHECK_I_KNOW_WHAT_I_AM_DOING=YES
+  _b check --lock-wait 120 --repair "$REPO"
+  rc=$?
+  unset BORG_CHECK_I_KNOW_WHAT_I_AM_DOING
+  if [ $rc -ge 2 ]; then
+    say "The repair could not finish. Nothing more was changed. Keep the backup drive or server as it is and ask for help."
+    return 2
+  fi
+  st_set last_check_result ""; st_set last_full_check_result ""
+  rm -f "$(_known)"                         # a repair may remove damaged backups: that is not a deletion alarm
+  REPAIRING=yes
+  _do_backup; rc=$?
+  REPAIRING=no
+  [ $rc -ge 2 ] && return $rc
+  _do_full_check || return $?
+  _tidy "$(st last_good_archive)"; rc=$?
+  [ $rc -ge 2 ] && return 2
+  return 0
+}
+
+# ---------------------------------------------------------------- list and restore
+cmd_list() {
+  local names a i=0
+  need_conf || return $?
+  need_borg || return 2
+  need_connected || return 3
+  need_pass || return 2
+  names=$(_archives) || { say "The list of backups could not be read."; return 2; }
+  [ -n "$names" ] || { say "There are no backups yet. To make one, type: $CMD run"; return 0; }
+  say "Your backups (newest last):"
+  while IFS= read -r a; do
+    i=$((i + 1))
+    printf '%3s) %s    (%s)\n' "$i" "$(_when_arch "$a")" "$a"
+  done <<< "$names"
+}
+
+cmd_restore() {
+  local from="" to="" all=no paths=() p rel names arch strip rc target hp
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --from|--to) [ $# -ge 2 ] || { say "Missing a value after $1."; return 2; }
+        [ "$1" = --from ] && from=$2 || to=$2; shift 2 ;;
+      --everything) all=yes; shift ;;
+      --) shift; paths+=("$@"); break ;;
+      -*) say "Unknown choice: $1 (see: secure-linux-backup --help)"; return 2 ;;
+      *) paths+=("$1"); shift ;;
+    esac
+  done
+  need_conf || return $?
+  need_borg || return 2
+  [ $all = yes ] || [ ${#paths[@]} -gt 0 ] || { say "Say what to get back, for example: $CMD restore Documents/letter.odt"; return 2; }
+  need_connected || return 3
+  need_pass || return 2
+  names=$(_archives) || { say "The list of backups could not be read."; return 2; }
+  [ -n "$names" ] || { say "There are no backups to get files back from yet."; return 2; }
+  if [ -n "$from" ] && [ "$from" != latest ]; then
+    printf '%s\n' "$names" | grep -qxF -- "$from" || { say "There is no backup with that name. To see them, type: $CMD list"; return 2; }
+    arch=$from
+  else
+    arch=$(st last_good_archive)
+    printf '%s\n' "$names" | grep -qxF -- "$arch" || arch=$(printf '%s\n' "$names" | tail -n 1)
+  fi
+  hp=${HOME%/}
+  # the home folder these backups were made from (another computer may have used another user name)
+  local src
+  src=$(_b info --lock-wait 120 --json "$REPO::$arch" | sed -n 's/.*"comment": *"[^"]*home=\([^"]*\)".*/\1/p' | head -n 1)
+  src=${src%/}; [[ "$src" == /* ]] || src=$hp
+  local inarch=()
+  if [ $all = no ]; then
+    for p in "${paths[@]}"; do
+      case "$p" in
+        "$hp") rel="" ;;
+        "$hp"/*) rel=${p#"$hp"/} ;;
+        /*) say "Only files from your home folder are in these backups."; return 2 ;;
+        *) rel=${p#./} ;;
+      esac
+      rel=${rel%/}
+      case "/$rel/" in */../*|*/./*) say "Please give the file's place inside your home folder, for example Documents/letter.odt"; return 2 ;; esac
+      if [ -z "$rel" ]; then all=yes; inarch=(); break; fi
+      inarch+=("${src#/}/$rel")
+    done
+  fi
+  target=${to:-$HOME/Restored-from-backup-$(date +%Y-%m-%d-%H%M%S)}
+  if [ -e "$target" ] && [ -n "$(ls -A "$target" 2>/dev/null)" ]; then
+    say "That folder already has files in it. Files are only ever restored into an empty or new folder, so nothing is replaced."
+    return 2
+  fi
+  mkdir -p "$target" || { say "Could not make the folder for the restored files."; return 2; }
+  target=$(cd "$target" && pwd)
+  strip=$(printf '%s' "${src#/}" | awk -F/ '{ print NF }')
+  [ $all = yes ] && say "Getting everything back from the backup of $(_when_arch "$arch"). This needs as much free space as your home folder."
+  ( cd "$target" && _b extract --lock-wait 120 --strip-components "$strip" "$REPO::$arch" "${inarch[@]}" )
+  rc=$?
+  if [ -z "$(ls -A "$target" 2>/dev/null)" ]; then
+    rmdir "$target" 2>/dev/null
+    if [ $rc -ge 2 ]; then say "Getting your files back did not work. Nothing in your home folder was changed."; return 2; fi
+    say "That file or folder is not in the backup from $(_when_arch "$arch"). Try an older backup: $CMD list"
+    return 2
+  fi
+  say "Done. Your files from the backup of $(_when_arch "$arch") are in: $target"
+  say "Nothing in your home folder was replaced. Copy back what you need."
+  if [ $rc -ne 0 ]; then say "Some files could not be restored (the list is in $LOG)."; return 1; fi
+  return 0
+}
+
+# ---------------------------------------------------------------- recovery sheet, passphrase, check mode, on/off
+cmd_sheet() {
+  need_conf || return $?
+  case "${1:-}" in
+    --path) printf '%s\n' "$SHEET"; return 0 ;;
+    --done)
+      [ "$SHEET" != "$DISK_SHEET" ] && rm -f "$SHEET"          # in memory: removing it is enough
+      if [ -f "$DISK_SHEET" ]; then                            # an older sheet on the disk
+        if command -v shred >/dev/null 2>&1; then shred -u "$DISK_SHEET" 2>/dev/null || rm -f "$DISK_SHEET"; else rm -f "$DISK_SHEET"; fi
+      fi
+      st_set sheet_done yes
+      say "Thank you. The recovery sheet file was removed from this computer. Keep your printed or saved copy safe, away from this computer."
+      return 0 ;;
+  esac
+  if [ ! -f "$SHEET" ]; then
+    need_connected || return 3
+    _write_sheet || { say "The recovery sheet could not be made: the passphrase could not be read from your keyring."; return 2; }
+  fi
+  say "Your recovery sheet is here: $SHEET"
+  say "Print it (or copy the passphrase into your password manager), then type: $CMD recovery-sheet --done"
+}
+
+cmd_repass() {   # the keyring was reset or the passphrase file was lost: type it again from the recovery sheet
+  local pass oldid oldsecret
+  need_conf || return $?
+  need_borg || return 2
+  need_connected || return 3
+  [ -t 0 ] && printf 'Passphrase from your recovery sheet (hidden): ' >&2
+  IFS= read -r -s pass || pass=""
+  [ -t 0 ] && printf '\n' >&2
+  pass=$(printf '%s' "$pass" | tr -d '\r' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+  [ -n "$pass" ] || { say "No passphrase was typed. Nothing was changed."; return 2; }
+  oldid=$ID oldsecret=$SECRET
+  ID=$(_gen_id); [[ "$ID" =~ ^[0-9a-f]{16}$ ]] || { ID=$oldid; say "Could not make an identifier. Nothing was changed."; return 2; }
+  if ! _store_secret "$ID" "$pass"; then ID=$oldid SECRET=$oldsecret; say "Could not store the passphrase safely. Nothing was changed."; return 2; fi
+  pass=""
+  if ! _b list --lock-wait 120 --short "$REPO" >/dev/null; then
+    _forget_secret; ID=$oldid SECRET=$oldsecret
+    say "That passphrase did not open the backups. Check your recovery sheet and try again. Nothing was changed."
+    return 2
+  fi
+  kv_set "$CONF" id "$ID"; kv_set "$CONF" secret "$SECRET"
+  case "$(st last_result)" in keyring-locked|passphrase-missing) st_set last_result "" ;; esac
+  _clear_alert home-backup-keyring
+  say "Thank you. The passphrase opens your backups and is saved on this computer again. Backups will work again."
+}
+
+cmd_checkmode() {
+  need_conf || return $?
+  case "${1:-}" in
+    auto|full|quick) ;;
+    *) say "Choose one: secure-linux-backup check-mode auto|full|quick"; return 2 ;;
+  esac
+  kv_set "$MAIN_CONF" verify_after "$1"
+  [ -f "$SECOND_CONF" ] && kv_set "$SECOND_CONF" verify_after "$1"
+  case "$1" in
+    auto) say "Checks are now chosen automatically for each backup: a full read-back of the new backup when your home folder is small (up to $SMALL_GB GB), or when the backup place is plugged in or reached over a wired connection; a quick check when it is reached over Wi-Fi and your home folder is large. All backups are read back in full every week either way." ;;
+    full) say "Every new backup is now read back in full straight after it is made (the most thorough choice, and the slowest). All backups are read back in full every week too." ;;
+    quick) say "Every new backup now gets a quick check straight after it is made. All backups are still read back in full every week, and old backups are only tidied when that weekly check has passed." ;;
+  esac
+}
+
+cmd_deletion_checked() {   # the person has looked at the deletion alarm: tidying may go on
+  need_conf || return $?
+  st_set deletion_alarm ""; st_set deletion_count ""
+  _clear_alert "$(_deleted_alert)"
+  say "Thank you. The alarm about deleted backups is cleared; old backups are tidied normally again."
+}
+
+# ---------------------------------------------------------------- your 3 copies (the 3-2-1 rule)
+# Read from the saved settings and results only: it works away from home, with the backup place unplugged, and with
+# backups off. It never starts borg and never touches the backup place.
+cmd_copies() {
+  local have=1 next="" m_set=no m_on=no m_good="" m_name="" alarm="" s_set=no s_good="" s_name="" s_due=no t days
+  t=$(now)
+  use_place main
+  if load_conf; then
+    m_set=yes; [ "$ENABLED" = yes ] && m_on=yes; m_name=$NAME; m_good=$(st last_good_time); alarm=$(st deletion_alarm)
+  fi
+  use_place second
+  if load_conf; then s_set=yes; s_name=$NAME; s_good=$(st last_good_time); _copy_due && s_due=yes; fi
+  use_place main
+  say "Your copies of your files - the 3-2-1 rule: 3 copies, on 2 different kinds of storage, 1 kept away from home."
+  say ""
+  say "1. On this computer: your files themselves."
+  if [ -e "$SYSROOT/etc/snapper/configs/root" ]; then
+    say "   System undo points (snapshots) are on. They can undo a bad update, but they do not hold your own files."
+  fi
+  if [ $m_set = no ]; then
+    say "2. Backups: not turned on yet. When they are on, your home folder is copied every day to your home server or a USB drive."
+  else
+    if [ $m_on = yes ]; then say "2. Backups to $m_name: ON, every day."; else say "2. Backups to $m_name: PAUSED (your backups are kept)."; fi
+    if num "$m_good"; then
+      have=$((have + 1)); days=$(( (t - m_good) / 86400 ))
+      say "   Last good backup: $(_when_epoch "$m_good") - checked after it was made."
+      [ "$days" -ge 7 ] && say "   That is $days days ago. Connect $m_name so a new backup can be made."
+    else
+      say "   No backup has been made yet."
+    fi
+  fi
+  if [ $s_set = no ]; then
+    say "3. A copy kept away from this computer: none yet. A second copy on a USB drive, kept somewhere else (at work, or"
+    say "   with family), keeps your files safe if this computer and your home server are both lost - for example in a"
+    say "   fire, a theft, or if ransomware or a mistake on this computer reaches your home server."
+  else
+    say "3. A copy kept away from this computer: the drive copy on $s_name."
+    if num "$s_good"; then have=$((have + 1)); say "   Last drive copy: $(_when_epoch "$s_good") - checked after it was made."
+    else say "   No drive copy has been made yet."; fi
+    say "   Keep the drive somewhere else between copies (at work, or with family), not next to this computer."
+    [ $s_due = yes ] && say "   This month's drive copy is due: plug in your backup drive."
+  fi
+  say ""
+  say "You have $have of 3 copies."
+  if num "$alarm"; then next="open Backups and look at the warning about deleted backups first."
+  elif [ $m_set = no ]; then next="turn on backups (open Backups and click Turn on backups)."
+  elif [ $m_on = no ]; then next="switch automatic backups on again (open Backups)."
+  elif ! num "$m_good"; then next="make the first backup (open Backups and click Back up now)."
+  elif [ $s_set = no ]; then next="add a second copy on a USB drive (open Backups and click Add a second copy on a USB drive), then keep that drive away from this computer."
+  elif ! num "$s_good" || [ $s_due = yes ]; then next="plug in your backup drive and make the drive copy."
+  else next="nothing to do. Keep the drive copy away from this computer between copies."; fi
+  say "Next step: $next"
+  say "How your copies are checked: every block of every backup is read back and checked once a week (at the next backup, if the backup place was not connected then), and a test restore of a few files runs after every backup."
+  return 0
+}
+
+# ---------------------------------------------------------------- one gentle offer: backups to the home server
+# Wave 0 H connects the owner's home server at /media/homeserver. Once it is connected and backups are not on, the
+# owner is offered backups there ONCE, as a quiet notice (the Secure Linux notifier shows it). Nothing is turned on by
+# itself: the person chooses in the Backups window. Other people on this computer are never asked.
+_owner() {
+  local u
+  u=$(cat "$SL_ETC/user" 2>/dev/null)
+  [ -n "$u" ] || u=$(sed -n 's/^SL_USER=//p' "$SL_ROOT/build.conf" 2>/dev/null | tail -n 1)
+  printf '%s' "$u"
+}
+_home_share_dir() {   # prints the home server's folder when the owner is at home and it is connected
+  local owner fs
+  owner=$(_owner)
+  [ -n "$owner" ] && [ "$owner" = "$ME" ] || return 1           # only the owner; an unknown owner is never asked
+  [ -e "$HS_READY" ] || return 1                                # the home server was connected by the owner (Wave 0 H)
+  [ "$(cat "$HS_LOCATION" 2>/dev/null)" = home ] || return 1    # away from home the automount is never touched
+  [ -d "$HS_WHERE" ] || return 1
+  fs=$(_mnt FSTYPE "$HS_WHERE")
+  _netfs "$fs" || return 1                                      # the share itself, not an empty local folder
+  printf '%s\n' "$HS_WHERE"
+}
+cmd_offer_home() {
+  local mark=$STATE_DIR/home-server-offer t
+  if [ "${1:-}" = --where ]; then _home_share_dir; return; fi
+  if [ -f "$MAIN_CONF" ]; then _clear_alert "$OFFER_ALERT"; return 0; fi   # backups are set up (or paused): no offer
+  if [ -f "$mark" ]; then                    # offered once already: the notice goes away after about a day
+    t=$(cat "$mark" 2>/dev/null)
+    if num "$t" && [ $(( $(now) - t )) -ge 72000 ]; then _clear_alert "$OFFER_ALERT"; fi
+    return 0
+  fi
+  _home_share_dir > /dev/null || return 0
+  _alert "$OFFER_ALERT" "Turn on backups to your home server?" \
+    "Your home server is connected. Backups can copy your home folder there every day: encrypted, compressed and checked. Nothing happens unless you choose it." \
+    "Open Backups and choose Turn on backups to my home server."
+  [ -f "$UALERTS/$OFFER_ALERT" ] || return 0   # nothing could be shown: try again another day
+  mkdir -p "$STATE_DIR"; now > "$mark"
+  return 0
+}
+
+cmd_off() {
+  load_conf || { say "Home folder backups are not set up, so there is nothing to switch off."; return 0; }
+  _timers disable
+  [ -f "$SECOND_CONF" ] && _copy_unit disable
+  kv_set "$CONF" enabled no
+  _clear_alert home-backup-copy-due; _clear_alert home-backup-keyring
+  say "Automatic backups are now OFF. Your backups and your passphrase were kept, so you can still get files back."
+  say "To switch them on again, type: secure-linux-backup on"
+}
+cmd_on() {
+  need_conf || return $?
+  kv_set "$CONF" enabled yes
+  [ -f "$SECOND_CONF" ] && _copy_unit enable
+  if _timers enable; then say "Automatic daily backups are ON again (to $NAME)."
+  else say "Backups are ON, but the daily schedule could not be switched on from here. Back up any time with: secure-linux-backup run"; fi
+}
+
+case "${1:-status}" in
+  -h|--help|help) sed -n '2,32p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+  status) cmd_status ;;
+  state) cmd_state ;;
+  setup) shift; cmd_setup "$@" ;;
+  run|now) shift; cmd_run "$@" ;;
+  check) shift; cmd_check "$@" ;;
+  check-mode) shift; cmd_checkmode "$@" ;;
+  repair) shift; cmd_repair "$@" ;;
+  list) cmd_list ;;
+  restore) shift; cmd_restore "$@" ;;
+  recovery-sheet) shift; cmd_sheet "$@" ;;
+  passphrase-again) cmd_repass ;;
+  deletion-checked) cmd_deletion_checked ;;
+  second|drive-copy) shift; cmd_second "$@" ;;
+  off) cmd_off ;;
+  on) cmd_on ;;
+  copies|3-2-1) cmd_copies ;;
+  install-borg) shift; cmd_install_borg "$@" ;;
+  offer-home) shift; cmd_offer_home "$@" ;;
+  *) say "Unknown command: $1 (see: secure-linux-backup --help)"; exit 2 ;;
+esac

@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=Earlier version notice
+Comment=Explains what to do after starting an earlier version from the boot menu
+Exec=/usr/local/bin/secure-linux-boot-rollback notice
+NoDisplay=true
+X-KDE-autostart-phase=2

@@ -67,7 +67,10 @@ class ControlCenterWindow(ui.SecureShell):
             self.preset_buttons[key] = radio
         page.append(presets)
         page.append(ui.label("Protection switches", css=("sl-section-title",)))
-        for key in self.model.FEATURE_ORDER[:10]:
+        for key in self.model.PROTECTION_SWITCHES:
+            page.append(self._feature_row(key))
+        page.append(ui.label("Sharing at home", css=("sl-section-title",)))
+        for key in self.model.HOME_SWITCHES:
             page.append(self._feature_row(key))
         self.activity_label = ui.label(self.controller.activity.get(), css=("sl-caption",))
         page.append(self.activity_label)
@@ -106,7 +109,7 @@ class ControlCenterWindow(ui.SecureShell):
         page = ui.page_box()
         ui.add_heading(page, "Hardware, encryption & app access", "These items need care. The centre explains what is possible instead of offering unsafe one-click promises.")
         grid = ui.flow_box()
-        for key in self.model.FEATURE_ORDER[10:]:
+        for key in self.model.INFO_FEATURES:
             info = self.model.FEATURES[key]
             card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
             card.add_css_class("sl-status-card")
@@ -151,6 +154,8 @@ class ControlCenterWindow(ui.SecureShell):
             ("usb_creator", "Create a Secure Linux USB", "Use the existing USB creator and its checks.", "drive-removable-media-symbolic"),
             ("usb_fixer", "Fix a USB drive", "Open the existing guided USB fixer.", "drive-harddisk-symbolic"),
             ("home_server", "Home & Server Helper", "Photos, files, containers and rootless Docker.", "network-server-symbolic"),
+            ("home_backup", "Backups", "Optional encrypted backups of your home folder to your home server or a USB drive.", "document-save-symbolic"),
+            ("versions", "Versions and updates", "See which release is on this computer, your saved master and a drive. Update, go back or read what changed.", "software-update-available-symbolic"),
             ("guide", "Read the START-HERE guide", "Open the offline beginner guide.", "help-browser-symbolic"),
         ]
         grid = ui.flow_box()

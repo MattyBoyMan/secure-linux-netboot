@@ -1,0 +1,28 @@
+# Navidrome for Secure Linux: your own private music streaming. Home network only.
+# Started only by secure-linux-server-apps, which fills in the SL_* values from this computer (see app.conf).
+# Image pinned by version AND digest (checked on Docker Hub, 2026-11-16): the official deluan/navidrome 0.64.2.
+# Runs as your own account (not as the administrator). Your music folder is mounted READ-ONLY.
+# Privacy: every outside service is switched off (artist pictures, Last.fm, the project's usage report), so it
+# talks to nothing on the internet. The first person to open it makes the first account: do that yourself straight away.
+services:
+  navidrome:
+    image: docker.io/deluan/navidrome:0.64.2@sha256:38dc2727bfcfd5ede290f8ada114fc90368146f265ae4701ddddbcbe2a44ee52
+    restart: unless-stopped
+    user: "${SL_UID:?user missing}:${SL_GID:?group missing}"
+    ports:
+      - "${SL_BIND:?home address missing}:${SL_PORT:?port missing}:4533"
+    volumes:
+      - "${SL_DATA:?data folder missing}/data:/data:Z"
+      - "${SL_DATA:?data folder missing}/music:/music:ro,z"
+    environment:
+      TZ: "${SL_TZ:-UTC}"
+      ND_MUSICFOLDER: /music
+      ND_DATAFOLDER: /data
+      ND_ENABLEEXTERNALSERVICES: "false"
+      ND_ENABLEINSIGHTSCOLLECTOR: "false"
+      ND_ENABLEGRAVATAR: "false"
+      ND_LASTFM_ENABLED: "false"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL

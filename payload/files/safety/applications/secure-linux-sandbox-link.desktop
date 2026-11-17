@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Open a Link Safely
+GenericName=Throw-away browser for links
+Comment=Open a web link you are not sure about in a fresh, empty browser that is deleted afterwards
+Exec=/usr/local/bin/secure-linux-sandbox link
+Icon=security-high
+Terminal=false
+Categories=Network;Security;
+Keywords=sandbox;safe;suspicious;link;phishing;scam;browser;

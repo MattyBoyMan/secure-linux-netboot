@@ -1,0 +1,8 @@
+[Unit]
+Description=Secure Linux: make (or offer) the copy on your backup drive when it is plugged in
+
+[Service]
+Type=oneshot
+Nice=19
+IOSchedulingClass=idle
+ExecStart=/usr/local/bin/secure-linux-backup second plugged-in

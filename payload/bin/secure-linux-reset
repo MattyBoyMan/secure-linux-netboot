@@ -1,0 +1,428 @@
+#!/bin/bash
+# secure-linux-reset: reset this computer, but keep your files.
+#   secure-linux-reset                       (from the menu) shows what happens, asks you, then does it
+#   secure-linux-reset plan                  show what would be kept and what would be reset (changes nothing)
+#   secure-linux-reset status                is there a reset point, and what did the last reset do?
+#   secure-linux-reset settings [--yes]      only your desktop settings start fresh, at the next start
+#   secure-linux-reset system [--yes]        remove the apps added since the first day, then repair Secure Linux
+#   secure-linux-reset undo-settings [--yes] put the desktop settings from the last reset back (at the next start)
+#   secure-linux-reset undo-apps [--yes]     install the apps the last reset removed again
+#   secure-linux-reset point [--yes]         make the reset point now, if this computer has none yet
+#   secure-linux-reset boot                  (run by the computer at start-up, before anyone logs in)
+#   secure-linux-reset apply-pending         (run at start-up for each person) finish a settings reset or undo
+# Always kept: your files (everything in your home folder), browser bookmarks and saved passwords, messages, email,
+# password safes, keys, saved Wi-Fi networks, your user account and your backup settings.
+# Nothing is deleted: old desktop settings are saved in a dated folder in your home folder, an undo point (snapshot)
+# is made before the system part changes anything, and the removed apps are listed so they can come back.
+set -u   # no pipefail: "cmd | grep -q" must not fail when grep stops reading early
+export LC_ALL=C
+SL_ROOT=${SL_ROOT:-/usr/local/lib/secure-linux}
+# shellcheck source=../lib/common.sh
+. "$SL_ROOT/lib/common.sh"
+# shellcheck source=../files/movereset/movereset-lib.sh
+. "$SL_ROOT/files/movereset/movereset-lib.sh"
+
+usage() { sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'; }
+CMD=${1:-start}; [ $# -gt 0 ] && shift
+YES=0
+for a in "$@"; do
+  case "$a" in
+    --yes) YES=1 ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "Unknown option: $a" >&2; usage >&2; exit 2 ;;
+  esac
+done
+case "$CMD" in
+  -h|--help|help) usage; exit 0 ;;
+  start|plan|status|settings|system|undo-settings|undo-apps|point|boot|apply-pending) ;;
+  *) echo "Unknown command: $CMD" >&2; usage >&2; exit 2 ;;
+esac
+SELF=/usr/local/bin/secure-linux-reset; [ -x "$SELF" ] || SELF=$(readlink -f "$0")   # polkit names /usr/local/bin
+MOVE=/usr/local/bin/secure-linux-move-setup; [ -x "$MOVE" ] || MOVE=$(dirname "$SELF")/secure-linux-move-setup
+# Administrator rights: re-run through pkexec (clear prompt from org.securelinux.movereset.policy).
+case "$CMD" in
+  system|undo-apps|point) [ "$(id -u)" -eq 0 ] || exec pkexec "$SELF" "$CMD" "$@" ;;
+  boot) [ "$(id -u)" -eq 0 ] || mr_die "This part is run by the computer itself at start-up. Nothing was changed." 1 ;;
+  start) trap mr_hold_window EXIT ;;   # the menu window stays open until the person has read the result
+  apply-pending) [ "$(id -u)" -ne 0 ] || mr_die "This part runs for one person, never as the administrator. Nothing was changed." 1 ;;
+esac
+
+say() { mr_say "$@"; }
+refuse_in_session() {
+  mr_in_rollback_session || return 0
+  mr_die "You are using an earlier day from the boot menu right now. Restart the computer normally first, then reset. Nothing was changed." 3
+}
+point_words() {   # "the first day (DATE)" or "the day the reset point was made (DATE)"
+  local d o; d=$(mr_point_date); o=$(sed -n '1p' "$MR_POINT/origin" 2>/dev/null)
+  if [ "$o" = first-setup ]; then printf 'the first day (%s)' "$d"; else printf 'the day the reset point was made (%s)' "$d"; fi
+}
+has_undo_point() { mr_have snapper && ! sl_is_atomic && snapper -c root get-config >/dev/null 2>&1; }
+settings_found() {   # how many entries of the reset list exist in this home folder now
+  local rel n=0
+  while IFS= read -r rel; do
+    mr_never "$rel" && continue
+    { [ -e "$HOME/$rel" ] || [ -L "$HOME/$rel" ]; } && n=$((n + 1))
+  done < <(mr_list reset-settings)
+  echo "$n"
+}
+
+# ---------------------------------------------------------------- what would happen (changes nothing)
+plan_kept() {
+  say "KEPT, not touched:"
+  say "  - Your files: everything in your home folder, such as Documents, Pictures, Music, Videos, Downloads and Desktop."
+  say "  - Browser bookmarks and saved passwords, messages, email, password safes, keys and sync pairings."
+  say "  - Your user account and password, your saved Wi-Fi networks and your backup settings."
+}
+plan_system() {
+  local fl rp n
+  say "APPS AND SYSTEM:"
+  if ! mr_point_exists; then
+    say "  - This computer has no reset point yet, so Secure Linux cannot tell which apps were added. No apps are removed."
+    say "    (To make one now: secure-linux-reset point)"
+  else
+    if fl=$(mr_added_flatpaks); then
+      if [ -n "$fl" ]; then
+        n=$(printf '%s\n' "$fl" | grep -c .)
+        say "  - App store apps added since $(point_words) are removed ($n): $(printf '%s\n' "$fl" | mr_join)"
+      else
+        say "  - No app store apps were added since $(point_words)."
+      fi
+    else
+      say "  - The list of app store apps could not be read right now, so none are removed."
+    fi
+    if sl_is_atomic; then
+      say "  - This computer uses the image-based system: programs that are part of the system image are not changed."
+    elif rp=$(mr_added_rpms); then
+      if [ -n "$rp" ]; then
+        n=$(printf '%s\n' "$rp" | grep -c .)
+        say "  - Programs added since $(point_words) are removed, if nothing else needs them ($n): $(printf '%s\n' "$rp" | mr_join)"
+      else
+        say "  - No other programs were added since $(point_words)."
+      fi
+    else
+      say "  - Programs added with the package tool are not checked (the first day's list is missing). They stay."
+    fi
+    say "  - Apps are only removed while this computer is online, so Secure Linux can put back anything of its own."
+    say "  - The optional apps list (App Library) goes back to the choices of $(point_words)."
+  fi
+  say "  - Secure Linux then checks and repairs its own settings. This can take a while."
+  if has_undo_point; then
+    say "  - An undo point is made first: 'Go back to an earlier day' at start-up can bring the system back."
+  else
+    say "  - No undo point can be made on this computer. The removed apps are listed, so 'secure-linux-reset undo-apps' can install them again."
+  fi
+}
+plan_settings() {
+  say "YOUR DESKTOP SETTINGS:"
+  say "  - Your desktop look, panels, shortcuts and default apps start fresh at the next start ($(settings_found) settings found)."
+  say "  - The old ones are not deleted: they are saved in your home folder in a folder called Secure-Linux-old-settings-<date>."
+  say "  - Secure Linux's own comfort settings (screen size, touchpad, date format) come back at your next login."
+  say "  - 'secure-linux-reset undo-settings' puts them back."
+}
+cmd_plan() {   # cmd_plan all|system|settings
+  local scope=${1:-all}
+  say "Reset this computer, keep my files: what would happen. Nothing is changed by this list."
+  say ""
+  plan_kept
+  [ "$scope" = settings ] || { say ""; plan_system; }
+  [ "$scope" = system ] || { say ""; plan_settings; }
+  return 0
+}
+
+# ---------------------------------------------------------------- status
+cmd_status() {
+  local last
+  if mr_point_exists; then
+    say "Reset point: made on $(mr_point_date) ($(sed -n '1p' "$MR_POINT/origin" 2>/dev/null | sed 's/first-setup/at the first setup/; s/by-hand/by hand/'))."
+  else
+    say "Reset point: none yet. A reset can still give you fresh desktop settings and repair Secure Linux."
+  fi
+  last=$(sed -n '1p' "$MR_STATE/last-reset" 2>/dev/null)
+  if [ -n "$last" ] && [ -f "$MR_STATE/$last/record" ]; then
+    say "Last reset: $(sed -n 's/^DATE=//p' "$MR_STATE/$last/record"); apps removed: $(sed -n 's/^REMOVED=//p' "$MR_STATE/$last/record")."
+  else
+    say "Last reset: none."
+  fi
+  [ -f "$MR_USTATE/settings-reset.pending" ] && say "Waiting for the next start: your desktop settings start fresh."
+  [ -f "$MR_USTATE/settings-undo.pending" ] && say "Waiting for the next start: your old desktop settings come back."
+  return 0
+}
+
+# ---------------------------------------------------------------- desktop settings (the person, no password)
+cmd_settings() {
+  refuse_in_session
+  if [ "$YES" != 1 ]; then cmd_plan settings; say ""; say "Run again with --yes to do it."; return 3; fi
+  mkdir -p "$MR_USTATE" || mr_die "Your settings folder could not be written. Nothing was changed." 1
+  rm -f "$MR_USTATE/settings-undo.pending"
+  printf 'reset\n' > "$MR_USTATE/settings-reset.pending" || mr_die "Your settings folder could not be written. Nothing was changed." 1
+  say "Done. Your desktop settings start fresh the next time this computer starts."
+  say "Your old settings will be saved in your home folder (Secure-Linux-old-settings-<date>). Restart when you are ready."
+}
+cmd_undo_settings() {
+  local name
+  refuse_in_session
+  name=$(sed -n '1p' "$MR_USTATE/last-settings-reset" 2>/dev/null)
+  [[ "$name" =~ ^Secure-Linux-old-settings-[0-9]{8}-[0-9]{6}(-[0-9]+)?$ ]] && [ -d "$HOME/$name" ] ||
+    mr_die "There are no saved desktop settings from a reset to put back. Nothing was changed." 1
+  if [ "$YES" != 1 ]; then
+    say "Put back your desktop settings from $HOME/$name at the next start."
+    say "The settings you have now are saved in a new Secure-Linux-old-settings-<date> folder first."
+    say "Run again with --yes to do it."; return 3
+  fi
+  mkdir -p "$MR_USTATE" || mr_die "Your settings folder could not be written. Nothing was changed." 1
+  rm -f "$MR_USTATE/settings-reset.pending"
+  printf '%s\n' "$name" > "$MR_USTATE/settings-undo.pending" || mr_die "Your settings folder could not be written. Nothing was changed." 1
+  say "Done. Your old desktop settings come back the next time this computer starts."
+}
+aside_folder() {   # a new, unused Secure-Linux-old-settings-<stamp> folder name
+  local st n=1 name; st=$(mr_stamp); name=Secure-Linux-old-settings-$st
+  while [ -e "$HOME/$name" ]; do n=$((n + 1)); name=Secure-Linux-old-settings-$st-$n; done
+  printf '%s' "$name"
+}
+move_aside() {   # move_aside REL DESTFOLDER   move ~/REL into DESTFOLDER/REL (the same disk: nothing is copied)
+  mkdir -p "$2/$(dirname "$1")" || return 1
+  mv -- "$HOME/$1" "$2/$1"
+}
+do_reset_settings() {
+  local name dest rel n=0 bad=0
+  name=$(aside_folder); dest=$HOME/$name
+  while IFS= read -r rel; do
+    mr_never "$rel" && continue
+    [ -e "$HOME/$rel" ] || [ -L "$HOME/$rel" ] || continue
+    if move_aside "$rel" "$dest"; then n=$((n + 1)); else bad=$((bad + 1)); fi
+  done < <(mr_list reset-settings)
+  if [ "$n" -gt 0 ]; then
+    cat > "$dest/READ-ME.txt" <<EOF
+These are your old desktop settings, saved by "Reset this computer, keep my files" on $(date '+%Y-%m-%d %H:%M').
+Your desktop started fresh. To put these settings back, run:  secure-linux-reset undo-settings --yes
+and restart. When you are happy with the fresh settings, you can delete this folder.
+EOF
+    printf '%s\n' "$name" > "$MR_USTATE/last-settings-reset"
+  fi
+  # Secure Linux's first-day comfort (screen scaling, touchpad, date formats: files/comfort/first-login.sh) wrote
+  # into the files just moved aside. Its run-once marks are cleared, so it is put back at the next login.
+  rm -f "$HOME/.local/state/secure-linux/comfort/scale" "$HOME/.local/state/secure-linux/comfort/touchpad" \
+    "$HOME/.local/state/secure-linux/comfort/formats"
+  printf '%s settings reset: %s moved aside to %s, %s could not be moved\n' "$(date '+%Y-%m-%d %H:%M')" "$n" "$name" "$bad" >> "$MR_USTATE/history.log"
+  return 0
+}
+do_undo_settings() {   # do_undo_settings FOLDERNAME
+  local name=$1 src aside rel n=0
+  [[ "$name" =~ ^Secure-Linux-old-settings-[0-9]{8}-[0-9]{6}(-[0-9]+)?$ ]] || return 1
+  src=$HOME/$name; [ -d "$src" ] || return 1
+  aside=$HOME/$(aside_folder)
+  while IFS= read -r rel; do
+    mr_never "$rel" && continue
+    [ -e "$src/$rel" ] || [ -L "$src/$rel" ] || continue
+    if [ -e "$HOME/$rel" ] || [ -L "$HOME/$rel" ]; then move_aside "$rel" "$aside" || continue; fi
+    mkdir -p "$HOME/$(dirname "$rel")" && mv -- "$src/$rel" "$HOME/$rel" && n=$((n + 1))
+  done < <(mr_list reset-settings)
+  printf '%s settings undo: %s put back from %s\n' "$(date '+%Y-%m-%d %H:%M')" "$n" "$name" >> "$MR_USTATE/history.log"
+  return 0
+}
+cmd_apply_pending() {   # run as the person at start-up, before the desktop starts
+  local name
+  [ -d "$MR_USTATE" ] || return 0
+  if [ -f "$MR_USTATE/settings-undo.pending" ]; then
+    name=$(sed -n '1p' "$MR_USTATE/settings-undo.pending")
+    rm -f "$MR_USTATE/settings-undo.pending"
+    do_undo_settings "$name" || echo "The saved desktop settings were not found; nothing was put back."
+  fi
+  if [ -f "$MR_USTATE/settings-reset.pending" ]; then
+    rm -f "$MR_USTATE/settings-reset.pending"
+    do_reset_settings
+  fi
+  return 0
+}
+
+# ---------------------------------------------------------------- start-up: finish requests before anyone logs in
+cmd_boot() {
+  local u x uid gid gecos home shell base ok st
+  getent passwd | while IFS=: read -r u x uid gid gecos home shell; do
+    case "$uid" in ''|*[!0-9]*) continue ;; esac
+    [ "$uid" -ge 1000 ] && [ "$uid" -lt 60000 ] || continue
+    case "$shell" in */nologin|*/false) continue ;; esac
+    ok=0; for base in ${MR_HOME_BASES:-/home /var/home}; do case "$home" in "$base"/?*) ok=1 ;; esac; done
+    [ "$ok" = 1 ] && [ -d "$home" ] || continue
+    ls "$home"/.local/state/secure-linux/movereset/*.pending >/dev/null 2>&1 || continue
+    st=$(loginctl show-user "$u" -p State --value 2>/dev/null)
+    case "$st" in active|online|closing)   # "lingering" (background services only, no desktop) is not logged in
+      echo "$u is logged in, so their settings wait for the next start."; continue ;;
+    esac
+    runuser -u "$u" -- env HOME="$home" USER="$u" LOGNAME="$u" SL_ROOT="$SL_ROOT" "$SELF" apply-pending </dev/null ||
+      echo "Finishing the desktop settings for $u did not work this time; it is tried again at the next start."
+    if [ -x "$MOVE" ]; then
+      runuser -u "$u" -- env HOME="$home" USER="$u" LOGNAME="$u" SL_ROOT="$SL_ROOT" "$MOVE" apply-pending </dev/null ||
+        echo "Finishing the moved settings for $u did not work this time; it is tried again at the next start."
+    fi
+  done
+  return 0
+}
+
+# ---------------------------------------------------------------- the system part (administrator)
+lock_or_die() {
+  mkdir -p "$MR_STATE" || mr_die "Secure Linux's own folder could not be written. Nothing was changed." 1
+  if mr_have flock; then
+    exec 9>"$MR_STATE/lock"
+    flock -n 9 || mr_die "A reset is already running. Nothing else was changed." 1
+  fi
+}
+remove_flatpaks() {   # remove_flatpaks RECORDDIR   -> prints how many were removed
+  local rec=$1 id fl n=0
+  fl=$(mr_added_flatpaks) || { say "The list of app store apps could not be read, so none were removed." >&2; echo 0; return 0; }
+  while IFS= read -r id; do
+    [ -n "$id" ] && mr_flatpak_id_ok "$id" || continue
+    if flatpak uninstall --system -y --noninteractive "$id" >&2; then
+      printf '%s\n' "$id" >> "$rec/removed-flatpaks.txt"; n=$((n + 1))
+    else
+      say "  $id could not be removed; it stays." >&2
+    fi
+  done <<< "$fl"
+  [ "$n" -gt 0 ] && flatpak uninstall --system --unused -y --noninteractive >&2
+  echo "$n"
+}
+remove_rpms() {   # remove_rpms RECORDDIR   -> prints how many were removed
+  local rec=$1 rp p ok=() n=0
+  sl_is_atomic && { echo 0; return 0; }
+  rp=$(mr_added_rpms) || { echo 0; return 0; }
+  [ -n "$rp" ] || { echo 0; return 0; }
+  # Only programs that nothing else needs: rpm checks that removing them breaks nothing ("--test" changes nothing).
+  while IFS= read -r p; do
+    mr_pkg_ok "$p" || continue
+    rpm -e --test "$p" >/dev/null 2>&1 && ok+=("$p")
+  done <<< "$rp"
+  [ ${#ok[@]} -gt 0 ] || { echo 0; return 0; }
+  if ! rpm -e --test "${ok[@]}" >/dev/null 2>&1; then
+    say "  Some added programs depend on each other in a way that cannot be removed safely; they stay." >&2
+    echo 0; return 0
+  fi
+  if dnf -y remove "${ok[@]}" >&2; then
+    printf '%s\n' "${ok[@]}" >> "$rec/removed-rpms.txt"; n=${#ok[@]}
+  else
+    say "  The added programs could not be removed; they stay." >&2
+  fi
+  echo "$n"
+}
+put_choices() {   # put_choices FILE   the App Library choices file becomes a copy of FILE (written whole, then swapped in)
+  [ -f "$1" ] || return 1
+  mkdir -p "$SL_ETC" && cp "$1" "$SL_ETC/.app-library.list.reset" && chmod 0644 "$SL_ETC/.app-library.list.reset" &&
+    mv -f "$SL_ETC/.app-library.list.reset" "$SL_ETC/app-library.list"
+}
+refresh_app_list() {   # the person's app list (~/.config/secure-linux/apps.txt): repair reinstalls what it names
+  local u h
+  u=$(sl_user); h=$(sl_user_home)
+  [ -n "$u" ] && [ -n "$h" ] && [ -d "$h" ] || return 0
+  [ -f "$SL_ROOT/files/experience/user-setup.sh" ] || return 0
+  runuser -u "$u" -- env HOME="$h" USER="$u" LOGNAME="$u" SL_ROOT="$SL_ROOT" bash "$SL_ROOT/files/experience/user-setup.sh" applist </dev/null ||
+    say "Note: your app list could not be refreshed, so the repair may put a removed app back."
+}
+cmd_system() {
+  local st rec snap="" nf=0 nr=0 al rc
+  refuse_in_session
+  if [ "$YES" != 1 ]; then cmd_plan system; say ""; say "Run again with --yes to do it."; return 3; fi
+  lock_or_die
+  st=$(mr_stamp); rec=$MR_STATE/reset-$st
+  mkdir -p "$rec" || mr_die "Secure Linux's own folder could not be written. Nothing was changed." 1
+  say "Resetting this computer. Your files are kept. What happens is shown here."
+  # 1. undo point
+  if has_undo_point; then
+    snap=$(snapper -c root create --type single --cleanup-algorithm number --description "Before reset (Secure Linux)" --print-number 2>/dev/null)
+    case "$snap" in ''|*[!0-9]*) snap=""; say "Note: the undo point could not be made. The removed apps are still listed, so they can come back." ;;
+      *) say "Undo point made (number $snap)." ;; esac
+  fi
+  [ -f "$SL_ETC/app-library.list" ] && cp "$SL_ETC/app-library.list" "$rec/app-library.before"
+  # 2. apps added since the reset point (only online: the repair below must be able to put back anything of ours)
+  if mr_point_exists; then
+    if sl_online; then
+      say "Removing the apps added since $(point_words)."
+      nf=$(remove_flatpaks "$rec")
+      nr=$(remove_rpms "$rec")
+      refresh_app_list
+    else
+      say "This computer is not online, so no apps were removed. Connect to the internet and reset again to remove them."
+    fi
+    # The optional-app choices of the reset point: the App Library's own file, copied back as it was that day.
+    put_choices "$MR_POINT/app-library.list" || say "Note: the optional apps list could not be put back."
+  fi
+  printf 'DATE=%s\nSNAPSHOT=%s\nREMOVED=%s\nREMOVED_FLATPAKS=%s\nREMOVED_RPMS=%s\n' \
+    "$(date '+%Y-%m-%d %H:%M')" "$snap" "$((nf + nr))" "$nf" "$nr" > "$rec/record"
+  printf '%s\n' "reset-$st" > "$MR_STATE/last-reset"
+  # 3. Secure Linux repairs itself (the same repair as "Repair setup" in Secure Linux Status)
+  say "Secure Linux now checks and repairs its own settings. This can take a while."
+  "$SL_ROOT/setup.sh" --repair --fresh; rc=$?
+  printf 'REPAIR_RC=%s\n' "$rc" >> "$rec/record"
+  say ""
+  say "Done. $((nf + nr)) app(s) removed. Your files were not touched."
+  [ "$rc" -eq 0 ] || say "The repair reported a problem. Open Secure Linux Status and choose 'Repair setup' to try again."
+  say "Restart the computer to finish."
+  return 0
+}
+cmd_undo_apps() {
+  local last rec id p n=0
+  last=$(sed -n '1p' "$MR_STATE/last-reset" 2>/dev/null)
+  [[ "$last" =~ ^reset-[0-9]{8}-[0-9]{6}$ ]] && [ -d "$MR_STATE/$last" ] || mr_die "No reset has removed apps on this computer. Nothing was changed." 1
+  rec=$MR_STATE/$last
+  if [ "$YES" != 1 ]; then
+    say "Install these apps again (removed by the reset on $(sed -n 's/^DATE=//p' "$rec/record" 2>/dev/null)):"
+    cat "$rec/removed-flatpaks.txt" "$rec/removed-rpms.txt" 2>/dev/null | sed 's/^/  - /'
+    say "Run again with --yes to do it."; return 3
+  fi
+  local scratch; scratch=$(mktemp) || scratch=/dev/null
+  while IFS= read -r id; do mr_flatpak_id_ok "$id" && { SL_FAILS=$scratch sl_flatpak_install "$id" && n=$((n + 1)); }; done < <(cat "$rec/removed-flatpaks.txt" 2>/dev/null)
+  while IFS= read -r p; do mr_pkg_ok "$p" && { SL_FAILS=$scratch sl_dnf_install "$p" && n=$((n + 1)); }; done < <(cat "$rec/removed-rpms.txt" 2>/dev/null)
+  [ "$scratch" = /dev/null ] || rm -f "$scratch"
+  [ -f "$rec/app-library.before" ] && { put_choices "$rec/app-library.before" || say "Note: the optional apps list could not be put back."; }
+  say "Done. $n app(s) are back."
+}
+cmd_point() {
+  local rc
+  if mr_point_exists; then say "This computer already has a reset point, made on $(mr_point_date). It is never replaced."; return 0; fi
+  if [ "$YES" != 1 ]; then
+    say "A reset point remembers which apps this computer has right now. A later reset removes the apps added after it."
+    say "Run again with --yes to make it now."; return 3
+  fi
+  mr_make_point by-hand; rc=$?
+  case $rc in
+    0) say "Reset point made. A reset will keep the apps this computer has today." ;;
+    2) say "This computer already has a reset point. It is never replaced." ;;
+    *) mr_die "The reset point could not be made this time. Nothing was changed." 1 ;;
+  esac
+}
+
+# ---------------------------------------------------------------- from the menu
+cmd_start() {
+  local a
+  refuse_in_session
+  cmd_plan all
+  say ""
+  say "What would you like to do?"
+  say "  1) Reset apps, system settings and my desktop settings (keeps my files)"
+  say "  2) Only give me fresh desktop settings (keeps my files and apps)"
+  say "  3) Nothing, close this window"
+  printf '%s' "Type 1, 2 or 3: "
+  IFS= read -r a || a=3; a=${a%$'\r'}
+  case "$a" in 1|2) ;; *) say "Nothing was changed."; return 0 ;; esac
+  printf '%s' "Type yes to start, anything else stops: "
+  local y=""; IFS= read -r y || y=""; y=${y%$'\r'}
+  [ "$y" = yes ] || { say "Nothing was changed."; return 0; }
+  YES=1
+  cmd_settings || return 1
+  if [ "$a" = 1 ]; then
+    pkexec "$SELF" system --yes || say "The apps and system part did not run (no password, or it was stopped). Your desktop settings still start fresh at the next start."
+  fi
+  say ""
+  say "Restart the computer when you are ready. Your desktop settings start fresh at the next start."
+}
+
+case "$CMD" in
+  start) cmd_start ;;
+  plan) cmd_plan all ;;
+  status) cmd_status ;;
+  settings) cmd_settings ;;
+  undo-settings) cmd_undo_settings ;;
+  system) cmd_system ;;
+  undo-apps) cmd_undo_apps ;;
+  point) cmd_point ;;
+  boot) cmd_boot ;;
+  apply-pending) cmd_apply_pending ;;
+esac

@@ -1,0 +1,10 @@
+[Unit]
+Description=Try the waiting optional apps again every hour
+
+[Timer]
+OnCalendar=hourly
+Persistent=true
+RandomizedDelaySec=10min
+
+[Install]
+WantedBy=timers.target

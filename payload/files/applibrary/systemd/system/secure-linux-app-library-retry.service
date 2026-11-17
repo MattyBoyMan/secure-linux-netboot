@@ -1,0 +1,13 @@
+# Installs the optional apps that were waiting for internet. Does nothing when none are waiting.
+[Unit]
+Description=Install optional apps that were waiting for internet
+Wants=network-online.target
+After=network-online.target
+ConditionPathExists=/var/lib/secure-linux/app-library-retry
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/secure-linux-app-library retry
+Nice=10
+IOSchedulingClass=idle
+TimeoutStartSec=2h

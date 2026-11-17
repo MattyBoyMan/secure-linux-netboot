@@ -38,7 +38,7 @@ The historical owner table was a parallel-editing convention, not a runtime rest
 | Applications/desktop | `40-apps-common.sh`, `50-apps-full.sh`, `70-desktop.sh`, `79-docker.sh` | AI, Setup Hub, native launchers, rootless Docker integration |
 | Migration/comfort | `45-migration.sh`, `75-comfort.sh`; on-demand migration and personalisation | `secure-linux-migrate`, `-finish`, `-family`, `-tips`, `-explain`, `wizard.d/` plug-ins |
 | Home Assistant/fleet | `76-homeassistant.sh` and optional server kit | `secure-linux-ha*`, `-home-server*`, `-pihole`, `-fleet*` |
-| Experience | welcome, backups, battery, firmware, release and Flipper integration | `secure-linux-welcome`, `-backup-check`, `-flipper`, `-release` |
+| Experience | welcome, backups, battery, firmware, release and Flipper integration | `secure-linux-welcome`, `-backup-check`, `-backup`, `-backup-gui`, `-flipper`, `-release`; `secure-linux-backup copies|install-borg|offer-home` (the 3-2-1 view, BorgBackup on demand, one gentle offer of backups to the home server) |
 
 ## Five-screen welcome contract
 
@@ -121,3 +121,70 @@ Home Assistant keys include `ha_url`, `ha_local`, `ha_token_file` (a path, never
 Guide sources are outside `linux/` in `guide/src/chapters/`, `guide/data/pages*.json` and `guide/data/apps-*.json`. Regenerate `guide/data/pages-chapters.json` with `node guide/tools/pack-chapters.mjs` and `guide/START-HERE.html` with `build-guide.ps1`. Update `guide/tools/coverage-map.json` for physical commands, top-level/legacy wizard IDs and every desktop menu label.
 
 `secure-linux-release stamp` is a deliberate source-linking action, not a substitute for rebuilding outputs. `secure-linux-release check` compares the canonical source record, installed record, Flipper hashes, rendered netboot output and selected saved masters. Documentation work must not relabel generated outputs or claim physical verification.
+
+## Updates, versions and release checking (added with the 2026-11 build)
+
+| Piece | What it is | Where |
+|---|---|---|
+| `secure-linux-kit-update` | `check`, `apply`, `undo` and `status`. Fetches only files whose SHA-256 differs, checks each one, then swaps. A tree lock makes two runs at once wait, then exit 75. `--set debian|flipper|netboot --tree DIR` keeps the Debian, Flipper and network-install files from their own signed lists. | `linux/bin/secure-linux-kit-update` |
+| `secure-linux-kit-update-auto` | Runs a few minutes after start-up and once a day (`secure-linux-kit-update-auto.timer`). In signed mode it applies a newer release by itself, refreshes helpers, menus and timers, syncs the saved master and leaves one note per release (`events.d/kit-update-done-<id>`, `kit-update-ready-<id>`). `undo` goes back and writes a hold so the same release is not installed again. `set --online yes|no --auto-apply yes|no --channel stable|testing --mirror FOLDER`. | `linux/bin/secure-linux-kit-update-auto`, `/etc/secure-linux/kit-update.conf` |
+| `secure-linux-release-verify` | `status` lists trusted and withdrawn keys. `check` verifies a release: `release.json` and `payload-files.json` with detached signatures against the public keys in `share/secure-linux-release-keys/*.asc`. Exit 0 verified, 1 refused, 2 usage, 3 not set up yet (bridge mode: callers keep their old behaviour). The signed channel record and the signed release history are verified the same way. | `linux/bin/secure-linux-release-verify` |
+| `secure-linux-versions` | The Versions screen: `--text`, `--json` or a window. Buttons run `secure-linux-update-now`, `secure-linux-kit-update-auto undo`, `secure-linux-whats-new --gui`, `secure-linux-explain --update`, and `secure-linux-kit-update-auto set`. Reading uses no network. | `linux/bin/secure-linux-versions`, `linux/lib/versions_model.py`, `linux/lib/versions_gtk.py` |
+| `secure-linux-whats-new` | Shows the note in `files/release-notes/release-notes.json` for the release that was just installed. Reads only the kit folder. | `linux/bin/secure-linux-whats-new` |
+| `secure-linux-kit-share` | `start`, `stop`, `status`, plus `serve`, `find` and `network` run by the system. Serves this computer's signed release record, file list, channel record and release history, read-only, on the home network only. Peers are listed in `/run/secure-linux/kit-peers.json`. | `linux/bin/secure-linux-kit-share`, `linux/files/kitshare/` |
+| `secure-linux-master-sync` | `run` and `status` only. Brings the saved master (the root-owned store behind the drive builder) up to this computer's release. Asks for a password through `pkexec`. | `linux/bin/secure-linux-master-sync` |
+| `secure-linux-boot-rollback` | `status`, `check`, `on`, `off`, `refresh`, `keep`, `newest`, `tidy`. Adds "go back to an earlier day" lines to the boot menu on Btrfs with Snapper. The normal start stays first and default. | `linux/bin/secure-linux-boot-rollback`, `linux/files/bootrollback/`, step `32-boot-rollback.sh` |
+
+## Drives, copies and checks
+
+| Piece | What it is |
+|---|---|
+| `secure-linux-usb-creator` | Plug-ins in `linux/lib/usbc_*.py`: generations (`master-undo`, `master-prune`), seal (`seal-personal`), live (`live-addon`) and refresh (`refresh-master`). Every plug-in checks the exact serial phrase before a disk write and refuses internal and non-removable disks. |
+| `secure-linux-usb-multi` | Several drives at once from the saved master, each fully checked. |
+| `secure-linux-drive-test` | Fake-capacity and bad-block test. Erases the drive. |
+| `secure-linux-check-drive` | Read-only check of a drive: the Secure Linux files against the signed list, shared files by size and SHA-256, per-drive files only noted. Launched from `CHECK-THIS-DRIVE.sh` (POSIX sh). Exit 0 good, 2 problem, 64 usage. |
+| `secure-linux-usb-fixer` | `check-drive` and `repair-drive`. Repair puts back shared files and never writes per-drive files or the persistence file. |
+| Passport | `SECURE-LINUX-DRIVE-FILES.json` (shared and per-drive lists, `linux/setup-data/drive-per-drive-files.txt`) and `SECURE-LINUX-DRIVE-PASSPORT.json` with a plain text twin, written at the end of a verified portable copy. A master never keeps either. |
+| Live drive | `linux/lib/usbc_live.py` adds the Fedora KDE live image (checked with Fedora's signed CHECKSUM through `gpgv`), a boot menu line and a per-drive persistence file. `linux/lib/live-session/secure-linux-live-session` is the read-only helper inside the live system. |
+| NOMAD | `nomad/` holds the offline library kit. `nomad/anywhere/drive-root/` holds the starters for the top of the drive (`START-NOMAD.cmd`, `START-NOMAD.command`, `START-NOMAD-LINUX.sh`) and the plain-text pages. Apple M-chip Macs cannot start from the drive. The no-restart way runs under the host system and is less secure than starting from the drive. |
+
+## Safety, home network and everyday helpers
+
+| Command | Purpose |
+|---|---|
+| `secure-linux-panic-lock` | Locks the screen, closes the home server folder, drops cached administrator credentials and clears the clipboard. Never asks for a password. |
+| `secure-linux-travel` | `on`, `off`, `status`, `boot`. Keeps the home server folder closed, switches Bluetooth and SSH off and uses random hardware addresses. Everything is put back by `off`. |
+| `secure-linux-sandbox` | `open FILE`, `link URL`, `check`. A bubblewrap sandbox with no network and no view of the home folder, deleted on exit. |
+| `secure-linux-if-stolen` | Checklist, serial number and an "if found" lock-screen message. There is no remote lock or wipe; the tool says so. |
+| `secure-linux-leak-check` | k-anonymity password check: only the first five characters of a SHA-1 leave the computer. |
+| `secure-linux-network-devices` | Lists devices on the home network and flags new ones. Local only. |
+| `secure-linux-attack-shield` | CrowdSec blocklist in three modes (`receive`, `local`, `share`). Off until `setup`. `panic-off` removes every block. |
+| `secure-linux-daily-summary` | One line about backups, updates, disk and security from results other helpers already wrote. |
+| `secure-linux-which-app` | Suggests one free app for a task, from `setup-data/task-apps.tsv` and `setup-data/app-equivalents.tsv`. |
+| `secure-linux-veracrypt-install` | Adds VeraCrypt from the maker's package after a SHA-256 check. `when` explains VeraCrypt, Cryptomator and the disk lock. |
+| `secure-linux-move-setup` | `pack`, `check`, `unpack`, `install-apps`. Passwords, keys and browser data never move. |
+| `secure-linux-reset` | `plan`, `status`, `settings`, `system`, `undo-settings`, `undo-apps`, `point`. Reset point made by step `96-reset-point.sh`. |
+| `secure-linux-phone-backup` | `check`, `backup`, `list`, `open`, `mirror`. Locked backups through `age` or `gpg`; scrcpy download is pinned by SHA-256. |
+| `secure-linux-home-share` | The owner's home server folder, ready at home. Its address and password are never in the kit or on a drive. |
+| `secure-linux-remote-access` | An own WireGuard door (`setup`, `add`, `remove`, `off`, `forget`) with a guard that keeps added devices from reaching other home devices. |
+| `secure-linux-media-server` | Front door to the Jellyfin setup script. Home network only. |
+| `secure-linux-live-health` | Netdata, local only, anonymous statistics off, never connected to Netdata Cloud. |
+| `secure-linux-app-library` | The Optional apps catalogue from `setup-data/apps.d/*.tsv`, run by step `52-app-library.sh`. |
+| `secure-linux-offline-library`, `secure-linux-translate-languages` | Offline Kiwix libraries and language files. Never automatic; size shown first. |
+| `secure-linux-tv-cleanup` | Hides apps on a Chromecast or Google TV over adb, with a saved state and `undo`. |
+| `secure-linux-ai-web`, `secure-linux-voice`, `secure-linux-server-apps`, `secure-linux-ntfy` | The AI chat page, the voice helper, the home-server app engine and the phone notification helper. |
+
+## Every command, by family
+
+Full names, so this file can be searched. `tests/guidecover` checks that every file in `linux/bin/` is named here.
+
+| Family | Commands |
+|---|---|
+| Updates and releases | `secure-linux-kit-update`, `secure-linux-kit-update-auto`, `secure-linux-kit-share`, `secure-linux-release`, `secure-linux-release-verify`, `secure-linux-versions`, `secure-linux-whats-new`, `secure-linux-update-now`, `secure-linux-update-gui`, `secure-linux-upgrade`, `secure-linux-master-sync`, `secure-linux-boot-rollback` |
+| Drives | `secure-linux-usb-creator`, `secure-linux-usb-creator-gui`, `secure-linux-usb-fixer`, `secure-linux-usb-fixer-gui`, `secure-linux-usb-multi`, `secure-linux-drive-test`, `secure-linux-check-drive`, `secure-linux-offline-bundle`, `secure-linux-offline-library`, `secure-linux-translate-languages` |
+| Health and repair | `secure-linux-check`, `secure-linux-health`, `secure-linux-hwtest`, `secure-linux-hwtest-marker`, `secure-linux-diag`, `secure-linux-diagnose`, `secure-linux-repair`, `secure-linux-status`, `secure-linux-status-gui`, `secure-linux-toolbox`, `secure-linux-drivers`, `secure-linux-firmware`, `secure-linux-battery`, `secure-linux-hibernate`, `secure-linux-parts`, `secure-linux-daily-summary`, `secure-linux-live-health`, `secure-linux-notify` |
+| Network and security | `secure-linux-dns`, `secure-linux-hotspot`, `secure-linux-vpn`, `secure-linux-zone`, `secure-linux-netguard`, `secure-linux-attack-shield`, `secure-linux-network-devices`, `secure-linux-security-audit`, `secure-linux-control-center`, `secure-linux-recovery-key`, `secure-linux-tpm-pin`, `secure-linux-mok-remove`, `secure-linux-fido2`, `secure-linux-leak-check`, `secure-linux-sandbox`, `secure-linux-panic-lock`, `secure-linux-travel`, `secure-linux-if-stolen`, `secure-linux-veracrypt-install` |
+| Backups and moving | `secure-linux-backup`, `secure-linux-backup-gui`, `secure-linux-backup-check`, `secure-linux-phone-backup`, `secure-linux-move-setup`, `secure-linux-reset`, `secure-linux-migrate`, `secure-linux-emergency-kit` |
+| Home and server | `secure-linux-home-server`, `secure-linux-home-server-gui`, `secure-linux-home-share`, `secure-linux-server-apps`, `secure-linux-media-server`, `secure-linux-pihole`, `secure-linux-remote-access`, `secure-linux-ntfy`, `secure-linux-fleet`, `secure-linux-fleet-join`, `secure-linux-ha`, `secure-linux-ha-learn`, `secure-linux-ha-secure`, `secure-linux-ha-setup`, `secure-linux-tv-cleanup`, `secure-linux-flipper` |
+| Everyday | `secure-linux-welcome`, `secure-linux-setup-hub`, `secure-linux-finish`, `secure-linux-ready`, `secure-linux-choice`, `secure-linux-care`, `secure-linux-family`, `secure-linux-tips`, `secure-linux-explain`, `secure-linux-which-app`, `secure-linux-app-library`, `secure-linux-outside-apps`, `secure-linux-terminal`, `secure-linux-activity` |
+| AI | `secure-linux-ai`, `secure-linux-ai-web`, `secure-linux-voice` |

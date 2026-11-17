@@ -1,0 +1,180 @@
+#!/usr/bin/env python3
+"""secure-linux-whats-new: a short plain-English "what changed" note after a kit update.
+
+  secure-linux-whats-new [--tree DIR]            print the note (also remembers it was shown)
+  secure-linux-whats-new --if-new                print nothing unless this update has not been shown yet
+  secure-linux-whats-new --gui                   show the note in a small window (zenity or kdialog), else print it
+  secure-linux-whats-new --notify                show the note as a desktop notification, else print it
+  secure-linux-whats-new --json                  the same facts as JSON (for other tools)
+  secure-linux-whats-new --no-mark               do not remember that the note was shown
+
+Reads, offline, only files inside the kit folder:
+  .kit-update.json           written by secure-linux-kit-update (release id, files updated/removed)
+  files/release-notes/release-notes.json   notes per release (shipped with the kit)
+  .whats-new-seen.json       the last release this tool showed (gives the "before" release)
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+RECORD = ".kit-update.json"
+SEEN = ".whats-new-seen.json"
+NOTES_REL = Path("files") / "release-notes" / "release-notes.json"
+VERSION_RE = re.compile(r"secure-linux-(\d+(?:\.\d+)*)")
+
+
+def read_json(path: Path):
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def version_of(release_id) -> str:
+    match = VERSION_RE.search(str(release_id or ""))
+    return match.group(1) if match else ""
+
+
+def key(version: str):
+    return tuple(int(p) for p in version.split(".")) if version else ()
+
+
+def friendly(release_id) -> str:
+    version = version_of(release_id)
+    return "release " + version if version else "an earlier release"
+
+
+def count(n: int, word: str) -> str:
+    return f"{n} {word}" if n == 1 else f"{n} {word}s"
+
+
+def build(tree: Path) -> dict:
+    record = read_json(tree / RECORD)
+    if not record or not record.get("release_id"):
+        return {"updated": False, "message": "No update has been applied to this kit yet, so there is nothing new to show."}
+    after = str(record["release_id"])
+    seen = read_json(tree / SEEN) or {}
+    before = str(seen.get("release_id") or "")
+    updated = int(record.get("files_updated") or 0)
+    removed = int(record.get("files_removed") or 0)
+    notes_doc = read_json(tree / NOTES_REL) or {}
+    releases = [r for r in notes_doc.get("releases", []) if isinstance(r, dict) and r.get("version")]
+    releases.sort(key=lambda r: key(str(r["version"])))
+    after_key, before_key = key(version_of(after)), key(version_of(before))
+    if before and before_key:
+        picked = [r for r in releases if before_key < key(str(r["version"])) <= after_key]
+    else:
+        picked = [r for r in releases if key(str(r["version"])) == after_key]
+    return {
+        "updated": True,
+        "before": before or None,
+        "after": after,
+        "already_shown": before == after,
+        "files_updated": updated,
+        "files_removed": removed,
+        "files_changed": updated + removed,
+        "applied_at": record.get("applied_at"),
+        "releases": [{"version": r["version"], "title": r.get("title", ""),
+                      "notes": [str(n) for n in r.get("notes", [])]} for r in picked],
+    }
+
+
+def render(info: dict) -> str:
+    if not info["updated"]:
+        return info["message"]
+    lines = ["What changed in this update", ""]
+    lines.append(f"You had: {friendly(info['before'])}" if info["before"] else "You had: not recorded")
+    lines.append(f"You have now: {friendly(info['after'])}")
+    if info["files_changed"] == 0:
+        lines.append("Files changed: none, your kit was already up to date.")
+    else:
+        text = f"Files changed: {info['files_changed']} ({count(info['files_updated'], 'updated file')}"
+        text += f", {count(info['files_removed'], 'old file')} removed)" if info["files_removed"] else ")"
+        lines.append(text)
+    lines.append("")
+    if info["releases"]:
+        for release in info["releases"]:
+            lines.append(f"{release['title']} (release {release['version']})".strip())
+            lines.extend("  - " + n for n in release["notes"])
+            lines.append("")
+    else:
+        lines.append("There are no written notes for this release yet. Everything keeps working as before.")
+        lines.append("")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def mark_seen(tree: Path, info: dict) -> None:
+    if not info["updated"]:
+        return
+    try:
+        (tree / SEEN).write_text(json.dumps({"release_id": info["after"]}, indent=2) + "\n", encoding="utf-8")
+    except OSError:
+        pass   # a read-only kit just shows the note again next time
+
+
+def show_window(text: str) -> bool:
+    title = "What changed"
+    if shutil.which("zenity"):
+        cmd = ["zenity", "--text-info", "--title", title, "--width", "520", "--height", "420"]
+    elif shutil.which("kdialog"):
+        cmd = ["kdialog", "--title", title, "--textbox", "/dev/stdin", "520", "420"]
+    else:
+        return False
+    try:
+        subprocess.run(cmd, input=text.encode("utf-8"), check=False, timeout=900)
+        return True
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def show_notification(info: dict, text: str) -> bool:
+    if not shutil.which("notify-send"):
+        return False
+    summary = f"Secure Linux updated to {friendly(info['after'])}" if info["updated"] else "Secure Linux"
+    body = f"{count(info['files_changed'], 'file')} changed. Type secure-linux-whats-new to read more." if info["updated"] else text
+    try:
+        subprocess.run(["notify-send", "-a", "Secure Linux", "-i", "software-update-available", summary, body],
+                       check=False, timeout=30)
+        return True
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(prog="secure-linux-whats-new", description="Show a short note about what an update changed.")
+    ap.add_argument("--tree", type=Path, default=Path(__file__).resolve().parent.parent,
+                    help="kit folder (default: the folder this tool is in)")
+    ap.add_argument("--if-new", action="store_true", help="say nothing if this update was already shown")
+    ap.add_argument("--gui", action="store_true", help="show in a small window")
+    ap.add_argument("--notify", action="store_true", help="show as a desktop notification")
+    ap.add_argument("--json", action="store_true", help="print JSON")
+    ap.add_argument("--no-mark", action="store_true", help="do not remember that it was shown")
+    args = ap.parse_args(argv)
+    info = build(args.tree)
+    if args.if_new and (not info["updated"] or info["already_shown"]):
+        return 0
+    text = render(info)
+    shown = False
+    if args.json:
+        print(json.dumps(info, indent=2, sort_keys=True))
+        shown = True
+    elif args.gui:
+        shown = show_window(text)
+    elif args.notify:
+        shown = show_notification(info, text)
+    if not shown:
+        sys.stdout.write(text)
+    if not args.no_mark and not args.json:
+        mark_seen(args.tree, info)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,186 @@
+#!/bin/bash
+# secure-linux-travel: travel mode, for when you take this computer out of the house.
+#
+#   secure-linux-travel on        turn travel mode on (asks for your password)
+#   secure-linux-travel off       turn it off again: everything travel mode changed is put back as it was
+#   secure-linux-travel status    is travel mode on? (--short prints on or off)
+#   secure-linux-travel           (from the menu) shows whether it is on and offers to switch
+#   secure-linux-travel boot      (run by the system at start-up) keeps travel mode's settings after a restart
+#
+# While travel mode is on:
+#   - the home server folder stays closed, even if a network looks like home
+#   - Bluetooth is switched off
+#   - remote login to this computer (SSH) is stopped, if it was running
+#   - Wi-Fi and network cables use a new made-up hardware address every time they connect
+# Your files, apps and saved Wi-Fi networks are not touched.
+set -u
+SL_ROOT=${SL_ROOT:-/usr/local/lib/secure-linux}
+. "$SL_ROOT/lib/common.sh"
+
+TR_SYS=${SL_TEST_SYSROOT:-}                     # tests only: prefix for the system folders
+TR_FLAG=$SL_ETC/travel-mode                     # exists while travel mode is on (the home server folder checks it)
+TR_NM=$TR_SYS/etc/NetworkManager/conf.d/95-secure-linux-travel.conf
+HS_UNITDIR=$TR_SYS/etc/systemd/system
+HS_UNIT=media-homeserver                        # the home server folder (made by secure-linux-home-share)
+HS_WHERE=/media/homeserver
+SSH_UNIT=sshd.service
+
+say() { printf '%s\n' "$*"; }
+tr_log() { command -v logger >/dev/null 2>&1 && logger -t secure-linux-travel "$1" 2>/dev/null; return 0; }
+usage() { sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'; }
+
+tr_is_on() { [ -f "$TR_FLAG" ]; }
+tr_note() { grep -qx "$1" "$TR_FLAG" 2>/dev/null; }   # tr_note LINE -> did travel mode record this change?
+
+tr_self() { local self=/usr/local/bin/secure-linux-travel; [ -x "$self" ] || self=$(readlink -f "$0"); printf '%s' "$self"; }
+tr_need_root() {   # re-run this command with administrator rights (clear password prompt, own polkit action)
+  [ "$(id -u)" -eq 0 ] && return 0
+  local self; self=$(tr_self)
+  exec pkexec "$self" "$@"
+}
+
+tr_close_home_folder() {   # close the home server folder now (fast, even when the server is switched off)
+  [ -e "$HS_UNITDIR/$HS_UNIT.automount" ] || [ -e "$HS_UNITDIR/$HS_UNIT.mount" ] || return 0
+  systemctl stop "$HS_UNIT.automount" >/dev/null 2>&1
+  if command -v mountpoint >/dev/null 2>&1 && mountpoint -q "$TR_SYS$HS_WHERE" 2>/dev/null; then
+    umount -l "$TR_SYS$HS_WHERE" >/dev/null 2>&1
+  fi
+  systemctl --no-block stop "$HS_UNIT.mount" >/dev/null 2>&1
+  return 0
+}
+
+tr_bluetooth_on() {   # true when at least one Bluetooth radio is switched on
+  command -v rfkill >/dev/null 2>&1 || return 1
+  rfkill list bluetooth 2>/dev/null | grep -qi 'soft blocked: no'
+}
+
+tr_write_nm() {
+  mkdir -p "${TR_NM%/*}" || return 1
+  cat > "$TR_NM.tmp" <<'EOF' || return 1
+# Secure Linux travel mode (removed again by: secure-linux-travel off)
+# A new made-up hardware address every time this computer connects, so other networks cannot recognise it.
+# Same section as 90-secure-linux-privacy.conf: this later file wins while travel mode is on.
+[connection-secure-linux-privacy]
+wifi.cloned-mac-address=random
+ethernet.cloned-mac-address=random
+EOF
+  chmod 0644 "$TR_NM.tmp" && mv -f "$TR_NM.tmp" "$TR_NM"
+}
+tr_nm_reload() { command -v nmcli >/dev/null 2>&1 && nmcli general reload conf >/dev/null 2>&1; return 0; }
+
+cmd_on() {
+  tr_need_root on
+  local was_on=0
+  tr_is_on && was_on=1
+  mkdir -p "$SL_ETC" || { say "Could not save the travel mode setting. Nothing was changed."; return 1; }
+  if [ $was_on = 0 ]; then
+    # first the switch itself: from now on the home server folder refuses to open (its units check this file)
+    printf 'on-since=%s\n' "$(date '+%Y-%m-%d %H:%M')" > "$TR_FLAG.tmp" && chmod 0644 "$TR_FLAG.tmp" \
+      && mv -f "$TR_FLAG.tmp" "$TR_FLAG" || { rm -f "$TR_FLAG.tmp"; say "Could not save the travel mode setting. Nothing was changed."; return 1; }
+  fi
+  tr_close_home_folder
+  # Bluetooth: switched off; remembered only when travel mode was the one that switched it off
+  if tr_bluetooth_on; then
+    rfkill block bluetooth >/dev/null 2>&1 && { tr_note bluetooth=switched-off || echo bluetooth=switched-off >> "$TR_FLAG"; }
+  fi
+  # remote login: stopped while travelling (only when it was running), started again by "off"
+  if systemctl is-active --quiet "$SSH_UNIT" 2>/dev/null; then
+    systemctl stop "$SSH_UNIT" >/dev/null 2>&1 && { tr_note ssh=stopped || echo ssh=stopped >> "$TR_FLAG"; }
+  fi
+  tr_write_nm && tr_nm_reload
+  tr_log "Travel mode switched on."
+  if [ $was_on = 1 ]; then say "Travel mode was already on. Its settings were checked again."
+  else say "Travel mode is on."; fi
+  say "  - The home server folder stays closed until you switch travel mode off."
+  tr_note bluetooth=switched-off && say "  - Bluetooth is off."
+  tr_note ssh=stopped && say "  - Remote login to this computer is stopped."
+  say "  - Wi-Fi uses a new made-up hardware address every time it connects (from the next connection)."
+  say "Switch it off at home with: secure-linux-travel off"
+  return 0
+}
+
+cmd_off() {
+  tr_need_root off
+  local rc=0
+  rm -f "$TR_NM" && tr_nm_reload
+  if ! tr_is_on; then
+    say "Travel mode is already off."
+    return 0
+  fi
+  if tr_note bluetooth=switched-off; then
+    rfkill unblock bluetooth >/dev/null 2>&1 || { rc=1; say "Bluetooth could not be switched back on. You can switch it on in the settings."; }
+  fi
+  if tr_note ssh=stopped; then
+    systemctl start "$SSH_UNIT" >/dev/null 2>&1 || { rc=1; say "Remote login could not be started again. Restarting the computer starts it."; }
+  fi
+  rm -f "$TR_FLAG" || { say "Could not switch travel mode off. Please try again."; return 1; }
+  # the home server folder opens again by itself, but only at home (secure-linux-home-share decides)
+  if [ -f "$SL_ROOT/bin/secure-linux-home-share" ]; then
+    bash "$SL_ROOT/bin/secure-linux-home-share" network >/dev/null 2>&1
+  fi
+  tr_log "Travel mode switched off."
+  say "Travel mode is off. Everything it changed is back as it was."
+  return $rc
+}
+
+cmd_boot() {   # at start-up: services such as remote login start again by themselves, so stop them again
+  [ "$(id -u)" -eq 0 ] || { say "This part is run by the system at start-up."; return 1; }
+  if ! tr_is_on; then
+    [ -e "$TR_NM" ] && { rm -f "$TR_NM"; tr_nm_reload; }   # left over from an interrupted "off"
+    return 0
+  fi
+  tr_close_home_folder
+  tr_note bluetooth=switched-off && rfkill block bluetooth >/dev/null 2>&1
+  tr_note ssh=stopped && systemctl stop "$SSH_UNIT" >/dev/null 2>&1
+  [ -e "$TR_NM" ] || { tr_write_nm && tr_nm_reload; }
+  tr_log "Travel mode is still on after the restart."
+  return 0
+}
+
+cmd_status() {
+  local since
+  if tr_is_on; then
+    [ "${1:-}" = --short ] && { say on; return 0; }
+    since=$(sed -n 's/^on-since=//p' "$TR_FLAG" 2>/dev/null | head -n 1)
+    say "Travel mode is on${since:+ (since $since)}. The home server folder stays closed."
+    say "Switch it off at home with: secure-linux-travel off"
+  else
+    [ "${1:-}" = --short ] && { say off; return 0; }
+    say "Travel mode is off."
+    say "Taking this computer out of the house? Switch it on with: secure-linux-travel on"
+  fi
+  return 0
+}
+
+cmd_menu() {   # from the menu: say where things stand and offer the switch
+  local want self out rc
+  . "$SL_ROOT/lib/sl-ui.sh"
+  ui_prefer_gui
+  ui_init
+  if tr_is_on; then
+    ui_yesno "Travel mode is on: the home server folder is closed, Bluetooth and remote login are off, and Wi-Fi uses a made-up address. Are you back home and want to switch travel mode off?" n "Switch it off" "Keep it on" || return 0
+    want=off
+  else
+    ui_yesno "Travel mode is for taking this computer out of the house. It closes the home server folder, switches off Bluetooth and remote login, and gives Wi-Fi a new made-up address on every network. Your files are not touched. Switch travel mode on now?" n "Switch it on" "Not now" || return 0
+    want=on
+  fi
+  if [ "$(id -u)" -eq 0 ]; then "cmd_$want"; return $?; fi
+  self=$(tr_self)
+  out=$(pkexec "$self" "$want" 2>&1); rc=$?
+  if [ $rc -eq 126 ] || [ $rc -eq 127 ]; then
+    ui_info "Nothing was changed: the password was not given." "Travel mode"
+    return 1
+  fi
+  ui_info "$out" "Travel mode"
+  return $rc
+}
+
+case "${1:-}" in
+  -h|--help|help) usage ;;
+  on)     cmd_on ;;
+  off)    cmd_off ;;
+  boot)   cmd_boot ;;
+  status) shift; cmd_status "${1:-}" ;;
+  '')     cmd_menu ;;
+  *)      say "Unknown choice: $1. Run secure-linux-travel --help to see what it can do."; exit 1 ;;
+esac

@@ -1,0 +1,34 @@
+# Stirling-PDF for Secure Linux: PDF tools in your web browser. Home network only.
+# Started only by secure-linux-server-apps, which fills in the SL_* values from this computer (see app.conf).
+# Image pinned by version AND digest (checked on Docker Hub, 2026-11-16): the official stirlingtools/stirling-pdf 3.3.0.
+# Licence: MIT for the main program (free to use). A few extra business features are paid; they stay switched off.
+# The image starts as the administrator inside the container ONLY to give its folders to you, then runs every PDF
+# tool as your own account (PUID/PGID), as the project's own scripts/init-without-ocr.sh does.
+# Privacy: usage reports (PostHog and the Scarf counter) and the "new version" check are switched OFF, there are no
+# accounts (nothing is stored), and files you work on stay on this computer. Search engines are told to keep out.
+services:
+  stirling-pdf:
+    image: docker.io/stirlingtools/stirling-pdf:3.3.0@sha256:ed7b1775c6706b5e5ea24fa6155f078eff1027bd35a17d21834e4407036025e6
+    restart: unless-stopped
+    ports:
+      - "${SL_BIND:?home address missing}:${SL_PORT:?port missing}:8080"
+    volumes:
+      - "${SL_DATA:?data folder missing}/configs:/configs:Z"
+      - "${SL_DATA:?data folder missing}/logs:/logs:Z"
+    environment:
+      TZ: "${SL_TZ:-UTC}"
+      PUID: "${SL_UID:?user missing}"
+      PGID: "${SL_GID:?group missing}"
+      SECURITY_ENABLELOGIN: "false"
+      SYSTEM_ENABLEANALYTICS: "false"
+      SYSTEM_ENABLEPOSTHOG: "false"
+      SYSTEM_ENABLESCARF: "false"
+      SYSTEM_SHOWUPDATE: "false"
+      SYSTEM_GOOGLEVISIBILITY: "false"
+      SYSTEM_ENABLEURLTOPDF: "false"
+      SYSTEM_ENABLEDESKTOPINSTALLSLIDE: "false"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - NET_RAW
+      - MKNOD

@@ -1,0 +1,46 @@
+[Unit]
+Description=Secure Linux: share this computer's checked updates with the other Secure Linux computers at home
+Documentation=man:secure-linux-kit-share
+After=network-online.target NetworkManager.service
+# Only after the person turned sharing on (secure-linux-kit-share start). Started and stopped by
+# secure-linux-kit-share-network.service: it runs only while this computer is on its home network.
+ConditionPathExists=/etc/secure-linux/kit-share-on
+
+[Service]
+Type=simple
+# The sharing port is opened in the home firewall zone only, and only while this service runs (never saved).
+ExecStartPre=+/usr/local/bin/secure-linux-kit-share firewall-open
+ExecStart=/usr/local/bin/secure-linux-kit-share serve
+ExecStopPost=+/usr/local/bin/secure-linux-kit-share firewall-close
+# 3 = signed releases not set up, 4 = not at home, 5 = nothing checked to share: starting again would only
+# refuse again. 75 = the home network address changed: start again on the new one.
+Restart=on-failure
+RestartSec=30
+RestartPreventExitStatus=3 4 5
+# Not a failure (no warning in the Status window): it simply has nothing to do here.
+SuccessExitStatus=3 4 5
+# The service only reads. It runs as a throw-away user with no rights to change anything.
+DynamicUser=yes
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+# AF_NETLINK: `ip -4 -o addr show` reads this computer's home address through a netlink socket (check C2 F4);
+# without it the service finds no home address and shares nothing.
+RestrictAddressFamilies=AF_INET AF_UNIX AF_NETLINK
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+AmbientCapabilities=
+UMask=0077

@@ -1,0 +1,38 @@
+# ntfy for Secure Linux: sends short messages from this computer to your phone. Home network only.
+# One recipe file: the x-secure-linux block below is read by secure-linux-server-apps, which fills in the SL_* values.
+# Image pinned by version AND digest (checked on Docker Hub, 2026-11-16): official binwiederhier/ntfy v2.38.0.
+# Licence: Apache-2.0 and GPL-2.0 (the project's own choice, free to use). The server has no accounts here: the secret
+# is the random topic name that "secure-linux-ntfy on" makes on this computer. Never share it.
+# It listens on its own high port inside (8080), so it needs no extra rights. It sends nothing to ntfy.sh.
+x-secure-linux:
+  title: ntfy (phone notifications)
+  about: Sends alerts from this computer to your phone. Home network only.
+  port: 8140
+  lan_only: yes
+  data_dirs: cache
+  user_dirs: cache
+  backup_include: cache
+  min_free_gb: 1
+  idea: X1
+services:
+  ntfy:
+    image: docker.io/binwiederhier/ntfy:v2.38.0@sha256:771309aecfce18d8fe2bfb8069994ddd6be6ca6ccdd7badace3d791a0045ff0d
+    restart: unless-stopped
+    user: "${SL_UID:?user missing}:${SL_GID:?group missing}"
+    command:
+      - serve
+    ports:
+      - "${SL_BIND:?home address missing}:${SL_PORT:?port missing}:8080"
+    volumes:
+      - "${SL_DATA:?data folder missing}/cache:/var/cache/ntfy:Z"
+    environment:
+      TZ: "${SL_TZ:-UTC}"
+      NTFY_LISTEN_HTTP: ":8080"
+      NTFY_BASE_URL: "http://${SL_BIND:?home address missing}:${SL_PORT:?port missing}"
+      NTFY_CACHE_FILE: /var/cache/ntfy/cache.db
+      NTFY_CACHE_DURATION: 72h
+      NTFY_BEHIND_PROXY: "false"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL

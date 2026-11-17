@@ -1,0 +1,36 @@
+# Activepieces for Secure Linux: automations that make your apps work together. Home network only.
+# Started only by secure-linux-server-apps, which fills in the SL_* values from this computer (see app.conf).
+# Image pinned by version AND digest (checked on Docker Hub, 2026-11-16): the official activepieces/activepieces 0.93.0.
+# Licence (re-checked 2026-11-16 in its LICENSE file at 0.93.0): MIT ("MIT Expat") for everything except the folders
+# packages/ee and packages/server/api/src/app/ee, which are paid business features. This recipe uses only the free
+# community edition: no licence key is set, so those paid parts stay locked.
+# It runs as your own account with every extra right removed. Its keys are made on this computer by the app itself
+# (single-computer mode keeps them in the config folder); nothing secret is written in this file.
+# Privacy: the usage report to the project is switched OFF. It downloads the list of add-ons ("pieces") from the
+# project so you can pick them; your automations only talk to the services you connect yourself.
+# The first person to open it makes the first account: do that yourself straight away.
+services:
+  activepieces:
+    image: docker.io/activepieces/activepieces:0.93.0@sha256:151c2a4326c30a6a8086297136644da9b58072212c35bca7c87dcb5724e7d687
+    restart: unless-stopped
+    user: "${SL_UID:?user missing}:${SL_GID:?group missing}"
+    ports:
+      - "${SL_BIND:?home address missing}:${SL_PORT:?port missing}:8080"
+    volumes:
+      - "${SL_DATA:?data folder missing}/config:/srv/ap/config:Z"
+      - "${SL_DATA:?data folder missing}/cache:/srv/ap/cache:Z"
+    environment:
+      TZ: "${SL_TZ:-UTC}"
+      HOME: /srv/ap/cache
+      AP_PORT: "8080"
+      AP_DB_TYPE: PGLITE
+      AP_REDIS_TYPE: MEMORY
+      AP_CONFIG_PATH: /srv/ap/config
+      AP_CACHE_BASE_PATH: /srv/ap/cache
+      AP_FRONTEND_URL: "http://${SL_BIND:?home address missing}:${SL_PORT:?port missing}"
+      AP_TELEMETRY_ENABLED: "false"
+      AP_EXECUTION_MODE: UNSANDBOXED
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL

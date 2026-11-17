@@ -1,0 +1,11 @@
+[Unit]
+Description=Secure Linux: daily one-line summary
+
+[Timer]
+OnStartupSec=25min
+OnCalendar=*-*-* 09:30
+Persistent=true
+RandomizedDelaySec=10min
+
+[Install]
+WantedBy=timers.target

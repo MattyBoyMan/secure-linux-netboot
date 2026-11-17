@@ -1,0 +1,10 @@
+[Unit]
+Description=Secure Linux: weekly full check of your home backups (switched on by secure-linux-backup setup)
+
+[Timer]
+OnCalendar=weekly
+Persistent=true
+RandomizedDelaySec=2h
+
+[Install]
+WantedBy=timers.target

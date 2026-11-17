@@ -1,0 +1,143 @@
+#!/bin/bash
+# secure-linux-live-session: the small helper shown in the Secure Linux live session (started from the drive).
+# It only reads. It never formats, mounts, partitions or writes to any disk, and never touches this computer's own disks.
+#   secure-linux-live-session [menu]     a short menu
+#   secure-linux-live-session welcome    the welcome note
+#   secure-linux-live-session guide      open the guide
+#   secure-linux-live-session check-drive  check the Secure Linux drive (read-only)
+#   secure-linux-live-session installer  how to install Secure Linux (shows the steps only)
+#   secure-linux-live-session nomad      start the NOMAD offline library, if it is on a plugged-in drive
+set -u
+HERE=$(CDPATH= cd -- "$(dirname -- "$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")")" && pwd)
+SEARCH_DIRS=${SL_LIVE_SEARCH_DIRS:-"/run/media/*/* /media/*/* /media/* /mnt/*"}
+PY=${PYTHON:-}
+if [ -z "$PY" ]; then
+  for PY in python3 python; do command -v "$PY" >/dev/null 2>&1 && "$PY" -c "import sys" >/dev/null 2>&1 && break; done
+fi
+say() { printf '%s\n' "$*"; }
+
+# A mounted drive that carries Secure Linux (looked for only; nothing is mounted here).
+find_drive() {
+  local d
+  for d in $SEARCH_DIRS; do
+    if [ -f "$d/linux-setup/SECURE-LINUX-DRIVE-FILES.json" ] || [ -d "$d/linux-setup/linux" ]; then
+      printf '%s\n' "$d"; return 0
+    fi
+  done
+  return 1
+}
+
+usage() { sed -n '2,9p' "$0" | sed 's/^# \{0,1\}//'; }
+
+cmd_welcome() {
+  local f
+  for f in "$HERE/WELCOME.txt" /usr/local/lib/secure-linux/live-session/WELCOME.txt; do
+    [ -f "$f" ] && { cat "$f"; return 0; }
+  done
+  say "Welcome to Secure Linux. This is a try-it session: nothing is installed and your computer's disks are not changed."
+}
+
+cmd_guide() {
+  local drive guide opener
+  drive=$(find_drive) || drive=""
+  guide=""
+  for f in "${drive:+$drive/guide/START-HERE.html}" "${drive:+$drive/linux-setup/guide/START-HERE.html}" \
+           "$HERE/../../../guide/START-HERE.html" /usr/local/share/secure-linux/guide/START-HERE.html; do
+    [ -n "$f" ] && [ -f "$f" ] && { guide=$f; break; }
+  done
+  if [ -z "$guide" ]; then
+    say "The guide was not found on a plugged-in drive. Plug in the Secure Linux drive and try again. Nothing was changed."
+    return 1
+  fi
+  say "The guide is here: $guide"
+  opener=${SL_LIVE_OPENER:-xdg-open}
+  if command -v "$opener" >/dev/null 2>&1; then
+    "$opener" "$guide" >/dev/null 2>&1 &
+    say "Opening it now."
+  else
+    say "Open that file with your web browser."
+  fi
+}
+
+cmd_check_drive() {
+  local drive tool
+  drive=$(find_drive) || { say "No Secure Linux drive was found. Plug it in and try again. Nothing was changed."; return 1; }
+  for tool in "$drive/linux-setup/linux/bin/secure-linux-check-drive" "$HERE/../../bin/secure-linux-check-drive" \
+              /usr/local/bin/secure-linux-check-drive; do
+    if [ -f "$tool" ]; then
+      say "Checking the drive at $drive (this only reads it)..."
+      "$PY" "$tool" --drive "$drive"
+      return $?
+    fi
+  done
+  say "The drive checker was not found. Nothing was changed."
+  return 1
+}
+
+cmd_installer() {
+  say "How to install Secure Linux on this computer"
+  say ""
+  say "This live session does not install anything, so nothing here can erase your computer's disks."
+  say "To install:"
+  say "  1. Save your work and switch the computer off."
+  say "  2. Switch it on again with this drive still plugged in, and choose it in the start-up menu."
+  say "  3. In the drive's menu, pick the line that sets up this computer."
+  say "  4. Follow the questions. The installer asks you before it changes any disk."
+  say "The guide has pictures and more help: secure-linux-live-session guide"
+}
+
+cmd_nomad() {
+  local drive="" kit="" d
+  for d in $SEARCH_DIRS; do
+    [ -f "$d/START-NOMAD.sh" ] && { drive=$d; break; }
+  done
+  if [ -n "$drive" ]; then
+    say "Starting NOMAD from $drive ..."
+    exec sh "$drive/START-NOMAD.sh"
+  fi
+  # No START-NOMAD.sh at the top of a drive (for example NOMAD on the drive's STORAGE part): start the NOMAD folder
+  # itself, the same path START-NOMAD.sh uses: <drive>/SecureLinux-NOMAD/start-nomad.sh (it asks for sudo itself).
+  for d in $SEARCH_DIRS; do
+    [ -f "$d/SecureLinux-NOMAD/start-nomad.sh" ] && { kit=$d/SecureLinux-NOMAD; break; }
+  done
+  if [ -n "$kit" ]; then
+    say "Starting NOMAD from $kit (the first start can take 5 to 15 minutes) ..."
+    cd "$kit" || return 1
+    exec bash ./start-nomad.sh
+  fi
+  say "NOMAD was not found on a plugged-in drive."
+  say "If NOMAD is on this drive, read BOOT-FROM-THE-DRIVE.txt in the drive's SecureLinux-NOMAD folder for the steps. Nothing was changed."
+  return 1
+}
+
+cmd_menu() {
+  local c
+  while :; do
+    say ""
+    say "Secure Linux live session"
+    say "  1) Read the guide"
+    say "  2) Check this drive"
+    say "  3) How to install Secure Linux"
+    say "  4) Start NOMAD"
+    say "  5) Welcome note"
+    say "  q) Quit"
+    printf 'Choose: '
+    read -r c || return 0
+    case "$c" in
+      1) cmd_guide ;; 2) cmd_check_drive ;; 3) cmd_installer ;; 4) cmd_nomad ;; 5) cmd_welcome ;;
+      q|Q) return 0 ;;
+      *) say "Please type 1, 2, 3, 4, 5 or q." ;;
+    esac
+  done
+}
+
+case "${1:-menu}" in
+  -h|--help|help) usage ;;
+  welcome) cmd_welcome ;;
+  guide) cmd_guide ;;
+  check-drive) cmd_check_drive ;;
+  installer) cmd_installer ;;
+  nomad) cmd_nomad ;;
+  menu) cmd_menu ;;
+  *) say "I did not understand '$1'. Type secure-linux-live-session --help."; exit 64 ;;
+esac

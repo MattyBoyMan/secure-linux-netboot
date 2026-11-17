@@ -1,0 +1,73 @@
+# Secure Linux TV cleanup - NEVER-TOUCH list.  Written 2026-11-14.
+# One shell-style pattern per line (* matches anything). Text after " # " is the reason.
+# The tool checks this list before every hide/disable and refuses a match even if you ask.
+# The tool never uninstalls system packages at all.
+# Sources: https://github.com/ohernandezdev/android-tv-tune/blob/main/data/never-disable.list (MIT),
+#          https://github.com/ohernandezdev/android-tv-tune/blob/main/docs/launcher.md,
+#          plus extra safety entries added by us (casting, voice, setup, anything named like a system service).
+
+# Android core
+android # Android itself
+com.android.* # Android system apps, settings, networking, installer, keychain
+com.google.android.gms* # Google Play services (almost every app needs it)
+com.google.android.gsf* # Google services framework
+com.android.vending # Google Play Store
+com.google.android.webview* # web engine used by apps
+com.google.android.trichromelibrary* # web engine library
+com.google.android.permissioncontroller* # app permissions
+com.google.android.packageinstaller* # installs apps
+com.google.android.ext.* # Google system extensions
+com.google.android.modulemetadata # system updates
+com.google.android.overlay.* # system look and settings overlays
+com.google.android.configupdater # system config updates
+com.google.android.gms.* # Google Play services parts
+
+# Casting (the whole point of a Chromecast)
+com.google.android.apps.mediashell* # built-in Chromecast receiver
+com.google.android.apps.cast* # casting
+*.chromecast* # casting
+*cast.receiver* # casting
+
+# Remote, voice and input: lose these and the remote stops working
+com.google.android.tv.remote* # remote control service
+com.google.android.tv.* # Google TV core services
+com.google.android.katniss* # voice search and the voice button
+com.google.android.inputmethod.* # on-screen keyboard
+*.inputmethod.* # keyboards
+*.globalkeyoverlay # remote key handling
+*.autopair # remote pairing
+*bluetooth* # Bluetooth (remote pairing)
+*.tvinput # TV inputs
+*.tvinput.* # TV inputs
+*.systemserver # vendor system service
+*.providers.config # vendor configuration
+
+# Home screen, setup and recovery (only the guided "clean home screen" step may touch the first two)
+com.google.android.apps.tv.launcherx* # Google TV home screen
+com.google.android.tungsten.* # Google TV setup and recovery
+com.google.android.tvrecommendations* # home screen recommendations engine
+com.google.android.leanbacklauncher* # Android TV home screen
+com.google.android.setupwizard* # setup wizard
+com.google.android.tv.setupwraith* # setup wizard
+*setupwraith* # setup wizard
+*setupwizard* # setup wizard
+*provision* # provisioning
+
+# Network and settings
+*wifi* # Wi-Fi
+*networkstack* # networking
+*.settings* # settings
+*.tethering* # network sharing
+*telephony* # phone parts some boxes need
+
+# Vendor chip and system drivers
+com.realtek.* # chip maker services
+com.mediatek.* # chip maker services
+com.amlogic.* # chip maker services
+com.tvos # TV operating layer
+
+# The apps this kit installs
+me.efesser.flauncher # FLauncher home screen
+org.smarttube.* # SmartTube
+com.spocky.projengmenu # Projectivy home screen (if you installed your own)
+com.google.android.youtube.tv # the normal YouTube app

@@ -1,0 +1,4 @@
+# 45-nomad.tsv: NOMAD Offline Library (Project NOMAD, kind kittool). The command secure-linux-nomad and the set-up step 80-nomad.sh come from package X4int;
+# the row is listed only: setup never installs it from here. The ready-made folder SecureLinux-NOMAD (22.4 GB, checked by SHA-256) is on the Secure Linux drive.
+# Columns (TAB separated): id kind title plain_description approx_size_mb profiles default arch idea
+secure-linux-nomad	kittool	NOMAD Offline Library	Wikipedia, books, maps and a private AI that work with no internet, started from your Secure Linux drive. Needs a normal PC (Intel or AMD) with at least 4 GB of memory and about 22 GB of room.	22400	full,lite	off	x86_64	X4

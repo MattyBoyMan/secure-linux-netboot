@@ -1,0 +1,34 @@
+[Unit]
+Description=Secure Linux: share updates only at home, and look for other Secure Linux computers at home
+After=network-online.target NetworkManager.service
+
+[Service]
+Type=oneshot
+# At home: starts sharing (when it was turned on) and writes the list of computers that check out
+# (/run/secure-linux/kit-peers.json). Away or offline: stops sharing and forgets that list.
+ExecStart=/usr/local/bin/secure-linux-kit-share network
+TimeoutStartSec=180
+NoNewPrivileges=yes
+# full, not strict: /run/secure-linux may not exist yet (the list is written there)
+ProtectSystem=full
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+# check C2 F10 (part): this service reads neighbours' answers and checks their signatures. It must stay root (it
+# starts and stops sharing and opens the firewall port, both asked over the system bus, and those checks are not
+# proven to accept root without its capabilities), so it keeps them, but gets no namespaces, real-time,
+# set-user-ID files, personality changes, kernel log, clock or host-name changes, or foreign system calls.
+ProtectKernelLogs=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+# AF_NETLINK: `ip -4 -o addr show` reads this computer's home address through a netlink socket (check C2 F4);
+# without it no other computer at home is ever looked for.
+RestrictAddressFamilies=AF_INET AF_UNIX AF_NETLINK

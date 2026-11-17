@@ -1,5 +1,5 @@
 # Fedora Kickstart: "The Complete Secure Linux Package" - NETBOOT build, rendered by netboot/render-netboot.sh
-# on 2026-11-14 (netboot render) (Fedora 44) from templates/fedora.ks. This is a PUBLIC file: no names, no password
+# on 2026-11-18 (netboot render) (Fedora 44) from templates/fedora.ks. This is a PUBLIC file: no names, no password
 # hashes, no Wi-Fi passwords. The setup screen asks for the login name and password instead (see the marked
 # netboot step in %pre). The Secure Linux payload and the guide are downloaded from the public repository
 # at install time (SL_PAYLOAD_SOURCE below), not embedded and not read from a USB stick.
@@ -81,6 +81,10 @@ command -v iw >/dev/null 2>&1 && iw reg set 'AU' >/dev/null 2>&1
 SID=$SERIAL; junk_id "$SID" && SID=""
 UID_=$UUID; junk_id "$UID_" && UID_=""
 
+# Locked personal settings: "no" in the kit. The drive builder's seal-personal (linux/lib/usbc_seal.py) turns it
+# to "yes" when it moves this drive's login, its home-server details and the other personal build.conf values into
+# linux-setup/private/personal-settings.enc1, locked with the same PIN as the saved Wi-Fi networks.
+SL_SEALED=no
 # Saved Wi-Fi networks from Windows (save-wifi.ps1): the copy made when the stick was built, plus the
 # stick's current file (SAVE-THIS-PC.cmd may have added this computer since). Newest record wins.
 umask 077
@@ -96,13 +100,20 @@ cat > /tmp/sl-wifi.py <<'SLWIFI_PY_END'
 #   sl-wifi.py list BUNDLE                     prints "N|name|security" per network
 #   sl-wifi.py keyfiles SELECTED DIR [SKIP_SSID_B64]   writes NetworkManager keyfiles (0600)
 #   sl-wifi.py encrypt PIN < plain > blob      (tests) same format as save-wifi.ps1
+#   sl-wifi.py unseal SEALED OUTDIR            open this drive's locked settings (PIN in $SL_WIFI_PIN) -> OUTDIR/
+#                                              user.ks, sl-sealed-build.conf, sl-sealed-home-pass (0600); prints the
+#                                              login name. Exit 2: wrong PIN or changed file. Exit 3: not usable.
 #
 # Record line (one per machine, newest last):  serial|uuid|date|computer|plain|base64(bundle)
 #                                         or:  serial|uuid|date|computer|enc1|base64(blob)
 # Bundle: one network per line:  base64(ssid bytes)|wpa-psk, sae or none|base64(password)|hidden 0/1
-# enc1 blob: "SLW1" salt(16) nonce(16) ciphertext tag(32). Keys: PBKDF2-HMAC-SHA256(PIN, salt, 200000) -> 64
-# bytes = enc key + mac key. Cipher: HMAC-SHA256(enc key, nonce || counter) keystream XOR (CTR mode with a
-# PRF). Tag: HMAC-SHA256(mac key, "SLW1" salt nonce ciphertext), checked before decrypting.
+# enc1 blob: "SLW2" rounds(4, big-endian) salt(16) nonce(16) ciphertext tag(32). Keys: PBKDF2-HMAC-SHA256(PIN,
+# salt, rounds) -> 64 bytes = enc key + mac key. Cipher: HMAC-SHA256(enc key, nonce || counter) keystream XOR (CTR
+# mode with a PRF). Tag: HMAC-SHA256(mac key, everything before the tag), checked before decrypting. New records use
+# NEW_ITERATIONS rounds; a record's own round count is read back (bounded) and is covered by the tag.
+# Older records ("SLW1" salt nonce ciphertext tag, always 200000 rounds) are still opened the same way.
+# A NEW lock needs a passphrase of 10 or more characters (save-wifi.ps1, make-usb.ps1, linux/lib/usbc_seal.py);
+# this helper opens any record with the PIN it was made with, so drives made before still install.
 import base64
 import hashlib
 import hmac
@@ -111,12 +122,15 @@ import re
 import sys
 import uuid
 
-MAGIC = b"SLW1"
+MAGIC = b"SLW1"                 # older records: always ITERATIONS rounds
+MAGIC2 = b"SLW2"                # newer records: the round count is stored in the record
 ITERATIONS = 200000
+NEW_ITERATIONS = 600000
+MAX_ITERATIONS = 5000000        # a changed record can never make the setup screen wait for minutes
 
 
-def _keys(pin, salt):
-    k = hashlib.pbkdf2_hmac("sha256", pin.encode("utf-8"), salt, ITERATIONS, 64)
+def _keys(pin, salt, rounds=ITERATIONS):
+    k = hashlib.pbkdf2_hmac("sha256", pin.encode("utf-8"), salt, rounds, 64)
     return k[:32], k[32:]
 
 
@@ -129,21 +143,31 @@ def _stream(key, nonce, n):
     return bytes(out[:n])
 
 
-def encrypt(pin, plain, salt=None, nonce=None):
+def encrypt(pin, plain, salt=None, nonce=None, iterations=NEW_ITERATIONS):
+    if not ITERATIONS <= iterations <= MAX_ITERATIONS:
+        raise ValueError("the number of key rounds is out of range")
     salt = salt or os.urandom(16)
     nonce = nonce or os.urandom(16)
-    kenc, kmac = _keys(pin, salt)
+    head = MAGIC2 + iterations.to_bytes(4, "big")
+    kenc, kmac = _keys(pin, salt, iterations)
     ct = bytes(a ^ b for a, b in zip(plain, _stream(kenc, nonce, len(plain))))
-    tag = hmac.new(kmac, MAGIC + salt + nonce + ct, hashlib.sha256).digest()
-    return MAGIC + salt + nonce + ct + tag
+    tag = hmac.new(kmac, head + salt + nonce + ct, hashlib.sha256).digest()
+    return head + salt + nonce + ct + tag
 
 
 def decrypt(pin, blob):
-    if len(blob) < 4 + 16 + 16 + 32 or blob[:4] != MAGIC:
+    if blob[:4] == MAGIC2 and len(blob) >= 8 + 16 + 16 + 32:
+        rounds = int.from_bytes(blob[4:8], "big")
+        if not ITERATIONS <= rounds <= MAX_ITERATIONS:
+            raise ValueError("not a Secure Linux Wi-Fi bundle")
+        head, rest = blob[:8], blob[8:]
+    elif blob[:4] == MAGIC and len(blob) >= 4 + 16 + 16 + 32:
+        rounds, head, rest = ITERATIONS, blob[:4], blob[4:]
+    else:
         raise ValueError("not a Secure Linux Wi-Fi bundle")
-    salt, nonce, ct, tag = blob[4:20], blob[20:36], blob[36:-32], blob[-32:]
-    kenc, kmac = _keys(pin, salt)
-    if not hmac.compare_digest(tag, hmac.new(kmac, MAGIC + salt + nonce + ct, hashlib.sha256).digest()):
+    salt, nonce, ct, tag = rest[:16], rest[16:32], rest[32:-32], rest[-32:]
+    kenc, kmac = _keys(pin, salt, rounds)
+    if not hmac.compare_digest(tag, hmac.new(kmac, head + salt + nonce + ct, hashlib.sha256).digest()):
         raise PermissionError("wrong PIN")
     return bytes(a ^ b for a, b in zip(ct, _stream(kenc, nonce, len(ct))))
 
@@ -227,6 +251,102 @@ def write_private(path, data):
             pass
 
 
+# ---------------------------------------------------------------- locked personal settings
+# The drive builder's seal-personal (linux/lib/usbc_seal.py) locks one drive's own settings with the SAME enc1 lock
+# and the SAME PIN as the Wi-Fi records above (no new cryptography), in linux-setup/private/personal-settings.enc1:
+# one line, base64(enc1 blob). The text inside the blob:
+#   SLSEAL1
+#   user=base64(the Kickstart "user ..." line)
+#   conf=base64(KEY=VALUE)                    one line per locked build.conf value
+#   homepass=base64(home-server password)     only when the owner chose to lock it too
+# Both sides check every value with the same rules (seal_text), so the installer only ever writes a login line it
+# knows, and only the build.conf keys listed here.
+SEAL_MAGIC = "SLSEAL1"
+SEALED_CONF_KEYS = ("SL_USER", "SL_FULLNAME", "IMMICH_URL", "HOME_WIFI_SSID", "HOME_SUBNET", "HOME_SHARE_PATH",
+                    "HOME_SHARE_USER", "HOME_SHARE_DOMAIN", "HOME_SHARE_FOLDER", "HOME_SHARE_UPDATES")
+USER_LINE_RE = re.compile(r'user --name=([a-z_][a-z0-9_-]{0,31}) --gecos="(?:[^"\\\x00-\x1f\x7f]|\\["\\])*" '
+                          r'--groups=wheel --iscrypted --password=\$6\$(?:rounds=[0-9]{1,9}\$)?[./0-9A-Za-z]{1,16}'
+                          r'\$[./0-9A-Za-z]{86}')
+CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def _b64(text):
+    return base64.b64encode(text.encode("utf-8")).decode("ascii")
+
+
+def seal_text(user_line, conf, home_password=None):
+    """The text locked inside the blob. Raises ValueError for anything the installer would not use."""
+    if not isinstance(user_line, str) or not USER_LINE_RE.fullmatch(user_line):
+        raise ValueError("the login line is not one the installer can use")
+    lines = [SEAL_MAGIC, "user=" + _b64(user_line)]
+    seen = set()
+    for key, value in conf:
+        if key not in SEALED_CONF_KEYS or key in seen:
+            raise ValueError("%s is not a setting that can be locked" % key)
+        if not isinstance(value, str) or len(value) > 1024 or CONTROL_RE.search(value):
+            raise ValueError("the value of %s cannot be locked" % key)
+        seen.add(key)
+        lines.append("conf=" + _b64(key + "=" + value))
+    if home_password is not None:
+        if (not isinstance(home_password, str) or not home_password or len(home_password) > 1024
+                or CONTROL_RE.search(home_password)):
+            raise ValueError("the home-server password is empty, too long or has a control character")
+        lines.append("homepass=" + _b64(home_password))
+    return "\n".join(lines) + "\n"
+
+
+def parse_seal_text(text):
+    """(user line, login name, [(key, value)], home-server password or None). ValueError when anything is off."""
+    lines = text.split("\n")
+    if lines and lines[-1] == "":
+        lines.pop()
+    if not lines or lines[0] != SEAL_MAGIC:
+        raise ValueError("not a Secure Linux locked-settings file")
+    user, conf, home = None, [], None
+    for line in lines[1:]:
+        kind, sep, value = line.partition("=")
+        if not sep:
+            raise ValueError("a line of the locked settings is not usable")
+        raw = base64.b64decode(value.encode("ascii"), validate=True).decode("utf-8")
+        if kind == "user" and user is None:
+            user = raw
+        elif kind == "conf":
+            key, sep, setting = raw.partition("=")
+            if not sep:
+                raise ValueError("a locked setting has no value")
+            conf.append((key, setting))
+        elif kind == "homepass" and home is None:
+            home = raw
+        else:
+            raise ValueError("the locked settings hold something unexpected")
+    seal_text(user, conf, home)
+    return user, USER_LINE_RE.fullmatch(user).group(1), conf, home
+
+
+def cmd_unseal(sealed, outdir):
+    try:
+        with open(sealed, encoding="ascii") as f:
+            blob = base64.b64decode(f.read().strip().encode("ascii"), validate=True)
+    except (OSError, ValueError):
+        return 3
+    try:
+        text = decrypt(os.environ.get("SL_WIFI_PIN", ""), blob).decode("utf-8")
+    except PermissionError:
+        return 2
+    except ValueError:
+        return 3
+    try:
+        user, name, conf, home = parse_seal_text(text)
+    except (ValueError, UnicodeError):
+        return 3
+    write_private(os.path.join(outdir, "user.ks"), user + "\n")
+    write_private(os.path.join(outdir, "sl-sealed-build.conf"), "".join("%s=%s\n" % kv for kv in conf))
+    if home is not None:
+        write_private(os.path.join(outdir, "sl-sealed-home-pass"), home + "\n")
+    print(name)
+    return 0
+
+
 # ---------------------------------------------------------------- commands
 def cmd_pick(records, serial, uid, out):
     serial, uid = serial.strip().lower(), uid.strip().lower()
@@ -301,6 +421,8 @@ def main(argv):
         return cmd_list(argv[2])
     if cmd == "keyfiles" and len(argv) in (4, 5):
         return cmd_keyfiles(*argv[2:])
+    if cmd == "unseal" and len(argv) == 4:
+        return cmd_unseal(argv[2], argv[3])
     if cmd == "encrypt" and len(argv) == 3:
         sys.stdout.write(base64.b64encode(encrypt(argv[2], sys.stdin.buffer.read())).decode() + "\n")
         return 0
@@ -328,6 +450,8 @@ mount_stick() {  # the Ventoy data partition, read-only (Ventoy 1.1.18+ exposes 
 if mount_stick; then
   [ -f /tmp/ventoy-ro/linux-setup/wifi-networks.txt ] && cat /tmp/ventoy-ro/linux-setup/wifi-networks.txt >> /tmp/wifi-records.txt
   [ -f /tmp/ventoy-ro/linux-setup/setup.conf ] && cp /tmp/ventoy-ro/linux-setup/setup.conf /tmp/setup.conf
+  [ "$SL_SEALED" = yes ] && [ -f /tmp/ventoy-ro/linux-setup/private/personal-settings.enc1 ] \
+    && cp /tmp/ventoy-ro/linux-setup/private/personal-settings.enc1 /tmp/sl-sealed.enc1
   # The builder already packages linux/. No template placeholder is needed here.
   for SL_PROGRESS_LIB in /tmp/ventoy-ro/linux-setup/linux/lib/sl-progress.sh /tmp/ventoy-ro/linux-setup/kit/linux/lib/sl-progress.sh; do
     [ -f "$SL_PROGRESS_LIB" ] && { cp "$SL_PROGRESS_LIB" /tmp/sl-progress.sh; break; }
@@ -348,6 +472,8 @@ sl_pre_begin() {
 }
 sl_pre_end() { sl_progress_spinner_stop "${1:-}"; }
 WIFI_KIND=$(python3 /tmp/sl-wifi.py pick /tmp/wifi-records.txt "$SID" "$UID_" /tmp/sl-wifi-record 2>/dev/null)
+SEALED=""; UNSEALED=""
+[ "$SL_SEALED" = yes ] && [ -s /tmp/sl-sealed.enc1 ] && SEALED=1
 umask 022
 
 # Optional Setup-App hand-off. No file means the original interactive path below, byte for byte.
@@ -1308,6 +1434,8 @@ if [ "$SETUP_AUTO" = 1 ] && [ "$WIFI_MODE" = skip ]; then WIFI_STEP=0
 elif eth_up; then WIFI_STEP=0
 else WIFI_STEP=1
 fi
+# Locked personal settings: their PIN is asked in the internet step, so that step is shown even with a cable
+[ -n "$SEALED" ] && WIFI_STEP=1
 TOTAL=4
 [ "$PROFILE" = full ] && TOTAL=$((TOTAL + 1))
 [ -d /sys/firmware/efi ] && TOTAL=$((TOTAL + 1))
@@ -1461,6 +1589,43 @@ else
   fi
 fi
 
+# ---------------------------------------------------------------- the one PIN question
+# The setup screen's ONE PIN / password question (3 tries). It opens the Wi-Fi networks saved from Windows (only
+# when no cable is connected: then they are needed) and this drive's locked personal settings. The PIN lives only
+# in this shell variable and is cleared right after; it is never written to a file and never shown.
+OPENED=""
+sl_unlock() {
+  local try want_wifi=""
+  [ "$WIFI_KIND" = enc1 ] && ! eth_up && want_wifi=1
+  if [ -n "$want_wifi" ]; then
+    echo "   This computer's saved Wi-Fi networks were locked with a PIN / password"
+    echo "   (chosen when they were saved in Windows)."
+    echo
+  fi
+  if [ -n "$SEALED" ]; then
+    echo "   Your own settings on this drive (your login and home-server details) are"
+    echo "   locked with your PIN / password. Type it to use them."
+    echo
+  fi
+  for try in 1 2 3; do
+    printf '   PIN / password: '; read -rs SL_WIFI_PIN || cancel; echo
+    if [ -n "$want_wifi" ] && [ -z "$OPENED" ] && SL_WIFI_PIN=$SL_WIFI_PIN python3 /tmp/sl-wifi.py open /tmp/sl-wifi-record /tmp/sl-wifi-bundle >/tmp/sl-wifi-count 2>/dev/null; then OPENED=1; fi
+    if [ -n "$SEALED" ] && [ -z "$UNSEALED" ] && SL_WIFI_PIN=$SL_WIFI_PIN python3 /tmp/sl-wifi.py unseal /tmp/sl-sealed.enc1 /tmp/ >/tmp/sl-sealed-name 2>/dev/null; then UNSEALED=1; fi
+    [ -n "$OPENED$UNSEALED" ] && break
+    echo "   That's not it."
+  done
+  SL_WIFI_PIN=""
+  if [ -n "$UNSEALED" ]; then
+    printf 'sl_username=%s\n' "$(cat /tmp/sl-sealed-name)" >> /tmp/secure-linux-choices
+    echo "   Your own settings are unlocked."
+  elif [ -n "$SEALED" ]; then
+    echo
+    echo "   Your own settings can't be opened, so the install carries on without them:"
+    echo "   it asks for your login before it starts."
+  fi
+  echo
+}
+
 # ---------------------------------------------------------------- internet for the install: cable first, then Wi-Fi
 umask 077   # before ANY file is written in this step: /tmp/secure-linux-wifi will hold Wi-Fi passwords (B5)
 : > /tmp/secure-linux-wifi
@@ -1469,7 +1634,11 @@ if [ "$WIFI_STEP" = 1 ]; then
   header "internet for the install"
   echo "   STEP $N of $TOTAL: internet for the install"
   echo
-  if eth_up; then
+  if [ -n "$SEALED" ] && [ "$SETUP_AUTO" = 1 ] && [ "$WIFI_MODE" = skip ] && ! eth_up; then
+    sl_unlock
+    echo "   Wi-Fi is skipped, as chosen in the Setup app."
+  elif eth_up; then
+    [ -n "$SEALED" ] && sl_unlock
     echo "   A network cable is connected - using it. No Wi-Fi questions needed."
     echo
     sleep 2
@@ -1477,19 +1646,12 @@ if [ "$WIFI_STEP" = 1 ]; then
     echo "   No network cable is connected, so this computer uses Wi-Fi for the install."
     echo "   (A cable or phone USB tethering works too: type C at the network list.)"
     echo
-    # The networks saved from this computer's Windows, if any (the PIN flow is unchanged)
-    OPENED=""
-    if [ "$WIFI_KIND" = enc1 ]; then
-      echo "   This computer's saved Wi-Fi networks were locked with a PIN / password"
-      echo "   (chosen when they were saved in Windows)."
-      echo
-      for try in 1 2 3; do
-        printf '   PIN / password: '; read -rs SL_WIFI_PIN || cancel; echo
-        if SL_WIFI_PIN=$SL_WIFI_PIN python3 /tmp/sl-wifi.py open /tmp/sl-wifi-record /tmp/sl-wifi-bundle >/tmp/sl-wifi-count 2>/dev/null; then OPENED=1; break; fi
-        echo "   That's not it."
-      done
-      SL_WIFI_PIN=""
-    elif [ -n "$WIFI_KIND" ]; then
+    # The networks saved from this computer's Windows, if any, and this drive's locked settings: one PIN
+    # question opens both (sl_unlock, above). Networks saved without a PIN open without a question.
+    if [ "$WIFI_KIND" = enc1 ] || [ -n "$SEALED" ]; then
+      sl_unlock
+    fi
+    if [ -n "$WIFI_KIND" ] && [ "$WIFI_KIND" != enc1 ]; then
       python3 /tmp/sl-wifi.py open /tmp/sl-wifi-record /tmp/sl-wifi-bundle >/tmp/sl-wifi-count 2>/dev/null && OPENED=1
     fi
     if [ -z "$OPENED" ] && [ -n "$WIFI_KIND" ]; then
@@ -3323,12 +3485,12 @@ case "$PROFILE" in
   full)
     printf 'url --mirrorlist="https://mirrors.fedoraproject.org/mirrorlist?repo=fedora-$releasever&arch=$basearch"\nrepo --name=updates --mirrorlist="https://mirrors.fedoraproject.org/mirrorlist?repo=updates-released-f$releasever&arch=$basearch"\n' > /tmp/payload.ks
     printf 'network --hostname=%s\nfirewall --enabled\n' "$HOST" > /tmp/profile.ks
-    printf '%%packages\n@^kde-desktop-environment\nflatpak\npython3\ncurl\ngit\nbtrfs-progs\nNetworkManager-wifi\n%s\n%%end\n' "$(echo $FIRMWARE | tr ' ' '\n')" > /tmp/packages.ks
+    printf '%%packages\n@^kde-desktop-environment\nflatpak\npython3\ncurl\ngit\nbtrfs-progs\nNetworkManager-wifi\ncifs-utils\npodman\nnftables\n%s\n%%end\n' "$(echo $FIRMWARE | tr ' ' '\n')" > /tmp/packages.ks
     ;;
   lite)
     printf 'url --mirrorlist="https://mirrors.fedoraproject.org/mirrorlist?repo=fedora-$releasever&arch=$basearch"\nrepo --name=updates --mirrorlist="https://mirrors.fedoraproject.org/mirrorlist?repo=updates-released-f$releasever&arch=$basearch"\n' > /tmp/payload.ks
     printf 'network --hostname=%s\nfirewall --enabled --service=ssh\nservices --enabled=sshd\n' "$HOST" > /tmp/profile.ks
-    printf '%%packages\n@^xfce-desktop-environment\nopenssh-server\nflatpak\npython3\ncurl\ngit\nbtrfs-progs\nNetworkManager-wifi\n%s\n%%end\n' "$(echo $FIRMWARE | tr ' ' '\n')" > /tmp/packages.ks
+    printf '%%packages\n@^xfce-desktop-environment\nopenssh-server\nflatpak\npython3\ncurl\ngit\nbtrfs-progs\nNetworkManager-wifi\ncifs-utils\npodman\nnftables\n%s\n%%end\n' "$(echo $FIRMWARE | tr ' ' '\n')" > /tmp/packages.ks
     ;;
   min)
     # fedora-min: the same Fedora from the same mirrors, but the lightest desktop (LXQt) for PCs with
@@ -3336,7 +3498,7 @@ case "$PROFILE" in
     # so only the desktop group differs.
     printf 'url --mirrorlist="https://mirrors.fedoraproject.org/mirrorlist?repo=fedora-$releasever&arch=$basearch"\nrepo --name=updates --mirrorlist="https://mirrors.fedoraproject.org/mirrorlist?repo=updates-released-f$releasever&arch=$basearch"\n' > /tmp/payload.ks
     printf 'network --hostname=%s\nfirewall --enabled --service=ssh\nservices --enabled=sshd\n' "$HOST" > /tmp/profile.ks
-    printf '%%packages\n@^lxqt-desktop-environment\nopenssh-server\nflatpak\npython3\ncurl\ngit\nbtrfs-progs\nNetworkManager-wifi\n%s\n%%end\n' "$(echo $FIRMWARE | tr ' ' '\n')" > /tmp/packages.ks
+    printf '%%packages\n@^lxqt-desktop-environment\nopenssh-server\nflatpak\npython3\ncurl\ngit\nbtrfs-progs\nNetworkManager-wifi\ncifs-utils\npodman\nnftables\n%s\n%%end\n' "$(echo $FIRMWARE | tr ' ' '\n')" > /tmp/packages.ks
     ;;
   atomic)
     # Fedora Kinoite (KDE Plasma, image-based). No package list: the image is the system.
@@ -3439,6 +3601,10 @@ if [ -s /tmp/secure-linux-wifi ]; then
   python3 /tmp/sl-wifi.py keyfiles /tmp/secure-linux-wifi "$SYSROOT/etc/NetworkManager/system-connections" ''
 fi
 rm -f /tmp/secure-linux-wifi
+# Locked personal settings opened on the setup screen: handed to the new system's own steps below (root only, 0600)
+for SL_SEALED_FILE in sl-sealed-build.conf sl-sealed-home-pass; do
+  [ -s "/tmp/$SL_SEALED_FILE" ] && [ -d "$SYSROOT/tmp" ] && install -m 0600 "/tmp/$SL_SEALED_FILE" "$SYSROOT/tmp/$SL_SEALED_FILE"
+done
 sl_stage_finish 5 'Choices and saved Wi-Fi settings handed over.'
 
 # Optional unfiltered AI model: copy it from the USB stick if it is there; otherwise first boot downloads it.
@@ -3530,9 +3696,13 @@ PASS_GUIDE
 fi
 # ---- Master copy: keep the stick's own files on this computer, so it can make new sticks later without the
 # original. Files only (installer, tools, setup apps, install images: several GB), each one hashed while copied
-# and read back. Left out: the offline app collection (large; it can be added later from a plugged-in stick) and
-# anything personal (PC scan, exported browser passwords, recovery notes). Skipped quietly when the computer has
-# little free space, the stick's tool is older than this feature, or anything fails: the install carries on.
+# and read back. Left out: the offline app collection (the drive builder adds this computer's own copy from
+# /var/cache/secure-linux/offline/app-bundles to every full drive), the PC scan, exported browser passwords and
+# recovery notes. Kept, because drives made here are for this computer's owner: the installer script (user,
+# password hash, Wi-Fi), build.conf and wifi-networks.txt (or, after seal-personal, the same settings locked with
+# the PIN). The store is root-only (0700); each drive made from it says so in its passport (personal "mine").
+# Skipped quietly when the computer has little free space, the stick's tool is older than this feature, or
+# anything fails: the install carries on.
 MASTER_TOOL="$OFF_MNT/linux-setup/linux/bin/secure-linux-usb-creator"
 MASTER_REL="$OFF_MNT/linux-setup/linux/release.json"
 MASTER_STORE="$SYSROOT/var/lib/secure-linux/usb-master"
@@ -3541,6 +3711,7 @@ if mountpoint -q "$OFF_MNT" && [ -f "$MASTER_REL" ] && command -v python3 >/dev/
   MASTER_FREE_KB=$(df -Pk "$SYSROOT/var" 2>/dev/null | awk 'NR==2 {print $4}')
   if [ "${MASTER_FREE_KB:-0}" -ge 41943040 ]; then
     sl_progress_spinner_start 'Saving a master copy of this stick on the computer. No percentage is available during this copy.'
+    install -d -m 0755 "$SYSROOT/var/lib/secure-linux"
     install -d -m 0700 "$MASTER_STORE"
     if timeout 5400 env PYTHONDONTWRITEBYTECODE=1 SL_USBC_PROGRESS_INTERVAL=30 python3 "$MASTER_TOOL" create --files-only \
          --variant online-only --store "$MASTER_STORE" --source-root "$OFF_MNT" --source-release "$MASTER_REL" \
@@ -3598,7 +3769,7 @@ chmod 0644 /etc/secure-linux/profile /etc/secure-linux/user /etc/secure-linux/ch
 # Validate every archive member before extraction: even a transport archive must never write outside
 # its staging root or introduce links/special files. The release record prevents old/new payload drift.
 SL_PAYLOAD_SOURCE="https://codeload.github.com/MattyBoyMan/secure-linux-netboot/tar.gz/refs/heads/main"
-SL_EXPECTED_RELEASE="secure-linux-2026.11.13-dd55a464400fead2"
+SL_EXPECTED_RELEASE="secure-linux-2026.11.17-8ec4456433e62ad7"
 SL=/usr/local/lib/secure-linux
 SLREPO=/tmp/sl-repo
 SLPAYLOAD="$SLREPO/secure-linux-netboot-main/payload"
@@ -3697,6 +3868,26 @@ if [ -f "$SL/bin/secure-linux-kit-update" ] && command -v python3 >/dev/null 2>&
   chmod 0755 "$SL/setup.sh" "$SL"/bin/* 2>/dev/null
   find "$SL" -type f -name '*.sh' -exec chmod 0755 {} + 2>/dev/null
 fi
+# ---- Locked personal settings (seal-personal, linux/lib/usbc_seal.py): the build.conf values opened on the setup
+# screen go back into this computer's own build.conf (only the keys that can be locked), and the home-server
+# password is kept root-only (0600) until the end of this %post, where the home-server helper takes it once and the
+# plain copy is removed (block "Home-server password unlocked at install" below), so it is not asked again.
+if [ -s /tmp/sl-sealed-build.conf ] && [ -f "$SL/build.conf" ]; then
+  while IFS= read -r SL_LINE || [ -n "$SL_LINE" ]; do
+    SL_KEY=${SL_LINE%%=*}
+    case "$SL_KEY" in
+      SL_USER|SL_FULLNAME|IMMICH_URL|HOME_WIFI_SSID|HOME_SUBNET|HOME_SHARE_PATH|HOME_SHARE_USER|HOME_SHARE_DOMAIN|HOME_SHARE_FOLDER|HOME_SHARE_UPDATES) ;;
+      *) continue ;;
+    esac
+    { grep -v "^$SL_KEY=" "$SL/build.conf"; printf '%s\n' "$SL_LINE"; } > "$SL/build.conf.sl-new" && mv -f "$SL/build.conf.sl-new" "$SL/build.conf"
+  done < /tmp/sl-sealed-build.conf
+  chmod 0644 "$SL/build.conf"
+fi
+if [ -s /tmp/sl-sealed-home-pass ]; then
+  install -d -m 0755 /etc/secure-linux/home-share
+  install -m 0600 /tmp/sl-sealed-home-pass /etc/secure-linux/home-share/password-from-install
+fi
+rm -f /tmp/sl-sealed-build.conf /tmp/sl-sealed-home-pass
 sl_stage_finish 55 'Secure Linux files unpacked.'
 
 # ---- The beginner's guide (opened on first login, also in the app menu)
@@ -3792,6 +3983,23 @@ sl_progress_spinner_start 'Preparing helpers and menus. No percentage is availab
 if [ -x "$SL/setup.sh" ]; then
   "$SL/setup.sh" --early || echo "setup.sh --early reported a problem (first boot repeats everything)"
 fi
+# ---- Home-server password unlocked at install (locked personal settings): used ONCE, then removed.
+# secure-linux-home-share setup reads the account (line 1; empty = the drive's) and the password (line 2) from
+# standard input only, keeps them in its own root-only credentials file and prepares the shared folder (exit 0 =
+# checked at home, 5 = saved, checked at home later). The plain copy is removed whatever happens; if the helper
+# could not take it, the owner is asked once at first login, exactly as without a lock. Nothing is printed.
+SL_HS_PASS=/etc/secure-linux/home-share/password-from-install
+if [ -s "$SL_HS_PASS" ] && [ -x "$SL/bin/secure-linux-home-share" ]; then
+  SL_HS_RC=0
+  { printf '\n'; head -n 1 "$SL_HS_PASS"; } | SL_ROOT="$SL" "$SL/bin/secure-linux-home-share" setup >/dev/null 2>&1 \
+    || SL_HS_RC=$?
+  case "$SL_HS_RC" in
+    0|5) echo "Home server: the password from the drive is saved for the shared folder (root only)." ;;
+    *) echo "Home server: the password from the drive could not be used; it is asked once at first login." ;;
+  esac
+fi
+rm -f "$SL_HS_PASS"
+unset SL_HS_PASS SL_HS_RC
 sl_stage_finish 95 'Early setup finished.'
 %end
 
@@ -3814,6 +4022,11 @@ for f in "$SYSROOT"/root/*.cfg "$SYSROOT"/root/*.ks "$SYSROOT"/var/log/anaconda/
   [ -f "$f" ] && sed -i -E 's/(--passphrase)(=| )("[^"]*"|[^ ]+)/\1=REMOVED/g' "$f"
 done
 rm -f /tmp/disk.ks
+# Locked personal settings: every opened copy goes (the new system keeps build.conf; the home-server password lives
+# only in the home-share helper's own credentials file, the plain copy from the install is removed here too)
+rm -f /tmp/user.ks /tmp/sl-sealed.enc1 /tmp/sl-sealed-name /tmp/sl-sealed-build.conf /tmp/sl-sealed-home-pass \
+  "$SYSROOT/tmp/sl-sealed-build.conf" "$SYSROOT/tmp/sl-sealed-home-pass" \
+  "$SYSROOT/etc/secure-linux/home-share/password-from-install"
 sl_progress_spinner_stop 'Final safety check finished.'
 sl_progress_done
 %end

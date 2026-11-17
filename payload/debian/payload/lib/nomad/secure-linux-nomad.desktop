@@ -1,0 +1,19 @@
+[Desktop Entry]
+Type=Application
+Name=NOMAD Offline Library
+GenericName=Offline library, maps and private AI
+Comment=Wikipedia, medical and repair books, maps and a private AI that work with no internet. Uses the Secure Linux drive when it is plugged in.
+Exec=secure-linux-nomad start --pause
+Icon=accessories-dictionary
+Terminal=true
+Categories=Education;Utility;
+Keywords=nomad;offline;wikipedia;library;maps;ai;kiwix;
+Actions=share;stop;
+
+[Desktop Action share]
+Name=Start NOMAD for my home network (devices type a code once)
+Exec=secure-linux-nomad start --share home --pause
+
+[Desktop Action stop]
+Name=Stop NOMAD (do this before unplugging the drive)
+Exec=secure-linux-nomad stop --pause

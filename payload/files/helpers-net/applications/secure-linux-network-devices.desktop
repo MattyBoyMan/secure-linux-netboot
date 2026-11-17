@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Who is on my Wi-Fi?
+GenericName=Home network devices
+Comment=See the devices on your home network and spot any new one. Nothing is sent anywhere.
+Exec=/usr/local/bin/secure-linux-network-devices --pause
+Icon=network-wireless
+Terminal=true
+Categories=Network;Security;
+Keywords=wifi;network;devices;router;intruder;who;stranger;
+StartupNotify=false

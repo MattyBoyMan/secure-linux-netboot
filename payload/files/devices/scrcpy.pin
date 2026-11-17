@@ -1,0 +1,11 @@
+# Secure Linux (devices): the one scrcpy build that secure-linux-phone-backup mirror may fetch. Text only, one KEY=value per line.
+# scrcpy is the free program that shows an Android phone on the computer screen. It is in neither Fedora nor Flathub, so the
+# tool downloads the maker's own build from the maker's own release page and refuses it unless the SHA-256 below matches.
+# Checked 2026-11-17: the value below was identical in (1) a file downloaded and hashed here, (2) the digest GitHub shows for the
+# release file and (3) the maker's published SHA256SUMS.txt for release v5.0.1.
+VERSION=5.0.1
+ARCH=x86_64
+URL=https://github.com/Genymobile/scrcpy/releases/download/v5.0.1/scrcpy-linux-x86_64-v5.0.1.tar.gz
+SHA256=9f969d30cc574816077edecda65719c1c70b0aee1df1ba5fa00779ac07b8fd6e
+SIZE_BYTES=17883742
+TOPDIR=scrcpy-linux-x86_64-v5.0.1

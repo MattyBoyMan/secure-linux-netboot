@@ -1,0 +1,67 @@
+# Secure Linux (movereset): your desktop look and behaviour. "Reset this computer, keep my files" MOVES these
+# aside (never deletes them) into ~/Secure-Linux-old-settings-<date>/ at the next start, before the desktop starts,
+# so the desktop starts fresh. "secure-linux-reset undo-settings" puts them back.
+# One path per line, relative to the home folder; a folder line covers everything inside it.
+# Never listed here: anything in never-touch.list (files, keys, passwords, browsers, messages, app data).
+#
+# KDE Plasma (full profile): look, panels, widgets, window rules, shortcuts, input, power, screen lock
+.config/kdeglobals
+.config/kwinrc
+.config/kwinrulesrc
+.config/kwinoutputconfig.json
+.config/plasmarc
+.config/plasmashellrc
+.config/plasma-org.kde.plasma.desktop-appletsrc
+.config/plasma-localerc
+.config/plasmanotifyrc
+.config/kglobalshortcutsrc
+.config/khotkeysrc
+.config/kcminputrc
+.config/kxkbrc
+.config/kscreenlockerrc
+.config/ksmserverrc
+.config/krunnerrc
+.config/kded5rc
+.config/kded6rc
+.config/powerdevilrc
+.config/powermanagementprofilesrc
+.config/kactivitymanagerdrc
+.config/kactivitymanagerd-statsrc
+.config/systemsettingsrc
+.config/breezerc
+.config/kcmfonts
+.config/ksplashrc
+.config/klaunchrc
+.config/kiorc
+.config/baloofilerc
+.config/Trolltech.conf
+.local/share/plasma
+.local/share/kactivitymanagerd
+.local/share/color-schemes
+.local/share/aurorae
+.local/share/kxmlgui5
+# Everyday KDE apps: their window and view settings (your documents are not here)
+.config/dolphinrc
+.config/konsolerc
+.local/share/konsole
+.config/katerc
+.config/kwriterc
+.config/spectaclerc
+.config/gwenviewrc
+.config/okularrc
+.config/okularpartrc
+.config/arkrc
+# Xfce (lite profile) and LXQt desktops
+.config/xfce4
+.config/lxqt
+.config/pcmanfm-qt
+.config/openbox
+# Toolkit look shared by every desktop, apps that start by themselves, default apps
+.config/gtkrc
+.config/gtkrc-2.0
+.gtkrc-2.0
+.config/gtk-3.0/settings.ini
+.config/gtk-4.0/settings.ini
+.config/xsettingsd
+.config/autostart
+.config/mimeapps.list

@@ -1,0 +1,346 @@
+#!/bin/bash
+# secure-linux-backup-gui: the "Backups" window. Turn on the optional home-folder backups with a few clicks,
+# back up now, check the backups, get a file, a folder or everything back, add a second copy on a USB drive.
+# Uses zenity; with no desktop (or no zenity) it prints the backup status and the commands instead.
+# secure-linux-backup-gui --offer-copy   (started by secure-linux-backup when the known backup drive is plugged in)
+# When BorgBackup is missing, turning backups on adds it first, after asking (from the App Library; on atomic
+# computers once into the system, with one restart). When the owner's home server is connected, "Turn on backups to
+# my home server" is offered first. "See my 3 copies" shows the 3-2-1 view.
+set -u
+case "${1:-}" in -h|--help) sed -n '2,5p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;; esac
+OFFER=no; [ "${1:-}" = --offer-copy ] && OFFER=yes
+TITLE="Backups"
+have() { command -v "$1" >/dev/null 2>&1; }
+SELF=$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")
+HERE=$(dirname "$SELF")
+if [ -x "$HERE/secure-linux-backup" ]; then TOOL=$HERE/secure-linux-backup; else TOOL=secure-linux-backup; fi
+
+if [ -z "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ] || ! have zenity; then
+  if [ "$OFFER" = yes ]; then "$TOOL" second status; exit 0; fi
+  "$TOOL" status
+  echo
+  echo "Back up now:            secure-linux-backup run"
+  echo "Get a file back:        secure-linux-backup restore Documents/letter.odt"
+  echo "Make the drive copy:    secure-linux-backup second run"
+  echo "All the choices:        secure-linux-backup --help"
+  exit 0
+fi
+
+WORK=$(mktemp -d "${TMPDIR:-/tmp}/sl-backup-gui.XXXXXX") || exit 1
+trap 'rm -rf "$WORK"' EXIT
+P=()   # () = the usual backups, (second) = the copy on the USB drive
+
+info() { zenity --info --no-markup --title="$TITLE" --width=520 --text="$1" 2>/dev/null; return 0; }
+err()  { zenity --error --no-markup --title="$TITLE" --width=520 --text="$1" 2>/dev/null; return 0; }
+ask()  { zenity --question --no-markup --title="$TITLE" --width=520 --ok-label="${2:-Yes}" --cancel-label="${3:-No}" --text="$1" 2>/dev/null; }
+busy() {   # busy "message" ARGS...   run the backup tool behind a "please wait" bar; output in $OUT, exit code in $RC
+  local msg=$1; shift
+  ( "$TOOL" "$@" > "$WORK/out" 2>&1 < /dev/null; echo $? > "$WORK/rc" ) |
+    zenity --progress --pulsate --auto-close --no-cancel --title="$TITLE" --width=460 --text="$msg" 2>/dev/null
+  OUT=$(cat "$WORK/out" 2>/dev/null); RC=$(cat "$WORK/rc" 2>/dev/null); RC=${RC:-2}
+}
+with_pass() {   # with_pass "message" ARGS...   like busy, with the typed passphrase given on standard input
+  local msg=$1; shift
+  ( printf '%s\n' "$PASS" | "$TOOL" "$@" > "$WORK/out" 2>&1; echo $? > "$WORK/rc" ) |
+    zenity --progress --pulsate --auto-close --no-cancel --title="$TITLE" --text="$msg" 2>/dev/null
+  PASS=""
+  OUT=$(cat "$WORK/out" 2>/dev/null); RC=$(cat "$WORK/rc" 2>/dev/null); RC=${RC:-2}
+}
+report() {   # show the tool's own plain-English words; problems as an error window
+  if [ "$RC" -ge 2 ]; then err "$OUT"; else info "$OUT"; fi
+}
+state() { "$TOOL" state 2>/dev/null | sed -n "s/^$1=//p" | head -n 1; }
+
+save_sheet() {   # save_sheet [second]   show a recovery sheet until the person confirms they saved it (or says "later")
+  local sheet what="your recovery sheet"
+  local -a SP=()
+  [ "${1:-}" = second ] && { SP=(second); what="the recovery sheet for your drive copy"; }
+  sheet=$("$TOOL" "${SP[@]}" recovery-sheet --path 2>/dev/null)
+  [ -n "$sheet" ] || return 0
+  [ -f "$sheet" ] || "$TOOL" "${SP[@]}" recovery-sheet >/dev/null 2>&1
+  [ -f "$sheet" ] || { err "The recovery sheet could not be made just now. Open Backups again later to see it."; return 0; }
+  if ask "Your recovery sheet holds the passphrase that unlocks your backups. Without it nobody can open them - not even you.
+
+Open it now so you can print it? (In the window that opens, press Ctrl+P to print.) Keep the printed sheet away from this computer." "Open to print" "Show it here"; then
+    have xdg-open && xdg-open "$sheet" >/dev/null 2>&1 &
+  fi
+  while true; do
+    if zenity --text-info --title="Your recovery sheet - print it or write it down" --width=640 --height=520 \
+         --filename="$sheet" --checkbox="I have printed it, or saved the passphrase somewhere safe" 2>/dev/null; then
+      "$TOOL" "${SP[@]}" recovery-sheet --done >/dev/null 2>&1
+      info "Thank you. Keep your recovery sheet somewhere safe and private, away from this computer."
+      return 0
+    fi
+    # never skipped silently: say what it means and let the person choose
+    if ask "You have not confirmed that $what is printed or saved.
+
+Without its passphrase nobody can open these backups if this computer is lost, stolen or broken - not even you." "Show the sheet again" "Remind me later"; then
+      continue
+    fi
+    info "Backups will remind you until $what is confirmed. You can open it again any time from the Backups window."
+    return 0
+  done
+}
+
+ask_restart() {   # ask_restart "message"   offer a restart (never without a yes)
+  if ask "$1
+
+Restart now? Save your work first." "Restart now" "Later"; then
+    systemctl reboot >/dev/null 2>&1 || err "The computer could not be restarted from here. Please restart it yourself."
+  fi
+  return 0
+}
+
+ensure_borg() {   # BorgBackup is needed for backups: add it on request (asked first, never by itself)
+  local b
+  b=$(state borg)
+  case "$b" in
+    no) ;;
+    after-restart) ask_restart "BorgBackup was added already. Restart the computer once to finish, then open Backups again."; return 1 ;;
+    *) return 0 ;;
+  esac
+  if [ "$(state atomic)" = yes ]; then
+    ask "Backups need a free program called BorgBackup. It is not on this computer yet.
+
+On this computer it is added to the system once, and the computer must restart once to finish. You may be asked for your password.
+
+Add BorgBackup now?" "Add BorgBackup" "Not now" || return 1
+  else
+    ask "Backups need a free program called BorgBackup (about 20 MB). It is not on this computer yet.
+
+It comes from the App Library. You may be asked for your password.
+
+Add BorgBackup now?" "Add BorgBackup" "Not now" || return 1
+  fi
+  busy "Adding BorgBackup. This can take a few minutes." install-borg --yes
+  case "$RC" in
+    0) return 0 ;;
+    5) ask_restart "$OUT"; return 1 ;;
+    1|6) info "$OUT"; return 1 ;;
+    *) report; return 1 ;;
+  esac
+}
+
+pick_folder() {   # pick_folder "title" [start folder]   prints the chosen folder
+  zenity --file-selection --directory --title="$1" --filename="${2:-/run/media/}" 2>/dev/null
+}
+
+start_backups() {   # start_backups FOLDER   turn backups on there, show the recovery sheet, offer the first backup
+  busy "Setting up your backups..." setup --to "$1" --yes
+  report
+  [ "$RC" -eq 0 ] || return 1
+  save_sheet
+  if ask "Make the first backup now? The first one can take a long time; later ones only save what changed." "Back up now" "Later"; then
+    busy "Backing up and checking your home folder. You can keep working." run
+    report
+  fi
+  return 0
+}
+
+turn_on() {
+  local how dir home
+  local -a rows=(TRUE "Turn on backups" FALSE "Use my existing backups (new or repaired computer)")
+  home=$("$TOOL" offer-home --where 2>/dev/null)
+  if [ -n "$home" ] && [ -d "$home" ]; then
+    rows=(TRUE "Turn on backups to my home server" FALSE "Turn on backups" FALSE "Use my existing backups (new or repaired computer)")
+  fi
+  how=$(zenity --list --radiolist --title="$TITLE" --width=560 --height=300 \
+    --text="Backups are OFF. They are optional.
+
+When they are on, your home folder is copied every day to your home server or a USB drive: encrypted (only you can open it), strongly compressed to save space, and checked after every backup so damage is caught straight away." \
+    --column="" --column="What would you like to do?" \
+    "${rows[@]}" 2>/dev/null) || return 1
+  case "$how" in
+    "Turn on backups to my home server")
+      ensure_borg || return 1
+      start_backups "$home" ;;
+    "Turn on backups")
+      ensure_borg || return 1
+      dir=$(pick_folder "Choose where to keep your backups: your home-server folder or a USB drive") || return 1
+      [ -n "$dir" ] || return 1
+      start_backups "$dir" ;;
+    "Use my existing backups"*)
+      ensure_borg || return 1
+      dir=$(pick_folder "Choose the folder that holds your backups (your home-server folder or USB drive)") || return 1
+      [ -n "$dir" ] || return 1
+      PASS=$(zenity --entry --hide-text --title="$TITLE" --width=480 \
+        --text="Type the backup passphrase from your recovery sheet:" 2>/dev/null) || return 1
+      with_pass "Opening your backups..." setup --to "$dir" --existing --yes
+      report ;;
+  esac
+}
+
+add_second() {   # a second, separate copy on a USB drive (its own encrypted store)
+  local dir auto
+  local -a A=()
+  ask "A second copy on a USB drive keeps your files safe even if your home server breaks, is stolen or is damaged.
+
+It is a separate encrypted copy made straight from your home folder, opened with the same passphrase as your other backups. Once a month you get a gentle reminder to plug the drive in; keep it away from the computer between copies.
+
+Plug in the USB drive now, then choose it in the next window." "Choose the drive" "Cancel" || return 1
+  dir=$(pick_folder "Choose your USB backup drive (or a folder on it)" "/run/media/${USER:-}/") || return 1
+  [ -n "$dir" ] || return 1
+  auto=$(zenity --list --checklist --title="$TITLE" --width=560 --height=260 \
+    --text="How should the drive copy be made? Tick the box to make it by itself; otherwise Backups asks you each time the drive is plugged in." \
+    --column="" --column="Choice" FALSE "Make the copy automatically when this drive is plugged in" 2>/dev/null) || return 1
+  [ -n "$auto" ] && A=(--automatic)
+  busy "Setting up the drive copy..." second setup --to "$dir" "${A[@]}" --yes
+  report
+  [ "$RC" -eq 0 ] || return 1
+  save_sheet second
+  if ask "Make the first drive copy now? The first one can take a long time; later ones only save what changed." "Make the copy now" "Later"; then
+    busy "Making the drive copy and checking it. You can keep working." second run
+    report
+  fi
+}
+
+offer_copy() {   # the known backup drive was plugged in (started by secure-linux-backup)
+  ask "Your backup drive is plugged in.
+
+Make this month's copy of your home folder on it now? It is encrypted and checked, and only what changed is saved." "Make the copy" "Not now" || return 0
+  busy "Making the drive copy and checking it. You can keep working." second run
+  report
+}
+
+choose_place() {   # sets P: the usual backups, or the copy on the backup drive when it is plugged in
+  local c
+  P=()
+  [ "$(state second)" = yes ] && [ "$(state second_connected)" = yes ] || return 0
+  c=$(zenity --list --radiolist --title="$TITLE" --width=520 --height=260 --text="Where should the files come from?" \
+    --column="" --column="Backups" TRUE "From your usual backups" FALSE "From the copy on your backup drive" 2>/dev/null) || return 1
+  case "$c" in *drive*) P=(second) ;; esac
+  return 0
+}
+
+choose_backup() {   # prints the name of the backup to restore from (newest first in the list)
+  local names rows=() a
+  names=$("$TOOL" "${P[@]}" list 2>/dev/null | sed -n 's/^ *[0-9]*) \(.*\)    (\(home-[^)]*\))$/\2\t\1/p')
+  [ -n "$names" ] || { err "No backups were found. Is your home server or backup drive connected?"; return 1; }
+  while IFS=$'\t' read -r a when; do rows=("$a" "$when" "${rows[@]}"); done <<< "$names"
+  zenity --list --title="$TITLE" --width=520 --height=420 --text="Which backup should the files come from? (newest first)" \
+    --column="Backup" --column="Made on" --hide-column=1 --print-column=1 "${rows[@]}" 2>/dev/null
+}
+
+restore_some() {   # restore_some file|folder
+  local from what
+  choose_place || return 1
+  from=$(choose_backup) || return 1
+  [ -n "$from" ] || return 1
+  if [ "$1" = file ]; then
+    what=$(zenity --file-selection --title="Choose the file to get back (its current copy is not replaced)" --filename="$HOME/" 2>/dev/null) || return 1
+  else
+    what=$(zenity --file-selection --directory --title="Choose the folder to get back (pick the folder where a lost file used to be)" --filename="$HOME/" 2>/dev/null) || return 1
+  fi
+  [ -n "$what" ] || return 1
+  busy "Getting your files back..." "${P[@]}" restore --from "$from" "$what"
+  report
+  open_result
+}
+open_result() {
+  local dir
+  dir=$(printf '%s\n' "$OUT" | sed -n 's/^Done\. .* are in: //p' | head -n 1)
+  [ -n "$dir" ] && [ -d "$dir" ] && have xdg-open && ask "Open the folder with your restored files?" "Open folder" "Close" &&
+    { xdg-open "$dir" >/dev/null 2>&1 & }
+  return 0
+}
+
+choose_check_mode() {
+  local cur c m a=FALSE f=FALSE q=FALSE
+  cur=$(state verify_after)
+  case "$cur" in full) f=TRUE ;; quick) q=TRUE ;; *) a=TRUE ;; esac
+  c=$(zenity --list --radiolist --title="$TITLE" --width=640 --height=320 \
+    --text="How should each new backup be checked straight after it is made?
+Whatever you choose, all your backups are read back in full once a week, and old backups are only tidied after that weekly check has passed." \
+    --column="" --column="Choice" \
+    "$a" "Automatic (recommended): chosen for you each time, and you are told why" \
+    "$f" "Full read-back after every backup (most thorough, slowest)" \
+    "$q" "Quick check after every backup (fastest)" 2>/dev/null) || return 0
+  case "$c" in Automatic*) m=auto ;; Full*) m=full ;; Quick*) m=quick ;; *) return 0 ;; esac
+  busy "Saving..." check-mode "$m"
+  report
+}
+
+type_pass_again() {
+  PASS=$(zenity --entry --hide-text --title="$TITLE" --width=480 \
+    --text="Type the backup passphrase from your recovery sheet (needed only if your keyring was reset):" 2>/dev/null) || return 0
+  with_pass "Checking the passphrase..." passphrase-again
+  report
+}
+
+menu() {
+  local status choice onoff second auto
+  local -a items
+  while true; do
+    status=$("$TOOL" status 2>&1)
+    if [ "$(state enabled)" = yes ]; then onoff="Turn automatic backups off"; else onoff="Turn automatic backups on"; fi
+    second=$(state second)
+    items=("Back up now" "Get a file back" "Get a folder back" "Get everything back"
+           "Check all backups" "Show my recovery sheet" "Repair backups" "$onoff")
+    if [ "$second" = yes ]; then
+      if [ "$(state second_automatic)" = yes ]; then auto="Ask me before each drive copy"; else auto="Make the drive copy automatically when the drive is plugged in"; fi
+      items+=("Make the drive copy now" "$auto" "Show the drive copy's recovery sheet" "Repair the drive copy" "Stop making drive copies")
+    else
+      items+=("Add a second copy on a USB drive")
+    fi
+    items+=("How backups are checked" "Type my backup passphrase again" "See my 3 copies (the 3-2-1 rule)")
+    [ -n "$(state deletion_alarm)" ] && items=("I have looked at the deleted backups" "${items[@]}")
+    choice=$(zenity --list --title="$TITLE" --width=680 --height=640 --text="$status" \
+      --column="What would you like to do?" "${items[@]}" 2>/dev/null) || return 0
+    case "$choice" in
+      "Back up now") busy "Backing up and checking your home folder. You can keep working." run; report ;;
+      "Get a file back") restore_some file ;;
+      "Get a folder back") restore_some folder ;;
+      "Get everything back")
+        if ask "Get everything back from your newest good backup?
+
+It goes into a NEW folder in your home folder, so nothing is replaced. It needs as much free space as your home folder." "Get everything back" "Cancel"; then
+          choose_place && { busy "Getting everything back. This can take a long time." "${P[@]}" restore --everything; report; open_result; }
+        fi ;;
+      "Check all backups") busy "Checking every backup, block by block. This can take a long time." check; report ;;
+      "Show my recovery sheet") save_sheet ;;
+      "Repair backups")
+        if ask "Repair is only needed after a check found a problem. It fixes the backup store, then makes a fresh backup and checks everything again.
+
+Repair now?" "Repair" "Cancel"; then
+          busy "Repairing and checking your backups. This can take a long time." repair --yes; report
+        fi ;;
+      "Turn automatic backups off") busy "Switching off..." off; report ;;
+      "Turn automatic backups on") busy "Switching on..." on; report ;;
+      "Add a second copy on a USB drive") add_second ;;
+      "Make the drive copy now") busy "Making the drive copy and checking it. You can keep working." second run; report ;;
+      "Ask me before each drive copy") busy "Saving..." second automatic off; report ;;
+      "Make the drive copy automatically when the drive is plugged in") busy "Saving..." second automatic on; report ;;
+      "Show the drive copy's recovery sheet") save_sheet second ;;
+      "Repair the drive copy")
+        if ask "Repair is only needed after a check of the drive copy found a problem. It fixes the drive copy, then makes a fresh copy and checks it all again. Your other backups are not touched.
+
+Repair now?" "Repair" "Cancel"; then
+          busy "Repairing and checking the drive copy. This can take a long time." second repair --yes; report
+        fi ;;
+      "Stop making drive copies")
+        if ask "Stop making copies on your backup drive? The copy already on the drive is kept, so you can still get files back from it later." "Stop" "Cancel"; then
+          busy "Switching off..." second forget; report
+        fi ;;
+      "How backups are checked") choose_check_mode ;;
+      "I have looked at the deleted backups")
+        if ask "Some backups disappeared from your backup place without Secure Linux removing them. Until you confirm, old backups are not tidied away (nothing is deleted).
+
+Only confirm if you deleted them yourself, or after you have checked the server. If you did not delete them, something else did - for example ransomware: keep this computer's files safe and get help." "I have looked" "Cancel"; then
+          busy "Saving..." deletion-checked; report
+        fi ;;
+      "Type my backup passphrase again") type_pass_again ;;
+      "See my 3 copies (the 3-2-1 rule)") info "$("$TOOL" copies 2>&1)" ;;
+      *) return 0 ;;
+    esac
+  done
+}
+
+if [ "$OFFER" = yes ]; then offer_copy; exit 0; fi
+if [ "$(state setup)" = yes ]; then
+  [ "$(state sheet_done)" = yes ] || save_sheet
+  if [ "$(state second)" = yes ] && [ "$(state second_sheet_done)" != yes ]; then save_sheet second; fi
+  menu
+else
+  turn_on && [ "$(state setup)" = yes ] && menu
+fi
+exit 0

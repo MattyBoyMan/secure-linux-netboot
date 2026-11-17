@@ -1,0 +1,814 @@
+#!/usr/bin/env python3
+"""secure-linux-kit-update-auto: keep this computer's Secure Linux files up to date by themselves.
+
+Runs by itself a few minutes after start-up and once a day (secure-linux-kit-update-auto.timer).
+It only calls secure-linux-kit-update (check, apply or undo), so a new release is always downloaded and
+verified file by file by that tool. It never fails when the computer is offline, and keeps the answer in a
+small file the update window reads.
+
+When release signing is set up (keys in this computer's own Secure Linux folder), a newer signed release is
+installed by itself. Before that it is only announced, unless /etc/secure-linux/kit-update-auto-apply exists.
+After an update the helpers, menus and timers are put in place, the saved master (if this computer keeps one)
+is brought up to the same release, and one plain note is left for the person. A run by itself (the timer)
+never downloads more than AUTO_MAX_DOWNLOAD_MB; a bigger update waits until the person chooses to update.
+
+  secure-linux-kit-update-auto [run] [--apply] [--force] [--report]   look now (skips if it looked in the last 20 hours)
+  secure-linux-kit-update-auto status [--text | --settings]          the last answer and the settings (no network)
+  secure-linux-kit-update-auto undo                                  go back to the previous version and keep it there
+  secure-linux-kit-update-auto set [--online yes|no] [--auto-apply yes|no] [--channel stable|testing]
+                                   [--mirror FOLDER | --no-mirror]   change the update settings (asks for your password)
+Settings file: /etc/secure-linux/kit-update.conf (only `set` writes it).
+Settings for tests: SL_ROOT, SL_STATE, SL_KIT_AUTO_STATE, SL_KIT_AUTO_APPLY_FLAG, SL_KIT_UPDATE_TOOL,
+SL_KIT_UPDATE_CONF, SL_KIT_UPDATE_HOLD, SL_RELEASE_VERIFY_TOOL, SL_USB_CREATOR_TOOL, SL_USB_MASTER_STORE,
+SL_REFRESH_HELPERS, SL_TEST_BASH.
+"""
+from __future__ import annotations
+
+import argparse
+import datetime
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+
+MIN_AGE_SECONDS = 20 * 3600
+RUN_TIMEOUT = 600
+VERIFY_TIMEOUT = 120
+REFRESH_TIMEOUT = 1800
+SYNC_TIMEOUT = 3600
+FRESH_DAYS = 30
+REFUSALS_FOR_ALERT = 2
+EXIT_BUSY = 75
+AUTO_MAX_DOWNLOAD_MB = "500"     # a run by itself (the timer) skips a bigger update; a person's run has no limit
+KEPT_CHANNEL = ".kit-update-channel.json"   # the signed channel record kit-update kept for the release here
+NAME = "secure-linux-kit-update-auto"
+DEFAULT_ROOT = "/usr/local/lib/secure-linux"
+DEFAULT_STORE = "/var/lib/secure-linux/usb-master"
+INSTALLED = Path("/usr/local/bin") / NAME
+RELEASE_ID_RE = re.compile(r"^secure-linux-([0-9]{4})\.([0-9]{2})\.([0-9]{2})-[0-9a-f]{16}$")
+ID_TEXT = r"secure-linux-[0-9]{4}\.[0-9]{2}\.[0-9]{2}-[0-9a-f]{16}"
+CHOICES = {"online": ("yes", "no"), "auto_apply": ("yes", "no"), "channel": ("stable", "testing")}
+SETTING_KEYS = ("online", "auto_apply", "channel", "mirror")
+MONTHS = ("January", "February", "March", "April", "May", "June", "July", "August", "September", "October",
+          "November", "December")
+REPAIR_HINT = "Open 'Secure Linux Status & Fixes' and choose 'Repair setup'."
+UPDATES_APP = "Install System & App Updates"
+
+MESSAGES = {
+    "current": "Your Secure Linux files are up to date.",
+    "available": "A newer Secure Linux release is ready. It will be installed safely when you choose to update.",
+    "updated": "Secure Linux files were updated and checked. The new files are used from now on.",
+    "updated-partly": ("Secure Linux files were updated and checked, but some new helpers could not be put in place "
+                       "yet. " + REPAIR_HINT),
+    "offline": "Could not look for a newer release because the computer is offline. Nothing is wrong.",
+    "online-off": "Online checks for Secure Linux files are switched off on this computer.",
+    "clock-wrong": ("This computer's clock seems wrong, so Secure Linux could not look for a newer release. "
+                    "Set the right date and time; nothing else is wrong."),
+    "held": ("You went back to the earlier Secure Linux release, so the newer one is not installed again. "
+             "A later release will be installed as usual."),
+    "refused": "A newer Secure Linux release could not be checked safely, so it was not installed. Your computer is fine.",
+    "busy": "Another update is running. Secure Linux will look again later.",
+    "unchanged": "No change was made to your Secure Linux files.",
+    "undone": ("You went back to the earlier Secure Linux release. The newer one is not installed again until an "
+               "even newer release is published."),
+    "damaged": "Some Secure Linux files on this computer are damaged. Installing updates puts them back.",
+    "repaired": "Some damaged Secure Linux files were put back and checked.",
+    "too-big": ("A large update is waiting. It was not downloaded by itself. Choose Install updates when "
+                "you are on a good connection."),
+    "check-stuck": ("The newest Secure Linux update did not pass its safety check and could not be undone. Your "
+                    "files are safe. The next update fixes this. " + REPAIR_HINT),
+    "check-undone": ("The newest Secure Linux update did not pass its safety check, so your computer went straight "
+                     "back to the version it had before. Nothing to do now."),
+}
+# Results that show the window a plain sentence (status --text); the others say nothing, never nag.
+SHOWN = ("available", "updated", "refused", "held", "undone", "clock-wrong", "damaged", "repaired", "too-big",
+         "check-stuck", "check-undone")
+# Results of a check that reached the published release and checked it.
+GOOD_CHECKS = ("current", "available", "updated", "held", "damaged", "repaired", "too-big")
+OLDER_LINES = ("is older than the release already here", "older than the local one")
+STALE_TEXT = ("Secure Linux has not been able to look for a newer release for over 30 days. "
+              "This is fine if the computer was offline.")
+
+
+# ---------------------------------------------------------------- places (tests redirect them)
+def root_text() -> str:
+    return os.environ.get("SL_ROOT", DEFAULT_ROOT)
+
+
+def root() -> Path:
+    return Path(root_text())
+
+
+def state_path() -> Path:
+    return Path(os.environ.get("SL_KIT_AUTO_STATE", "/var/lib/secure-linux/kit-update-auto.json"))
+
+
+def apply_flag() -> Path:
+    return Path(os.environ.get("SL_KIT_AUTO_APPLY_FLAG", "/etc/secure-linux/kit-update-auto-apply"))
+
+
+def conf_path() -> Path:
+    return Path(os.environ.get("SL_KIT_UPDATE_CONF", "/etc/secure-linux/kit-update.conf"))
+
+
+def hold_path() -> Path:
+    return Path(os.environ.get("SL_KIT_UPDATE_HOLD", "/var/lib/secure-linux/kit-update-hold.json"))
+
+
+def sl_state() -> Path:
+    return Path(os.environ.get("SL_STATE", "/var/lib/secure-linux"))
+
+
+def store_text() -> str:
+    return os.environ.get("SL_USB_MASTER_STORE", DEFAULT_STORE)
+
+
+def tool_path() -> Path:
+    given = os.environ.get("SL_KIT_UPDATE_TOOL")
+    if given:
+        return Path(given)
+    # The tree's own copy is the one every update verified and replaced. The copy beside this program in
+    # /usr/local/bin can be older, so it is only a fallback.
+    tree_copy = root() / "bin" / "secure-linux-kit-update"
+    if tree_copy.is_file():
+        return tree_copy
+    return Path(__file__).resolve().with_name("secure-linux-kit-update")
+
+
+def verifier_path() -> Path:
+    given = os.environ.get("SL_RELEASE_VERIFY_TOOL")
+    return Path(given) if given else root() / "bin" / "secure-linux-release-verify"
+
+
+def creator_path() -> Path:
+    given = os.environ.get("SL_USB_CREATOR_TOOL")
+    return Path(given) if given else root() / "bin" / "secure-linux-usb-creator"
+
+
+def master_sync_helper() -> Path:
+    return root() / "bin" / "secure-linux-master-sync"
+
+
+def refresh_script() -> Path:
+    given = os.environ.get("SL_REFRESH_HELPERS")
+    return Path(given) if given else root() / "lib" / "refresh-helpers.sh"
+
+
+def bash() -> str:
+    return os.environ.get("SL_TEST_BASH") or shutil.which("bash") or "/bin/bash"
+
+
+def now() -> datetime.datetime:
+    return datetime.datetime.now(datetime.timezone.utc)
+
+
+def say(text: str) -> None:
+    print(text, flush=True)
+
+
+# ---------------------------------------------------------------- small files
+def write_atomic(path: Path, data: bytes, mode: int = 0o644) -> None:
+    """Write through a temporary file in the same folder, then rename it into place."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle, name = tempfile.mkstemp(dir=str(path.parent), prefix="." + path.name + ".")
+    try:
+        with os.fdopen(handle, "wb") as out:
+            out.write(data)
+            out.flush()
+            os.fsync(out.fileno())
+        os.chmod(name, mode)
+        os.replace(name, path)
+    except BaseException:
+        try:
+            os.unlink(name)
+        except OSError:
+            pass
+        raise
+
+
+def read_state() -> dict:
+    try:
+        data = json.loads(state_path().read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def write_state(data: dict) -> None:
+    try:
+        write_atomic(state_path(), (json.dumps(data, indent=2, sort_keys=True) + "\n").encode("utf-8"))
+    except OSError:
+        pass   # a failed note must never matter
+
+
+def read_hold() -> str:
+    try:
+        data = json.loads(hold_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return ""
+    value = data.get("release_id") if isinstance(data, dict) else None
+    return value if isinstance(value, str) and RELEASE_ID_RE.match(value) else ""
+
+
+def write_hold(release_id: str) -> None:
+    write_atomic(hold_path(), (json.dumps({"release_id": release_id}, indent=2, sort_keys=True) + "\n").encode("utf-8"))
+
+
+def clear_hold() -> None:
+    try:
+        hold_path().unlink()
+    except OSError:
+        pass
+
+
+def release_of_tree() -> str:
+    try:
+        value = json.loads((root() / "release.json").read_text(encoding="utf-8")).get("release_id")
+    except (OSError, ValueError, AttributeError):
+        return ""
+    return value if isinstance(value, str) and RELEASE_ID_RE.match(value) else ""
+
+
+def nice_date(release_id: str) -> str:
+    match = RELEASE_ID_RE.match(release_id or "")
+    if not match:
+        return "a newer release"
+    year, month, day = (int(part) for part in match.groups())
+    if not 1 <= month <= 12:
+        return "a newer release"
+    return f"{day} {MONTHS[month - 1]} {year}"
+
+
+def release_date(release_id: str) -> str:
+    match = RELEASE_ID_RE.match(release_id or "")
+    return "".join(match.groups()) if match else ""
+
+
+# ---------------------------------------------------------------- notices for the person
+# Problems go to alerts.d (shown once a day until they are fixed, then removed). One-off news goes to events.d
+# (shown once per person, ever). Setup makes both folders; without them nothing is written.
+def put_notice(kind: str, ident: str, title: str, message: str, hint: str = "") -> None:
+    folder = sl_state() / kind
+    if not folder.is_dir():
+        return
+    try:
+        write_atomic(folder / ident, f"{title}\n{message}\n{hint}\n".encode("utf-8"))
+    except OSError:
+        pass
+
+
+def drop_notices(kind: str, prefix: str, keep: str = "") -> None:
+    folder = sl_state() / kind
+    if not folder.is_dir():
+        return
+    for path in folder.glob(prefix + "*"):
+        if path.name != keep:
+            try:
+                path.unlink()
+            except OSError:
+                pass
+
+
+def note_updated(release_id: str) -> None:
+    ident = f"kit-update-done-{release_id}"
+    drop_notices("events.d", "kit-update-ready-")
+    drop_notices("events.d", "kit-update-done-", keep=ident)
+    put_notice("events.d", ident, "Secure Linux was updated",
+               f"Secure Linux was updated to {nice_date(release_id)}. See what changed.",
+               "secure-linux-whats-new --gui")
+
+
+def note_ready(release_id: str) -> None:
+    ident = f"kit-update-ready-{release_id}"
+    drop_notices("events.d", "kit-update-ready-", keep=ident)
+    put_notice("events.d", ident, "A newer Secure Linux release is ready",
+               f"A newer Secure Linux release is ready. Open '{UPDATES_APP}' to install it.",
+               f"Open '{UPDATES_APP}' to install it.")
+
+
+# ---------------------------------------------------------------- settings (contract C8)
+def build_get(key: str) -> str:
+    try:
+        text = (root() / "build.conf").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+    value = ""
+    for line in text.splitlines():
+        if line.startswith(key + "="):
+            value = line[len(key) + 1:].strip().strip("\"'")
+    return value
+
+
+def valid_mirror(value: str) -> bool:
+    if not isinstance(value, str) or not value.startswith("/") or len(value) > 4096:
+        return False
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in value):
+        return False
+    return ".." not in value.split("/")
+
+
+def read_settings_file() -> tuple[dict, bool]:
+    values: dict = {}
+    try:
+        text = conf_path().read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return values, True
+    except (OSError, UnicodeDecodeError):
+        return values, False
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip().lower().replace("-", "_")
+        if key in SETTING_KEYS:
+            values[key] = value.strip()
+    return values, True
+
+
+def settings() -> dict:
+    values, readable = read_settings_file()
+    online = values.get("online")
+    if online is None:
+        online = "no" if build_get("KIT_UPDATE_ONLINE").lower() == "no" else "yes"
+    online = online.lower()
+    if online not in CHOICES["online"] or not readable:
+        online = "no"          # never go online on a guess
+    auto = (values.get("auto_apply") or "yes").lower()
+    if auto not in CHOICES["auto_apply"]:
+        auto = "no"
+    channel = (values.get("channel") or "stable").lower()
+    if channel not in CHOICES["channel"]:
+        channel = "stable"
+    mirror = values.get("mirror")
+    if mirror is None:
+        share = build_get("HOME_SHARE_UPDATES").strip("/")
+        mirror = f"/media/homeserver/{share}" if share and valid_mirror(f"/media/homeserver/{share}") else ""
+    elif mirror and not valid_mirror(mirror):
+        mirror = ""
+    return {"online": online, "auto_apply": auto, "channel": channel, "mirror": mirror}
+
+
+def write_settings(changes: dict) -> None:
+    path = conf_path()
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
+        lines = ["# Secure Linux update settings. Change them with: secure-linux-kit-update-auto set --help"]
+    out, seen = [], set()
+    for raw in lines:
+        key = None
+        if "=" in raw and not raw.lstrip().startswith("#"):
+            key = raw.split("=", 1)[0].strip().lower().replace("-", "_")
+        if key in changes:
+            if key not in seen:
+                out.append(f"{key}={changes[key]}")
+                seen.add(key)
+            continue
+        out.append(raw)
+    for key in SETTING_KEYS:
+        if key in changes and key not in seen:
+            out.append(f"{key}={changes[key]}")
+    write_atomic(path, ("\n".join(out) + "\n").encode("utf-8"))
+
+
+# ---------------------------------------------------------------- administrator rights
+def is_root() -> bool:
+    # Tests on a computer without root accounts: honoured only while the settings file and the hold file are
+    # both redirected away from the real ones, so it can never reach the real system files.
+    if (os.environ.get("SL_TEST_PRETEND_ROOT") == "1" and os.environ.get("SL_KIT_UPDATE_CONF")
+            and os.environ.get("SL_KIT_UPDATE_HOLD")):
+        return True
+    return hasattr(os, "geteuid") and os.geteuid() == 0
+
+
+def elevate(arguments: list[str]) -> int:
+    """Run this program again behind its own password prompt (org.securelinux.kitupdateauto.*)."""
+    program = shutil.which("pkexec")
+    if not program:
+        say("This needs an administrator password, but the password window is not available. Nothing was changed.")
+        return 1
+    me = INSTALLED if INSTALLED.is_file() else Path(__file__).resolve()
+    try:
+        return subprocess.run([program, str(me), *arguments]).returncode
+    except OSError:
+        say("The password window could not be opened. Nothing was changed.")
+        return 1
+
+
+# ---------------------------------------------------------------- the kit-update tool and friends
+def call(argv: list[str], timeout: int, env: dict | None = None) -> tuple[int, str]:
+    try:
+        done = subprocess.run(argv, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                              timeout=timeout, env=env)
+        return done.returncode, done.stdout or ""
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return -1, ""
+
+
+def call_kit(command: str, *extra: str) -> tuple[int, str]:
+    return call([sys.executable, str(tool_path()), command, "--tree", root_text(), *extra], RUN_TIMEOUT)
+
+
+def signed_mode() -> bool:
+    """C1: signing is set up when the verifier accepts this computer's own key folder (exit 0)."""
+    tool = verifier_path()
+    keys = root() / "share" / "secure-linux-release-keys"
+    if not tool.is_file() or not keys.is_dir():
+        return False
+    code, _ = call([sys.executable, str(tool), "--keys", str(keys), "status"], VERIFY_TIMEOUT)
+    return code == 0
+
+
+def last_line(output: str) -> str:
+    lines = [line for line in output.splitlines() if line.startswith("KIT UPDATE:")]
+    return lines[-1] if lines else ""
+
+
+def classify(output: str, code: int = 0, ahead_on_testing: bool = False) -> tuple[str, str]:
+    """Turn the kit-update line into (result, plain message).
+
+    ahead_on_testing: this computer takes stable releases but still has a newer test release (it was switched
+    from testing back to stable). The stable release published then is older than the one here, which is not
+    a refused update: the computer is up to date until stable catches up (P17 finding F6)."""
+    line = last_line(output)
+    if code == EXIT_BUSY or "Another update is running" in line:
+        result = "busy"
+    elif "already the latest" in line:
+        result = "current"
+    elif "a newer release is published" in line:
+        result = "available"
+    elif "but the safety check after the update failed" in line:
+        result = "check-stuck"
+    elif "so the update was undone at once" in line:
+        result = "check-undone"
+    elif ": updated to " in line:
+        result = "updated"
+    elif "no internet" in line:
+        result = "offline"
+    elif "Online checks are switched off" in line:
+        result = "online-off"
+    elif "clock seems wrong" in line:
+        result = "clock-wrong"
+    elif "you went back from" in line:
+        result = "held"
+    elif ": put back " in line and "damaged or missing" in line:
+        result = "repaired"
+    elif "are damaged or missing" in line:
+        result = "damaged"
+    elif "allowed for updates that run by themselves" in line:
+        result = "too-big"
+    elif ahead_on_testing and any(older in line for older in OLDER_LINES):
+        result = "current"
+    elif "kept the local copy unchanged" in line:
+        result = "refused"
+    else:
+        result = "unchanged"
+    return result, MESSAGES[result]
+
+
+def published_id(output: str) -> str:
+    match = re.search(r"a newer release is published \((" + ID_TEXT + r");", last_line(output))
+    return match.group(1) if match else ""
+
+
+def updated_id(output: str) -> str:
+    match = re.search(r": updated to (" + ID_TEXT + r") ", last_line(output))
+    return match.group(1) if match else ""
+
+
+def testing_release_here() -> bool:
+    """The release here came with a signed channel record that says testing (kept by kit-update after it
+    checked the record; only read here, to choose the words)."""
+    path = root() / KEPT_CHANNEL
+    try:
+        if path.is_symlink() or not path.is_file() or path.stat().st_size > 65536:
+            return False
+        record = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    here = release_of_tree()
+    return (isinstance(record, dict) and record.get("channel") == "testing" and bool(here)
+            and record.get("release_id") == here)
+
+
+def held_back(remote: str, hold: str) -> bool:
+    """The held release, or anything published before it, waits; a newer release clears the hold."""
+    if not hold or not remote:
+        return False
+    if remote == hold:
+        return True
+    return release_date(remote) < release_date(hold)
+
+
+def refresh_helpers() -> bool:
+    script = refresh_script()
+    if not script.is_file():
+        return False
+    env = dict(os.environ, SL_ROOT=root().as_posix())
+    code, _ = call([bash(), script.as_posix()], REFRESH_TIMEOUT, env=env)
+    return code == 0
+
+
+def sync_master() -> str:
+    """Bring the saved master up to this computer's release. A failure is one alert, never a failed update."""
+    store = store_text()
+    if not (Path(store) / "current").exists():
+        return ""
+    code, _ = call([sys.executable, str(creator_path()), "sync-master", "--store", store, "--from-tree", root_text()],
+                   SYNC_TIMEOUT)
+    if code == 0:
+        drop_notices("alerts.d", "kit-master-sync")
+        refresh_master_status()
+        return "Your saved master was brought up to the same release."
+    put_notice("alerts.d", "kit-master-sync", "Saved master not updated yet",
+               "Your saved master could not be brought up to the new release. This computer is updated and fine.",
+               "Open the drive builder, choose 'My saved master' and then 'Update my saved master'.")
+    return "Your saved master could not be brought up to the new release yet. This computer is updated and fine."
+
+
+def refresh_master_status() -> None:
+    """The "My saved master" window reads a small status file that only an administrator step writes
+    (secure-linux-master-sync). After the saved master was brought up to the new release, that helper writes it
+    again from the saved master, so the window shows the new release. Only as root, so it never opens a
+    password window; a failure changes nothing else."""
+    helper = master_sync_helper()
+    if is_root() and helper.is_file():
+        call([bash(), helper.as_posix(), "status"], 120)     # it only reads the saved master: quick
+
+
+def too_soon(state: dict) -> bool:
+    try:
+        then = datetime.datetime.fromisoformat(state["checked_at"])
+    except (KeyError, ValueError, TypeError):
+        return False
+    return (now() - then).total_seconds() < MIN_AGE_SECONDS
+
+
+# ---------------------------------------------------------------- commands
+LAST_RESULT = ""      # the answer of the last run() in this process (retry turns it into an exit code)
+
+
+def run(apply_requested: bool, force: bool, report: bool, ignore_hold: bool = False) -> int:
+    global LAST_RESULT
+    state = read_state()
+    if not force and too_soon(state):
+        return 0
+    conf = settings()
+    output, code, extra = "", 0, ""
+    if conf["online"] == "no":
+        result, message = "online-off", MESSAGES["online-off"]     # kit-update is never asked to go online
+    else:
+        automatic = conf["auto_apply"] == "yes" and (signed_mode() or apply_flag().exists())
+        apply = apply_requested or automatic
+        hold = read_hold()
+        ahead = conf["channel"] == "stable" and testing_release_here()
+        if apply and hold and not ignore_hold:
+            code, output = call_kit("check")
+            first, _ = classify(output, code, ahead)
+            if first not in ("available", "damaged") or held_back(published_id(output), hold):
+                apply = False         # nothing to install, or only the release the person went back from
+        if apply:
+            # a run by itself (the timer) never downloads a very large update; a person's run has no limit
+            limit = () if (apply_requested or force) else ("--max-download-mb", AUTO_MAX_DOWNLOAD_MB)
+            # "Try it again" (retry): the person asked for the release they went back from, so the hold is lifted
+            code, output = call_kit("apply", *limit, *(("--ignore-hold",) if ignore_hold else ()))
+        elif not output:
+            code, output = call_kit("check")
+        result, message = classify(output, code, ahead)
+        if result == "available" and held_back(published_id(output), hold) and not ignore_hold:
+            result, message = "held", MESSAGES["held"]
+        if result == "updated":
+            clear_hold()          # a newer release was installed: nothing is held back any more
+            if not refresh_helpers():
+                message = MESSAGES["updated-partly"]
+            extra = sync_master()
+            note_updated(updated_id(output) or release_of_tree())
+        elif result == "available":
+            note_ready(published_id(output))
+    new = dict(state)
+    new["last_attempt"] = now().isoformat()
+    new.setdefault("first_attempt", new["last_attempt"])
+    keep_old = result in ("offline", "busy") or (result == "unchanged" and state.get("result") == "available")
+    if state.get("result") and keep_old:
+        new["message_last_try"] = message       # keep what we knew before; only note that we tried
+    else:
+        new.update(result=result, message=message, detail=last_line(output), checked_at=now().isoformat())
+        new.pop("message_last_try", None)
+    if result in GOOD_CHECKS:
+        new["last_good_check"] = now().isoformat()
+    if result == "refused":
+        new["refusals"] = int(state.get("refusals") or 0) + 1
+        if new["refusals"] >= REFUSALS_FOR_ALERT:
+            put_notice("alerts.d", "kit-update-refused", "A newer release was not installed",
+                       MESSAGES["refused"], "Nothing needs doing now. It is tried again tomorrow.")
+    elif result in GOOD_CHECKS + ("online-off",):
+        new["refusals"] = 0
+        drop_notices("alerts.d", "kit-update-refused")
+    if extra:
+        new["master"] = extra
+    write_state(new)
+    LAST_RESULT = result
+    if report:
+        say(message)
+        if extra:
+            say(extra)
+    return 0
+
+
+def stale(state: dict) -> bool:
+    if state.get("result") not in ("offline", "refused", "clock-wrong", "unchanged", "busy"):
+        return False
+    since = state.get("last_good_check") or state.get("first_attempt")
+    try:
+        then = datetime.datetime.fromisoformat(since)
+    except (TypeError, ValueError):
+        return False
+    return (now() - then).days >= FRESH_DAYS
+
+
+def status(text: bool, show_settings: bool) -> int:
+    state = read_state()
+    conf = settings()
+    hold = read_hold()
+    if show_settings:
+        if conf["online"] == "yes":
+            say("Secure Linux looks for its own updates online once a day.")
+        else:
+            say("Online checks for Secure Linux files are switched off on this computer.")
+        if hold:
+            say(f"Held back: the {nice_date(hold)} release, because you went back from it. "
+                "A later release is installed as usual.")
+        return 0
+    if text:
+        result = state.get("result")
+        if result in SHOWN:
+            say(state.get("message", "") or MESSAGES[result])
+        elif result == "current":
+            say("Secure Linux files: up to date.")
+        if stale(state):
+            say(STALE_TEXT)
+        # anything else (never checked, offline, unchanged): say nothing, never nag
+        return 0
+    answer = dict(state or {"result": "never-checked"})
+    answer.update(online=conf["online"], auto_apply=conf["auto_apply"], channel=conf["channel"],
+                  hold=hold or None)
+    say(json.dumps(answer, indent=2, sort_keys=True))
+    return 0
+
+
+def undo() -> int:
+    if not is_root():
+        return elevate(["undo"])
+    leaving = release_of_tree()
+    code, output = call([sys.executable, str(tool_path()), "undo", "--tree", root_text()], RUN_TIMEOUT)
+    line = last_line(output) or "KIT UPDATE: going back could not be started. Nothing was changed."
+    say(line)
+    if code != 0:
+        return code if code > 0 else 1
+    if leaving and read_hold() != leaving:
+        try:
+            write_hold(leaving)
+        except OSError:
+            say("The newer release could not be held back, so it may be installed again at the next update.")
+    if refresh_helpers():
+        drop_notices("alerts.d", "kit-helpers-refresh")
+    else:
+        put_notice("alerts.d", "kit-helpers-refresh", "Some new helpers could not be installed",
+                   "Some new helpers could not be installed. Choose 'Repair setup' to fix it.", REPAIR_HINT)
+    state = read_state()
+    state.update(result="undone", message=MESSAGES["undone"], detail=line, checked_at=now().isoformat())
+    write_state(state)
+    drop_notices("events.d", "kit-update-ready-")
+    return 0
+
+
+def retry() -> int:
+    """"Try it again": install the release the person went back from after all. Exactly a person's own update
+    (no size limit) with the hold lifted for this run, followed by the same helper refresh, saved master sync and
+    status file. Asks for the password like undo (org.securelinux.kitupdateauto.retry)."""
+    if not is_root():
+        return elevate(["retry"])
+    run(True, True, True, ignore_hold=True)
+    if LAST_RESULT in ("updated", "current", "repaired"):
+        return 0
+    return 75 if LAST_RESULT == "busy" else 1
+
+
+def set_settings(args: argparse.Namespace) -> int:
+    changes: dict = {}
+    for key, given in (("online", args.online), ("auto_apply", args.auto_apply), ("channel", args.channel)):
+        if given is None:
+            continue
+        value = given.strip().lower()
+        if value not in CHOICES[key]:
+            say(f"--{key.replace('_', '-')} must be {' or '.join(CHOICES[key])}. Nothing was changed.")
+            return 2
+        changes[key] = value
+    if args.mirror is not None:
+        if not valid_mirror(args.mirror):
+            say("--mirror must be a full folder path that starts with /, for example /media/homeserver/updates. "
+                "Nothing was changed.")
+            return 2
+        changes["mirror"] = args.mirror
+    if args.no_mirror:
+        changes["mirror"] = ""
+    if not changes:
+        say("Nothing to change. Use --online, --auto-apply, --channel, --mirror or --no-mirror.")
+        return 2
+    if not is_root():
+        again = ["set"]
+        for key in ("online", "auto_apply", "channel"):
+            if key in changes:
+                again += [f"--{key.replace('_', '-')}", changes[key]]
+        if "mirror" in changes:
+            again += ["--mirror", changes["mirror"]] if changes["mirror"] else ["--no-mirror"]
+        return elevate(again)
+    try:
+        write_settings(changes)
+    except OSError as exc:
+        say(f"The update settings could not be saved ({exc.strerror or exc}). Nothing was changed.")
+        return 1
+    shown = ", ".join(f"{key.replace('_', '-')} {changes[key] or 'none'}" for key in SETTING_KEYS if key in changes)
+    say(f"Update settings saved: {shown}.")
+    return 0
+
+
+def fresher_copy() -> Path | None:
+    """The copy in the Secure Linux folder is the one each update verified. If this program is an older copy
+    (for example /usr/local/bin before its helpers were refreshed), the folder's copy does the work."""
+    if os.environ.get("SL_KIT_AUTO_DELEGATED") == "1":
+        return None
+    tree_copy = root() / "bin" / NAME
+    try:
+        me = Path(__file__).resolve()
+        if not tree_copy.is_file() or tree_copy.resolve() == me:
+            return None
+        return tree_copy if tree_copy.read_bytes() != me.read_bytes() else None
+    except OSError:
+        return None
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog=NAME, description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = parser.add_subparsers(dest="command")
+    runner = sub.add_parser("run", help="look for a newer release now")
+    runner.add_argument("--apply", action="store_true", help="install a newer release (Install updates)")
+    runner.add_argument("--force", action="store_true", help="look even if it looked in the last 20 hours")
+    runner.add_argument("--report", action="store_true", help="print the plain answer")
+    show = sub.add_parser("status", help="show the last answer and the settings (no network)")
+    which = show.add_mutually_exclusive_group()
+    which.add_argument("--text", action="store_true", help="one plain line for the update window")
+    which.add_argument("--settings", action="store_true", help="the online setting and any held release")
+    sub.add_parser("undo", help="go back to the previous version and keep the newer one away")
+    sub.add_parser("retry", help="install the release you went back from after all (Try it again)")
+    change = sub.add_parser("set", help="change the update settings")
+    change.add_argument("--online", metavar="yes|no")
+    change.add_argument("--auto-apply", dest="auto_apply", metavar="yes|no")
+    change.add_argument("--channel", metavar="stable|testing")
+    mirror = change.add_mutually_exclusive_group()
+    mirror.add_argument("--mirror", metavar="FOLDER")
+    mirror.add_argument("--no-mirror", dest="no_mirror", action="store_true")
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    newer = fresher_copy()
+    if newer is not None:
+        env = dict(os.environ, SL_KIT_AUTO_DELEGATED="1")
+        try:
+            return subprocess.run([sys.executable, str(newer), *argv], env=env).returncode
+        except OSError:
+            pass   # fall back to this copy
+    args = build_parser().parse_args(argv)
+    if args.command == "set":
+        return set_settings(args)
+    if args.command == "undo":
+        try:
+            return undo()
+        except Exception as exc:   # asked for by a person: say what happened
+            say(f"Going back could not be finished ({type(exc).__name__}). Running it again is safe.")
+            return 1
+    if args.command == "retry":
+        try:
+            return retry()
+        except Exception as exc:   # asked for by a person: say what happened
+            say(f"The release was not installed ({type(exc).__name__}). Nothing else was changed. "
+                "Trying again is safe.")
+            return 1
+    try:
+        if args.command == "status":
+            return status(args.text, args.settings)
+        return run(getattr(args, "apply", False), getattr(args, "force", False), getattr(args, "report", False))
+    except Exception:   # a background check never fails loudly
+        return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

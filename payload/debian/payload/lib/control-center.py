@@ -112,7 +112,7 @@ class ControlCenterController:
         self.demo = demo
         self.on_message = on_message
         self.statuses: Dict[str, model.FeatureStatus] = {}
-        self.values: Dict[str, Value] = {key: Value(False) for key in model.FEATURE_ORDER[:10]}
+        self.values: Dict[str, Value] = {key: Value(False) for key in model.SWITCH_FEATURES}
         self.preset = Value("recommended")
         self.setting_preset = False
         self.busy = False
@@ -136,6 +136,7 @@ class ControlCenterController:
             "usbguard": ("off", True, True), "fail2ban": ("on", True, True), "screen_lock": ("off", True, True),
             "auditd": ("off", True, True), "secure_boot": ("on", True, False), "disk_encryption": ("on", True, False),
             "flatpak_permissions": ("available", True, False), "docker_rootless": ("off", True, False),
+            "kit_share": ("off", True, True),
         }
         self.statuses = {
             key: model.FeatureStatus(key, state=value[0], detail=model.FEATURES[key]["summary"], supported=value[1],
@@ -286,6 +287,8 @@ class ControlCenterController:
             "usb_creator": ("secure-linux-usb-creator-gui", []),
             "usb_fixer": ("secure-linux-usb-fixer-gui", []),
             "home_server": ("secure-linux-home-server-gui", []),
+            "home_backup": ("secure-linux-backup-gui", []),
+            "versions": ("secure-linux-versions", []),
             "guide": ("secure-linux-guide", []),
             "status": ("secure-linux-status-gui", []),
             "vpn_setup": ("secure-linux-welcome", ["--page", "vpn"]),

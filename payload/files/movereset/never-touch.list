@@ -1,0 +1,72 @@
+# Secure Linux (movereset): NEVER moved aside by "Reset this computer, keep my files" and NEVER packed by
+# "Move my setup". One path per line, relative to the home folder; a folder line covers everything inside it.
+# The tests check that no line of reset-settings.list or move-settings.list is, holds, or lies inside one of these.
+#
+# Your own folders of files
+Desktop
+Documents
+Downloads
+Music
+Pictures
+Videos
+Templates
+Public
+# Keys, passwords and password safes
+.ssh
+.gnupg
+.pki
+.password-store
+.local/share/keyrings
+.local/share/kwalletd
+.config/kwalletrc
+.config/Bitwarden
+.config/keepassxc
+.cache/keepassxc
+.local/share/keepassxc
+.netrc
+.git-credentials
+.config/gh
+.gitconfig
+.config/git
+.docker
+.kube
+.aws
+.azure
+# Secure Linux's own per-person records: backup settings and the backup key, app list, requests
+.config/secure-linux
+.local/state/secure-linux
+.local/share/secure-linux
+.config/borg
+.cache/borg
+# Browsers (bookmarks, saved passwords, history), messages, email
+.mozilla
+.librewolf
+.config/BraveSoftware
+.config/chromium
+.config/google-chrome
+.config/microsoft-edge
+.thunderbird
+.config/Signal
+.config/Element
+.config/evolution
+.local/share/evolution
+# App store apps and their data (each app keeps its own settings and sign-ins here)
+.var
+.local/share/flatpak
+# Sync pairings, cloud and VPN sign-ins, authenticator codes
+.config/syncthing
+.local/state/syncthing
+.config/rclone
+.config/kdeconnect
+.config/Nextcloud
+.local/share/Nextcloud
+.config/onedrive
+.config/protonvpn
+.config/Proton
+.config/Mullvad VPN
+.config/ente
+.local/share/io.ente.auth
+# Notes and documents kept by apps
+.config/obsidian
+.config/joplin-desktop
+.local/share/Trash

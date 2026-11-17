@@ -1,0 +1,470 @@
+#!/bin/bash
+# secure-linux-home-share: your own home server's shared folder, ready in ~/HomeServer when you are at home.
+# It only does something on computers installed from a drive whose private settings name a home server.
+# On every other computer it does nothing and shows nothing.
+#
+#   secure-linux-home-share login     (run at every login) asks the owner once for the home server password,
+#                                     then keeps ~/HomeServer ready. Other people and other computers: nothing.
+#   secure-linux-home-share connect   type the home server password again (for example after changing it)
+#   secure-linux-home-share status    is the home server set up, and is this computer at home right now?
+#   secure-linux-home-share forget    remove the saved password and the connection from this computer
+#   secure-linux-home-share keys      names of the private settings the drive builder may write (names only)
+#   secure-linux-home-share network   (run by the system when the network changes) connect at home only
+#   secure-linux-home-share setup     (run with administrator rights) reads the account name and password
+#                                     from standard input, never from the command line
+# The home server address, account name and password are never shown, never logged and never stored in the kit.
+set -u
+SL_ROOT=${SL_ROOT:-/usr/local/lib/secure-linux}
+. "$SL_ROOT/lib/common.sh"
+
+# Tests (and only tests) redirect the system folders with SL_TEST_SYSROOT and SL_ETC, like the other helpers.
+HS_SYS=${SL_TEST_SYSROOT:-}
+HS_ETC=$SL_ETC/home-share                      # folder 0755; the credentials file inside is 0600, root only
+HS_CRED=$HS_ETC/credentials
+HS_READY=$HS_ETC/ready                         # exists only after the owner typed the password
+HS_ETC_REAL=${SL_ETC#"$HS_SYS"}/home-share     # the path written into the unit files (no test prefix)
+HS_UNITDIR=$HS_SYS/etc/systemd/system
+HS_WHERE=/media/homeserver                     # one fixed place; ~/HomeServer is a link to it
+HS_UNIT=media-homeserver                       # systemd's name for /media/homeserver
+HS_LOCATION=$HS_SYS/run/secure-linux/location  # home|away|offline, written by the network dispatcher
+HS_CHECKDIR=$HS_SYS/run/secure-linux/home-share-check
+HS_NETFP=$HS_ETC/home-network                  # root only (0600): the home router's hardware address, seen at setup
+HS_NETSTATE=$HS_SYS/run/secure-linux/home-share-network   # one word for status: matched|different|unknown|learned
+HS_MAX_ASKS=3                                  # "Not now" is respected: after 3 the login stops asking
+HS_FP_TRIES=${SL_HOMESHARE_FP_TRIES:-10}       # seconds to wait for the home router to answer after a network change
+case $HS_FP_TRIES in ''|*[!0-9]*) HS_FP_TRIES=10 ;; esac
+[ "$HS_FP_TRIES" -ge 1 ] || HS_FP_TRIES=1
+
+say() { printf '%s\n' "$*"; }
+hs_log() {   # hs_log "message"   (system journal; never the address, account or password)
+  command -v logger >/dev/null 2>&1 && logger -t secure-linux-home-share "$1" 2>/dev/null
+  return 0
+}
+
+# ---------------------------------------------------------------- private settings (build.conf)
+# HOME_SHARE_PATH    the shared folder, //server/share or \\server\share (optionally /sub/folder). Turns the feature on.
+# HOME_SHARE_USER    the account name for the shared folder (optional: asked once when empty)
+# HOME_SHARE_DOMAIN  the workgroup or computer name of that account (optional)
+# HOME_SHARE_FOLDER  the folder name in the owner's home (optional, default HomeServer)
+# HOME_SHARE_UPDATES folder on the share that holds a copy of the published kit (optional; design only, see notes)
+
+hs_clean() { local v=$1; v=${v%$'\r'}; printf '%s' "$v"; }
+
+hs_valid_path() {   # //host/share[/sub...]  host: name or IPv4; share/sub: letters, digits, space . _ - $
+  local p=$1 rest host seg
+  local -a segs=()
+  [[ "$p" =~ ^//[^/]+/[^/].*$ ]] || return 1
+  [ ${#p} -le 512 ] || return 1
+  rest=${p#//}; host=${rest%%/*}; rest=${rest#*/}
+  [[ "$host" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]{0,252})$ ]] || return 1
+  case "$host" in *..*|*.-*|*-.*|*-|*.) return 1 ;; esac
+  rest=${rest%/}
+  IFS=/ read -r -a segs <<<"$rest"     # no word splitting or wildcards: each folder name is checked as typed
+  [ ${#segs[@]} -ge 1 ] || return 1
+  for seg in "${segs[@]}"; do
+    [[ "$seg" =~ ^[A-Za-z0-9_.\$-]([A-Za-z0-9\ _.\$-]{0,79})$ ]] || return 1
+    case "$seg" in .|..|*' ') return 1 ;; esac
+  done
+  return 0
+}
+hs_valid_account() { [[ "$1" =~ ^[A-Za-z0-9._@\ -]{1,104}$ ]] && [[ "$1" != ' '* ]] && [[ "$1" != *' ' ]]; }
+hs_valid_domain() { [[ "$1" =~ ^[A-Za-z0-9._-]{0,64}$ ]]; }
+hs_valid_folder() { [[ "$1" =~ ^[A-Za-z0-9_-]([A-Za-z0-9\ _-]{0,63})$ ]] && [[ "$1" != *' ' ]]; }
+hs_valid_subpath() {   # a folder on the share, for example Kit/Releases (same rules as the share's folder names)
+  local p=${1//\\//} seg
+  local -a segs=()
+  p=${p#/}; p=${p%/}
+  [ -n "$p" ] && [ ${#p} -le 256 ] || return 1
+  case "$p" in *//*) return 1 ;; esac
+  IFS=/ read -r -a segs <<<"$p"
+  for seg in "${segs[@]}"; do
+    [[ "$seg" =~ ^[A-Za-z0-9_.\$-]([A-Za-z0-9\ _.\$-]{0,79})$ ]] || return 1
+    case "$seg" in .|..|*' ') return 1 ;; esac
+  done
+  return 0
+}
+
+hs_settings() {   # sets HS_PATH HS_USER HS_DOMAIN HS_FOLDER HS_UPDATES. rc 1 = no home-server entry, rc 2 = entry not valid
+  HS_PATH=$(hs_clean "$(sl_build_get HOME_SHARE_PATH)")
+  HS_USER=$(hs_clean "$(sl_build_get HOME_SHARE_USER)")
+  HS_DOMAIN=$(hs_clean "$(sl_build_get HOME_SHARE_DOMAIN)")
+  HS_FOLDER=$(hs_clean "$(sl_build_get HOME_SHARE_FOLDER)")
+  HS_UPDATES=$(hs_clean "$(sl_build_get HOME_SHARE_UPDATES)")
+  [ -n "$HS_PATH" ] || return 1
+  HS_PATH=${HS_PATH//\\//}
+  hs_valid_path "$HS_PATH" || return 2
+  [ -z "$HS_USER" ] || hs_valid_account "$HS_USER" || return 2
+  hs_valid_domain "$HS_DOMAIN" || return 2
+  [ -n "$HS_FOLDER" ] || HS_FOLDER=HomeServer
+  hs_valid_folder "$HS_FOLDER" || HS_FOLDER=HomeServer
+  return 0
+}
+
+hs_me() { id -un 2>/dev/null; }
+hs_location() { local w; w=$(cat "$HS_LOCATION" 2>/dev/null); printf '%s' "${w:-offline}"; }
+hs_have_cifs() {
+  command -v mount.cifs >/dev/null 2>&1 || [ -x "$HS_SYS/usr/sbin/mount.cifs" ] || [ -x "$HS_SYS/sbin/mount.cifs" ]
+}
+
+# ---------------------------------------------------------------- the owner's side (runs as the person logging in)
+hs_user_state() { printf '%s' "${XDG_STATE_HOME:-$HOME/.local/state}/secure-linux/home-share"; }
+
+hs_link() {   # ~/HomeServer -> /media/homeserver  (never replaces anything the owner made)
+  local link="$HOME/$HS_FOLDER" target=$HS_SYS$HS_WHERE
+  if [ -L "$link" ]; then
+    [ "$(readlink "$link")" = "$target" ] && return 0
+    hs_log "A link with the home server folder name already exists and points somewhere else; it was left alone."
+    return 0
+  fi
+  if [ -e "$link" ]; then
+    hs_log "Something with the home server folder name already exists in the home folder; it was left alone."
+    return 0
+  fi
+  ln -s "$target" "$link" 2>/dev/null || hs_log "Could not make the home server link in the home folder."
+  return 0
+}
+
+hs_ui() {
+  [ -n "${SLUI_LOADED:-}" ] && return 0
+  . "$SL_ROOT/lib/sl-ui.sh"
+  UI_APP="Home server"
+  command -v ui_prefer_gui >/dev/null 2>&1 && ui_prefer_gui
+  ui_init
+}
+
+hs_ask_and_save() {   # asks the owner for the password (and the account name if the drive did not carry one)
+  local acct=$HS_USER pw rc
+  hs_ui
+  if [ -z "$acct" ]; then
+    ui_input "What is your account name on the home server? (The name you use to open it from your other computer.)" || return 1
+    acct=$UI_REPLY
+    hs_valid_account "$acct" || { ui_error "That account name has characters the home server cannot use." "Try again with: secure-linux-home-share connect"; return 1; }
+  fi
+  ui_secret "Type your home server password. It is kept safely on this computer only, so you never have to type it again." || return 1
+  pw=$UI_REPLY; UI_REPLY=""
+  [ -n "$pw" ] || { ui_error "No password was typed, so nothing was saved." "You can try again at any time with: secure-linux-home-share connect"; return 1; }
+  case "$pw" in *[$'\r\n']*) pw=""; ui_error "That password has a line break in it, so it was not saved." "Try again with: secure-linux-home-share connect"; return 1 ;; esac
+  ui_say "Next, your computer asks for your own login password. That allows the home server password to be stored safely."
+  # The account name and password travel through a pipe: never on a command line, never in a file the owner can see.
+  printf '%s\n%s\n' "$acct" "$pw" | pkexec /usr/local/bin/secure-linux-home-share setup >/dev/null 2>&1
+  rc=$?
+  pw=""
+  case $rc in
+    0) ui_info "Your home server is ready. Open the $HS_FOLDER folder in your home folder. It works whenever you are at home and the server is switched on." "Home server connected" ;;
+    3) ui_error "The home server did not accept that password, so it was not kept." "Check the password, then try again with: secure-linux-home-share connect" ;;
+    4) ui_info "Your password is saved. The home server could not be reached just now (it may be switched off). Your $HS_FOLDER folder opens by itself when the server is on." "Saved" ;;
+    5) ui_info "Your password is saved. Your $HS_FOLDER folder opens by itself when you are back on your home network." "Saved" ;;
+    *) ui_error "The home server could not be set up this time. Nothing else on this computer was changed." "Try again later with: secure-linux-home-share connect" ;;
+  esac
+  [ $rc -eq 0 ] || [ $rc -eq 4 ] || [ $rc -eq 5 ]
+}
+
+cmd_login() {
+  local rc st n
+  hs_settings; rc=$?
+  [ $rc -eq 1 ] && return 0                     # no home server on this drive: nothing happens, nothing is shown
+  [ "$(hs_me)" = "$(sl_user)" ] || return 0     # only the owner of this computer
+  [ $rc -eq 0 ] || { hs_log "The home server entry in the private settings is not valid; nothing was connected."; return 0; }
+  if [ -e "$HS_READY" ]; then hs_link; return 0; fi
+  st=$(hs_user_state); mkdir -p "$st" 2>/dev/null
+  n=$(cat "$st/asked" 2>/dev/null); case $n in ''|*[!0-9]*) n=0 ;; esac
+  [ "$n" -ge "$HS_MAX_ASKS" ] && return 0
+  printf '%s\n' $((n + 1)) > "$st/asked" 2>/dev/null
+  hs_ui
+  ui_yesno "Your home server can open by itself in a folder called $HS_FOLDER whenever you are at home. Connect it now? You only do this once." y "Connect" "Not now" || return 0
+  if hs_ask_and_save && hs_link; then
+    # P20: the one gentle home-backup offer comes now, not at the next daily check
+    command -v secure-linux-backup >/dev/null 2>&1 && secure-linux-backup offer-home >/dev/null 2>&1 || true
+  fi
+  return 0
+}
+
+cmd_connect() {
+  local rc
+  hs_settings; rc=$?
+  [ $rc -eq 1 ] && { say "This computer was not set up with a home server, so there is nothing to connect."; return 0; }
+  [ $rc -eq 0 ] || { say "The home server setting on this computer is not valid. Make the drive again with the correct home server, then reinstall."; return 1; }
+  [ "$(hs_me)" = "$(sl_user)" ] || { say "Only the owner of this computer can connect the home server."; return 1; }
+  hs_ask_and_save && hs_link
+}
+
+cmd_status() {
+  local rc
+  hs_settings; rc=$?
+  if [ $rc -eq 1 ]; then say "This computer was not set up with a home server. Nothing to do."; return 0; fi
+  [ $rc -eq 0 ] || { say "Home server: the private setting is not valid, so it is not used."; return 1; }
+  if [ -e "$HS_READY" ]; then say "Home server: set up for $(sl_user). The folder is ~/$HS_FOLDER."
+  else say "Home server: not set up yet. The owner can run: secure-linux-home-share connect"; fi
+  case "$(hs_location)" in
+    home) say "Network: you are at home, so the home server can open." ;;
+    away) say "Network: you are away from home, so the home server stays closed." ;;
+    *) say "Network: not connected, so the home server stays closed." ;;
+  esac
+  if [ "$(hs_location)" = home ]; then
+    case "$(cat "$HS_NETSTATE" 2>/dev/null)" in
+      matched|learned) say "Home network check: this is the home network the home server was set up on." ;;
+      different) say "Home network check: this network is not the one the home server was set up on (for example a new router), so the folder stays closed. If this really is your home network, run: secure-linux-home-share connect" ;;
+      unknown) [ -e "$HS_NETFP" ] && say "Home network check: your home router could not be seen just now, so the folder stays closed. It tries again when the network changes." ;;
+    esac
+  fi
+  if command -v mountpoint >/dev/null 2>&1 && mountpoint -q "$HS_SYS$HS_WHERE" 2>/dev/null; then say "Open right now: yes"
+  else say "Open right now: no (it opens by itself the moment you use the folder at home)"; fi
+  if [ -z "$HS_UPDATES" ]; then say "Copy of the kit on the home server: no folder is set."
+  elif hs_valid_subpath "$HS_UPDATES"; then say "Copy of the kit on the home server: a folder is set."
+  else say "Copy of the kit on the home server: the folder setting is not valid, so it is not used."; fi
+  return 0
+}
+
+cmd_keys() {
+  say "Private settings a drive builder may write into build.conf (names only; the values stay on the owner's drive):"
+  say "  HOME_SHARE_PATH     the shared folder, for example //server/share (turns this feature on)"
+  say "  HOME_SHARE_USER     the account name for the shared folder (optional; asked once if empty)"
+  say "  HOME_SHARE_DOMAIN   the workgroup or computer name of that account (optional)"
+  say "  HOME_SHARE_FOLDER   the folder name in the home folder (optional, default HomeServer)"
+  say "  HOME_SHARE_UPDATES  a folder on the share with a copy of the published kit (optional, for a later update source)"
+  say "The password is never a setting. The owner types it once on the computer."
+}
+
+# ---------------------------------------------------------------- the system side (administrator)
+hs_need_root() {
+  [ "$(id -u)" -eq 0 ] && return 0
+  [ "${1:-}" = forget ] && exec pkexec "$(readlink -f "$0")" forget   # one clear password box, then run again
+  say "This step needs administrator rights. Use: secure-linux-home-share connect" >&2
+  return 2
+}
+
+hs_write_private() {   # hs_write_private PATH MODE < content   (atomic; made with a closed umask)
+  local path=$1 mode=$2 dir tmp old
+  dir=$(dirname "$path"); old=$(umask); umask 077
+  tmp=$(mktemp "$dir/.home-share.XXXXXX") || { umask "$old"; return 1; }
+  if ! cat > "$tmp"; then rm -f "$tmp"; umask "$old"; return 1; fi
+  chmod "$mode" "$tmp" && mv -f "$tmp" "$path" || { rm -f "$tmp"; umask "$old"; return 1; }
+  umask "$old"
+}
+
+hs_options() {   # hs_options CREDENTIALS-FILE UID GID  -> mount options (the password is only in the credentials file)
+  printf 'credentials=%s,uid=%s,gid=%s,forceuid,forcegid,file_mode=0600,dir_mode=0700,vers=3.0,seal,soft,echo_interval=10,nosuid,nodev' \
+    "$1" "$2" "$3"
+}
+
+hs_write_units() {   # hs_write_units UID GID
+  local opts; opts=$(hs_options "$HS_ETC_REAL/credentials" "$1" "$2")
+  mkdir -p "$HS_UNITDIR" || return 1
+  hs_write_private "$HS_UNITDIR/$HS_UNIT.mount" 0644 <<EOF || return 1
+# Written by secure-linux-home-share on the owner's computer only. Not part of the published kit.
+[Unit]
+Description=Home server shared folder
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=$HS_ETC_REAL/ready
+
+[Mount]
+What=$HS_PATH
+Where=$HS_WHERE
+Type=cifs
+Options=$opts
+TimeoutSec=20
+LazyUnmount=yes
+ForceUnmount=yes
+EOF
+  hs_write_private "$HS_UNITDIR/$HS_UNIT.automount" 0644 <<EOF || return 1
+# Written by secure-linux-home-share. Started only while this computer is on the home network.
+[Unit]
+Description=Open the home server shared folder when it is used
+ConditionPathExists=$HS_ETC_REAL/ready
+
+[Automount]
+Where=$HS_WHERE
+TimeoutIdleSec=10min
+EOF
+}
+
+hs_close() {   # stop the folder (fast, even when the server is switched off)
+  systemctl stop "$HS_UNIT.automount" >/dev/null 2>&1
+  if command -v mountpoint >/dev/null 2>&1 && mountpoint -q "$HS_SYS$HS_WHERE" 2>/dev/null; then
+    umount -l "$HS_SYS$HS_WHERE" >/dev/null 2>&1
+  fi
+  systemctl --no-block stop "$HS_UNIT.mount" >/dev/null 2>&1
+  return 0
+}
+
+hs_verify() {   # hs_verify UID GID -> rc 0 = the server accepted the login, 3 = wrong login, 4 = not reachable now
+  local err rc
+  mkdir -p "$HS_CHECKDIR" || return 4
+  err=$(mount -t cifs "$HS_PATH" "$HS_CHECKDIR" -o "$(hs_options "$HS_CRED" "$1" "$2")" 2>&1 >/dev/null)
+  rc=$?
+  if [ $rc -eq 0 ]; then umount "$HS_CHECKDIR" >/dev/null 2>&1; rmdir "$HS_CHECKDIR" 2>/dev/null; return 0; fi
+  rmdir "$HS_CHECKDIR" 2>/dev/null
+  case "$err" in *'error(13)'*|*'Permission denied'*|*'error(1)'*|*'Operation not permitted'*) return 3 ;; esac
+  return 4
+}
+
+# ---------------------------------------------------------------- is this really the owner's home network?
+# The network dispatcher says "home" when the Wi-Fi or wired connection has the home name. A look-alike Wi-Fi that
+# copies the name (and knows the Wi-Fi password) would pass that test. So at setup the hardware address of the home
+# router is kept (root only), and the folder opens only when the router answering now is that same router.
+hs_default_routes() {   # prints "router-address connection" for every default route (checked plain values only)
+  local via dev
+  ip -4 route show default 2>/dev/null |
+    awk '{ via=""; dev=""; for (i = 1; i < NF; i++) { if ($i == "via") via = $(i+1); if ($i == "dev") dev = $(i+1) } if (via != "" && dev != "") print via, dev }' |
+    while read -r via dev; do
+      [[ "$via" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] && [[ "$dev" =~ ^[A-Za-z0-9._@-]{1,32}$ ]] && printf '%s %s\n' "$via" "$dev"
+    done
+  return 0
+}
+hs_nudge_routers() {   # just after connecting the router may not have answered yet: ask each one once (local network only)
+  command -v ip >/dev/null 2>&1 && command -v ping >/dev/null 2>&1 || return 0
+  local via dev
+  hs_default_routes | while read -r via dev; do ping -c 1 -W 1 -I "$dev" "$via" >/dev/null 2>&1; done
+  return 0
+}
+hs_gateway_macs() {   # prints the hardware address of every default router that is known right now (lower case)
+  command -v ip >/dev/null 2>&1 || return 0
+  local via dev mac
+  hs_default_routes |
+    while read -r via dev; do
+      mac=$(ip -4 neigh show to "$via" dev "$dev" 2>/dev/null |
+        awk '{ for (i = 1; i < NF; i++) if ($i == "lladdr") { print tolower($(i+1)); exit } }')
+      [[ "$mac" =~ ^[0-9a-f]{2}(:[0-9a-f]{2}){5}$ ]] && [ "$mac" != 00:00:00:00:00:00 ] && printf '%s\n' "$mac"
+    done | sort -u
+}
+hs_netstate() {   # hs_netstate WORD   (a plain word for status; never an address)
+  mkdir -p "${HS_NETSTATE%/*}" 2>/dev/null && printf '%s\n' "$1" > "$HS_NETSTATE" 2>/dev/null && chmod 0644 "$HS_NETSTATE" 2>/dev/null
+  return 0
+}
+hs_record_home() {   # keep the home router's address (rc 1 = no router could be seen: nothing kept)
+  local macs
+  macs=$(hs_gateway_macs)
+  [ -n "$macs" ] || return 1
+  printf '%s\n' "$macs" | sed 's/^/gateway=/' | hs_write_private "$HS_NETFP" 0600
+}
+hs_home_check() {   # at home: rc 0 = the same home network as at setup (or the first time: learned now), 1 = not sure or not
+  local want now m tries=0
+  if [ ! -s "$HS_NETFP" ]; then
+    if hs_record_home; then hs_netstate learned; else hs_netstate unknown; fi
+    return 0                         # nothing kept yet: the network name alone decides, as before
+  fi
+  want=$(sed -n 's/^gateway=//p' "$HS_NETFP")
+  while :; do
+    now=$(hs_gateway_macs)
+    if [ -n "$now" ]; then
+      while IFS= read -r m; do
+        [ -n "$m" ] && printf '%s\n' "$want" | grep -qxF -- "$m" && { hs_netstate matched; return 0; }
+      done <<<"$now"
+      hs_netstate different
+      return 1
+    fi
+    [ "$tries" -eq 0 ] && hs_nudge_routers
+    tries=$((tries + 1))
+    [ "$tries" -ge "$HS_FP_TRIES" ] && break
+    sleep 1
+  done
+  hs_netstate unknown
+  return 1
+}
+
+cmd_setup() {   # stdin: line 1 account name (may be empty = the drive's HOME_SHARE_USER), line 2 password
+  local rc owner uid gid acct pw v
+  hs_need_root setup || return $?
+  hs_settings; rc=$?
+  [ $rc -eq 1 ] && { say "This computer was not set up with a home server. Nothing was changed."; return 1; }
+  [ $rc -eq 0 ] || { say "The home server setting on this computer is not valid. Nothing was changed."; return 1; }
+  owner=$(sl_user)
+  uid=$(id -u "$owner" 2>/dev/null) && gid=$(id -g "$owner" 2>/dev/null) || { say "Could not find the owner's account. Nothing was changed."; return 1; }
+  IFS= read -r acct || acct=""; IFS= read -r pw || pw=""
+  acct=$(hs_clean "$acct"); pw=$(hs_clean "$pw")
+  [ -n "$acct" ] || acct=$HS_USER
+  hs_valid_account "$acct" || { pw=""; say "The account name is missing or has characters the home server cannot use. Nothing was changed."; return 1; }
+  [ -n "$pw" ] && [ ${#pw} -le 1024 ] || { pw=""; say "The password was empty or too long. Nothing was changed."; return 1; }
+  case "$pw" in *[$'\r\n\t']*) pw=""; say "The password has a control character in it. Nothing was changed."; return 1 ;; esac
+  if ! hs_have_cifs; then
+    if sl_is_atomic; then
+      pw=""
+      say "This computer needs the free Fedora package cifs-utils first. Ask for help to add it, then run: secure-linux-home-share connect"
+      return 1
+    fi
+    sl_dnf_install cifs-utils >/dev/null 2>&1
+    hs_have_cifs || { pw=""; say "The free program that opens shared folders (cifs-utils) could not be installed. Connect to the internet and try again."; return 1; }
+  fi
+  mkdir -p "$HS_ETC" && chmod 0755 "$HS_ETC" || { pw=""; say "Could not prepare the settings folder. Nothing was changed."; return 1; }
+  {
+    printf 'username=%s\npassword=%s\n' "$acct" "$pw"
+    [ -n "$HS_DOMAIN" ] && printf 'domain=%s\n' "$HS_DOMAIN"
+  } | hs_write_private "$HS_CRED" 0600 || { pw=""; say "Could not save the password safely. Nothing was changed."; return 1; }
+  pw=""
+  hs_write_units "$uid" "$gid" || { rm -f "$HS_CRED"; say "Could not write the connection settings. Nothing was kept."; return 1; }
+  mkdir -p "$HS_SYS$HS_WHERE" && chmod 0755 "$HS_SYS$HS_WHERE"
+  v=5
+  if [ "$(hs_location)" = home ]; then
+    hs_close
+    hs_verify "$uid" "$gid"; v=$?
+    if [ $v -eq 3 ]; then
+      rm -f "$HS_CRED" "$HS_READY"
+      hs_log "The home server did not accept the login; the password was not kept."
+      return 3
+    fi
+    # The owner is at home and typed the password just now: this is the home network to remember.
+    hs_record_home || rm -f "$HS_NETFP"
+  fi
+  : > "$HS_READY" && chmod 0644 "$HS_READY"
+  systemctl daemon-reload >/dev/null 2>&1
+  systemctl enable --now secure-linux-home-share.path >/dev/null 2>&1
+  systemctl enable secure-linux-home-share.service >/dev/null 2>&1
+  cmd_network
+  hs_log "Home server shared folder set up for the owner."
+  return $v
+}
+
+cmd_from_install() {   # root, once: the home-server password unlocked from the drive at install time (P19)
+  local f=$HS_ETC/password-from-install pw rc
+  hs_need_root from-install || return $?
+  [ -s "$f" ] || return 0
+  IFS= read -r pw < "$f"; rm -f "$f"
+  printf '\n%s\n' "$pw" | cmd_setup; rc=$?
+  pw=""
+  return $rc
+}
+
+cmd_network() {   # at home: the folder opens on first use. Anywhere else: it is closed and never tried.
+  local rc
+  hs_need_root network || return $?
+  hs_settings; rc=$?
+  if [ $rc -ne 0 ] || [ ! -e "$HS_READY" ]; then
+    [ -e "$HS_UNITDIR/$HS_UNIT.automount" ] && hs_close
+    return 0
+  fi
+  if [ "$(hs_location)" = home ]; then
+    if hs_home_check; then
+      systemctl start "$HS_UNIT.automount" >/dev/null 2>&1 || hs_log "The home server folder could not be prepared just now."
+    else
+      hs_close
+      hs_log "This network has the home name but is not the home network the home server was set up on; the folder stays closed."
+    fi
+  else
+    hs_close
+  fi
+  return 0
+}
+
+cmd_forget() {
+  hs_need_root forget || return $?
+  hs_close
+  systemctl disable --now secure-linux-home-share.path secure-linux-home-share.service >/dev/null 2>&1
+  rm -f "$HS_CRED" "$HS_READY" "$HS_NETFP" "$HS_NETSTATE" "$HS_UNITDIR/$HS_UNIT.mount" "$HS_UNITDIR/$HS_UNIT.automount"
+  systemctl daemon-reload >/dev/null 2>&1
+  hs_log "Home server shared folder removed from this computer."
+  say "The home server password and connection were removed from this computer. Your files on the server were not touched."
+}
+
+case "${1:-}" in
+  login) cmd_login ;;
+  connect) cmd_connect ;;
+  status) cmd_status ;;
+  keys) cmd_keys ;;
+  setup) cmd_setup ;;
+  network) cmd_network ;;
+  forget) cmd_forget ;;
+  from-install) cmd_from_install ;;
+  -h|--help|help|"") sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//' ;;
+  *) say "Unknown command. Use: secure-linux-home-share help" >&2; exit 2 ;;
+esac

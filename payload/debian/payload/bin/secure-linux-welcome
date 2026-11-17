@@ -7,6 +7,7 @@
 #   secure-linux-welcome --page NAME      one page on its own: wifi updates browser backup recovery health vpn snapshots
 #   secure-linux-welcome --list           the pages and whether they are done
 #   secure-linux-welcome --status         one line: what is done
+#   secure-linux-welcome --files-check    tell the person (once) when the installer found damaged Secure Linux files
 # What it decides for you (no question): firmware, microcode, updates, firewall, encrypted DNS, the default browser, the weekly
 # hardware check, the weekly virus scan (computers with 1.5 GB of memory or more), system snapshots before updates.
 # What it may ask (only when detection says it matters, most important first, never more than 3 per run, the rest at the next login):
@@ -337,6 +338,30 @@ run_page() {
   return 0
 }
 
+# P30 snippet F: the installer checked the Secure Linux files against their published list (debian/installer/late.sh
+# keeps its answer: ok N | damaged BAD N FIRST | no-list | no-tool | bad-list). When some did not match, the person is
+# told once, in plain words, with the way out. Nothing is changed and nothing is asked.
+FILES_CHECK=${SL_FILES_CHECK_FILE:-/var/lib/secure-linux/debian-files-check}
+files_check_answer() { head -c 2048 "$FILES_CHECK" 2>/dev/null | head -n 1; }
+notice_pending() {   # 0 while the installer's "damaged" answer has not been told yet
+  wz_is_done files-check && return 1
+  case "$(files_check_answer)" in damaged\ *) return 0 ;; esac
+  return 1
+}
+files_check_notice() {
+  local word bad total first
+  notice_pending || return 0
+  [ "$(ui_tool)" = none ] && return 0          # no screen now: told at the next login
+  read -r word bad total first <<<"$(files_check_answer)"
+  [ "$word" = damaged ] || return 0
+  case "$bad" in ''|*[!0-9]*) return 0 ;; esac
+  case "$total" in ''|*[!0-9]*) return 0 ;; esac
+  first=$(printf '%s' "$first" | tr -cd 'A-Za-z0-9._/+-' | cut -c1-120)
+  CUR=files-check
+  wz_info "While Secure Linux was being installed, $bad of its $total files did not match their published list${first:+ (the first one: $first)}. This can happen when a download was cut short or the install drive is wearing out. Your own files are not affected. If something does not work, install Secure Linux again from a fresh download or a newly made drive."
+  wz_done files-check
+}
+
 page_ids() { local f; for f in "$SL_ROOT"/wizard.d/*.sh; do [ -f "$f" ] && echo "$f"; done; }
 run_plugin() {   # a page from another area; one that fails never stops the wizard
   local f=$1 key; key=$(basename "$f" .sh)
@@ -347,6 +372,7 @@ run_plugin() {   # a page from another area; one that fails never stops the wiza
 
 wizard() {   # exactly five screens; old q_* and plug-ins remain post-install tools
   local again=${1:-} q
+  files_check_notice                         # P30 snippet F: before anything else, and also when nothing is open
   [ "$again" = again ] || anything_open || return 0
   [ "$(ui_tool)" = none ] && { echo "No screen or terminal to ask on; the welcome wizard will run at your next login."; return 0; }
   . "$SL_ROOT/wizard.d/00-core.sh"
@@ -371,11 +397,12 @@ case "${1:-}" in
   --list) for p in $PAGES; do printf '%-10s %-34s %s\n' "$p" "$(page_title_of "$p")" "$(wz_is_done "q-$p" && echo done || echo 'not asked / nothing to ask')"; done ;;
   --status) echo "$(grep -c '^q-' "$DONE") question(s) answered; summary $(wz_is_done summary && echo shown || echo 'not shown yet')" ;;
   --again) : > "$DONE"; wizard again ;;
+  --files-check) files_check_notice ;;
   --page) [ -n "${2:-}" ] || { echo "Which page? $PAGES"; exit 2; }
           case " $PAGES " in *" $2 "*) run_page "$2" ;; *) echo "Unknown page: $2 (pages: $PAGES)"; exit 1 ;; esac ;;
   --autostart)
     # at login: only if something is still open; give the desktop a moment to settle first
-    anything_open || exit 0
+    anything_open || notice_pending || exit 0
     [ -n "${SL_WIZARD_ANSWERS:-}" ] || sleep "${SL_WELCOME_DELAY:-20}"
     wizard ;;
   "") wizard ;;

@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Reset This Computer (Keep My Files)
+GenericName=Fresh start without losing your files
+Comment=Remove the apps added since the first day, repair Secure Linux and start with fresh desktop settings. Your files are kept.
+Exec=/usr/local/bin/secure-linux-reset
+Icon=edit-undo
+Terminal=true
+Categories=System;Settings;
+Keywords=reset;fresh start;factory;clean;repair;restore;keep files;

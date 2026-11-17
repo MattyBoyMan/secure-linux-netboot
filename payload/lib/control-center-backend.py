@@ -28,7 +28,9 @@ SYSROOT = Path(os.environ.get("SL_CC_SYSROOT", "/"))
 BIN = Path(os.environ.get("SL_CC_BIN", "/usr/local/bin"))
 SELF = Path(__file__).resolve()
 ON_STATES = {"on", "encrypted", "family", "private", "home", "warp", "active", "enabled"}
-FEATURES = {"firewall", "opensnitch", "dns", "vpn", "updates", "clamav", "usbguard", "fail2ban", "screen_lock", "auditd"}
+FEATURES = {"firewall", "opensnitch", "dns", "vpn", "updates", "clamav", "usbguard", "fail2ban", "screen_lock", "auditd",
+            "kit_share"}
+KIT_SHARE_ON = "/etc/secure-linux/kit-share-on"   # written only by `secure-linux-kit-share start` (the person's choice)
 
 
 def rooted(name: str) -> Path:
@@ -347,6 +349,23 @@ def docker_status() -> Dict[str, object]:
     return item
 
 
+def kit_share_status() -> Dict[str, object]:
+    """Share updates with the other Secure Linux computers at home (secure-linux-kit-share, P29). On means the
+    person turned it on; the tool's own status lines say whether it can share right now."""
+    item = status_template("kit_share")
+    tool = helper("secure-linux-kit-share")
+    if not tool.is_file():
+        item.update(state="not-installed", detail="Sharing updates with other computers at home is not available on this computer.")
+        return item
+    on = rooted(KIT_SHARE_ON).is_file()
+    said = run([tool, "status"])
+    detail = short_output(said, "") if said.returncode == 0 else ""
+    item.update(state="on" if on else "off", supported=True, manageable=True, can_disable=True,
+                detail=detail or ("Sharing updates with other computers at home is on." if on else
+                                  "Sharing updates with other computers at home is off."))
+    return item
+
+
 STATUS_FUNCTIONS = {
     "firewall": firewall_status,
     "opensnitch": opensnitch_status,
@@ -360,6 +379,7 @@ STATUS_FUNCTIONS = {
     "screen_lock": screen_lock_status,
     "auditd": lambda: service_status("auditd", ("auditd.service",), "The audit service is running with its existing rules.",
                                              "Auditd is installed but stopped.", "Auditd is not installed on this setup.", can_disable=False),
+    "kit_share": kit_share_status,
 }
 
 # Buttons in the GUI use these informational readers too.
@@ -407,6 +427,11 @@ def execute(feature: str, desired: bool) -> subprocess.CompletedProcess:
         return run(["systemctl", "enable", "--now", "auditd.service"])
     if feature == "screen_lock":
         return set_screen_lock(desired)
+    if feature == "kit_share":
+        tool = helper("secure-linux-kit-share")
+        if not tool.is_file():
+            return subprocess.CompletedProcess([], 1, "Sharing updates is not available on this computer. Nothing was changed.")
+        return run([tool, "start" if desired else "stop"])
     return subprocess.CompletedProcess([], 2, "Operation is not allowed")
 
 
@@ -445,8 +470,9 @@ def set_screen_lock(desired: bool) -> subprocess.CompletedProcess:
 
 def needs_elevation(feature: str) -> bool:
     # DNS and VPN helpers own their own pkexec boundaries and must remain in the
-    # user's session. Screen lock is always per user.
-    return feature not in {"dns", "vpn", "screen_lock"}
+    # user's session. Screen lock is always per user. secure-linux-kit-share asks for the password itself
+    # (polkit actions org.securelinux.kitshare.start / .stop name exactly that tool and that word).
+    return feature not in {"dns", "vpn", "screen_lock", "kit_share"}
 
 
 def run_privileged(args: Sequence[object]) -> subprocess.CompletedProcess:

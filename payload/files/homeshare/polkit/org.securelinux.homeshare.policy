@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<!-- Secure Linux home server folder: clear password prompts for secure-linux-home-share.
+     Installed to /usr/share/polkit-1/actions/ (see the integration notes for the 00-early.sh line).
+     tests/integration/run.sh reads every files/*/polkit/*.policy, so these actions are checked there too. -->
+<policyconfig>
+  <vendor>The Complete Secure Linux Package</vendor>
+  <action id="org.securelinux.homeshare-setup">
+    <description>Save the home server password on this computer</description>
+    <message>Secure Linux needs your password to keep your home server password safely on this computer, so it opens by itself at home</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/bin/secure-linux-home-share</annotate>
+    <annotate key="org.freedesktop.policykit.exec.argv1">setup</annotate>
+  </action>
+  <action id="org.securelinux.homeshare-forget">
+    <description>Remove the home server password from this computer</description>
+    <message>Secure Linux needs your password to remove the saved home server password and connection from this computer</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/bin/secure-linux-home-share</annotate>
+    <annotate key="org.freedesktop.policykit.exec.argv1">forget</annotate>
+  </action>
+</policyconfig>

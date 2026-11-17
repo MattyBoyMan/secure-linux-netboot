@@ -237,6 +237,11 @@ Where would you like to back up?" usb "A USB drive (simplest)" later "Not now")
 4. Open \"Schedule\" and switch on daily backups. Pika backs up whenever the drive is plugged in."
          want backup_target usb; bg flatpak run org.gnome.World.PikaBackup ;;
     server)
+         if [ -e "$SL_ETC/home-share/ready" ] && [ "$(id -un)" = "$(sl_user)" ] && have secure-linux-backup-gui; then
+           # The owner's home server is connected (Wave 0 H): the Backups window turns on encrypted, compressed and
+           # checked backups there with a few clicks (it asks first, and adds BorgBackup when it is missing).
+           want backup_target server; bg secure-linux-backup-gui; return 0
+         fi
          target="ssh://$USER@$host/~/backups/$(hostname 2>/dev/null || echo laptop)"
          echo "$target" > "$USTATE/backup-server-url"; to_clipboard "$target"
          ui_info backup_server "Pika Backup opens next.

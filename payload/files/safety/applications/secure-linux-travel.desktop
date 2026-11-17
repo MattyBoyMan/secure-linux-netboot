@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Travel Mode
+GenericName=Safer settings away from home
+Comment=Taking this computer out of the house? Close the home server folder and switch off Bluetooth and remote login
+Exec=/usr/local/bin/secure-linux-travel
+Icon=preferences-system-network
+Terminal=false
+Categories=Utility;Security;
+Keywords=travel;holiday;airport;cafe;away;bluetooth;privacy;

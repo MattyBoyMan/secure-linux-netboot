@@ -1,0 +1,412 @@
+#!/bin/bash
+# secure-linux-ai-web: a private AI chat page in your web browser (Open WebUI), using the AI models on this computer.
+#   secure-linux-ai-web                     switch the chat page on (if needed) and open it in your web browser
+#   secure-linux-ai-web start | stop        switch the chat page on or off (your chats are kept)
+#   secure-linux-ai-web status              is it on, which address to open, and who can reach it
+#   secure-linux-ai-web share               let your other devices at home use it (after you made your account)
+#   secure-linux-ai-web private             this computer only again (this is how it starts)
+#   secure-linux-ai-web documents           get the small helper model that lets the AI answer from your own files
+#   secure-linux-ai-web autostart on|off    switch the chat page on by itself when you sign in
+#   secure-linux-ai-web remove [--delete-data]   take it away; your chats are kept unless you type DELETE
+# The first account made on the page is its owner. Until that account exists the page can be opened on this
+# computer only. Sign-in is always on and nobody else can make an account. The page is shared with your home
+# network only after this tool has checked both, on a network you marked as home (never the internet).
+# Nothing is sent out: no cloud AI, no web search, no usage counting. Open WebUI runs in Podman (or Docker) from
+# the exact version this kit checked (version and digest). Your own password is never asked for or kept here.
+set -u
+export LC_ALL=C
+
+P=${SL_TEST_PREFIX:-}                       # tests only: lets the firewall part run without administrator rights
+SL_ROOT=${SL_ROOT:-/usr/local/lib/secure-linux}
+NAME=secure-linux-ai-web
+OWUI_VERSION=0.13.3
+OWUI_REPO=ghcr.io/open-webui/open-webui
+OWUI_INDEX=sha256:46b59158e6558eeb980bc828e0f1b30238ad24d82ed84d5e5eda1dab2a082f14
+IMAGE=$OWUI_REPO:v$OWUI_VERSION@$OWUI_INDEX
+# Every content id that proves the local image is the checked one (read live from ghcr.io on 2026-11-17):
+# the multi-machine index, the amd64 and arm64 manifests, and the amd64 and arm64 image configs (the image id
+# Podman and classic Docker show). Docker with the containerd store shows the index digest.
+GOOD_IDS="46b59158e6558eeb980bc828e0f1b30238ad24d82ed84d5e5eda1dab2a082f14
+e731360d9e6eeb25482d90cf3d564ce81a1c4a10e6a84ed9e6c63aa7ac48b0b6
+c2c9eb42cc8c52e1365fb791069ba38fc87d32e4d778acdc4fc5443e4c1b620d
+62514316c1be1eb34ea50f438a9dbf25277108f199d126530a8ccabf8feeacc0
+9357f683dae9fb5a85182b26c1ff0dc4a1e085eb131679a9a6e12fd859648c29"
+OLLAMA_URL=http://127.0.0.1:11434
+EMBED_MODEL=nomic-embed-text:v1.5           # the helper model for "ask your own documents" (Apache-2.0, about 0.3 GB)
+EMBED_DIGEST=0a109f422b47e3a30ba2b10eca18548e944e8a23073ee3f3e947efcf3c45e59f   # sha256 of its registry manifest
+PORT=${SL_AIWEB_PORT:-3080}
+WAIT=${SL_AIWEB_WAIT:-300}                  # seconds to wait for the page (the first start sets up its database)
+MIN_GB=${SL_AIWEB_MIN_GB:-6}
+LOCAL=127.0.0.1
+SELF=/usr/local/bin/secure-linux-ai-web; [ -x "$SELF" ] || SELF=$(readlink -f "$0")   # polkit names /usr/local/bin
+DATA=${XDG_DATA_HOME:-${HOME:-/nonexistent}/.local/share}/secure-linux/ai-web
+STATE_DIR=${XDG_STATE_HOME:-${HOME:-/nonexistent}/.local/state}/secure-linux
+STATEF=$STATE_DIR/ai-web.state
+LOG=$STATE_DIR/ai-web.log
+UNITF=${XDG_CONFIG_HOME:-${HOME:-/nonexistent}/.config}/systemd/user/secure-linux-ai-web.service
+PY=python3; command -v python3 >/dev/null 2>&1 || PY=python
+
+say() { printf '%s\n' "$*"; }
+stop() { say "$*"; say "Nothing was changed."; exit 1; }     # before any change
+fail() { say "$*"; exit 1; }                                 # after a change: the message says what is left
+log() {
+  mkdir -p "$STATE_DIR" 2>/dev/null || return 0
+  ( umask 077; printf '%s %s\n' "$(date '+%F %T')" "$*" >> "$LOG" ) 2>/dev/null
+  return 0
+}
+logged() { # run a command; its output goes to the private log only
+  log "run: $*"
+  mkdir -p "$STATE_DIR" 2>/dev/null
+  ( umask 077; "$@" >> "$LOG" 2>&1 )
+}
+
+case "${1:-}" in -h|--help|help) sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;; esac
+case $PORT in ''|*[!0-9]*) stop "The chat page port '$PORT' is not a number." ;; esac
+[ "$PORT" -ge 1024 ] && [ "$PORT" -le 65535 ] || stop "The chat page port must be between 1024 and 65535."
+
+# ---------------------------------------------------------------- this computer
+private_ip() {
+  local a=${1:-} part oldifs
+  case $a in ''|*[!0-9.]*) return 1 ;; esac
+  oldifs=$IFS; IFS=.; set -- $a; IFS=$oldifs
+  [ $# -eq 4 ] || return 1
+  for part in "$@"; do case $part in ''|*[!0-9]*) return 1 ;; esac; [ "$part" -le 255 ] || return 1; done
+  case "$1.$2" in 192.168|172.1[6-9]|172.2[0-9]|172.3[01]) return 0 ;; esac
+  [ "$1" = 10 ]
+}
+home_address() {
+  local a
+  if [ -n "${SL_AIWEB_BIND+x}" ]; then a=$SL_AIWEB_BIND   # set (even empty): the only source
+  else a=$(ip -4 route get 1.1.1.1 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p' | head -n 1); fi
+  private_ip "$a" || return 1
+  printf '%s' "$a"
+}
+at_home() { # the network this computer is on now is one you marked as home (secure-linux-zone); anything else: no
+  local z=""
+  command -v secure-linux-zone >/dev/null 2>&1 && z=$(secure-linux-zone status --short 2>/dev/null | tail -n 1)
+  [ "$z" = home ]
+}
+NOT_HOME="This network is not marked as your home network."
+free_kb() { df -Pk "$1" 2>/dev/null | awk 'NR==2 {print $4}'; }
+state_get() { [ -r "$STATEF" ] && sed -n "s/^$1=//p" "$STATEF" | head -n 1; }
+state_set() {
+  local k=$1 v=$2 old=""
+  mkdir -p "$STATE_DIR" || fail "Could not save the chat page settings."
+  [ -r "$STATEF" ] && old=$(grep -v "^$k=" "$STATEF")
+  ( umask 077; { [ -n "$old" ] && printf '%s\n' "$old"; printf '%s=%s\n' "$k" "$v"; } > "$STATEF.new" ) &&
+    mv -f "$STATEF.new" "$STATEF" || fail "Could not save the chat page settings."
+}
+not_admin() {
+  [ "$(id -u)" != 0 ] || stop "Run this from your own account, not the administrator account. The chat page belongs to you."
+}
+
+# ---------------------------------------------------------------- the container
+pick_engine() {
+  if [ -n "${SL_AIWEB_ENGINE:-}" ]; then ENGINE=$SL_AIWEB_ENGINE
+  elif command -v podman >/dev/null 2>&1; then ENGINE=podman
+  elif command -v docker >/dev/null 2>&1; then ENGINE=docker
+  else stop "No container tool (Podman or Docker) was found. Turn on Docker in Home & Server Helper first, then try again."; fi
+  case $ENGINE in docker|podman) : ;; *) stop "Unknown container tool '$ENGINE'." ;; esac
+}
+e() { "$ENGINE" "$@"; }
+norm_id() { local i=${1#sha256:}; i=$(printf '%s' "$i" | tr 'A-F' 'a-f'); case $i in *[!0-9a-f]*|'') return 1 ;; esac; printf '%s' "$i"; }
+checked_image() { # prints the id of a local image that is exactly the checked one; fails if there is none
+  local ref id
+  for ref in "$IMAGE" "$OWUI_REPO@$OWUI_INDEX" "$OWUI_REPO:v$OWUI_VERSION"; do
+    id=$(e image inspect --format '{{.Id}}' "$ref" 2>/dev/null | head -n 1) || continue
+    id=$(norm_id "$id") || continue
+    printf '%s\n' "$GOOD_IDS" | grep -qx "$id" && { printf '%s' "$id"; return 0; }
+    log "image $ref has id $id, which is not a checked id"
+  done
+  return 1
+}
+drop_unchecked() { e rmi "$OWUI_REPO:v$OWUI_VERSION" >/dev/null 2>&1; return 0; }
+offline_file() { # the copy carried on the drive, if there is one
+  local d f
+  for d in ${SL_AIWEB_OFFLINE_DIR:+"$SL_AIWEB_OFFLINE_DIR"} "$SL_ROOT/offline/ai-web" /usr/local/lib/secure-linux/offline/ai-web; do
+    for f in "$d/open-webui-v$OWUI_VERSION.tar" "$d/open-webui-v$OWUI_VERSION.tar.gz"; do
+      [ -f "$f" ] && { printf '%s' "$f"; return 0; }
+    done
+  done
+  return 1
+}
+get_image() { # IMG= the checked image id; loads the drive copy first, then downloads
+  local f free
+  IMG=$(checked_image) && return 0
+  if f=$(offline_file); then
+    say "Loading the chat page from this drive (no internet needed)..."
+    logged e load -i "$f"
+    IMG=$(checked_image) && return 0
+    drop_unchecked
+    say "The copy on this drive is not the one this kit checked, so it was not used."
+  fi
+  mkdir -p "$DATA" 2>/dev/null
+  free=$(free_kb "$DATA")
+  case $free in ''|*[!0-9]*) : ;; *) [ "$free" -ge $((MIN_GB * 1024 * 1024)) ] ||
+    stop "The chat page needs at least $MIN_GB GB of free space on this computer; there is less. Free some space first." ;; esac
+  say "Downloading the chat page (Open WebUI $OWUI_VERSION, about 1.6 GB, only once). This can take a while..."
+  # name:tag@digest first; an engine that does not take both is given the digest alone (the same checked image)
+  logged e pull "$IMAGE" || logged e pull "$OWUI_REPO@$OWUI_INDEX" ||
+    stop "Could not download the chat page. Check the internet connection, then try again."
+  IMG=$(checked_image) && return 0
+  drop_unchecked
+  stop "The downloaded chat page is not the exact version this kit checked, so it was removed and not started."
+}
+running() { e ps --filter "name=^$NAME\$" --format '{{.Names}}' 2>/dev/null | grep -qx "$NAME"; }
+current_bind() { e inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$NAME" 2>/dev/null | sed -n 's/^HOST=//p' | head -n 1; }
+run_page() { # run_page ADDRESS: (re)create the page, listening on ADDRESS only. Sign-in on, new accounts closed.
+  e rm -f "$NAME" >/dev/null 2>&1
+  mkdir -p "$DATA" && chmod 700 "$DATA" || fail "Could not make the folder for your chats ($DATA)."
+  log "start page on $1:$PORT engine=$ENGINE image=$IMG"
+  logged e run -d --name "$NAME" --label org.securelinux.app=ai-web \
+    --network host --pull=never --security-opt no-new-privileges \
+    -v "$DATA:/app/backend/data:Z" \
+    -e "HOST=$1" -e "PORT=$PORT" \
+    -e WEBUI_AUTH=True -e ENABLE_SIGNUP=False -e DEFAULT_USER_ROLE=pending \
+    -e ENABLE_OAUTH_SIGNUP=False -e ENABLE_LDAP=False -e ENABLE_API_KEYS=False \
+    -e "OLLAMA_BASE_URL=$OLLAMA_URL" -e ENABLE_OLLAMA_API=True -e ENABLE_OPENAI_API=False -e ENABLE_DIRECT_CONNECTIONS=False \
+    -e ENABLE_WEB_SEARCH=False -e ENABLE_COMMUNITY_SHARING=False -e ENABLE_VERSION_UPDATE_CHECK=False -e OFFLINE_MODE=True \
+    -e SCARF_NO_ANALYTICS=true -e DO_NOT_TRACK=true -e ANONYMIZED_TELEMETRY=false \
+    -e RAG_EMBEDDING_ENGINE=ollama -e "RAG_EMBEDDING_MODEL=$EMBED_MODEL" -e "RAG_OLLAMA_BASE_URL=$OLLAMA_URL" \
+    -e WEBUI_SECRET_KEY_FILE=/app/backend/data/.webui_secret_key \
+    "sha256:$IMG"
+}
+wait_up() { # wait_up ADDRESS
+  local i=0
+  while [ "$i" -lt "$WAIT" ]; do
+    curl -fsS --max-time 3 "http://$1:$PORT/health" >/dev/null 2>&1 && return 0
+    i=$((i + 2)); sleep 2
+  done
+  return 1
+}
+# gate ADDRESS: prints ok, noaccount, noauth, signup or noanswer. Reads the page's own public settings.
+gate() {
+  local cfg
+  cfg=$(curl -fsS --max-time 5 "http://$1:$PORT/api/config" 2>/dev/null) || { echo noanswer; return 0; }
+  printf '%s' "$cfg" | "$PY" -c '
+import json, sys
+try:
+    d = json.loads(sys.stdin.read())
+except Exception:
+    print("noanswer"); sys.exit(0)
+f = d.get("features") if isinstance(d, dict) else None
+if not isinstance(f, dict): print("noanswer")
+elif d.get("onboarding") is not None and d.get("onboarding") is not False: print("noaccount")
+elif f.get("auth") is not True: print("noauth")
+elif f.get("enable_signup") is not False: print("signup")
+else: print("ok")' 2>/dev/null || echo noanswer
+}
+gate_words() {
+  case $1 in
+    noaccount) say "No account has been made on the chat page yet. Open it on this computer and make your own account first (the first account is the owner)." ;;
+    noauth) say "Sign-in is switched off on the chat page, so it can not be shared." ;;
+    signup) say "The chat page lets new people make accounts. Switch off 'new sign-ups' in its admin settings first." ;;
+    *) say "The chat page did not answer." ;;
+  esac
+}
+ollama_note() {
+  curl -fsS --max-time 3 "$OLLAMA_URL/api/version" >/dev/null 2>&1 && return 0
+  say "Note: the AI engine on this computer is not answering, so the chat page has no AI models yet."
+  say "      Set up AI first with 'Private AI' in the menu (or: secure-linux-ai setup)."
+}
+
+# ---------------------------------------------------------------- firewall (administrator part)
+fw() { if firewall-cmd --state >/dev/null 2>&1; then firewall-cmd --permanent "$@"; else firewall-offline-cmd "$@"; fi; }
+cmd_home_firewall() { # open|close the page's port in the home zone only, never the public (away) zone
+  [ -n "$P" ] || [ "$(id -u)" -eq 0 ] || exec pkexec "$SELF" home-firewall "$@"
+  command -v firewall-cmd >/dev/null 2>&1 || { say "Note: no firewall tool found. The chat page still listens only on your home-network address."; return 0; }
+  case "${1:-}" in
+    open) fw --zone=home --query-port="$PORT/tcp" >/dev/null 2>&1 || fw --zone=home --add-port="$PORT/tcp" >/dev/null || return 1 ;;
+    close) if fw --zone=home --query-port="$PORT/tcp" >/dev/null 2>&1; then fw --zone=home --remove-port="$PORT/tcp" >/dev/null || return 1; fi ;;
+    *) stop "Use: secure-linux-ai-web home-firewall open|close" ;;
+  esac
+  firewall-cmd --state >/dev/null 2>&1 && firewall-cmd --reload >/dev/null
+  return 0
+}
+home_firewall() { # as the person: asks for the administrator password once
+  if [ -n "$P" ]; then cmd_home_firewall "$1"; else pkexec "$SELF" home-firewall "$1"; fi
+}
+
+# ---------------------------------------------------------------- commands
+go_private() { # the page on this computer only, and checked to answer there
+  run_page "$LOCAL" || fail "Could not start the chat page. The details are in $LOG."
+  wait_up "$LOCAL" || fail "The chat page did not start in time. Try again in a minute; details are in $LOG."
+}
+cmd_start() {
+  local b cur r
+  not_admin; pick_engine
+  if ! running && command -v ss >/dev/null 2>&1 && [ -n "$(ss -Hltn "sport = :$PORT" 2>/dev/null)" ]; then
+    stop "Another program on this computer already uses port $PORT, which the chat page needs."
+  fi
+  get_image
+  ollama_note
+  cur=""; running && cur=$(current_bind)
+  if [ -n "$cur" ] && [ "$cur" != "$LOCAL" ]; then
+    # already shared: check again; anything wrong and it goes back to this computer only
+    r=$(gate "$cur")
+    if [ "$r" = ok ] && at_home; then URL=http://$cur:$PORT; say "The chat page is on and shared with your home network: $URL"; return 0; fi
+    if [ "$r" = ok ]; then say "$NOT_HOME"; else gate_words "$r"; fi
+    say "So the chat page now works on this computer only."
+    go_private; URL=http://$LOCAL:$PORT; return 0
+  fi
+  if [ "$cur" != "$LOCAL" ]; then say "Starting the chat page..."; go_private; fi
+  URL=http://$LOCAL:$PORT
+  [ "$(state_get SHARE)" = yes ] || { say "The chat page is on (this computer only): $URL"; return 0; }
+  if ! b=$(home_address) || ! at_home; then
+    say "You asked to share the chat page at home, but this computer is not on a home network now."; say "It works on this computer only: $URL"; return 0
+  fi
+  r=$(gate "$LOCAL")
+  if [ "$r" != ok ]; then gate_words "$r"; say "So the chat page works on this computer only for now: $URL"; return 0; fi
+  share_on "$b"
+}
+share_on() { # share_on ADDRESS: the gate has passed on this computer; move the page to the home address
+  local r
+  run_page "$1" || { go_private; fail "Could not share the chat page. It works on this computer only: http://$LOCAL:$PORT"; }
+  if ! wait_up "$1"; then go_private; fail "The chat page did not answer on your home address, so it works on this computer only: http://$LOCAL:$PORT"; fi
+  r=$(gate "$1")
+  if [ "$r" != ok ]; then gate_words "$r"; go_private; fail "So it was not shared. It works on this computer only: http://$LOCAL:$PORT"; fi
+  URL=http://$1:$PORT
+  say "The chat page is shared with your home network: $URL"
+  say "On your phone or other computer at home, open that address and sign in with your account."
+}
+cmd_share() {
+  local b cur r
+  not_admin; pick_engine
+  b=$(home_address) || stop "Could not find this computer's home-network address. Connect to your home network (Wi-Fi or cable at home) and try again."
+  at_home || stop "$NOT_HOME So the chat page was not shared. If this is your home, mark it first with: secure-linux-zone set-home"
+  running || stop "The chat page is not on. Open it first (secure-linux-ai-web), make your own account, then share it."
+  cur=$(current_bind)
+  r=$(gate "${cur:-$LOCAL}")
+  [ "$r" = ok ] || { gate_words "$r"; stop "So the chat page was not shared."; }
+  IMG=$(checked_image) || stop "The chat page program is not the checked version. Run: secure-linux-ai-web start"
+  state_set SHARE yes
+  share_on "$b"
+  # the port is opened once here (it stays open in the home zone); a later start never asks for the password again
+  home_firewall open || say "Note: the firewall could not be changed. Other devices may not reach the page yet."
+}
+cmd_private() {
+  local was
+  not_admin; pick_engine
+  was=$(state_get SHARE)
+  state_set SHARE no
+  if running && [ "$(current_bind)" != "$LOCAL" ]; then
+    IMG=$(checked_image) || fail "The chat page program is not the checked version. Run: secure-linux-ai-web start"
+    go_private
+  fi
+  if [ "$was" = yes ]; then home_firewall close || say "Note: the firewall could not be changed."; fi
+  say "The chat page works on this computer only now: http://$LOCAL:$PORT"
+}
+cmd_stop() {
+  not_admin; pick_engine
+  running || { e rm -f "$NAME" >/dev/null 2>&1; say "The chat page is already off."; return 0; }
+  logged e stop -t 20 "$NAME"; e rm -f "$NAME" >/dev/null 2>&1
+  say "The chat page is off. Your chats are kept in $DATA."
+}
+cmd_status() {
+  local cur r
+  pick_engine
+  if ! running; then say "The chat page is off. Switch it on with: secure-linux-ai-web"; return 0; fi
+  cur=$(current_bind); [ -n "$cur" ] || cur=$LOCAL
+  if [ "$cur" = "$LOCAL" ]; then say "The chat page is on (this computer only): http://$cur:$PORT"
+  else say "The chat page is on and shared with your home network: http://$cur:$PORT"; fi
+  r=$(gate "$cur")
+  case $r in
+    ok) say "Sign-in is on, and nobody else can make an account." ;;
+    *) gate_words "$r" ;;
+  esac
+  [ "$(state_get SHARE)" = yes ] && [ "$cur" = "$LOCAL" ] && say "You asked to share it at home: it will be shared when the checks pass and you are at home."
+  return 0
+}
+cmd_open() {
+  local h
+  cmd_start
+  h=${URL#http://}; h=${h%:*}
+  case $(gate "$h") in
+    noaccount) say "First time: make your own account on the page. The first account is the owner."
+               say "Choose your own password and keep it somewhere safe; this computer does not keep a copy." ;;
+  esac
+  if curl -fsS --max-time 3 "$OLLAMA_URL/api/version" >/dev/null 2>&1 &&
+     ! curl -fsS --max-time 5 "$OLLAMA_URL/api/tags" 2>/dev/null | grep -q "\"$EMBED_MODEL\""; then
+    say "To ask questions about your own documents, run this once: secure-linux-ai-web documents"
+  fi
+  xdg-open "$URL" >/dev/null 2>&1 || say "Open this address in your web browser: $URL"
+  return 0
+}
+cmd_documents() {
+  local tags d
+  not_admin
+  curl -fsS --max-time 3 "$OLLAMA_URL/api/version" >/dev/null 2>&1 ||
+    stop "The AI engine on this computer is not answering. Set up AI first with 'Private AI' in the menu (or: secure-linux-ai setup)."
+  command -v ollama >/dev/null 2>&1 || stop "The AI engine (Ollama) is not installed. Set up AI first with 'Private AI' in the menu."
+  say "Getting the helper model that lets the AI read your documents ($EMBED_MODEL, about 0.3 GB, only once)..."
+  logged ollama pull "$EMBED_MODEL" || stop "Could not download the helper model. Check the internet connection, then try again."
+  tags=$(curl -fsS --max-time 10 "$OLLAMA_URL/api/tags" 2>/dev/null) || fail "The AI engine did not answer after the download. Try again."
+  d=$(printf '%s' "$tags" | "$PY" -c '
+import json, sys
+want = sys.argv[1]
+try:
+    for m in json.loads(sys.stdin.read()).get("models", []):
+        if m.get("name") == want or m.get("model") == want:
+            print(str(m.get("digest", "")).lower().replace("sha256:", "")); break
+except Exception:
+    pass' "$EMBED_MODEL" 2>/dev/null)
+  [ "$d" = "$EMBED_DIGEST" ] ||
+    fail "The helper model that was downloaded is not the one this kit checked, so asking your documents is not ready. Remove it with: ollama rm $EMBED_MODEL"
+  say "Ready. To ask your own documents: open the chat page and choose Attach Files in the message box,"
+  say "or keep a set of files under Knowledge and pick it in a chat with Attach Knowledge."
+  say "Your files stay on this computer; they are read by the AI here, not sent anywhere."
+}
+cmd_autostart() {
+  not_admin
+  case "${1:-}" in
+    on)
+      mkdir -p "${UNITF%/*}" || fail "Could not make the folder for the start-up setting."
+      printf '%s\n' '[Unit]' 'Description=Private AI chat page (Open WebUI) for this account' 'After=network-online.target' '' \
+        '[Service]' 'Type=oneshot' 'RemainAfterExit=yes' 'TimeoutStartSec=900' \
+        "ExecStart=$SELF start" "ExecStop=$SELF stop" '' '[Install]' 'WantedBy=default.target' > "$UNITF" ||
+        fail "Could not save the start-up setting."
+      systemctl --user daemon-reload >/dev/null 2>&1
+      systemctl --user enable secure-linux-ai-web.service >/dev/null 2>&1 || say "Note: could not switch on the start-up setting now; it is saved and works after the next sign-in."
+      say "The chat page now switches on by itself when you sign in." ;;
+    off)
+      systemctl --user disable secure-linux-ai-web.service >/dev/null 2>&1
+      rm -f "$UNITF"; systemctl --user daemon-reload >/dev/null 2>&1
+      say "The chat page no longer switches on by itself." ;;
+    *) stop "Use: secure-linux-ai-web autostart on|off" ;;
+  esac
+}
+cmd_remove() {
+  local del=no ans
+  case "${1:-}" in '') : ;; --delete-data) del=yes ;; *) stop "Use: secure-linux-ai-web remove [--delete-data]" ;; esac
+  not_admin; pick_engine
+  if [ "$del" = yes ]; then
+    say "This deletes every chat, account and document on the chat page ($DATA). It can not be undone."
+    printf 'Type DELETE to delete them, or press Enter to keep them: '
+    IFS= read -r ans || ans=""
+    [ "$ans" = DELETE ] || stop "Kept. Your chats were not deleted."
+  fi
+  e rm -f "$NAME" >/dev/null 2>&1
+  e rmi "$OWUI_REPO:v$OWUI_VERSION" >/dev/null 2>&1; e rmi "$IMAGE" >/dev/null 2>&1
+  [ -f "$UNITF" ] && cmd_autostart off >/dev/null
+  if [ "$(state_get SHARE)" = yes ]; then home_firewall close || say "Note: the firewall could not be changed."; fi
+  rm -f "$STATEF"
+  if [ "$del" = yes ]; then rm -rf "$DATA"; say "The chat page and everything on it were removed."
+  else say "The chat page was removed. Your chats are kept in $DATA (they come back if you switch it on again)."; fi
+}
+
+pause_end() { # the menu entry opens a window: keep it open until the person has read the message
+  local rc=$?
+  if [ -t 0 ] && [ -t 1 ]; then printf 'Press Enter to close this window. '; IFS= read -r _ || :; fi
+  return $rc
+}
+cmd=${1:-open}; [ $# -gt 0 ] && shift
+log "command: $cmd $*"
+case $cmd in
+  open) trap pause_end EXIT; [ $# -eq 0 ] || stop "Use: secure-linux-ai-web"; cmd_open ;;
+  start|stop|status|share|private|documents)
+    [ $# -eq 0 ] || stop "Use: secure-linux-ai-web $cmd"; "cmd_$cmd" ;;
+  autostart) [ $# -eq 1 ] || stop "Use: secure-linux-ai-web autostart on|off"; cmd_autostart "$1" ;;
+  remove) [ $# -le 1 ] || stop "Use: secure-linux-ai-web remove [--delete-data]"; cmd_remove "${1:-}" ;;
+  home-firewall) [ $# -eq 1 ] || stop "Use: secure-linux-ai-web home-firewall open|close"; cmd_home_firewall "$1" ;;
+  *) stop "Unknown command '$cmd'. See: secure-linux-ai-web --help" ;;
+esac

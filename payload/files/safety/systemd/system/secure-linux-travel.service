@@ -1,0 +1,11 @@
+# Secure Linux travel mode: after a restart, keep travel mode's settings (while it is off, it only tidies up)
+[Unit]
+Description=Keep travel mode on after a restart
+After=sshd.service NetworkManager.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/secure-linux-travel boot
+
+[Install]
+WantedBy=multi-user.target

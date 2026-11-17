@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Service
+MimeType=all/allfiles;
+X-KDE-ServiceTypes=KonqPopupMenu/Plugin
+Actions=openSafely;
+X-KDE-Priority=TopLevel
+
+[Desktop Action openSafely]
+Name=Open Safely (throw-away sandbox)
+Icon=security-high
+Exec=/usr/local/bin/secure-linux-sandbox open %f

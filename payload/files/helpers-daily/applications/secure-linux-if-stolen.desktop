@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=If my computer is lost or stolen
+GenericName=Lost or stolen checklist
+Comment=A checklist of what to do, and an "if found" message for the lock screen
+Exec=/usr/local/bin/secure-linux-if-stolen --pause
+Icon=dialog-warning
+Terminal=true
+Categories=System;Security;
+Keywords=stolen;lost;theft;missing;laptop;if found;checklist;serial;
+StartupNotify=false

@@ -1,13 +1,348 @@
-#!/bin/sh
-# Graphical frontend only; disk operations stay in secure-linux-usb-creator.
-set -eu
-SELF=$(readlink -f "$0" 2>/dev/null || printf '%s\n' "$0")
-HERE=$(dirname "$SELF")
-if [ -n "${SL_ROOT:-}" ] && [ -r "$SL_ROOT/lib/gui_tools_launcher.py" ]; then
-  APP=$SL_ROOT/lib/gui_tools_launcher.py
-elif [ -r "$HERE/../lib/gui_tools_launcher.py" ]; then
-  APP=$HERE/../lib/gui_tools_launcher.py
-else
-  APP=/usr/local/lib/secure-linux/lib/gui_tools_launcher.py
-fi
-exec python3 "$APP" --app usb --view creator "$@"
+#!/usr/bin/env python3
+# This is a Python program. The next three lines do nothing in Python; they let the launcher syntax
+# check (`bash -n`) read the file too: bash sees ':' and a here-document that ends on the last line.
+''':'
+: <<'END_OF_PYTHON'
+'''
+"""Drive-builder window launcher, plus the "My saved master" section.
+
+Without arguments it opens the normal drive-builder window (the existing launcher).
+With --master-panel it opens the small "My saved master" window: it shows whether a
+saved master exists and which release it holds, and has one "Update my saved master"
+button. The saved master belongs to the administrator, so the window never opens it itself:
+both the look (status) and the update (run) go through secure-linux-master-sync, which asks
+for the password once and then runs: secure-linux-usb-creator sync-master --store STORE --from-tree TREE
+No file mode of the saved master is ever changed from here.
+All disk work stays in secure-linux-usb-creator. The functions below need no display.
+"""
+import json
+import os
+import subprocess
+import sys
+import threading
+
+END_OF_PYTHON = None   # the last line of this file names it, to close the bash here-document
+
+DEFAULT_STORE = "/var/lib/secure-linux/usb-master"
+DEFAULT_TREE = "/usr/local/lib/secure-linux"
+HERE = os.path.dirname(os.path.realpath(__file__))
+
+
+def creator_command(env=None):
+    """The command words that start the creator tool (SL_USB_CREATOR_CMD is for tests only)."""
+    env = os.environ if env is None else env
+    override = env.get("SL_USB_CREATOR_CMD")
+    if override:
+        return override.split("\x1f") if "\x1f" in override else [override]
+    return [os.path.join(HERE, "secure-linux-usb-creator")]
+
+
+def build_sync_command(store=DEFAULT_STORE, tree=DEFAULT_TREE, env=None):
+    """Exact command for the update button. Files-only masters; no device option exists here."""
+    return creator_command(env) + ["sync-master", "--store", store, "--from-tree", tree]
+
+
+def read_master_status(store=DEFAULT_STORE):
+    """Look at the store without changing anything. Returns a plain dict."""
+    status = {"exists": False, "master_id": "", "release_id": "", "files_only": False, "created_at": "", "problem": ""}
+    try:
+        with open(os.path.join(store, "current"), encoding="utf-8") as handle:
+            master_id = handle.read().strip()
+    except FileNotFoundError:
+        return status
+    except OSError:
+        status["problem"] = "unreadable"
+        return status
+    if not master_id or "/" in master_id or "\\" in master_id or master_id.startswith("."):
+        status["problem"] = "unreadable"
+        return status
+    try:
+        with open(os.path.join(store, "generations", master_id, "manifest.json"), encoding="utf-8") as handle:
+            manifest = json.load(handle)
+        release_id = str(manifest.get("release", {}).get("release_id", ""))
+    except (OSError, ValueError, AttributeError):
+        status["problem"] = "unreadable"
+        return status
+    status.update(
+        exists=True, master_id=master_id, release_id=release_id,
+        files_only=manifest.get("kind") == "files-only", created_at=str(manifest.get("created_at", "")),
+    )
+    return status
+
+
+def status_text(status):
+    """Beginner wording for the section heading and body: (title, body, can_update)."""
+    if status.get("problem"):
+        return ("Your saved master cannot be read",
+                "The saved master is there but could not be opened. Making a new one from a finished USB will fix this.",
+                False)
+    if not status.get("exists"):
+        return ("No saved master yet",
+                "Nothing is saved here yet. Save one from a finished drive first, then you can keep it up to date here.",
+                False)
+    release = status.get("release_id") or "unknown"
+    if not status.get("files_only"):
+        return ("Saved master found",
+                f"Saved release: {release}. This one is a full drive copy, so it is updated by saving a new one.",
+                False)
+    return ("Saved master found",
+            f"Saved release: {release}. It keeps the files for making new drives, and you can bring it up to date at any time.",
+            True)
+
+
+def classify_result(returncode, output):
+    """Turn the tool's exit code and last words into (ok, headline, detail) in plain English."""
+    lines = [line.strip() for line in str(output).splitlines() if line.strip()]
+    text = "\n".join(lines)
+    if returncode == 0:
+        if "MASTER ALREADY CURRENT" in text:
+            return True, "Your saved master is already up to date.", "Nothing needed changing."
+        if "MASTER UPDATED AND VERIFIED" in text:
+            kit = next((line for line in lines if line.startswith("Kit release:")), "")
+            detail = "Your saved master now matches this computer's release and was checked."
+            return True, "Your saved master is updated.", (kit + ". " if kit else "") + detail
+        return True, "Your saved master is updated.", "The update finished."
+    reason = ""
+    for line in reversed(lines):
+        low = line.lower()
+        if low.startswith(("error", "the master was not updated", "this saved master", "no saved master", "this computer")):
+            reason = line
+            break
+    if not reason and lines:
+        reason = lines[-1]
+    if "no saved master" in text.lower() or "no file tree" in text.lower():
+        headline = "There is no saved master to update yet."
+    else:
+        headline = "The update did not finish, and your saved master was not changed."
+    detail = (reason + " " if reason else "") + "Your earlier saved master is still safe to use."
+    return False, headline, detail
+
+
+def progress_text(line):
+    """Short friendly words for a line of tool output, or '' to hide it."""
+    line = str(line).strip()
+    if not line:
+        return ""
+    if "%" in line or line.lower().startswith(("checking", "copying", "hashing", "verifying")):
+        return line[:120]
+    return ""
+
+
+class OneAtATime:
+    """Gate so the update can never be started twice."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.busy = False
+
+    def try_start(self):
+        with self._lock:
+            if self.busy:
+                return False
+            self.busy = True
+            return True
+
+    def finish(self):
+        with self._lock:
+            self.busy = False
+
+
+def run_sync(gate, store, tree, on_progress=None, env=None, runner=subprocess.Popen):
+    """Run the update once. Returns (ok, headline, detail); a second call while busy is refused."""
+    if not gate.try_start():
+        return False, "An update is already running.", "Please wait for it to finish."
+    try:
+        try:
+            proc = runner(build_sync_command(store, tree, env), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                          text=True, errors="replace")
+        except OSError:
+            return False, "The update could not start.", "The drive-builder tool was not found on this computer."
+        collected = []
+        for line in proc.stdout:
+            collected.append(line)
+            if on_progress:
+                shown = progress_text(line)
+                if shown:
+                    on_progress(shown)
+        code = proc.wait()
+        close = getattr(proc.stdout, "close", None)
+        if close:
+            close()
+        return classify_result(code, "".join(collected))
+    finally:
+        gate.finish()
+
+
+HELPER_NAME = "secure-linux-master-sync"
+
+
+def helper_command(action, env=None):
+    """The command that looks at (status) or updates (run) the saved master with a password prompt.
+
+    SL_MASTER_SYNC_CMD is for tests only, like SL_USB_CREATOR_CMD above."""
+    if action not in ("run", "status"):
+        raise ValueError("The saved master helper only understands run and status")
+    env = os.environ if env is None else env
+    override = env.get("SL_MASTER_SYNC_CMD")
+    if override:
+        base = override.split("\x1f") if "\x1f" in override else [override]
+    else:
+        base = [os.path.join(HERE, HELPER_NAME)]
+    return base + [action]
+
+
+def parse_helper_status(returncode, output):
+    """Turn the helper's two plain lines (or its exit code) into the same dict read_master_status gives."""
+    status = {"exists": False, "master_id": "", "release_id": "", "files_only": False, "created_at": "", "problem": ""}
+    if returncode in (126, 127):
+        status["problem"] = "password"        # the password window was closed or not accepted
+        return status
+    if returncode != 0:
+        status["problem"] = "unreadable"
+        return status
+    lines = [line.strip() for line in str(output).splitlines() if line.strip()]
+    if "Saved master: none" in lines:
+        return status
+    release = next((line[len("Release: "):] for line in lines if line.startswith("Release: ")), "")
+    if not release:
+        status["problem"] = "unreadable"
+        return status
+    status.update(exists=True, release_id=release, files_only="Files only: yes" in lines)
+    return status
+
+
+def read_master_status_via_helper(env=None, runner=subprocess.run):
+    """Ask secure-linux-master-sync status (password only if nobody has looked yet). Never changes anything."""
+    try:
+        done = runner(helper_command("status", env), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                      stderr=subprocess.STDOUT, text=True, errors="replace", timeout=600)
+    except (OSError, subprocess.SubprocessError):
+        return {"exists": False, "master_id": "", "release_id": "", "files_only": False, "created_at": "",
+                "problem": "helper"}
+    return parse_helper_status(done.returncode, done.stdout)
+
+
+def helper_status_text(status):
+    """Like status_text, with words for the password step: (title, body, can_update)."""
+    problem = status.get("problem")
+    if problem == "password":
+        return ("Your saved master was not checked",
+                "No password was entered, so nothing was looked at and nothing was changed. "
+                "You can still update it: you will be asked for your password.",
+                True)
+    if problem == "helper":
+        return ("The saved master tool was not found",
+                "This computer is missing a small part of Secure Linux. Nothing was changed.",
+                False)
+    if problem:
+        return ("Your saved master could not be checked",
+                "It could not be looked at just now. Nothing was changed. Updating it may fix this.",
+                True)
+    return status_text(status)
+
+
+def run_master_update(gate, on_progress=None, env=None, runner=subprocess.Popen):
+    """Run the update through the password helper once. Returns (ok, headline, detail); a second call is refused."""
+    if not gate.try_start():
+        return False, "An update is already running.", "Please wait for it to finish."
+    try:
+        try:
+            proc = runner(helper_command("run", env), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                          stdin=subprocess.DEVNULL, text=True, errors="replace")
+        except OSError:
+            return False, "The update could not start.", "The saved master tool was not found on this computer."
+        collected = []
+        for line in proc.stdout:
+            collected.append(line)
+            if on_progress:
+                shown = progress_text(line)
+                if shown:
+                    on_progress(shown)
+        code = proc.wait()
+        close = getattr(proc.stdout, "close", None)
+        if close:
+            close()
+        if code in (126, 127):
+            return (False, "The update did not start.",
+                    "No password was entered, so nothing was changed. Your earlier saved master is still safe to use.")
+        return classify_result(code, "".join(collected))
+    finally:
+        gate.finish()
+
+
+def panel(store=DEFAULT_STORE, tree=DEFAULT_TREE):
+    # store and tree stay in the signature for older callers; the helper owns both paths now.
+    import gi
+    gi.require_version("Gtk", "4.0")
+    from gi.repository import GLib, Gtk
+
+    gate = OneAtATime()
+
+    def activate(app):
+        win = Gtk.ApplicationWindow(application=app, title="My saved master")
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        for side in ("top", "bottom", "start", "end"):
+            getattr(box, "set_margin_" + side)(18)
+        head, text = Gtk.Label(label="Looking at your saved master", xalign=0), Gtk.Label(label="One moment...", xalign=0, wrap=True)
+        head.add_css_class("title-2")
+        note = Gtk.Label(label="", xalign=0, wrap=True)
+        button = Gtk.Button(label="Update my saved master")
+        button.set_sensitive(False)
+
+        def apply_status(status):
+            t, b, c = helper_status_text(status)
+            head.set_label(t)
+            text.set_label(b)
+            button.set_sensitive(c and not gate.busy)
+            return False
+
+        def refresh():
+            # Off the window thread: the first look may wait for the password.
+            threading.Thread(target=lambda: GLib.idle_add(apply_status, read_master_status_via_helper()),
+                             daemon=True).start()
+
+        def finished(result):
+            ok, headline, detail = result
+            note.set_label(headline + " " + detail)
+            refresh()
+            return False
+
+        def work():
+            result = run_master_update(gate, on_progress=lambda s: GLib.idle_add(note.set_label, s))
+            GLib.idle_add(finished, result)
+
+        def clicked(_button):
+            if gate.busy:
+                return
+            button.set_sensitive(False)
+            note.set_label("Updating your saved master. You may be asked for your password. This can take a few minutes...")
+            threading.Thread(target=work, daemon=True).start()
+
+        button.connect("clicked", clicked)
+        for widget in (head, text, button, note):
+            box.append(widget)
+        win.set_child(box)
+        win.present()
+        refresh()
+
+    app = Gtk.Application(application_id="org.securelinux.SavedMaster")
+    app.connect("activate", activate)
+    return app.run([])
+
+
+def main(argv):
+    if "--master-panel" in argv:
+        return panel()
+    root = os.environ.get("SL_ROOT", "")
+    for candidate in (os.path.join(root, "lib", "gui_tools_launcher.py") if root else "",
+                      os.path.join(HERE, "..", "lib", "gui_tools_launcher.py"),
+                      "/usr/local/lib/secure-linux/lib/gui_tools_launcher.py"):
+        if candidate and os.path.isfile(candidate):
+            os.execvp("python3", ["python3", candidate, "--app", "usb", "--view", "creator"] + argv)
+    sys.stderr.write("The drive-builder window files were not found.\n")
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
+END_OF_PYTHON

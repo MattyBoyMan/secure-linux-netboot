@@ -1,0 +1,4 @@
+# Enabled by 00-early.sh on every profile: notice arriving home or leaving home, and look again every few hours.
+# The sharing service itself is started only by these, and only after the person turned sharing on.
+secure-linux-kit-share-network.path
+secure-linux-kit-share-network.timer

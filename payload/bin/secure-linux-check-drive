@@ -1,0 +1,696 @@
+#!/usr/bin/env python3
+"""secure-linux-check-drive: is this Secure Linux drive still exactly as it was made? (read-only)
+
+  secure-linux-check-drive                  check the drive this tool is on (run from the drive itself)
+  secure-linux-check-drive --drive DIR      check the drive mounted at DIR (run from a Secure Linux computer)
+  secure-linux-check-drive --keys DIR       use these trusted release keys (default: the ones beside this tool)
+
+What it checks (contract C5; nothing on the drive is ever written, renamed or deleted):
+  1. The Secure Linux files (the drive's linux-setup/linux folder) against the SIGNED release file list,
+     with secure-linux-release-verify. The signature files on a drive are the ones a verified update kept
+     (.kit-update-release.json.sig, .kit-update-published-files.json and its .sig) or the published names
+     (release.json.sig, payload-files.json, payload-files.json.sig).
+     While signing is not set up yet (no release key in the kit: "bridge mode") these files cannot be proven to
+     come from the maker; the tool says so and still checks them against the drive's own file list.
+     Once a release key is trusted, a drive whose Secure Linux files cannot be proven (no signature files on it,
+     or no signature checker on this computer) is a PROBLEM, never GOOD: deleting the signature files must not
+     turn a changed drive into a good one.
+  2. Every other file against the drive's own file list (linux-setup/SECURE-LINUX-DRIVE-FILES.json, contract
+     C3). A drive without that list (made by an older or a Windows drive builder) gets a read test instead.
+  3. Files made for this drive only (the installer settings, the boot menu, saved Wi-Fi, the passport...:
+     setup-data/drive-per-drive-files.txt) are reported and never "fixed".
+
+  Answer   exit
+  good      0    nothing is damaged (the result line says whether the Secure Linux files are also proven)
+  problem   2    something is missing, changed, unreadable or not signed correctly (all listed)
+  usage    64    the command was typed wrong
+"""
+from __future__ import annotations
+
+import sys
+
+sys.dont_write_bytecode = True      # run from a drive: never leave __pycache__ folders behind on it
+
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path, PurePosixPath
+import re
+import shutil
+import stat
+import subprocess
+import tempfile
+
+HERE = Path(__file__).resolve().parent
+KIT_TREE = "linux-setup/linux"                         # where the drive builders put the kit's linux tree
+DRIVE_LIST = "linux-setup/SECURE-LINUX-DRIVE-FILES.json"  # contract C3
+PASSPORT_JSON = "SECURE-LINUX-DRIVE-PASSPORT.json"     # contract C3
+LAUNCHER = "CHECK-THIS-DRIVE.sh"                       # contract C5, at the drive's top
+LAUNCHER_IN_KIT = "files/drive/CHECK-THIS-DRIVE.sh"    # the same file inside the signed kit tree
+PATTERN_FILE = "setup-data/drive-per-drive-files.txt"  # contract C3, inside a linux tree
+VERIFIER = "secure-linux-release-verify"
+KEYS_FOLDER = "secure-linux-release-keys"
+RECORD = "release.json"
+# (record signature, file list, file list signature): the bytes a verified update keeps (secure-linux-kit-update
+# KEPT), then the names a published release uses (contract C1).
+KEPT_SET = (".kit-update-release.json.sig", ".kit-update-published-files.json", ".kit-update-published-files.json.sig")
+PUBLISHED_SET = ("release.json.sig", "payload-files.json", "payload-files.json.sig")
+MAX_RECORD = 65536
+MAX_SIGNATURE = 65536
+MAX_FILE_LIST = 2 * 1024 * 1024
+MAX_DRIVE_LIST = 64 * 1024 * 1024
+MAX_PASSPORT = 65536
+SMALL_FILE = 16 * 1024 * 1024        # per-drive files up to this size are compared with the drive's list
+BIG_FILE = 256 * 1024 * 1024         # files from this size get their own "checking ..." line
+VERIFIER_TIMEOUT = 300
+HASH_RE = re.compile(r"^[0-9a-f]{64}$")
+# The kit-update payload rules (linux/bin/secure-linux-kit-update UNMANAGED, SKIP_TOP, SKIP_PATHS, UNDO_NAMES):
+# files with these names are never part of a published release, so they are checked like any other drive file.
+NOT_RELEASE_NAMES = {"release.json", "build.conf", "START-HERE.html", ".kit-update.json", ".kit-update-files.json",
+                     "payload-files.json", ".whats-new-seen.json", ".kit-update.lock", *KEPT_SET, *PUBLISHED_SET}
+NOT_RELEASE_TOP = {"rescue", "server", "asahi", "build.conf", "debian",
+                   ".kit-update-undo", ".kit-update-undo-pending", ".kit-update-undo-old"}
+NOT_RELEASE_PATHS = (("hw", "mac"),)
+GENERATED_DIRS = {"__pycache__"}
+GENERATED_SUFFIXES = (".pyc", ".pyo")
+# Used when no drive-per-drive-files.txt can be read; the same content as that file (contract C3).
+BUILTIN_PER_DRIVE = (
+    "ventoy/script/secure-linux.ks",
+    "ventoy/script/debian-*.cfg",
+    "ventoy/script/debian-sl-*.tar.gz",
+    "ventoy/ventoy.json",
+    "linux-setup/linux/build.conf",
+    "linux-setup/kit/linux/build.conf",
+    "linux-setup/wifi-networks.txt",
+    "linux-setup/backups.txt",
+    "linux-setup/setup.conf",
+    "linux-setup/scan/**",
+    "linux-setup/recovery/**",
+    "linux-setup/private/**",
+    "SECURE-LINUX-DRIVE-PASSPORT.*",
+    "linux-setup/SECURE-LINUX-DRIVE-FILES.json",
+    "CHECK-THIS-DRIVE.sh",
+    "**/*.enc1",
+    "scan/**",
+    "linux-setup/preflight/**",
+    "persistence/**",
+)
+# Saved-changes (persistence) files of a live drive change all the time: never read, only reported.
+PERSISTENCE = ("persistence/**", "**/*persistence*.dat", "**/*persistence*.img")
+SHOW_AT_MOST = 25
+
+
+def say(text: str = "") -> None:
+    print(text, flush=True)
+
+
+# ------------------------------------------------------------------ small helpers
+def safe_relative(value: object) -> bool:
+    if not isinstance(value, str) or not value or "\\" in value or "\0" in value:
+        return False
+    pure = PurePosixPath(value)
+    return not pure.is_absolute() and pure.as_posix() == value and all(p not in ("", ".", "..") for p in pure.parts)
+
+
+def glob_regex(pattern: str) -> re.Pattern:
+    """Contract C3 matching (the drive builder's rule): from the drive's top, case ignored; `**` crosses folders,
+    `**/` at the start also matches the top; `*` and `?` stay inside one name."""
+    parts, index = [], 0
+    while index < len(pattern):
+        if pattern.startswith("**/", index):
+            parts.append("(?:[^/]*/)*")
+            index += 3
+        elif pattern.startswith("**", index):
+            parts.append(".*")
+            index += 2
+        elif pattern[index] == "*":
+            parts.append("[^/]*")
+            index += 1
+        elif pattern[index] == "?":
+            parts.append("[^/]")
+            index += 1
+        else:
+            parts.append(re.escape(pattern[index]))
+            index += 1
+    return re.compile("".join(parts) + r"\Z", re.IGNORECASE | re.DOTALL)
+
+
+def safe_glob(pattern: str) -> bool:
+    return bool(pattern) and "\\" not in pattern and "\0" not in pattern and not pattern.startswith("/") \
+        and all(part not in ("", ".", "..") for part in pattern.split("/"))
+
+
+def read_patterns(path: Path) -> list[str] | None:
+    try:
+        if path.is_symlink() or not path.is_file() or path.stat().st_size > MAX_PASSPORT * 4:
+            return None
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeDecodeError):
+        return None
+    found = []
+    for line in lines:
+        words = line.split("#", 1)[0].split()
+        if words and safe_glob(words[0]):
+            found.append(words[0])
+    return found or None
+
+
+def read_bounded(path: Path, limit: int) -> bytes | None:
+    """The bytes of a plain file (one byte past `limit` at most, so callers can refuse an oversized one)."""
+    try:
+        if path.is_symlink() or not path.is_file():
+            return None
+        with open(path, "rb") as handle:
+            return handle.read(limit + 1)
+    except OSError:
+        return None
+
+
+def file_digest(path: Path) -> tuple[str, int]:
+    digest, size = hashlib.sha256(), 0
+    with open(path, "rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+            size += len(block)
+    return digest.hexdigest(), size
+
+
+def human(size: int) -> str:
+    value = float(size)
+    for unit in ("bytes", "KB", "MB", "GB", "TB"):
+        if value < 1024 or unit == "TB":
+            return f"{int(value)} {unit}" if unit == "bytes" else f"{value:.1f} {unit}"
+        value /= 1024
+    return f"{size} bytes"
+
+
+def part_of_release(relative: str) -> bool:
+    """Would a published release list this kit-tree file? (the kit-update payload rules)"""
+    parts = PurePosixPath(relative).parts
+    if relative in NOT_RELEASE_NAMES or parts[0] in NOT_RELEASE_TOP:
+        return False
+    if any(part in GENERATED_DIRS for part in parts) or relative.endswith(GENERATED_SUFFIXES):
+        return False
+    return not any(parts[:len(skip)] == skip for skip in NOT_RELEASE_PATHS)
+
+
+# ------------------------------------------------------------------ the drive
+class Drive:
+    def __init__(self, root: Path):
+        self.root = root
+        self.kit = root / KIT_TREE
+        self.files: dict[str, str] = {}       # lower-case relative path -> relative path as found
+        self.links: list[str] = []
+        self.unreadable_folders: list[str] = []
+        for base, folders, names in os.walk(root, followlinks=False,
+                                            onerror=lambda exc: self.unreadable_folders.append(str(exc.filename))):
+            keep = []
+            for name in sorted(folders):
+                path = Path(base) / name
+                if path.is_symlink():
+                    self.links.append(path.relative_to(root).as_posix())
+                else:
+                    keep.append(name)
+            folders[:] = keep
+            for name in sorted(names):
+                path = Path(base) / name
+                relative = path.relative_to(root).as_posix()
+                try:
+                    mode = os.lstat(path).st_mode
+                except OSError:
+                    self.unreadable_folders.append(relative)
+                    continue
+                if stat.S_ISLNK(mode):
+                    self.links.append(relative)
+                elif stat.S_ISREG(mode):
+                    self.files[relative.lower()] = relative
+
+    def find(self, relative: str) -> str | None:
+        """The path as it is on the drive (FAT and exFAT ignore case), or None when there is no such file."""
+        return self.files.get(relative.lower())
+
+
+class Report:
+    def __init__(self):
+        self.problems: list[str] = []
+        self.notes: list[str] = []
+        self.done: set[str] = set()           # lower-case drive paths already checked
+
+    def problem(self, text: str) -> None:
+        self.problems.append(text)
+
+    def note(self, text: str) -> None:
+        self.notes.append(text)
+
+
+def compare(drive: Drive, report: Report, relative: str, sha: str, size: int | None, since: str) -> bool:
+    """One expected file: present, a plain file, the right size and the right SHA-256. True when it matches."""
+    report.done.add(relative.lower())
+    found = drive.find(relative)
+    if found is None:
+        if relative in drive.links or any(relative.lower() == link.lower() for link in drive.links):
+            report.problem(f"{relative} is a link to somewhere else, not a real file.")
+        else:
+            report.problem(f"{relative} is missing.")
+        return False
+    path = drive.root / found
+    try:
+        actual_size = path.stat().st_size
+        if size is not None and actual_size != size:
+            report.problem(f"{relative} has changed since {since}.")
+            return False
+        if actual_size >= BIG_FILE:
+            say(f"  checking {relative} ({human(actual_size)}) ...")
+        actual, _ = file_digest(path)
+    except OSError:
+        report.problem(f"{relative} could not be read. The drive may be failing.")
+        return False
+    if actual != sha:
+        report.problem(f"{relative} has changed since {since}.")
+        return False
+    return True
+
+
+# ------------------------------------------------------------------ step 1: the signed release
+class Release:
+    PROVEN, BRIDGE, UNPROVEN, REFUSED = "proven", "bridge", "unproven", "refused"
+
+    def __init__(self, state: str, text: str, files: dict | None = None, used: tuple = ()):
+        self.state, self.text, self.files, self.used = state, text, files, used
+
+
+def run_verifier(verifier: Path, keys: Path, *arguments: str) -> tuple[int, str]:
+    try:
+        result = subprocess.run([sys.executable, "-B", str(verifier), "--keys", str(keys), *arguments],
+                                capture_output=True, text=True, timeout=VERIFIER_TIMEOUT,
+                                env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1", "LC_ALL": "C"})
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return -1, f"the signature checker could not run ({type(exc).__name__})"
+    lines = [line.strip() for line in result.stdout.splitlines() if line.strip().startswith("RELEASE ")]
+    if result.returncode not in (0, 1, 3) or not lines:
+        return -1, "the signature checker (secure-linux-release-verify) did not work"
+    return result.returncode, lines[0]
+
+
+def refusal_reason(line: str) -> str:
+    """The plain reason inside the verifier's answer line."""
+    for marker in ("RELEASE SIGNATURE: refused - ", "RELEASE KEYS: the key folder is not usable - "):
+        if line.startswith(marker):
+            line = line[len(marker):]
+    for tail in (" Nothing was changed.", "."):
+        if line.endswith(tail):
+            line = line[:-len(tail)]
+    return line or "the signature checker gave no answer"
+
+
+def keys_present(keys: Path) -> bool:
+    try:
+        return keys.is_dir() and (any(keys.glob("*.asc")) or bool(read_patterns(keys / "revoked.txt")))
+    except OSError:
+        return True
+
+
+def check_release(drive: Drive, keys: Path, verifier: Path) -> Release:
+    kit = drive.kit
+    if not verifier.is_file():
+        if keys_present(keys):
+            return Release(Release.REFUSED, "the signature checker (secure-linux-release-verify) is missing, so the "
+                                            "signed release cannot be checked")
+        return Release(Release.BRIDGE, "signing is not set up yet")
+    code, line = run_verifier(verifier, keys, "status")
+    if code == 3:
+        return Release(Release.BRIDGE, "signing is not set up yet")
+    if code == -1:
+        return Release(Release.REFUSED, f"{line}, so the signed release cannot be checked")
+    if code != 0:
+        return Release(Release.REFUSED, f"the trusted release keys cannot be used: {refusal_reason(line)}")
+    chosen = next((names for names in (KEPT_SET, PUBLISHED_SET)
+                   if any(drive.find(f"{KIT_TREE}/{name}") for name in names)), None)
+    if chosen is None:
+        return Release(Release.UNPROVEN, "this drive carries no release signature")
+    if not (shutil.which("gpgv") or shutil.which("gpgv2")):
+        return Release(Release.UNPROVEN, "this computer has no signature checker (gpgv, part of gnupg2), so the "
+                                         "signature could not be checked here")
+    # Read every signed file ONCE; the verifier and the file check below use exactly these bytes.
+    wanted = {RECORD: (RECORD, MAX_RECORD), "release.json.sig": (chosen[0], MAX_SIGNATURE),
+              "payload-files.json": (chosen[1], MAX_FILE_LIST), "payload-files.json.sig": (chosen[2], MAX_SIGNATURE)}
+    data: dict[str, bytes] = {}
+    for published, (name, limit) in wanted.items():
+        found = drive.find(f"{KIT_TREE}/{name}")
+        raw = read_bounded(drive.root / found, limit) if found else None
+        if raw is not None:
+            data[published] = raw
+    if "payload-files.json" not in data:
+        return Release(Release.REFUSED, "the signed list of Secure Linux files is missing")
+    work = Path(tempfile.mkdtemp(prefix="sl-check-drive-"))      # on this computer, never on the drive
+    try:
+        for name, raw in data.items():
+            (work / name).write_bytes(raw)
+        code, line = run_verifier(verifier, keys, "check", "--from", str(work))
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+    if code == 3:
+        return Release(Release.BRIDGE, "signing is not set up yet")
+    if code != 0:
+        return Release(Release.REFUSED, f"the Secure Linux files did not pass the signature check: "
+                                        f"{refusal_reason(line)}")
+    try:
+        listed = json.loads(data["payload-files.json"].decode("utf-8-sig"))["files"]
+        if not isinstance(listed, dict):
+            raise ValueError
+    except (UnicodeDecodeError, ValueError, KeyError, TypeError):
+        return Release(Release.REFUSED, "the signed list of Secure Linux files cannot be read")
+    files = {}
+    for relative, digest in listed.items():
+        if not safe_relative(relative) or not isinstance(digest, str) or not HASH_RE.match(digest):
+            return Release(Release.REFUSED, "the signed list of Secure Linux files holds an unsafe entry")
+        files[relative] = digest
+    used = (RECORD, *chosen)
+    return Release(Release.PROVEN, line.replace("RELEASE SIGNATURE: verified - ", "").strip(), files, used)
+
+
+def check_kit_files(drive: Drive, report: Report, release: Release) -> int:
+    """Every file the signed list names, plus anything in the kit folder that a release would list but this one
+    does not (it would be installed with the release)."""
+    for relative, digest in sorted(release.files.items()):
+        compare(drive, report, f"{KIT_TREE}/{relative}", digest, None, "the release was signed")
+    for name in release.used:
+        report.done.add(f"{KIT_TREE}/{name}".lower())
+    listed = {relative.lower() for relative in release.files}
+    prefix = KIT_TREE.lower() + "/"
+    extra = sorted(found for low, found in drive.files.items()
+                   if low.startswith(prefix) and low[len(prefix):] not in listed
+                   and part_of_release(found[len(prefix):]))
+    for found in extra:
+        report.problem(f"{found} is not part of the signed release (it would be installed with it).")
+        report.done.add(found.lower())
+    return len(release.files)
+
+
+# ------------------------------------------------------------------ step 2: the drive's own file list
+def read_drive_list(drive: Drive, report: Report) -> tuple[dict | None, bytes | None]:
+    found = drive.find(DRIVE_LIST)
+    if found is None:
+        return None, None
+    raw = read_bounded(drive.root / found, MAX_DRIVE_LIST)
+    damaged = f"This drive's file list ({DRIVE_LIST}) is damaged, so the other files could not be compared with it."
+    if raw is None or len(raw) > MAX_DRIVE_LIST:
+        report.problem(damaged)
+        return None, raw
+    try:
+        value = json.loads(raw.decode("utf-8-sig"))
+    except (UnicodeDecodeError, ValueError):
+        report.problem(damaged)
+        return None, raw
+    if not isinstance(value, dict) or value.get("schema") != 1:
+        report.problem(damaged)
+        return None, raw
+    out = {}
+    for group in ("shared", "per_drive"):
+        part = value.get(group)
+        if not isinstance(part, dict):
+            report.problem(damaged)
+            return None, raw
+        clean = {}
+        for relative, info in part.items():
+            size = info.get("size") if isinstance(info, dict) else None
+            if (not safe_relative(relative) or not isinstance(info, dict) or not HASH_RE.match(str(info.get("sha256")))
+                    or not isinstance(size, int) or isinstance(size, bool) or size < 0):
+                report.problem(damaged)
+                return None, raw
+            clean[relative] = (info["sha256"], size)
+        out[group] = clean
+    return out, raw
+
+
+def check_passport(drive: Drive, report: Report, list_raw: bytes | None, kit_release: str) -> None:
+    found = drive.find(PASSPORT_JSON)
+    if found is None:
+        return
+    raw = read_bounded(drive.root / found, MAX_PASSPORT)
+    try:
+        passport = json.loads(raw.decode("utf-8-sig")) if raw is not None and len(raw) <= MAX_PASSPORT else None
+    except (UnicodeDecodeError, ValueError):
+        passport = None
+    if not isinstance(passport, dict) or passport.get("schema") != 1:
+        report.problem(f"This drive's passport ({PASSPORT_JSON}) is damaged.")
+        return
+    made_at, release_id = str(passport.get("made_at", "")), str(passport.get("release_id", ""))
+    say(f"Passport: made {made_at or 'at an unknown time'} with release {release_id or 'unknown'}.")
+    if passport.get("check") != "passed":
+        report.problem("This drive's passport says the drive did NOT pass its own check when it was made.")
+    if list_raw is None:
+        report.problem(f"This drive's passport names a file list ({DRIVE_LIST}) that is missing.")
+    elif hashlib.sha256(list_raw).hexdigest() != str(passport.get("list_sha256", "")).lower():
+        report.problem(f"This drive's file list ({DRIVE_LIST}) does not match its passport (it was changed or "
+                       "damaged after the drive was made).")
+    if release_id and kit_release and release_id != kit_release:
+        report.note(f"This drive was made with release {release_id}; its Secure Linux files are now release "
+                    f"{kit_release}.")
+
+
+class PerDrive:
+    """Files made for this drive only (contract C3). Reported, never checked as damage, never changed."""
+
+    def __init__(self, drive: Drive, drive_list: dict | None):
+        patterns = list(BUILTIN_PER_DRIVE)
+        for source in (drive.kit / PATTERN_FILE, HERE.parent / PATTERN_FILE):
+            found = read_patterns(source)
+            if found:
+                patterns += found
+                break
+        self.globs = [glob_regex(pattern) for pattern in patterns + list(PERSISTENCE)]
+        self.persist = [glob_regex(pattern) for pattern in PERSISTENCE]
+        self.listed = {relative.lower() for relative in (drive_list or {}).get("per_drive", {})}
+        self.persist_paths = ventoy_persistence(drive)
+
+    def persistence(self, relative: str) -> bool:
+        return relative.lower() in self.persist_paths or any(regex.match(relative) for regex in self.persist)
+
+    def __call__(self, relative: str) -> bool:
+        return (relative.lower() in self.listed or self.persistence(relative)
+                or any(regex.match(relative) for regex in self.globs))
+
+
+def ventoy_persistence(drive: Drive) -> set[str]:
+    """Saved-changes files named in this drive's ventoy.json ('persistence' entries), lower case."""
+    found: set[str] = set()
+    where = drive.find("ventoy/ventoy.json")
+    raw = read_bounded(drive.root / where, MAX_PASSPORT * 16) if where else None
+    try:
+        value = json.loads(raw.decode("utf-8-sig")) if raw else None
+    except (UnicodeDecodeError, ValueError):
+        return found
+    if not isinstance(value, dict):
+        return found
+    for key, entries in value.items():
+        if not str(key).startswith("persistence") or not isinstance(entries, list):
+            continue
+        for entry in entries:
+            backends = entry.get("backend") if isinstance(entry, dict) else None
+            for backend in (backends if isinstance(backends, list) else [backends]):
+                if isinstance(backend, str) and safe_relative(backend.lstrip("/")):
+                    found.add(backend.lstrip("/").lower())
+    return found
+
+
+def check_others(drive: Drive, report: Report, drive_list: dict | None, per_drive: PerDrive) -> tuple[int, int, int]:
+    """(files compared or read, per-drive files reported, files not part of the drive) for everything not checked
+    against the signed release."""
+    checked = reported = 0
+    per_drive_seen: set[str] = set()
+    if drive_list is not None:
+        for relative, (sha, size) in sorted(drive_list["shared"].items()):
+            if relative.lower() in report.done:
+                continue
+            if per_drive(relative):
+                continue                                  # reported below with the other per-drive files
+            compare(drive, report, relative, sha, size, "the drive was made")
+            checked += 1
+        for relative, (sha, size) in sorted(drive_list["per_drive"].items()):
+            per_drive_seen.add(relative.lower())
+            found = drive.find(relative)
+            reported += 1
+            if found is None:
+                report.note(f"{relative} was made for this drive and is not on it any more.")
+                continue
+            if per_drive.persistence(relative) or size > SMALL_FILE:
+                continue
+            try:
+                actual, actual_size = file_digest(drive.root / found)
+            except OSError:
+                report.problem(f"{found} could not be read. The drive may be failing.")
+                continue
+            if actual != sha or actual_size != size:
+                report.note(f"{found} was made for this drive and has changed since (this can be normal, for "
+                            "example after saving Wi-Fi networks).")
+        for relative, (sha, _) in drive_list["shared"].items():
+            if per_drive(relative) and relative.lower() not in report.done:
+                per_drive_seen.add(relative.lower())
+                reported += int(drive.find(relative) is not None)
+    others = 0
+    for low, found in sorted(drive.files.items()):
+        if low in report.done or low in per_drive_seen:
+            continue
+        if per_drive(found):
+            reported += 1
+            continue
+        if drive_list is not None:
+            relative = found[len(KIT_TREE) + 1:] if low.startswith(KIT_TREE.lower() + "/") else ""
+            if relative and part_of_release(relative):    # never somebody's own file: setup would install it
+                report.problem(f"{found} was not on this drive when it was made (it would be installed with the "
+                               "Secure Linux files).")
+            else:
+                others += 1                               # not part of the drive when it was made: not checked
+            continue
+        try:                                              # no list to compare with: make sure it can be read
+            size = (drive.root / found).stat().st_size
+            if size >= BIG_FILE:
+                say(f"  reading {found} ({human(size)}) ...")
+            file_digest(drive.root / found)
+        except OSError:
+            report.problem(f"{found} could not be read. The drive may be failing.")
+        checked += 1
+    return checked, reported, others
+
+
+# ------------------------------------------------------------------ the whole check
+def default_drive() -> Path | None:
+    """The drive this tool is on: <drive>/linux-setup/linux/bin/secure-linux-check-drive."""
+    if HERE.name == "bin" and HERE.parent.name == "linux" and HERE.parent.parent.name == "linux-setup":
+        return HERE.parent.parent.parent
+    return None
+
+
+def release_id_of(drive: Drive) -> str:
+    found = drive.find(f"{KIT_TREE}/{RECORD}")
+    raw = read_bounded(drive.root / found, MAX_RECORD) if found else None
+    try:
+        value = json.loads(raw.decode("utf-8-sig")).get("release_id") if raw else None
+    except (UnicodeDecodeError, ValueError, AttributeError):
+        value = None
+    return value if isinstance(value, str) and re.match(r"^secure-linux-[0-9.]+-[0-9a-f]+$", value) else ""
+
+
+def show(kind: str, lines: list[str]) -> None:
+    for line in lines[:SHOW_AT_MOST]:
+        say(f"{kind}: {line}")
+    if len(lines) > SHOW_AT_MOST:
+        say(f"{kind}: ... and {len(lines) - SHOW_AT_MOST} more.")
+
+
+def check(root: Path, keys: Path, verifier: Path) -> int:
+    say("Secure Linux drive check (read-only: nothing on the drive is changed)")
+    say(f"Drive: {root}")
+    if not root.is_dir():
+        say("RESULT: PROBLEM - I could not open that drive folder. Is the drive plugged in?")
+        return 2
+    drive = Drive(root)
+    if drive.find(f"{KIT_TREE}/{RECORD}") is None and drive.find(f"{KIT_TREE}/setup.sh") is None:
+        say(f"RESULT: PROBLEM - I could not find the Secure Linux files on this drive ({KIT_TREE}). "
+            "Is this the right drive?")
+        return 2
+    report = Report()
+    for folder in drive.unreadable_folders:
+        report.problem(f"{folder} could not be read. The drive may be failing.")
+    kit_release = release_id_of(drive)
+    say(f"Release on the drive: {kit_release or 'unknown'}")
+    say(f"Checking {len(drive.files)} files. A large drive can take several minutes.")
+
+    release = check_release(drive, keys, verifier)
+    drive_list, list_raw = read_drive_list(drive, report)
+    instead = ("They were checked against this drive's own file list instead." if drive_list is not None else
+               "This drive has no file list, so they were only read to make sure they can be read.")
+    if release.state == Release.PROVEN:
+        count = check_kit_files(drive, report, release)
+        kit_line = f"Secure Linux files: {count} checked against the signed release ({release.text})."
+    elif release.state == Release.REFUSED:
+        report.problem(release.text[0].upper() + release.text[1:] + ".")
+        kit_line = ("Secure Linux files: they could NOT be proven to come from the maker (see the problem below). "
+                    f"{instead}")
+    elif release.state == Release.BRIDGE:
+        kit_line = (f"Secure Linux files: {release.text}, so they cannot be proven to come from the maker yet. "
+                    f"{instead}")
+    else:                       # a release key is trusted, yet this drive's Secure Linux files are not proven
+        report.problem(f"This computer trusts a Secure Linux release key, but the Secure Linux files on this drive "
+                       f"cannot be proven to come from the maker ({release.text}). They could have been changed. "
+                       "Make the drive again with the drive builder, or check it on a Secure Linux computer.")
+        kit_line = (f"Secure Linux files: {release.text}, so they cannot be proven to come from the maker. "
+                    f"{instead}")
+
+    check_passport(drive, report, list_raw, kit_release)
+    launcher, in_kit = drive.find(LAUNCHER), drive.find(f"{KIT_TREE}/{LAUNCHER_IN_KIT}")
+    if launcher and in_kit:
+        try:
+            if (root / launcher).read_bytes() != (root / in_kit).read_bytes():
+                report.problem(f"{launcher} at the top of the drive is not the one in the Secure Linux files "
+                               "(it was changed).")
+        except OSError:
+            report.problem(f"{launcher} could not be read. The drive may be failing.")
+    per_drive = PerDrive(drive, drive_list)
+    checked, reported, others = check_others(drive, report, drive_list, per_drive)
+
+    say(kit_line)
+    if drive_list is not None:
+        say(f"Other files: {checked} checked against this drive's own file list.")
+    else:
+        say(f"Other files: this drive has no file list (it was made by an older drive builder), so {checked} files "
+            "were only read to make sure they can be read.")
+    say(f"Made for this drive only: {reported} files (installer settings, boot menu, saved Wi-Fi and the like). "
+        "They are reported, never changed.")
+    if others:
+        say(f"Not part of the drive when it was made: {others} files (for example your own files). "
+            "They were not checked.")
+    show("NOTE", report.notes)
+    show("PROBLEM", report.problems)
+    if report.problems:
+        say(f"RESULT: PROBLEM - {len(report.problems)} problem(s) found (listed above). Do not use this drive to "
+            "install or repair a computer. Make it again with the drive builder, or use \"Check and repair a "
+            "drive\". Nothing on the drive was changed.")
+        return 2
+    if release.state == Release.PROVEN:
+        say("RESULT: GOOD - this drive is exactly as it was made, and its Secure Linux files are proven to come "
+            "from the maker.")
+        return 0
+    if release.state == Release.BRIDGE:
+        say("RESULT: GOOD - no damage was found. The Secure Linux files could not be proven to come from the "
+            "maker yet (see above).")
+        say("Note: a check run from the drive itself cannot notice if someone removed both the release key and the "
+            "signatures from it. For a check that does not trust this drive, check it on a Secure Linux computer: "
+            "secure-linux-check-drive --drive FOLDER uses that computer's own key.")
+        return 0
+    say("RESULT: PROBLEM - the Secure Linux files could not be proven to come from the maker. Nothing on the drive "
+        "was changed.")                  # not reachable: every other state has added a problem above
+    return 2
+
+
+class Parser(argparse.ArgumentParser):
+    def error(self, message):            # exit 2 means "the drive has a problem", so a typing mistake is 64
+        self.print_usage(sys.stderr)
+        print(f"{self.prog}: {message}", file=sys.stderr)
+        sys.exit(64)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = Parser(prog="secure-linux-check-drive",
+                    description="Check a Secure Linux drive, read-only: the Secure Linux files against the signed "
+                                "release, every other file against the drive's own file list. Exit 0 good, "
+                                "2 problem.")
+    parser.add_argument("--drive", type=Path, help="the drive's top folder (default: the drive this tool is on)")
+    parser.add_argument("--keys", type=Path,
+                        default=Path(os.environ.get("SL_RELEASE_KEYS_DIR", HERE.parent / "share" / KEYS_FOLDER)),
+                        help="folder of trusted release keys (default: the ones beside this tool)")
+    args = parser.parse_args(argv)
+    root = args.drive.expanduser() if args.drive else default_drive()
+    if root is None:
+        parser.error("give the drive's folder with --drive DIR (this tool is not on a Secure Linux drive)")
+    try:
+        return check(Path(os.path.abspath(root)), args.keys.expanduser(), HERE / VERIFIER)
+    except KeyboardInterrupt:
+        say("RESULT: PROBLEM - the check was stopped before it finished. Nothing on the drive was changed.")
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

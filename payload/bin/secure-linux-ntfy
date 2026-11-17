@@ -1,0 +1,230 @@
+#!/bin/bash
+# secure-linux-ntfy: send this computer's alerts (backup, updates, Wi-Fi and the rest) to your phone. OFF until you turn it on.
+#   secure-linux-ntfy                    a simple menu
+#   secure-linux-ntfy status             is it on, and where do alerts go (never shows the secret topic name)
+#   secure-linux-ntfy on [--server URL]  turn it on; makes a random private topic name and shows how to use it on your phone
+#   secure-linux-ntfy off [--forget]     turn it off (--forget also throws the topic name away; the next "on" makes a new one)
+#   secure-linux-ntfy topic              show the topic name and server to type into the phone app (keep it private)
+#   secure-linux-ntfy test               send one test message now
+#   secure-linux-ntfy send TITLE TEXT [urgent]   send one message (used by the alert tool; does nothing while it is off)
+# Alerts go to YOUR OWN ntfy app (secure-linux-server-apps install ntfy), which listens on your home network only,
+# so your phone gets them while it is on your home Wi-Fi (or on your VPN's home mode). A server outside your home
+# is refused unless you add --public; then only a short note without details is sent, and the topic name is the
+# only protection, so anyone who learns it can read those notes. The topic name is made from the computer's random
+# source, kept in a file only you can read (mode 600), never put on a command line and never written to a log.
+set -u
+export LC_ALL=C
+
+CONF=${SL_NTFY_CONF:-${XDG_CONFIG_HOME:-$HOME/.config}/secure-linux/ntfy.conf}
+STATEDIR=${SL_NTFY_APPSTATE:-/var/lib/secure-linux/server-apps}
+LASTERR=${SL_NTFY_LASTERR:-${XDG_STATE_HOME:-$HOME/.local/state}/secure-linux/ntfy-last-error}
+
+say() { printf '%s\n' "$*"; }
+stop() { say "$*"; say "Nothing was changed."; exit 1; }
+
+case "${1:-}" in -h|--help|help) sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;; esac
+
+# ---------------------------------------------------------------- the settings file (read, never run)
+kv_get() { # kv_get FILE KEY
+  local line
+  [ -r "$1" ] || return 1
+  while IFS= read -r line || [ -n "$line" ]; do
+    line=${line%$'\r'}
+    case $line in "$2="*) printf '%s' "${line#*=}"; return 0 ;; esac
+  done < "$1"
+  return 1
+}
+valid_topic() { [[ ${1:-} =~ ^[A-Za-z0-9_-]{16,64}$ ]]; }
+valid_server() { [[ ${1:-} =~ ^https?://[A-Za-z0-9._-]+(:[0-9]{1,5})?/?$ ]]; }
+host_of() { local h=${1#*://}; h=${h%%/*}; printf '%s' "${h%%:*}"; }
+private_host() { # a name or address that stays inside the home
+  local h=${1:-} a b
+  case $h in localhost|*.local|*.lan|*.home.arpa) return 0 ;; esac
+  [[ $h =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]] || return 1
+  a=${h%%.*}; b=${h#*.}; b=${b%%.*}
+  [ "$a" = 10 ] && return 0
+  [ "$a" = 127 ] && return 0
+  [ "$a" = 192 ] && [ "$b" = 168 ] && return 0
+  [ "$a" = 172 ] && [ "$b" -ge 16 ] && [ "$b" -le 31 ] && return 0
+  return 1
+}
+own_server_url() { # the address of the ntfy home-server app, if it is set up on this computer
+  local u
+  u=$(kv_get "$STATEDIR/ntfy.state" URL) || return 1
+  valid_server "$u" && private_host "$(host_of "$u")" || return 1
+  printf '%s' "${u%/}"
+}
+enabled() { [ "$(kv_get "$CONF" ENABLED 2>/dev/null)" = yes ]; }
+current_server() { # an own server follows the app's current address; any other server is the saved one
+  local s
+  if [ "$(kv_get "$CONF" SOURCE 2>/dev/null)" = own ]; then s=$(own_server_url) && { printf '%s' "$s"; return 0; }; fi
+  s=$(kv_get "$CONF" SERVER 2>/dev/null) || return 1
+  valid_server "$s" || return 1
+  printf '%s' "${s%/}"
+}
+write_conf() { # write_conf ENABLED SOURCE SERVER TOPIC PUBLIC
+  local d tmp
+  d=${CONF%/*}
+  mkdir -p "$d" || stop "Could not make the settings folder $d."
+  tmp=$CONF.new
+  ( umask 077; printf 'ENABLED=%s\nSOURCE=%s\nSERVER=%s\nTOPIC=%s\nPUBLIC=%s\n' "$1" "$2" "$3" "$4" "$5" > "$tmp" ) &&
+    chmod 600 "$tmp" && mv -f "$tmp" "$CONF" || stop "Could not save the settings file."
+}
+new_topic() {
+  local s
+  s=$(tr -dc 'a-z0-9' < /dev/urandom 2>/dev/null | head -c 24)
+  [ ${#s} -eq 24 ] || return 1
+  printf 'sl-%s' "$s"
+}
+note_error() { # the last problem, without any secret, so "status" can say why messages are not arriving
+  mkdir -p "${LASTERR%/*}" 2>/dev/null || return 0
+  printf '%s %s\n' "$(date '+%F %T')" "$1" > "$LASTERR" 2>/dev/null
+  return 0
+}
+
+# ---------------------------------------------------------------- sending
+json_str() { # a plain-text value as a JSON string (no control characters, quotes and backslashes escaped)
+  printf '%s' "$1" | tr -d '\000-\010\013-\037' | awk 'BEGIN { ORS = "" }
+    { gsub(/\\/, "\\\\"); gsub(/"/, "\\\""); gsub(/\t/, "\\t"); if (NR > 1) printf "\\n"; print }'
+}
+publish() { # publish TITLE TEXT PRIORITY: 0 sent, 1 not sent (the reason goes to the last-error note)
+  local server topic public title text body
+  server=$(current_server) || { note_error "no server address"; return 1; }
+  topic=$(kv_get "$CONF" TOPIC 2>/dev/null) || topic=""
+  valid_topic "$topic" || { note_error "no topic name"; return 1; }
+  public=$(kv_get "$CONF" PUBLIC 2>/dev/null) || public=no
+  command -v curl >/dev/null 2>&1 || { note_error "curl is missing"; return 1; }
+  title=$1; text=$2
+  if [ "$public" = yes ]; then title="Secure Linux"; text="Something needs your attention. Open Secure Linux Status on the computer."; fi
+  title=${title:0:100}; text=${text:0:600}
+  body=$(printf '{"topic":"%s","title":"%s","message":"%s","priority":%s}' "$topic" "$(json_str "$title")" "$(json_str "$text")" "$3")
+  # The body (with the topic) goes in through standard input, never on the command line, where other programs could read it.
+  if printf '%s' "$body" | curl -fsS -o /dev/null --connect-timeout 3 --max-time 8 \
+       -H 'Content-Type: application/json' --data-binary @- "$server/" 2>/dev/null; then
+    rm -f "$LASTERR" 2>/dev/null
+    return 0
+  fi
+  note_error "the server did not answer"
+  return 1
+}
+cmd_send() {
+  local prio=3
+  [ $# -ge 2 ] || stop "Use: secure-linux-ntfy send TITLE TEXT [urgent]"
+  enabled || exit 0                      # off: nothing is sent, nothing is asked
+  case "${3:-}" in urgent|critical) prio=4 ;; esac
+  publish "$1" "$2" "$prio"
+  exit 0                                 # a failed phone message must never get in the way of the alert itself
+}
+
+# ---------------------------------------------------------------- commands
+cmd_status() {
+  local s src pub
+  if ! enabled; then
+    [ "${1:-}" = --short ] && { say off; return 0; }
+    say "Phone alerts are OFF. Nothing is sent to your phone."
+    say "Turn them on with: secure-linux-ntfy on"
+    return 0
+  fi
+  [ "${1:-}" = --short ] && { say on; return 0; }
+  s=$(current_server) || s="(not found: is the ntfy app set up?)"
+  pub=$(kv_get "$CONF" PUBLIC 2>/dev/null) || pub=no
+  src=$(kv_get "$CONF" SOURCE 2>/dev/null) || src=""
+  say "Phone alerts are ON."
+  say "  Sent to: $s$([ "$src" = own ] && echo ' (your own ntfy app, home network only)')"
+  [ "$pub" = yes ] && say "  This is a server outside your home: only a short note without details is sent."
+  [ -s "$LASTERR" ] && say "  Last problem: $(cut -d' ' -f3- "$LASTERR") (at $(cut -d' ' -f1,2 "$LASTERR"))"
+  say "  Show the phone settings with: secure-linux-ntfy topic"
+  return 0
+}
+cmd_topic() {
+  local s t
+  enabled || stop "Phone alerts are off. Turn them on first with: secure-linux-ntfy on"
+  s=$(current_server) || stop "Could not find the ntfy server address. Set the app up with: secure-linux-server-apps install ntfy"
+  t=$(kv_get "$CONF" TOPIC) || stop "The saved settings are damaged. Turn alerts off and on again."
+  say "On your phone, open the free ntfy app, then:"
+  say "  1. Add a subscription (the + button)."
+  say "  2. Turn on 'Use another server' and type:  $s"
+  say "  3. Topic name:  $t"
+  say "Keep the topic name private: it is the only key to your alerts. Do not post it or send it in a message."
+  say "Your phone gets alerts while it is on your home Wi-Fi (or on your VPN's home mode). iPhones can be slow or late with a home server."
+}
+cmd_on() {
+  local server="" public=no src=own t
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --server) [ $# -ge 2 ] || stop "Use: secure-linux-ntfy on [--server URL] [--public]"; server=$2; shift ;;
+      --public) public=ask ;;
+      *) stop "Use: secure-linux-ntfy on [--server URL] [--public]" ;;
+    esac
+    shift
+  done
+  if [ -z "$server" ]; then
+    server=$(own_server_url) || stop "Your own ntfy app is not set up yet. Set it up with: secure-linux-server-apps install ntfy   (then run this again)"
+  else
+    valid_server "$server" || stop "That server address does not look right. Write it like http://192.168.1.20:8140 or https://ntfy.example.org"
+    server=${server%/}; src=other
+    if ! private_host "$(host_of "$server")"; then
+      [ "$public" = ask ] || stop "That server is outside your home. Alerts are not sent there unless you add --public (only a short note without details is sent, and the topic name is the only protection)."
+      case $server in https://*) public=yes ;; *) stop "A server outside your home must use https://" ;; esac
+    else
+      public=no
+    fi
+  fi
+  [ "$public" = ask ] && public=no
+  t=$(kv_get "$CONF" TOPIC 2>/dev/null)
+  valid_topic "${t:-}" || t=$(new_topic) || stop "Could not make a random topic name."
+  write_conf yes "$src" "$server" "$t" "$public"
+  say "Phone alerts are ON. Alerts from this computer will be sent to your phone through ntfy."
+  t=""
+  cmd_topic
+  say "Check it works with: secure-linux-ntfy test"
+}
+cmd_off() {
+  local t
+  if [ "${1:-}" = --forget ]; then rm -f "$CONF" "$LASTERR"; say "Phone alerts are OFF and the topic name is thrown away."; return 0; fi
+  [ $# -eq 0 ] || stop "Use: secure-linux-ntfy off [--forget]"
+  if [ -f "$CONF" ]; then
+    t=$(kv_get "$CONF" TOPIC 2>/dev/null) || t=""
+    write_conf no "$(kv_get "$CONF" SOURCE 2>/dev/null)" "$(kv_get "$CONF" SERVER 2>/dev/null)" "$t" "$(kv_get "$CONF" PUBLIC 2>/dev/null)"
+  fi
+  say "Phone alerts are OFF. Nothing is sent to your phone. Turn them on again with: secure-linux-ntfy on"
+}
+cmd_test() {
+  enabled || stop "Phone alerts are off. Turn them on first with: secure-linux-ntfy on"
+  if publish "Secure Linux test" "If you can read this on your phone, alerts are working." 3; then
+    say "Sent. Look at your phone now. If nothing arrives, check that the phone is on your home Wi-Fi and that the ntfy app has this topic."
+  else
+    say "Could not send the test message ($(cut -d' ' -f3- "$LASTERR" 2>/dev/null))."
+    say "Check that the ntfy app is running: secure-linux-server-apps status ntfy"
+    return 1
+  fi
+}
+cmd_menu() {
+  local a
+  say "Phone alerts (ntfy)"
+  cmd_status
+  say ""
+  say "  1. Turn on"
+  say "  2. Turn off"
+  say "  3. Show what to type into the phone app"
+  say "  4. Send a test message"
+  say "  0. Leave"
+  printf 'Choose a number: '
+  read -r a || a=0
+  case $a in
+    1) cmd_on ;; 2) cmd_off ;; 3) cmd_topic ;; 4) cmd_test ;; 0|'') : ;;
+    *) stop "That is not one of the choices." ;;
+  esac
+}
+
+cmd=${1:-menu}; [ $# -gt 0 ] && shift
+case $cmd in
+  status) cmd_status "$@" ;;
+  on) cmd_on "$@" ;;
+  off) cmd_off "$@" ;;
+  topic) [ $# -eq 0 ] || stop "Use: secure-linux-ntfy topic"; cmd_topic ;;
+  test) cmd_test ;;
+  send) cmd_send "$@" ;;
+  menu) cmd_menu ;;
+  *) stop "Unknown choice '$cmd'. See: secure-linux-ntfy --help" ;;
+esac

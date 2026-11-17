@@ -1,0 +1,25 @@
+# 60-everyday-makers.tsv: private vaults, one mouse for two computers, game streaming, makers' tools, notes and money apps (ideas 69, 74, 75, 76, 77, 81).
+# Columns (TAB separated): id kind title plain_description approx_size_mb profiles default arch idea
+# Every flatpak id was checked live on Flathub (API appstream and summary pages) on 2026-11-17, every rpm name on mdapi.fedoraproject.org the same day.
+# Evidence: tests/appseveryday/live-checks.tsv. Sizes are Flathub's installed size (rounded); sdrpp (rpm, with its few libraries) is an estimate, not measured.
+# Defaults follow the plan: Cryptomator, Xournal++ and HomeBank on; everything else only if chosen. Makers' tools carry " - Makers" in the title.
+# Not in this file on purpose:
+#   scrcpy (idea 73) is in neither Fedora nor Flathub; secure-linux-phone-backup mirror fetches the maker's own build and checks its SHA-256.
+#   Espanso (idea 77) is in neither Fedora nor Flathub (Flathub's espansoGUI is only a settings helper), so it is not offered.
+org.cryptomator.Cryptomator	flatpak	Cryptomator (private vaults)	Keeps private files in a locked folder (a vault) that you can sync to any cloud or USB drive. Only you can read what is inside.	140	full,lite,atomic	on	all	69
+io.github.input_leap.input-leap	flatpak	Input Leap (one mouse, two computers)	Use one keyboard and mouse across two computers on your home network. On the newer Wayland desktop it can be fiddly; the guide explains.	14	full,lite,atomic	off	all	74
+dev.lizardbyte.app.Sunshine	flatpak	Sunshine (stream this computer)	Lets another device on your home network see and control this computer's screen, for example to play games from the couch. Opens its ports on the home network only.	111	full,atomic	off	all	75
+com.moonlight_stream.Moonlight	flatpak	Moonlight (watch another computer)	Shows a computer running Sunshine on this screen with very little delay, so you can use it from another room. Works with Sunshine.	18	full,lite,atomic	off	all	75
+org.freecad.FreeCAD	flatpak	FreeCAD (3D design) - Makers	Design real objects in 3D, such as parts for a 3D printer. Free and powerful. A big download.	1277	full,atomic	off	all	76
+org.kicad.KiCad	flatpak	KiCad (circuit boards) - Makers	Draw electronic circuits and design circuit boards. The big library of 3D part pictures is a separate, much larger download.	1195	full,atomic	off	all	76
+com.prusa3d.PrusaSlicer	flatpak	PrusaSlicer (3D printing) - Makers	Turns a 3D model into the steps a 3D printer follows. Works with most printers, not only Prusa.	273	full,atomic	off	all	76
+com.orcaslicer.OrcaSlicer	flatpak	OrcaSlicer (3D printing) - Makers	Another free slicer for 3D printers, with many ready-made printer settings. Pick this or PrusaSlicer, whichever you like.	601	full,atomic	off	all	76
+com.ultimaker.cura	flatpak	UltiMaker Cura (3D printing) - Makers	A well-known free slicer for 3D printers. Flathub does not mark this package as verified by UltiMaker, so choose it only if you want Cura.	879	full,atomic	off	x86_64	76
+cc.arduino.IDE2	flatpak	Arduino IDE (small boards) - Makers	Write and send programs to Arduino and similar small boards. Needs an Intel or AMD computer.	564	full,atomic	off	x86_64	76
+org.raspberrypi.rpi-imager	flatpak	Raspberry Pi Imager - Makers	Puts the Raspberry Pi system on a memory card. It erases the card you pick, so read the name of the card twice before you press Write.	8	full,lite,atomic	off	all	76
+sdrpp	rpm	SDR++ (radio receiver) - Makers	Listen to the radio spectrum with a cheap USB radio stick (an RTL-SDR). Shows what is on the air as a moving picture. Needs the stick.	40	full	off	x86_64	76
+org.openrgb.OpenRGB	flatpak	OpenRGB (computer lights) - Makers	Control the coloured lights on your keyboard, memory and case in one place, with no company account.	16	full,lite,atomic	off	all	76
+com.github.xournalpp.xournalpp	flatpak	Xournal++ (notes and PDF signing)	Write or draw on a page, mark up a PDF, and sign a PDF by drawing your signature. Free and works offline.	236	full,lite,atomic	on	all	77
+com.github.hluk.copyq	flatpak	CopyQ (clipboard history)	Remembers the last things you copied so you can paste an older one again. The full setup already has this built in, so it is offered for lighter setups.	13	lite	off	all	77
+fr.free.Homebank	flatpak	HomeBank (home money)	Keep track of your accounts, spending and budget on your own computer. Nothing is sent to a bank or a company.	10	full,lite,atomic	on	all	81
+org.gnucash.GnuCash	flatpak	GnuCash (full accounts)	Full double-entry accounts for a household or a small business. More powerful than HomeBank and harder to learn.	279	full,atomic	off	all	81

@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Talk to my AI
+GenericName=Voice assistant
+Comment=Speak to your private AI and hear it answer. It runs on this computer and nothing is recorded or sent anywhere.
+Exec=/usr/local/bin/secure-linux-voice talk --pause
+Icon=audio-input-microphone
+Terminal=true
+Categories=Utility;Science;AudioVideo;
+Keywords=voice;speak;talk;assistant;AI;microphone;private;offline;Piper;Whisper;
+StartupNotify=false

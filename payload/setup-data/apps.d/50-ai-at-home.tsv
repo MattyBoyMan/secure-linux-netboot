@@ -1,0 +1,7 @@
+# 50-ai-at-home.tsv: Secure Linux tools for the AI on this computer (kind kittool). They are already on the computer; the library only lists them.
+# The id is the command name in /usr/local/bin. Each one sets itself up the first time it is opened and asks before it downloads anything.
+# Columns (TAB separated): id kind title plain_description approx_size_mb profiles default arch idea
+# Sizes: AI chat page = the Open WebUI container image for Intel and AMD (1.6 GB download, registry 2026-11-17). Talk to my AI = about 250 MB of speech
+# programs (the tool's own estimate) plus the 75 MB listening model and the 63 MB voice, both checked by size and SHA-256 when downloaded.
+secure-linux-ai-web	kittool	AI chat page	A private chat page in your web browser for the AI on this computer, and for asking questions about your own files. Nothing is sent to the internet. Set up Private AI first.	1646	full	off	all	61
+secure-linux-voice	kittool	Talk to my AI	Speak to the AI on this computer and hear it answer. It runs only on this computer and nothing is recorded or sent anywhere. Set up Private AI first.	390	full	off	all	62

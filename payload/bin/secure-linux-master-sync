@@ -1,0 +1,109 @@
+#!/bin/bash
+# secure-linux-master-sync: keep the saved master (the copy of Secure Linux that makes new drives) up to date.
+# Asks for the password once (through pkexec) when started by the logged-in user. Used by the "My saved master" window.
+#   secure-linux-master-sync run      bring the saved master up to date from this computer's installed files
+#   secure-linux-master-sync status   print the saved master's release and whether it holds files only; nothing else
+# Anything else is refused. The saved master's own folder is never made readable for other people.
+set -u
+export LC_ALL=C
+
+STORE=/var/lib/secure-linux/usb-master
+TREE=/usr/local/lib/secure-linux
+CREATOR=/usr/local/bin/secure-linux-usb-creator
+STATUS_FILE=/var/lib/secure-linux/usb-master-status
+
+# Test hooks. They are honoured ONLY when SL_MASTER_SYNC_TEST=1 is set, so a normal run cannot be redirected.
+CREATOR_CMD=("$CREATOR")
+READ_STORE=$STORE
+if [ "${SL_MASTER_SYNC_TEST:-}" = 1 ]; then
+  if [ -n "${SL_USB_CREATOR_CMD:-}" ]; then
+    case "$SL_USB_CREATOR_CMD" in
+      *$'\x1f'*) IFS=$'\x1f' read -r -a CREATOR_CMD <<<"$SL_USB_CREATOR_CMD" ;;
+      *) CREATOR_CMD=("$SL_USB_CREATOR_CMD") ;;
+    esac
+  fi
+  READ_STORE=${SL_MASTER_SYNC_PREFIX:-}$STORE
+  STATUS_FILE=${SL_MASTER_SYNC_PREFIX:-}$STATUS_FILE
+fi
+my_uid() {
+  if [ "${SL_MASTER_SYNC_TEST:-}" = 1 ] && [ -n "${SL_MASTER_SYNC_UID:-}" ]; then printf '%s\n' "$SL_MASTER_SYNC_UID"; else id -u; fi
+}
+
+case "${1:-}" in -h|--help) sed -n '2,6p' "$0"; exit 0 ;; esac
+if [ "$#" -ne 1 ] || { [ "$1" != run ] && [ "$1" != status ]; }; then
+  echo "This helper only understands 'run' and 'status'. Nothing was changed." >&2
+  exit 2
+fi
+ACTION=$1
+
+PY=""; for _py in python3 python; do command -v "$_py" >/dev/null 2>&1 && "$_py" -c pass >/dev/null 2>&1 && { PY=$_py; break; }; done
+
+# The two plain lines the window shows. Printed from the status file anyone may read, or from the store itself.
+status_file_lines() {
+  [ -r "$STATUS_FILE" ] || return 1
+  local lines
+  lines=$(grep -E '^(Release: [A-Za-z0-9._+~-]{1,64}|Files only: (yes|no)|Saved master: none)$' "$STATUS_FILE" 2>/dev/null) || return 1
+  [ -n "$lines" ] || return 1
+  printf '%s\n' "$lines"
+}
+store_status_lines() {
+  [ -n "$PY" ] || return 3
+  "$PY" - "$READ_STORE" <<'PYEND'
+import json, os, re, sys
+store = sys.argv[1]
+try:
+    with open(os.path.join(store, "current"), encoding="utf-8") as handle:
+        generation = handle.read().strip()
+except FileNotFoundError:
+    print("Saved master: none")
+    sys.exit(0)
+except OSError:
+    sys.exit(3)
+if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", generation):
+    sys.exit(3)
+try:
+    with open(os.path.join(store, "generations", generation, "manifest.json"), encoding="utf-8") as handle:
+        manifest = json.load(handle)
+    release = str(manifest.get("release", {}).get("release_id", ""))
+    files_only = manifest.get("kind") == "files-only"
+except (OSError, ValueError, AttributeError):
+    sys.exit(3)
+release = re.sub(r"[^A-Za-z0-9._+~-]", "", release)[:64] or "unknown"
+print("Release: " + release)
+print("Files only: " + ("yes" if files_only else "no"))
+PYEND
+}
+# A new, small file that holds only the two lines above (readable by everyone). The store itself is not touched.
+write_status_file() {
+  local dir tmp
+  dir=$(dirname "$STATUS_FILE"); [ -d "$dir" ] || return 0
+  tmp="$STATUS_FILE.new.$$"
+  printf '%s\n' "$1" > "$tmp" 2>/dev/null || { rm -f "$tmp"; return 0; }
+  chmod 0644 "$tmp" 2>/dev/null
+  mv -f "$tmp" "$STATUS_FILE" 2>/dev/null || rm -f "$tmp"
+}
+
+if [ "$(my_uid)" -ne 0 ]; then
+  # Looking is free for everyone once an administrator step has written the small status file.
+  if [ "$ACTION" = status ] && status_file_lines; then exit 0; fi
+  SELF=/usr/local/bin/secure-linux-master-sync; [ -x "$SELF" ] || SELF=$(readlink -f "$0")   # polkit names /usr/local/bin
+  [ -n "$(command -v pkexec)" ] || { echo "The password window is not available on this computer. Nothing was changed." >&2; exit 1; }
+  exec pkexec "$SELF" "$ACTION"
+fi
+
+case "$ACTION" in
+  run)
+    "${CREATOR_CMD[@]}" sync-master --store "$STORE" --from-tree "$TREE"
+    rc=$?
+    if [ "$rc" -eq 0 ]; then
+      lines=$(store_status_lines) && write_status_file "$lines"
+    fi
+    exit "$rc"
+    ;;
+  status)
+    lines=$(store_status_lines); rc=$?
+    if [ "$rc" -ne 0 ]; then echo "The saved master could not be read. Nothing was changed." >&2; exit 1; fi
+    write_status_file "$lines"
+    printf '%s\n' "$lines"
+    ;;
+esac

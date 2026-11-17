@@ -32,8 +32,43 @@ if ! command -v sl_progress_start >/dev/null 2>&1; then
 fi
 sl_stage_finish() { sl_progress_spinner_stop "$2"; sl_progress_update "$1"; }
 sl_progress_start 100 'Secure Linux final setup. Percentages advance when real stages finish.'
+
+# Idea 21: check the Secure Linux files against the list published with them (debian-files.sha256, written by
+# netboot/render-netboot.sh; the signed payload-files.json lists the same files). This never stops the install:
+# the answer is shown, kept for the first start, and the install goes on exactly as before.
+# Answers: ok N | damaged BAD N FIRST | no-list | no-tool | bad-list. Test switch: SL_SHA256SUM (default sha256sum).
+SL_SUMTOOL=${SL_SHA256SUM:-sha256sum}
+sl_check_files() {
+  list=$SL/debian-files.sha256
+  [ -f "$list" ] || { echo no-list; return 0; }
+  command -v "$SL_SUMTOOL" >/dev/null 2>&1 || { echo no-tool; return 0; }
+  n=0; bad=0; first=
+  while IFS= read -r line || [ -n "$line" ]; do
+    want=${line%%  *}; path=${line#*  }
+    [ ${#want} -eq 64 ] && [ "$path" != "$line" ] || { echo bad-list; return 0; }
+    case "$want" in *[!0-9a-f]*) echo bad-list; return 0 ;; esac
+    case "$path" in ''|/*|..|../*|*/..|*/../*|*\\*) echo bad-list; return 0 ;; esac
+    n=$((n + 1))
+    have=$("$SL_SUMTOOL" "$SL/$path" 2>/dev/null | cut -d ' ' -f 1)
+    if [ "$have" != "$want" ]; then bad=$((bad + 1)); [ -n "$first" ] || first=$path; fi
+  done < "$list"
+  [ "$n" -gt 0 ] || { echo bad-list; return 0; }
+  if [ "$bad" -eq 0 ]; then echo "ok $n"; else echo "damaged $bad $n $first"; fi
+}
+sl_progress_spinner_start 'Checking the Secure Linux files against their published list. No percentage is available during this check.'
+SL_FILES_CHECK=$(sl_check_files)
+case "$SL_FILES_CHECK" in
+  ok\ *) sl_progress_spinner_stop "All ${SL_FILES_CHECK#ok } Secure Linux files match their published list." ;;
+  damaged\ *)
+    sl_rest=${SL_FILES_CHECK#damaged }; sl_bad=${sl_rest%% *}; sl_rest=${sl_rest#* }
+    sl_progress_spinner_stop "Secure Linux: $sl_bad of ${sl_rest%% *} files do not match their published list (first: ${sl_rest#* }). The install goes on. If something does not work after the first start, install again from a fresh download or drive." ;;
+  no-list) sl_progress_spinner_stop 'Secure Linux: these files came without a published list, so they were not checked. The install goes on.' ;;
+  no-tool) sl_progress_spinner_stop 'Secure Linux: this installer has no checking tool, so the files were not checked. The install goes on.' ;;
+  *) sl_progress_spinner_stop 'Secure Linux: the list of files is damaged, so the files were not checked. The install goes on.' ;;
+esac
 sl_progress_spinner_start 'Copying Secure Linux files. No percentage is available during this copy.'
 mkdir -p "$DEST" "$TGT/etc/secure-linux" "$TGT/var/lib/secure-linux" "$TGT/var/log/secure-linux"
+printf '%s\n' "$SL_FILES_CHECK" > "$TGT/var/lib/secure-linux/debian-files-check" 2>/dev/null   # for the first start
 cp -a "$SL/payload/." "$DEST/"
 chmod 0755 "$DEST/setup.sh" 2>/dev/null
 chmod 0755 "$DEST"/bin/* 2>/dev/null

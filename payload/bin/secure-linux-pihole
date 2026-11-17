@@ -1,8 +1,620 @@
 #!/bin/sh
 # Optional whole-home Pi-hole: graphical by default, narrow CLI with arguments.
+# The "home-*" commands run Pi-hole in a container on THIS computer (or a home server / Raspberry Pi
+# reached with --host user@name), guide the router, and prove it works. See: secure-linux-pihole home-help
 set -eu
+
+# ---------------------------------------------------------------------------
+# Home ad-blocker path (home-*). Self-contained on purpose: it needs only sh,
+# sudo, and (for a server) ssh; for the check, dig or nslookup. Every change
+# is shown first and only done with --go.
+# ---------------------------------------------------------------------------
+SL_TEST_NAME="sl-check.home.arpa"
+SL_AD_NAME="doubleclick.net"
+SL_ISB_IMAGE="ghcr.io/dmunozv04/isponsorblocktv:v2.11.0@sha256:d1e876636754fb2b54490feebe3af4a321f7f2a932a2d57b67b2a667eea40823"
+SL_UPSTREAMS="9.9.9.9;149.112.112.112"
+SL_PI_LISTS="https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts
+https://raw.githubusercontent.com/Perflyst/PiHoleBlocklist/master/SmartTV.txt
+https://raw.githubusercontent.com/Perflyst/PiHoleBlocklist/master/android-tracking.txt
+https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/light-onlydomains.txt"
+
+pi_say() { printf '%s\n' "$*"; }
+pi_stop() { printf 'STOPPED (nothing was changed by this step): %s\n' "$*" >&2; exit 2; }
+pi_ssh() { ${SL_SSH:-ssh} -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new "$@"; }
+pi_sudo() { ${SL_SUDO:-sudo} "$@"; }
+pi_is_local() { [ "${PI_HOST:-local}" = local ]; }
+pi_run_user() { if pi_is_local; then sh -s; else pi_ssh "$PI_HOST" 'sh -s'; fi; }
+pi_run_root() { if pi_is_local; then pi_sudo sh -s; else pi_ssh "$PI_HOST" 'sudo -n sh -s'; fi; }
+pi_run_tty() { # one command line without single quotes, run as root with a terminal
+  if pi_is_local; then pi_sudo sh -c "$1"; else pi_ssh -t "$PI_HOST" "sudo sh -c '$1'"; fi
+}
+pi_where() { if pi_is_local; then printf 'this computer'; else printf '%s' "$PI_HOST"; fi; }
+
+pi_valid_host() { case "$1" in ''|*[!A-Za-z0-9._@-]*|-*) return 1 ;; esac; }
+pi_valid_ip() {
+  case "$1" in *[!0-9.]*|'') return 1 ;; esac
+  oldifs=$IFS; IFS=.; set -- $1; IFS=$oldifs
+  [ "$#" -eq 4 ] || return 1
+  for part in "$@"; do
+    case "$part" in ''|*[!0-9]*) return 1 ;; esac
+    [ "$part" -le 255 ] || return 1
+  done
+  case "$1.$2" in 192.168|172.1[6-9]|172.2[0-9]|172.3[01]) return 0 ;; esac
+  [ "$1" = 10 ] && return 0
+  return 1
+}
+
+pi_lib_dir() {
+  if [ -n "${SL_ROOT:-}" ] && [ -r "$SL_ROOT/lib/pihole_core.py" ]; then printf '%s\n' "$SL_ROOT/lib"
+  elif [ -r "$HERE/../lib/pihole_core.py" ]; then printf '%s\n' "$HERE/../lib"
+  else printf '%s\n' /usr/local/lib/secure-linux/lib; fi
+}
+
+# The Pi-hole image is the one this kit already reviewed and pinned by tag + digest in pihole_core.py.
+pi_image() {
+  core=$(pi_lib_dir)/pihole_core.py
+  [ -r "$core" ] || pi_stop "The kit's Pi-hole files are incomplete ($core is missing)."
+  version=$(sed -n 's/^PIHOLE_VERSION = "\(.*\)"$/\1/p' "$core")
+  digest=$(sed -n 's/^PIHOLE_DIGEST = "\(.*\)"$/\1/p' "$core")
+  case "$version$digest" in ''|*[!A-Za-z0-9.:_-]*) pi_stop "Could not read the pinned Pi-hole image from the kit." ;; esac
+  printf 'docker.io/pihole/pihole:%s@%s\n' "$version" "$digest"
+}
+
+pi_state_dir() {
+  printf '%s\n' "${SL_PIHOLE_PI_STATE:-${XDG_STATE_HOME:-$HOME/.local/state}/secure-linux/pihole-home}"
+}
+
+pi_help() {
+  cat <<'EOF'
+HOME AD BLOCKER: Pi-hole on this computer or your home server, plus the router steps
+
+What you need: this Linux computer (or your home server) switched on all the time, with Docker or
+Podman. Turn Docker on in the Home & Server Helper first if it is not there. A Raspberry Pi works the
+same way: use --host you@raspberrypi.local (Raspberry Pi OS 64-bit, SSH on).
+--host defaults to "this computer". For a home server use --host you@servername.
+
+The steps (each one has an undo):
+  1. secure-linux-pihole home-setup                       shows the plan, changes nothing
+     secure-linux-pihole home-setup --go                  does it (about 5 minutes)
+  2. secure-linux-pihole home-router-guide unifi --pi-ip 192.168.1.5     what to click in your router
+     (types: unifi, openwrt, mikrotik, opnsense, pfsense, asus, generic, no-redirect)
+  3. secure-linux-pihole home-check --pi-ip 192.168.1.5   proves it is really working
+
+If something goes wrong, or you want a break from blocking:
+  secure-linux-pihole home-pause  --minutes 5     blocking off for 5 minutes (the internet keeps working)
+  secure-linux-pihole home-resume --go            blocking back on
+  secure-linux-pihole home-off    --go            blocking off until you turn it on (the internet keeps working)
+  secure-linux-pihole home-remove --go --router-dns-removed
+                                                  removes it (only after the router no longer points at it)
+  secure-linux-pihole home-status
+
+Optional, off by default (presses "Skip Ad" and skips sponsor segments in the TV's YouTube app):
+  secure-linux-pihole home-youtube status|on|off|remove
+
+Honest limits: this blocks ad and tracker NAMES. It cannot stop ads that come from the same name as
+the video, and it does not promise zero ads. The computer must stay switched on, because the whole
+home asks it for names.
+The older graphical and "install" commands of this tool still work as before.
+EOF
+}
+
+# --- scripts sent on standard input (no secret is ever a command-line argument) ---
+pi_probe_script() {
+  cat <<'EOF'
+# SL-PROBE
+echo "ARCH=$(uname -m)"
+route=$(ip -4 route get 1.1.1.1 2>/dev/null | head -n 1)
+echo "SRC=$(echo "$route" | sed -n 's/.* src \([0-9.]*\).*/\1/p')"
+dev=$(echo "$route" | sed -n 's/.* dev \([^ ]*\).*/\1/p')
+echo "MAC=$(cat /sys/class/net/$dev/address 2>/dev/null)"
+echo "SUDO=$(sudo -n true 2>/dev/null && echo 1 || echo 0)"
+EOF
+}
+
+pi_get() { printf '%s\n' "$1" | sed -n "s/^$2=//p" | head -n 1; }
+
+PI_ENGINE_SNIPPET='ENGINE=$(command -v docker || command -v podman || true)
+if [ -z "$ENGINE" ]; then
+  if command -v apt-get >/dev/null 2>&1; then
+    echo "Installing Docker from the Debian / Raspberry Pi OS package list (docker.io)..."
+    DEBIAN_FRONTEND=noninteractive apt-get update
+    DEBIAN_FRONTEND=noninteractive apt-get install -y docker.io
+    ENGINE=$(command -v docker || true)
+  fi
+fi
+if [ -z "$ENGINE" ]; then echo "SL_RESULT=no-engine"; exit 5; fi
+systemctl enable --now docker >/dev/null 2>&1 || true
+systemctl enable podman-restart.service >/dev/null 2>&1 || true'
+
+PI_FIREWALL_SNIPPET='fw() { if firewall-cmd --state >/dev/null 2>&1; then firewall-cmd --permanent "$@"; else firewall-offline-cmd "$@"; fi; }'
+
+pi_install_script() { # image ip network tz password
+  printf '%s\n' "# SL-INSTALL" "set -eu" "IMAGE='$1'" "PI_IP='$2'" "NETWORK='$3'" "TZNAME='$4'" "TESTNAME='$SL_TEST_NAME'" "UPSTREAMS='$SL_UPSTREAMS'"
+  printf '%s\n' "$PI_ENGINE_SNIPPET"
+  cat <<'EOF'
+if "$ENGINE" ps -a --format '{{.Names}}' | grep -qx pihole; then echo "SL_RESULT=already"; exit 0; fi
+if ss -H -lntu 2>/dev/null | awk '{print $5}' | grep -E "^(0\.0\.0\.0|\*|\[::\]|$PI_IP):53$" >/dev/null; then echo "SL_RESULT=port53-busy"; exit 6; fi
+umask 077
+mkdir -p /opt/secure-linux-pihole/etc-pihole
+EOF
+  printf "cat > /opt/secure-linux-pihole/admin-password <<'SL_PW_END'\n%s\nSL_PW_END\n" "$5"
+  printf "cat > /opt/secure-linux-pihole/etc-pihole/adlists.list <<'SL_LISTS_END'\n%s\nSL_LISTS_END\n" "$SL_PI_LISTS"
+  printf '%s\n' "$PI_FIREWALL_SNIPPET"
+  cat <<'EOF'
+chmod 600 /opt/secure-linux-pihole/admin-password
+chmod 755 /opt/secure-linux-pihole /opt/secure-linux-pihole/etc-pihole
+chmod 644 /opt/secure-linux-pihole/etc-pihole/adlists.list
+if command -v firewall-cmd >/dev/null 2>&1; then
+  for pp in 53/tcp 53/udp 80/tcp; do fw --zone=home --query-port="$pp" >/dev/null 2>&1 || fw --zone=home --add-port="$pp" || true; done
+  firewall-cmd --state >/dev/null 2>&1 && firewall-cmd --reload || true
+fi
+echo "Downloading the Pi-hole image fixed by this kit..."
+"$ENGINE" pull "$IMAGE"
+"$ENGINE" run -d --name pihole --restart unless-stopped \
+  -e TZ="$TZNAME" \
+  -e WEBPASSWORD_FILE=pihole_webpasswd \
+  -e FTLCONF_dns_listeningMode=ALL \
+  -e FTLCONF_dns_upstreams="$UPSTREAMS" \
+  -e FTLCONF_webserver_acl="+$NETWORK,+127.0.0.1" \
+  -e FTLCONF_dns_hosts="$PI_IP $TESTNAME" \
+  -v /opt/secure-linux-pihole/etc-pihole:/etc/pihole:Z \
+  -v /opt/secure-linux-pihole/admin-password:/run/secrets/pihole_webpasswd:ro,Z \
+  -p "$PI_IP:53:53/tcp" -p "$PI_IP:53:53/udp" -p "$PI_IP:80:80/tcp" \
+  "$IMAGE"
+echo "Waiting for Pi-hole to start (it downloads the block lists first, up to 3 minutes)..."
+n=0
+while [ "$n" -lt 36 ]; do
+  if "$ENGINE" exec pihole dig +short +time=2 +tries=1 @127.0.0.1 "$TESTNAME" 2>/dev/null | grep -q "$PI_IP"; then
+    echo "SL_RESULT=ready"; exit 0
+  fi
+  n=$((n+1)); sleep 5
+done
+echo "SL_RESULT=not-ready"; exit 3
+EOF
+}
+
+pi_control_script() { # verb minutes
+  printf '%s\n' "# SL-CONTROL" "set -eu" "VERB='$1'" "MINUTES='${2:-}'"
+  printf '%s\n' 'ENGINE=$(command -v docker || command -v podman || true)' '[ -n "$ENGINE" ] || { echo "SL_RESULT=no-engine"; exit 5; }'
+  printf '%s\n' "$PI_FIREWALL_SNIPPET"
+  cat <<'EOF'
+case "$VERB" in
+  pause)  "$ENGINE" exec pihole pihole disable "${MINUTES}m" ;;
+  resume) "$ENGINE" exec pihole pihole enable ;;
+  off)    "$ENGINE" exec pihole pihole disable ;;
+  status) "$ENGINE" ps --filter name=pihole --format '{{.Names}} {{.Status}}'; "$ENGINE" exec pihole pihole status || true ;;
+  remove)
+    "$ENGINE" rm -f pihole
+    if command -v firewall-cmd >/dev/null 2>&1; then
+      for pp in 53/tcp 53/udp 80/tcp; do fw --zone=home --query-port="$pp" >/dev/null 2>&1 && fw --zone=home --remove-port="$pp" || true; done
+      firewall-cmd --state >/dev/null 2>&1 && firewall-cmd --reload || true
+    fi ;;
+esac
+echo "SL_RESULT=done"
+EOF
+}
+
+pi_isb_script() { # verb
+  printf '%s\n' "# SL-ISB" "set -eu" "VERB='$1'" "IMAGE='$SL_ISB_IMAGE'"
+  printf '%s\n' "$PI_ENGINE_SNIPPET"
+  cat <<'EOF'
+DATA=/opt/secure-linux-isponsorblocktv/data
+exists() { "$ENGINE" ps -a --format '{{.Names}}' | grep -qx isponsorblocktv; }
+case "$VERB" in
+  status)
+    if exists; then "$ENGINE" ps -a --filter name=isponsorblocktv --format '{{.Names}} {{.Status}}'; "$ENGINE" logs --tail 5 isponsorblocktv 2>&1 || true
+    else echo "Not installed."; fi ;;
+  start)
+    if exists; then "$ENGINE" update --restart unless-stopped isponsorblocktv 2>/dev/null || true; "$ENGINE" start isponsorblocktv
+    else
+      [ -s "$DATA/config.json" ] || { echo "SL_RESULT=not-paired"; exit 4; }
+      "$ENGINE" run -d --name isponsorblocktv --restart unless-stopped -v "$DATA:/app/data:Z" "$IMAGE"
+    fi ;;
+  stop) if exists; then "$ENGINE" update --restart=no isponsorblocktv 2>/dev/null || true; "$ENGINE" stop isponsorblocktv; fi ;;
+  remove) if exists; then "$ENGINE" rm -f isponsorblocktv; fi; "$ENGINE" rmi "$IMAGE" >/dev/null 2>&1 || true; rm -rf /opt/secure-linux-isponsorblocktv ;;
+esac
+echo "SL_RESULT=done"
+EOF
+}
+
+pi_parse_common() { # sets PI_HOST GO MINUTES ROUTER_OK PI_IP WRITE from arguments
+  PI_HOST=local; GO=0; MINUTES=5; ROUTER_OK=0; PI_IP=""; WRITE=""
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --host) PI_HOST=${2:-}; shift 2 ;;
+      --ip|--pi-ip) PI_IP=${2:-}; shift 2 ;;
+      --go) GO=1; shift ;;
+      --minutes) MINUTES=${2:-}; shift 2 ;;
+      --router-dns-removed) ROUTER_OK=1; shift ;;
+      --write-script) WRITE=${2:-}; shift 2 ;;
+      *) pi_stop "Unknown option: $1 (see: secure-linux-pihole home-help)" ;;
+    esac
+  done
+  pi_valid_host "$PI_HOST" || pi_stop "--host must be 'local' (this computer) or a name like me@servername."
+}
+
+pi_setup() {
+  pi_parse_common "$@"
+  image=$(pi_image)
+  pi_say "SET UP PI-HOLE ON $(pi_where)"
+  pi_say "I am only reading things first (nothing is changed yet)."
+  probe=$(pi_probe_script | pi_run_user) || pi_stop "I could not reach $(pi_where). For a server: check the name, that it is on, and that SSH works."
+  arch=$(pi_get "$probe" ARCH)
+  case "$arch" in aarch64|x86_64) : ;; *) pi_stop "This machine is $arch. The Pi-hole image this kit checked runs on 64-bit machines only (on a Raspberry Pi write Raspberry Pi OS 64-bit)." ;; esac
+  [ -n "$PI_IP" ] || PI_IP=$(pi_get "$probe" SRC)
+  pi_valid_ip "$PI_IP" || pi_stop "I could not work out the home-network address (got '$PI_IP'). Give it with --ip 192.168.1.5."
+  mac=$(pi_get "$probe" MAC)
+  tz=$(timedatectl show -p Timezone --value 2>/dev/null || cat /etc/timezone 2>/dev/null || echo UTC)
+  case "$tz" in ''|*[!A-Za-z0-9_/+-]*) tz=UTC ;; esac
+  network="${PI_IP%.*}.0/24"
+  statedir="$(pi_state_dir)/$PI_HOST"
+  pi_say ""
+  pi_say "THE PLAN"
+  pi_say "  1. Use Docker or Podman (installed from the Debian package list on Raspberry Pi OS if missing)."
+  pi_say "  2. Run Pi-hole from the image this kit has already checked: $image"
+  pi_say "  3. Turn on these block lists, which include smart-TV and tracking lists:"
+  printf '%s\n' "$SL_PI_LISTS" | sed 's/^/       /'
+  pi_say "  4. Pi-hole asks Quad9 (9.9.9.9) for names it does not block. Address: $PI_IP (web page: http://$PI_IP/admin)."
+  pi_say "  5. Open the home firewall zone for DNS (port 53) and the web page (80) if firewalld is used."
+  pi_say "  6. Make a random admin password and save it here: $statedir/admin-password"
+  pi_say "  Nothing in your router changes in this step. Undo for this step: home-remove."
+  pi_say ""
+  pi_say "FIXED ADDRESS (important): this machine must always keep $PI_IP. In your router make a fixed address /"
+  pi_say "DHCP reservation for it (hardware address ${mac:-unknown}). On UniFi see: home-router-guide unifi --pi-ip $PI_IP"
+  if ! pi_is_local && [ "$(pi_get "$probe" SUDO)" != 1 ] && [ -z "$WRITE" ]; then
+    pi_say "NOTE: that account needs a password for administrator commands, so I cannot do it over SSH."
+    pi_say "Run again with --write-script FILE, copy that file to the machine and run it there with: sudo sh FILE"
+    [ "$GO" = 1 ] && pi_stop "Cannot continue over SSH (no passwordless administrator rights)."
+  fi
+  if [ "$GO" != 1 ] && [ -z "$WRITE" ]; then
+    pi_say ""
+    pi_say "DRY RUN: nothing was changed. Add --go to do it."
+    return 0
+  fi
+  password=$(LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom | head -c 16)
+  [ "${#password}" -eq 16 ] || pi_stop "Could not make a random password."
+  script=$(pi_install_script "$image" "$PI_IP" "$network" "$tz" "$password")
+  if [ -n "$WRITE" ]; then
+    ( umask 077; mkdir -p "$statedir"; printf '%s\n' "$password" > "$statedir/admin-password"; printf '%s\n' "$script" > "$WRITE" )
+    pi_say "Wrote the setup script to $WRITE (it contains the admin password; keep it private and delete it afterwards)."
+    pi_say "Copy it to the machine and run: sudo sh $(basename "$WRITE")"
+    return 0
+  fi
+  pi_say "Working now. This can take a few minutes..."
+  out=$(printf '%s\n' "$script" | pi_run_root) || {
+    printf '%s\n' "$out"
+    case "$out" in
+      *SL_RESULT=no-engine*) pi_stop "No Docker or Podman was found. Turn on Docker in the Home & Server Helper first." ;;
+      *SL_RESULT=port53-busy*) pi_stop "Something already answers DNS (port 53) on $PI_IP. Remove it first; I will not fight it." ;;
+      *) pi_stop "The setup did not finish. Nothing in your router was changed. Run home-remove to clean up." ;;
+    esac
+  }
+  case "$out" in *SL_RESULT=already*) pi_say "Pi-hole is already installed here. Nothing to do. Use home-check to test it."; return 0 ;; esac
+  ( umask 077; mkdir -p "$statedir"; printf '%s\n' "$password" > "$statedir/admin-password" )
+  printf '%s\n' "$out" | grep -v '^SL_RESULT' || true
+  pi_say ""
+  pi_say "PI-HOLE IS RUNNING at $PI_IP"
+  pi_say "  Web page:   http://$PI_IP/admin   Password: $password   (also saved in $statedir/admin-password)"
+  pi_say "  Next: give $PI_IP a fixed address in your router, then run: secure-linux-pihole home-router-guide unifi --pi-ip $PI_IP"
+  pi_say "  Then prove it works: secure-linux-pihole home-check --pi-ip $PI_IP"
+}
+
+pi_control() { # verb
+  verb=$1; shift
+  pi_parse_common "$@"
+  case "$MINUTES" in ''|*[!0-9]*) pi_stop "--minutes must be a whole number like 5." ;; esac
+  { [ "$MINUTES" -ge 1 ] && [ "$MINUTES" -le 1440 ]; } || pi_stop "--minutes must be between 1 and 1440."
+  case "$verb" in
+    pause) pi_say "Pause blocking for $MINUTES minutes. Pi-hole keeps answering names, so the internet keeps working; only blocking stops. It turns itself back on." ;;
+    resume) pi_say "Turn blocking back on." ;;
+    off) pi_say "Turn blocking off until you turn it on again. Pi-hole keeps answering names, so the internet keeps working; ads will show again." ;;
+    status) : ;;
+    remove)
+      pi_say "Remove Pi-hole (the container; Docker and your block lists stay)."
+      [ "$ROUTER_OK" = 1 ] || pi_stop "Before removing, change your router so it no longer uses this Pi-hole for DNS (set DNS back to automatic) and remove any redirect rule. Otherwise every device loses the internet. Then run again with --router-dns-removed."
+      ;;
+  esac
+  if [ "$verb" != status ] && [ "$verb" != pause ] && [ "$GO" != 1 ]; then
+    pi_say "DRY RUN: nothing was changed. Add --go to do it."
+    return 0
+  fi
+  out=$(pi_control_script "$verb" "$MINUTES" | pi_run_root) || { printf '%s\n' "$out"; pi_stop "That did not work. Is Pi-hole installed (home-status)?"; }
+  printf '%s\n' "$out" | grep -v '^SL_RESULT' || true
+  pi_say "Done."
+}
+
+pi_youtube() {
+  verb=${1:-}
+  [ "$#" -gt 0 ] && shift
+  pi_parse_common "$@"
+  case "$verb" in on|off|remove|status) : ;; *) pi_stop "Use: home-youtube status | on | off | remove" ;; esac
+  pi_say "SKIP YOUTUBE ADS AND SPONSOR SEGMENTS ON THE TV (optional, uses the open-source iSponsorBlockTV)"
+  pi_say "What it does: while the normal YouTube app plays on your TV, it presses 'Skip Ad' the moment YouTube offers it,"
+  pi_say "skips sponsor and intro segments, and can mute ads. It does NOT stop ads from starting, and YouTube can change"
+  pi_say "things so it stops working for a while. It does not work for the SmartTube app. This computer must stay on."
+  data=/opt/secure-linux-isponsorblocktv/data
+  case "$verb" in
+    status)
+      out=$(pi_isb_script status | pi_run_root) || pi_stop "Could not read the status."
+      printf '%s\n' "$out" | grep -v '^SL_RESULT' || true
+      return 0 ;;
+    on)
+      pi_say "Step A: pairing. On the TV open YouTube > Settings > Link with TV code. You type that code on the next screen."
+      pi_say "Step B: it starts and keeps running. Undo: home-youtube off (stops, keeps the pairing) or remove (deletes everything)."
+      [ "$GO" = 1 ] || { pi_say "DRY RUN: nothing was changed. Add --go to do it."; return 0; }
+      pi_run_tty "E=\$(command -v docker || command -v podman); mkdir -p $data && \"\$E\" run --rm -it -v $data:/app/data:Z $SL_ISB_IMAGE --setup-cli" || pi_stop "Pairing did not finish. Nothing is running."
+      out=$(pi_isb_script start | pi_run_root) || pi_stop "Could not start it."
+      printf '%s\n' "$out" | grep -v '^SL_RESULT' || true
+      pi_say "It is running. Play a YouTube video with an ad on the TV to see it work." ;;
+    off|remove)
+      if [ "$verb" = remove ]; then pi_say "remove: stops the skipper and deletes its files and image."; else pi_say "off: stops the skipper; the pairing is kept."; fi
+      [ "$GO" = 1 ] || { pi_say "DRY RUN: nothing was changed. Add --go to do it."; return 0; }
+      scriptverb=stop
+      [ "$verb" = remove ] && scriptverb=remove
+      pi_isb_script "$scriptverb" | pi_run_root >/dev/null || pi_stop "That did not work."
+      pi_say "Done." ;;
+  esac
+}
+
+# --- router guide ------------------------------------------------------------
+pi_router_guide() {
+  family=${1:-}
+  [ "$#" -gt 0 ] && shift
+  pi_parse_common "$@"
+  case "$family" in unifi|openwrt|mikrotik|opnsense|pfsense|asus|generic|no-redirect) : ;; *) pi_stop "Router types: unifi, openwrt, mikrotik, opnsense, pfsense, asus, generic, no-redirect." ;; esac
+  pi_valid_ip "$PI_IP" || pi_stop "Give the Pi-hole's home-network address with --pi-ip, for example --pi-ip 192.168.1.5."
+  net="${PI_IP%.*}.0/24"
+  cat <<EOF
+ROUTER GUIDE for the Pi-hole at $PI_IP  (router type: $family)
+
+BEFORE YOU START
+  - Keep the router's admin page open. Write down every value before you change it. That is your undo.
+  - Do step 1 first, test, then step 2. Test with: secure-linux-pihole home-check --pi-ip $PI_IP
+  - If the whole home loses the internet: put the old values back (the UNDO lines below). To stop blocking
+    without breaking anything use: secure-linux-pihole home-pause --minutes 5
+  - This computer (or server) must stay on. If it is off, devices that use it for DNS have no internet.
+
+STEP 1 - HAND OUT PI-HOLE AS DNS (works on almost every router)
+  In the router's LAN / DHCP settings, set the DNS server (DNS 1) to $PI_IP and save. Leave DNS 2 empty
+  (a second public DNS lets devices skip Pi-hole). Reconnect Wi-Fi on a device, or restart it.
+  Give $PI_IP a fixed address (DHCP / address reservation) so it never changes.
+  If your router also hands out IPv6 DNS, clear that too, or devices may skip Pi-hole.
+  UNDO: set the DNS field back to automatic (or the old value you wrote down).
+EOF
+  case "$family" in
+    unifi) cat <<EOF
+  UniFi Cloud Gateway (UniFi OS / UniFi Network). Click paths below come from Ubiquiti's own help pages,
+  read on 2026-11-14 (help.ui.com articles "UniFi - DNS Troubleshooting Guide", "UniFi DHCP Server",
+  "DNAT, SNAT, and Masquerading in UniFi", "Zone-Based Firewalls in UniFi", "UniFi Gateway - Ad Blocking",
+  "Content and Domain Filtering in UniFi"). Menu names can change in newer versions: if one is missing, look for
+  the same words nearby.
+  1a) Settings > Networks > [your network name] > DHCP Service Management > DNS Server:
+      choose manual, enter $PI_IP as DNS Server 1, leave the others empty, Apply Changes. Do this for each network
+      whose devices should use Pi-hole. Devices pick it up when their lease renews (up to 24 hours): turn a TV off
+      and on to speed it up.
+  1b) Do NOT change Settings > Internet > DNS Server. That is the gateway's own DNS; Ubiquiti warns that a custom
+      internal DNS there can block the ui.com addresses UniFi needs.
+  1c) Fixed address for $PI_IP: UniFi Client Devices > this machine > Settings > Fixed IP Address
+      (this exact label is UNVERIFIED on the current version; look for "Fixed IP").
+  1d) Built-in blocking. Ubiquiti says (Ad Blocking help page):
+        "Clients using custom DNS servers are redirected to use the UniFi Gateway DNS server when Ad Blocking is enabled"
+      and (Content Filtering help page): "Content filtering works by redirecting DNS traffic to the UniFi Gateway".
+      That would send devices to UniFi's list instead of Pi-hole. For the networks that use Pi-hole, turn OFF
+      Settings > CyberSecure > Content Filter policies (and their "Enable Ad Blocking" option) and Ad Blocking
+      in Application Firewall. Use one blocker, not two.
+
+STEP 2 - FORCE EVERY DEVICE THROUGH PI-HOLE, CHROMECASTS INCLUDED
+  Why: Chromecasts and many TVs ignore the DNS your router hands out and ask Google (8.8.8.8 / 8.8.4.4) directly.
+  The fix is to REDIRECT those requests to Pi-hole, not to block 8.8.8.8: reports say a Chromecast stops working
+  if 8.8.8.8 cannot be reached. Redirecting still gives it an answer.
+  We redirect only the well-known public DNS addresses (8.8.8.8, 8.8.4.4, 1.1.1.1, 1.0.0.1). Pi-hole itself asks
+  Quad9 (9.9.9.9), which is not redirected, so there is no loop.
+  Where: UniFi Network 9.4: Settings > Policy Table > Create New Policy.   9.3: Settings > Policy Engine.
+  2a) NAT > Dest. NAT, name "SL redirect public DNS":
+        Interface: your home network (the one the TVs are on).  Protocol: TCP and UDP.
+        Translated IP Address: $PI_IP    Translated Port: 53
+        Source: Any (or your home network).  Destination: IP address 8.8.8.8, 8.8.4.4, 1.1.1.1, 1.0.0.1, Port 53.
+      Click Add.
+  2b) NAT > Masquerade, name "SL Pi-hole replies":
+        Interface: the same home network.  Protocol: TCP and UDP.
+        Source: your home network.  Destination: IP address $PI_IP, Port 53.
+      (Without this the TV may reject the answer because it comes from $PI_IP and not from 8.8.8.8.
+       It is needed when Pi-hole and the TVs share one network. Whether your version needs it is UNVERIFIED:
+       home-check tells you.)
+  2c) Firewall policy, name "SL block encrypted DNS" (Zones > Create Policy, or Policy Table > Create New Policy):
+        Source zone Internal, Destination zone External, Protocol TCP, Destination Port: Specific 853, Action: Block.
+  2d) Firewall policy, name "SL block Google DoH":
+        Source zone Internal, Destination zone External, Protocol TCP, Destination IP 8.8.8.8 and 8.8.4.4,
+        Destination Port: Specific 443, Action: Block.
+      (This only closes Google's encrypted DNS. Other encrypted-DNS providers are not covered. It is UNVERIFIED that
+       the Chromecast uses it at all: home-check shows whether it is open.)
+  Custom rules sit above the built-in ones but under other custom rules; use Reorder if a rule does not act.
+  Optional, more thorough: a Dest. NAT with Destination "Any" and Port 53 catches every other resolver too, but then
+  Pi-hole's own questions loop back to Pi-hole unless the source leaves out $PI_IP. Not recommended unless your
+  Source box accepts a range that leaves $PI_IP out (UNVERIFIED).
+  UNDO: in the same table switch each "SL ..." policy off (toggle) or delete it, then Apply.
+EOF
+    ;;
+    openwrt) cat <<EOF
+
+STEP 2 - FORCE EVERY DEVICE THROUGH PI-HOLE, CHROMECASTS INCLUDED
+  Why: Chromecasts ask Google (8.8.8.8 / 8.8.4.4) directly. REDIRECT those requests, do not block them.
+  OpenWrt (LuCI web page), based on a community guide (not the OpenWrt wiki):
+   a) Network > Firewall > Port Forwards > Add:  Protocol TCP+UDP, Source zone lan, External port 53,
+      Destination zone lan, Internal IP $PI_IP, Internal port 53.
+      Advanced settings > Source IP address: !$PI_IP   (so Pi-hole's own questions are not sent back to itself)
+   b) Network > Firewall > NAT Rules > Add:  Protocol TCP+UDP, Outbound zone lan, Source address any,
+      Destination address $PI_IP, Destination port 53, Action MASQUERADE, do not rewrite the port.
+      (Without this, clients complain "reply from unexpected source".)
+   c) Optional: Traffic Rules > Add: Source lan, Destination wan, Protocol TCP, Port 853, Action reject
+      (blocks encrypted DNS on port 853; devices then fall back to normal DNS, which rule a) redirects).
+  UNDO: delete or disable those rules and click Save & Apply.
+EOF
+    ;;
+    mikrotik) cat <<EOF
+
+STEP 2 - FORCE EVERY DEVICE THROUGH PI-HOLE, CHROMECASTS INCLUDED
+  Why: Chromecasts ask Google (8.8.8.8 / 8.8.4.4) directly. REDIRECT those requests, do not block them.
+  MikroTik RouterOS (New Terminal), from a community guide. Replace $net with your home network if it differs:
+    /ip firewall nat
+    add chain=dstnat action=dst-nat to-addresses=$PI_IP protocol=udp src-address=!$PI_IP dst-address=!$PI_IP dst-port=53 comment=sl-pihole
+    add chain=dstnat action=dst-nat to-addresses=$PI_IP protocol=tcp src-address=!$PI_IP dst-address=!$PI_IP dst-port=53 comment=sl-pihole
+    add chain=srcnat action=masquerade protocol=udp src-address=$net dst-address=$PI_IP dst-port=53 comment=sl-pihole
+    add chain=srcnat action=masquerade protocol=tcp src-address=$net dst-address=$PI_IP dst-port=53 comment=sl-pihole
+  Optional, blocks encrypted DNS on port 853 (check the interface name for your router):
+    /ip firewall filter add chain=forward action=drop protocol=tcp dst-port=853 out-interface-list=WAN comment=sl-pihole
+  UNDO: /ip firewall nat remove [find comment=sl-pihole]   and   /ip firewall filter remove [find comment=sl-pihole]
+EOF
+    ;;
+    opnsense|pfsense) cat <<EOF
+
+STEP 2 - FORCE EVERY DEVICE THROUGH PI-HOLE, CHROMECASTS INCLUDED
+  Why: Chromecasts ask Google (8.8.8.8 / 8.8.4.4) directly. REDIRECT those requests, do not block them.
+  OPNsense / pfSense (web page), from community guides (no official page found); labels vary by version:
+   a) Firewall > NAT > Port Forward > Add: Interface LAN, Protocol TCP/UDP,
+      Source: any, Destination: tick "Invert" and enter $PI_IP, Destination port range DNS (53),
+      Redirect target IP $PI_IP, Redirect target port DNS (53). Save, then Apply.
+   b) Make sure outbound NAT lets Pi-hole's replies look like they came from the address the device asked
+      (automatic outbound NAT usually does this; if answers fail, add an outbound NAT rule for LAN traffic
+      to $PI_IP port 53).
+   c) Optional: Firewall > Rules > LAN: Block, TCP, destination port 853 (encrypted DNS).
+  UNDO: disable or delete that port-forward rule and Apply.
+EOF
+    ;;
+    asus) cat <<EOF
+
+STEP 2 - FORCE EVERY DEVICE THROUGH PI-HOLE, CHROMECASTS INCLUDED
+  ASUS routers: the stock ASUS firmware can hand out Pi-hole (step 1) but has no redirect rule for devices
+  that ignore it. Community reports say the Merlin firmware's "DNS Director" (LAN > DNSFilter) can force
+  clients to a chosen DNS server. That is community-sourced and model-dependent; test with home-check.
+  If your router has no such option, read the "no-redirect" guide for what you can still do.
+  UNDO: set DNS Director / DNSFilter back to Disabled.
+EOF
+    ;;
+    no-redirect|generic) cat <<EOF
+
+STEP 2 - FORCE EVERY DEVICE THROUGH PI-HOLE, CHROMECASTS INCLUDED
+  If your router has no redirect or firewall rule (most routers from an internet provider do not):
+   - Step 1 alone covers phones, laptops and most TVs.
+   - Chromecasts that insist on Google DNS cannot be forced by step 1. Honest options:
+       1. Set the DNS by hand on that device. On Chromecast with Google TV: Settings > Network & Internet >
+          your Wi-Fi name > IP settings > Static, keep the address values, and put $PI_IP in the DNS field.
+          (Third-party guides describe this; menu names vary by version. Apps that use their own DNS can still skip it.)
+       2. Put a second router that CAN redirect (for example one running OpenWrt, or a MikroTik) behind your
+          main router and use the rules for that family. That is a buying decision for you.
+       3. Accept partial blocking, and use secure-linux-tv-cleanup to cut ads on the TV itself.
+   - Routing tricks for 8.8.8.8 / 8.8.4.4 are not recommended here (UNVERIFIED, may break casting).
+  If you have a router that can redirect, choose: unifi, openwrt, mikrotik, opnsense, pfsense or asus.
+EOF
+    ;;
+  esac
+  cat <<EOF
+
+WHAT THIS CANNOT DO (said plainly)
+  - Devices that use DNS-over-HTTPS (port 443) look like normal web traffic. A router rule cannot catch them all.
+  - Ads that come from the same name as the video (for example inside YouTube) are not blocked by DNS.
+  - No setup promises zero ads.
+
+PROVE IT:  secure-linux-pihole home-check --pi-ip $PI_IP
+EOF
+}
+
+# --- check ---------------------------------------------------------------------
+pi_ask() { # server name -> ANS (answer) and RC (9 = no reply)
+  RC=0
+  if command -v dig >/dev/null 2>&1; then
+    raw=$(dig +short +time=3 +tries=1 "@$1" "$2" A 2>/dev/null) || RC=$?
+    ANS=$(printf '%s\n' "$raw" | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -n 1 || true)
+  elif command -v nslookup >/dev/null 2>&1; then
+    raw=$(nslookup -type=A -timeout=3 "$2" "$1" 2>&1) || true
+    case "$raw" in *"timed out"*|*"no servers could be reached"*|*"communications error"*) RC=9 ;; esac
+    ANS=$(printf '%s\n' "$raw" | awk '/^Name:/{n=1} n && /^Address/{print $NF}' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -n 1 || true)
+  else
+    pi_stop "I need the 'dig' program (Fedora: sudo dnf install bind-utils) or 'nslookup'."
+  fi
+}
+
+pi_check() {
+  pi_parse_common "$@"
+  pi_valid_ip "$PI_IP" || pi_stop "Give the Pi-hole's home-network address with --pi-ip, for example --pi-ip 192.168.1.5."
+  fail=0; partial=0
+  pi_say "CHECKING THAT YOUR HOME REALLY USES THE PI-HOLE AT $PI_IP (this only asks DNS questions)"
+  pi_say ""
+  pi_ask "$PI_IP" "$SL_TEST_NAME"
+  if [ "$ANS" = "$PI_IP" ]; then
+    pi_say "1. PASS  Pi-hole answers its own test name. It is up."
+  else
+    pi_say "1. FAIL  Nothing at $PI_IP answered the test name correctly. Is it on, is the address right, did setup finish (home-status)?"
+    fail=1
+  fi
+  if [ "$fail" = 0 ]; then
+    pi_ask "$PI_IP" "$SL_AD_NAME"
+    if [ "$ANS" = "0.0.0.0" ]; then
+      pi_say "2. PASS  An advert name ($SL_AD_NAME) is blocked by Pi-hole (answer 0.0.0.0)."
+    else
+      pi_say "2. WARN  The advert name $SL_AD_NAME got a real answer ('${ANS:-none}'). Block lists may still be loading, or blocking is paused (home-resume)."
+      partial=1
+    fi
+    sysans=$(getent hosts "$SL_TEST_NAME" 2>/dev/null | awk '{print $1}' | head -n 1 || true)
+    if [ "$sysans" = "$PI_IP" ]; then
+      pi_say "3. PASS  This computer's own DNS goes through Pi-hole (it found the Pi-hole-only test name)."
+    else
+      pi_say "3. WARN  This computer's own DNS does NOT go through Pi-hole yet. Do router step 1 (hand out Pi-hole as DNS), then reconnect Wi-Fi."
+      partial=1
+    fi
+    for google in 8.8.8.8 8.8.4.4 1.1.1.1 1.0.0.1; do
+      pi_ask "$google" "$SL_TEST_NAME"
+      if [ "$ANS" = "$PI_IP" ]; then
+        pi_say "4. PASS  A question sent straight to $google is redirected to Pi-hole. Devices that insist on it are caught."
+      elif [ "$RC" = 9 ]; then
+        pi_say "4. WARN  Nothing answers at $google: your network may block it. If a Chromecast stops working, remove that rule (redirect instead of block)."
+        partial=1
+      else
+        pi_say "4. WARN  A question sent to $google went there, not to Pi-hole. Devices with built-in DNS skip Pi-hole. Do router step 2 (home-router-guide)."
+        partial=1
+      fi
+    done
+    if command -v dig >/dev/null 2>&1 && dig +tls +short +time=3 +tries=1 @8.8.8.8 example.com >/dev/null 2>&1; then
+      pi_say "5. WARN  Encrypted DNS to Google (port 853) is open. Devices using it skip Pi-hole. Block port 853 in the router (rule 2c)."
+      partial=1
+    else
+      pi_say "5. PASS  Encrypted DNS to Google (port 853) did not get through (blocked, or this dig cannot test it)."
+    fi
+    if command -v curl >/dev/null 2>&1; then
+      doh=$(curl -s -m 5 -H 'accept: application/dns-json' 'https://8.8.8.8/resolve?name=example.com&type=A' 2>/dev/null || true)
+      case "$doh" in
+        *'"Answer"'*) pi_say "6. WARN  Google's DNS-over-HTTPS (8.8.8.8 port 443) is open. Apps that use it skip Pi-hole. Block it (rule 2d)."; partial=1 ;;
+        *) pi_say "6. PASS  Google's DNS-over-HTTPS at 8.8.8.8 did not answer." ;;
+      esac
+    fi
+    pi_say "   Not tested: other DNS-over-HTTPS providers and ads that share the video's own name. No test can promise zero ads."
+  fi
+  pi_say ""
+  if [ "$fail" = 1 ]; then
+    pi_say "PIHOLE_HOME_CHECK_FAILED  Pi-hole is not answering. Do not change the router yet."
+    return 1
+  elif [ "$partial" = 1 ]; then
+    pi_say "PIHOLE_HOME_CHECK_PARTIAL  Pi-hole works, but some devices can still skip it (see the WARN lines)."
+    return 3
+  fi
+  pi_say "PIHOLE_HOME_CHECK_OK  Everything tested goes through Pi-hole. This proves the tests above, not that every ad is gone."
+}
+
 SELF=$(readlink -f "$0" 2>/dev/null || printf '%s\n' "$0")
 HERE=$(dirname "$SELF")
+case "${1:-}" in
+  home-help) pi_help; exit 0 ;;
+  home-setup) shift; pi_setup "$@"; exit $? ;;
+  home-router-guide) shift; pi_router_guide "$@"; exit $? ;;
+  home-check) shift; pi_check "$@"; exit $? ;;
+  home-pause) shift; pi_control pause "$@"; exit $? ;;
+  home-resume) shift; pi_control resume "$@"; exit $? ;;
+  home-off) shift; pi_control off "$@"; exit $? ;;
+  home-remove) shift; pi_control remove "$@"; exit $? ;;
+  home-status) shift; pi_control status "$@"; exit $? ;;
+  home-youtube) shift; pi_youtube "$@"; exit $? ;;
+esac
+
 if [ -n "${SL_ROOT:-}" ] && [ -r "$SL_ROOT/lib/pihole_cli.py" ]; then
   LIB=$SL_ROOT/lib
 elif [ -r "$HERE/../lib/pihole_cli.py" ]; then

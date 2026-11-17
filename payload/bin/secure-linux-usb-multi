@@ -1,0 +1,296 @@
+#!/usr/bin/env python3
+# secure-linux-usb-multi: make several Secure Linux drives at once from the saved master, each one fully checked.
+"""Make several Secure Linux drives at once from the saved master. Each drive is made and checked by the drive
+builder (secure-linux-usb-creator), one copy of it per drive, all at the same time.
+
+  secure-linux-usb-multi --store STORE --mode portable --ventoy-installer Ventoy2Disk.sh \\
+      --target /dev/sdb --confirm "ERASE <serial of sdb>" --target /dev/sdc --confirm "ERASE <serial of sdc>"
+  secure-linux-usb-multi --store STORE --mode clone --target /dev/sdb --confirm "ERASE <serial>" [...]
+
+Every --target needs its own --confirm, in the same order. Every drive is checked BEFORE any drive is touched:
+one wrong phrase, an internal disk, a drive in use or the same drive twice stops everything, and nothing is written.
+At the end there is one line per drive, and "ALL DRIVES VERIFIED" only when every drive passed its full check.
+Exit 0 = all drives verified, 2 = at least one drive failed, 1 = refused (nothing was written).
+"""
+
+import argparse
+import datetime
+import importlib.machinery
+import importlib.util
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+
+INSTALLED_SELF = "/usr/local/bin/secure-linux-usb-multi"
+BUILDER_NAME = "secure-linux-usb-creator"
+SUCCESS = {
+    "clone": re.compile(r"^VERIFIED CLONE\b", re.M),
+    "portable": re.compile(r"^VERIFIED PORTABLE TOOLS COPY\b", re.M),
+}
+REASON = re.compile(r"^(REFUSED / STOPPED SAFELY|VERIFICATION FAILED|STOPPED SAFELY|Interrupted)\b.*$", re.M)
+EXIT_ALL, EXIT_REFUSED, EXIT_SOME_FAILED = 0, 1, 2
+
+
+class Refused(Exception):
+    """Nothing was started and nothing was written."""
+
+
+def builder_path():
+    here = Path(__file__).resolve().parent
+    for candidate in (here / BUILDER_NAME, Path("/usr/local/bin") / BUILDER_NAME):
+        if candidate.is_file():
+            return candidate
+    raise Refused("the drive builder (secure-linux-usb-creator) is missing. Nothing was written.")
+
+
+def load_builder(path):
+    """Load the drive builder as a module, so the checks before starting use exactly its identity rules."""
+    sys.dont_write_bytecode = True
+    loader = importlib.machinery.SourceFileLoader("secure_linux_usb_creator", str(path))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    try:
+        loader.exec_module(module)
+    except Exception as exc:  # noqa: BLE001 - any failure means the drives cannot be checked safely
+        raise Refused(f"the drive builder could not start ({exc.__class__.__name__}). Nothing was written.") from exc
+    for name in ("Devices", "identity", "identity_label", "require_unambiguous", "CreatorError"):
+        if not hasattr(module, name):
+            raise Refused("the drive builder is incomplete. Nothing was written.")
+    return module
+
+
+def removable(device):
+    return device.get("tran") == "usb" or bool(device.get("rm"))
+
+
+def check_targets(builder, rows, targets, phrases):
+    """Every target is checked before any drive is touched. Returns [(path, drive), ...] or raises Refused."""
+    if not targets:
+        raise Refused("choose at least one drive with --target. Nothing was written.")
+    if len(phrases) != len(targets):
+        raise Refused("every --target needs its own --confirm phrase, in the same order. Nothing was written.")
+    chosen = []
+    seen_paths, seen_ids = set(), set()
+    for number, (wanted, phrase) in enumerate(zip(targets, phrases), 1):
+        path = os.path.realpath(os.path.abspath(wanted))
+        if path in seen_paths:
+            raise Refused(f"{wanted} is listed twice. Nothing was written.")
+        seen_paths.add(path)
+        matches = [row for row in rows if os.path.realpath(row["path"]) == path]
+        if len(matches) != 1:
+            raise Refused(f"drive {number} ({wanted}) is not a USB or removable whole drive. "
+                          "Internal disks are never used. Nothing was written.")
+        drive = matches[0]
+        if not removable(drive):
+            raise Refused(f"drive {number} ({wanted}) is an internal or fixed disk. Nothing was written.")
+        try:
+            ident = builder.require_unambiguous(rows, drive)
+        except builder.CreatorError as exc:
+            raise Refused(f"drive {number} ({wanted}): {exc}. Nothing was written.") from exc
+        if ident in seen_ids:
+            raise Refused(f"drive {number} ({wanted}) is the same drive as an earlier one. Nothing was written.")
+        seen_ids.add(ident)
+        if drive.get("mountpoints"):
+            raise Refused(f"drive {number} ({wanted}) is in use. Eject it in Files first. Nothing was written.")
+        if drive.get("ro"):
+            raise Refused(f"drive {number} ({wanted}) is read-only. Nothing was written.")
+        expected = "ERASE " + builder.identity_label(drive)
+        if phrase != expected:
+            raise Refused(f'the phrase for drive {number} ({wanted}) must be exactly "{expected}". Nothing was written.')
+        chosen.append((wanted, drive))
+    return chosen
+
+
+def builder_command(args, creator, target, phrase):
+    command = [sys.executable, str(creator), args.mode, "--store", args.store, "--target", target,
+               "--confirm", phrase, "--non-interactive"]
+    for option in ("master_id", "state_dir", "current_release", "mock_devices", "ventoy_installer", "variant",
+                   "storage", "storage_format"):
+        value = getattr(args, option)
+        if value is not None:
+            command += ["--" + option.replace("_", "-"), str(value)]
+    if args.restart:
+        command.append("--restart")
+    return command
+
+
+def drive_result(mode, exit_code, text):
+    """A drive passed only when its builder ended with 0 AND printed its own VERIFIED line."""
+    if exit_code == 0 and SUCCESS[mode].search(text):
+        return True, ""
+    found = [match.group(0).strip() for match in REASON.finditer(text)]
+    if found:
+        return False, found[-1]
+    if exit_code == 0:
+        return False, "the drive builder did not report a verified drive"
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    return False, (lines[-1] if lines else f"the drive builder stopped (exit {exit_code})")
+
+
+def default_log_dir():
+    stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    return tempfile.mkdtemp(prefix=f"secure-linux-usb-multi-{stamp}-")
+
+
+def elevate(argv):
+    me = INSTALLED_SELF if os.access(INSTALLED_SELF, os.X_OK) else os.path.realpath(sys.argv[0])
+    if not shutil.which("pkexec"):
+        raise Refused("administrator rights are needed to make drives, and the password prompt is not available.")
+    os.execvp("pkexec", ["pkexec", me] + list(argv))
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        prog="secure-linux-usb-multi",
+        description="Make several Secure Linux drives at once from the saved master. Each drive is fully checked. "
+                    "Making a drive ERASES everything on it.",
+        epilog='Example: secure-linux-usb-multi --store /var/lib/secure-linux/usb-master --mode clone '
+               '--target /dev/sdb --confirm "ERASE 1111" --target /dev/sdc --confirm "ERASE 2222"')
+    parser.add_argument("--store", required=True, help="the saved master's folder")
+    parser.add_argument("--mode", required=True, choices=("portable", "clone"),
+                        help="portable = Portable tools copy (any big enough drive); clone = exact copy")
+    parser.add_argument("--target", action="append", default=[], help="a whole USB drive; repeat for every drive")
+    parser.add_argument("--confirm", action="append", default=[],
+                        help='the exact phrase for the --target before it: ERASE and its serial number (or WWN)')
+    parser.add_argument("--master-id", help="use an older saved generation instead of the current one")
+    parser.add_argument("--state-dir", help="where the drive builder keeps its receipts")
+    parser.add_argument("--current-release", help="this computer's release.json (the drive builder's default if left out)")
+    parser.add_argument("--ventoy-installer", help="portable only: the genuine Ventoy2Disk.sh")
+    parser.add_argument("--variant", choices=("full", "online-only"), help="portable only: full or online-only")
+    parser.add_argument("--storage", choices=("remaining", "none"), help="portable only: personal storage partition")
+    parser.add_argument("--storage-format", help="portable only: file system for the storage partition")
+    parser.add_argument("--restart", action="store_true", help="start every drive again from the beginning")
+    parser.add_argument("--max-at-once", type=int, default=0, help="most drives made at the same time (0 = all)")
+    parser.add_argument("--log-dir", help="folder for one log per drive (default: a new temporary folder)")
+    parser.add_argument("--json", action="store_true", help="print one line of JSON at the end")
+    parser.add_argument("--mock-devices", help="test-only drive list; every drive in it must be a regular file")
+    return parser
+
+
+def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    args = build_parser().parse_args(argv)
+
+    def out(text):
+        if not args.json:
+            print(text, flush=True)
+
+    summary = {"mode": args.mode, "drives": []}
+    try:
+        if args.mode == "portable" and not args.ventoy_installer:
+            raise Refused("a Portable tools copy needs --ventoy-installer. Nothing was written.")
+        if args.mode == "clone":
+            extra = [name for name, value in (("--ventoy-installer", args.ventoy_installer), ("--variant", args.variant),
+                                              ("--storage", args.storage), ("--storage-format", args.storage_format))
+                     if value is not None]
+            if extra:
+                raise Refused(f"{', '.join(extra)} is only for a Portable tools copy (--mode portable), "
+                              "not for an exact copy. Nothing was written.")
+        if not args.mock_devices:
+            if not sys.platform.startswith("linux"):
+                raise Refused("making real drives works only on Secure Linux. Nothing was written.")
+            if os.geteuid() != 0:
+                elevate(argv)
+        creator = builder_path()
+        builder = load_builder(creator)
+        try:
+            rows = builder.Devices(args.mock_devices).scan(probe_smart=False)
+        except builder.CreatorError as exc:
+            raise Refused(f"{exc}. Nothing was written.") from exc
+        chosen = check_targets(builder, rows, args.target, args.confirm)
+        log_dir = args.log_dir or default_log_dir()
+        os.makedirs(log_dir, exist_ok=True)
+        out(f"Making {len(chosen)} drive(s). Every drive is erased, then checked in full.")
+        done = run_jobs(args, creator, prepare_jobs(chosen, args.confirm, log_dir), out)
+    except Refused as exc:
+        line = f"REFUSED: {exc}"
+        if args.json:
+            print(json.dumps({"result": "refused", "message": line, "drives": []}, sort_keys=True), flush=True)
+        else:
+            print(line, flush=True)
+        return EXIT_REFUSED
+    except KeyboardInterrupt:
+        print("Stopped. Every drive that did not finish is NOT ready: make it again before using it.", flush=True)
+        return EXIT_SOME_FAILED
+
+    passed = 0
+    for job in done:
+        text = job["log"].read_text(encoding="utf-8", errors="replace") if job["log"].is_file() else ""
+        ok, reason = drive_result(args.mode, job["exit"], text)
+        passed += ok
+        label = job["drive"].get("serial") or job["drive"].get("wwn") or "unknown"
+        if ok:
+            out(f"Drive {job['number']}: {job['target']} (serial {label}) - VERIFIED")
+        else:
+            out(f"Drive {job['number']}: {job['target']} (serial {label}) - FAILED: {reason}")
+        summary["drives"].append({"number": job["number"], "device": job["target"], "serial": label,
+                                  "status": "verified" if ok else "failed", "exit_code": job["exit"],
+                                  "reason": reason, "log": str(job["log"])})
+    total = len(done)
+    if passed == total:
+        line = f"ALL DRIVES VERIFIED: {total} of {total} drives are ready."
+        code = EXIT_ALL
+    else:
+        line = (f"SOME DRIVES FAILED: {passed} of {total} drives verified. "
+                "Do not use a drive marked FAILED until it has been made again.")
+        code = EXIT_SOME_FAILED
+    out(f"Logs for each drive: {log_dir}")
+    if args.json:
+        summary.update(result="all-verified" if code == EXIT_ALL else "some-failed", message=line, log_dir=str(log_dir))
+        print(json.dumps(summary, sort_keys=True), flush=True)
+    else:
+        print(line, flush=True)
+    return code
+
+
+def prepare_jobs(chosen, phrases, log_dir):
+    jobs = []
+    for number, ((target, drive), phrase) in enumerate(zip(chosen, phrases), 1):
+        jobs.append({"number": number, "target": target, "drive": drive, "phrase": phrase,
+                     "log": Path(log_dir) / f"drive-{number}.log", "proc": None, "handle": None, "exit": None})
+    return jobs
+
+
+def run_jobs(args, creator, jobs, out):
+    """Start one drive builder per drive (at most --max-at-once at the same time) and wait for every one."""
+    limit = args.max_at_once if args.max_at_once and args.max_at_once > 0 else len(jobs)
+    waiting = list(jobs)
+    running = []
+    try:
+        while waiting or running:
+            while waiting and len(running) < limit:
+                job = waiting.pop(0)
+                job["handle"] = open(job["log"], "w", encoding="utf-8")
+                command = builder_command(args, creator, job["target"], job["phrase"])
+                job["proc"] = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=job["handle"],
+                                               stderr=subprocess.STDOUT)
+                running.append(job)
+                out(f"Started drive {job['number']}: {job['target']}")
+            for job in list(running):
+                code = job["proc"].poll()
+                if code is not None:
+                    job["exit"] = code
+                    job["handle"].close()
+                    running.remove(job)
+            if running:
+                time.sleep(0.2)
+    except KeyboardInterrupt:
+        for job in running:
+            try:
+                job["exit"] = job["proc"].wait()
+            except KeyboardInterrupt:
+                job["proc"].terminate()
+                job["exit"] = job["proc"].wait()
+            job["handle"].close()
+        raise
+    return jobs
+
+
+if __name__ == "__main__":
+    sys.exit(main())

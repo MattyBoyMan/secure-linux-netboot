@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Move My Setup to Another Computer
+GenericName=Take your apps, desktop look and files to a new computer
+Comment=Pack your apps, choices, desktop look and files into a folder, then bring them in on another Secure Linux computer. Passwords and keys never move.
+Exec=/usr/local/bin/secure-linux-move-setup
+Icon=document-export
+Terminal=true
+Categories=System;Utility;
+Keywords=move;new computer;transfer;copy setup;migrate;bring over;

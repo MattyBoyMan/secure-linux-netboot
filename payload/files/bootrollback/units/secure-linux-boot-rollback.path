@@ -1,0 +1,12 @@
+# Secure Linux boot rollback: refresh the boot menu list when a snapshot or a kernel is added or removed.
+[Unit]
+Description=Secure Linux: watch for new snapshots and kernels (boot menu "go back" list)
+ConditionKernelCommandLine=!rd.securelinux.rollback
+
+[Path]
+PathChanged=/.snapshots
+PathChanged=/boot/loader/entries
+Unit=secure-linux-boot-rollback-refresh.service
+
+[Install]
+WantedBy=paths.target

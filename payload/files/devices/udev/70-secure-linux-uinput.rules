@@ -1,0 +1,4 @@
+# Secure Linux (devices): Sunshine (game streaming) needs to type and move the mouse for the person who connects to it.
+# This rule lets the logged-in person's programs create a virtual keyboard and mouse. It is installed ONLY when
+# Sunshine is installed, because any program the person runs could use it to press keys. Installed by steps/53-device-extras.sh.
+KERNEL=="uinput", SUBSYSTEM=="misc", OPTIONS+="static_node=uinput", TAG+="uaccess"

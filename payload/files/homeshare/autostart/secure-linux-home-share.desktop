@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Home server folder
+Comment=Opens your own home server folder at home (only on computers set up with one; does nothing otherwise)
+Exec=/usr/local/bin/secure-linux-home-share login
+Icon=folder-remote
+NoDisplay=true
+X-GNOME-Autostart-enabled=true
+X-GNOME-Autostart-Delay=15
+X-KDE-autostart-phase=2

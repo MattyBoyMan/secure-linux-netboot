@@ -1,0 +1,13 @@
+[Unit]
+Description=Secure Linux: open the home server folder only on the home network
+After=NetworkManager.service
+# Only on the owner's computer, after the owner typed the home server password once.
+# On every other computer this never runs.
+ConditionPathExists=/etc/secure-linux/home-share/ready
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/secure-linux-home-share network
+
+[Install]
+WantedBy=multi-user.target

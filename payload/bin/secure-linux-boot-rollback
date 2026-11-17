@@ -1,0 +1,748 @@
+#!/bin/bash
+# secure-linux-boot-rollback: "Go back to an earlier day" in the boot menu (Fedora full/lite on Btrfs + Snapper).
+# If an update breaks the computer, pick an earlier day at startup. Your own files are never changed by it.
+#   secure-linux-boot-rollback status            what is on, and which earlier days the boot menu offers
+#   secure-linux-boot-rollback check             is this computer's layout one this tool knows is safe? (changes nothing)
+#   secure-linux-boot-rollback on  [--dry-run]   add the boot menu entries (the normal start stays first and default)
+#   secure-linux-boot-rollback off [--dry-run]   remove everything "on" added (snapshots and your files are kept)
+#   secure-linux-boot-rollback refresh [--dry-run] [--quiet]   rebuild the list (runs by itself after new snapshots)
+#   secure-linux-boot-rollback keep [--dry-run] [--yes]        while using an earlier day: keep it as the normal system
+#   secure-linux-boot-rollback newest [--dry-run] [--yes]      undo "keep": return to the newest version
+#   secure-linux-boot-rollback tidy [--dry-run] [--yes]        delete spare system copies left by keep / newest
+# What goes back: programs and system settings (the root part of the disk). What does NOT go back: your home
+# folder (documents, photos, personal settings), app store (Flatpak) apps, AI models, and the kernel files
+# in /boot. Using an earlier day changes nothing on the disk until you choose "keep".
+# Design notes and evidence: see the X2a integration notes (grub-btrfs v4.14 was studied; not used, see there).
+set -u
+export LC_ALL=C
+
+P=${SL_BR_PREFIX:-}                      # tests only: a folder that stands in for "/"
+SL_ROOT=${SL_ROOT:-/usr/local/lib/secure-linux}
+FILES=$SL_ROOT/files/bootrollback
+SELF=/usr/local/bin/secure-linux-boot-rollback; [ -x "$SELF" ] || SELF=$(readlink -f "$0" 2>/dev/null || echo "$0")
+BOOT=${SL_BR_BOOT:-$P/boot}              # tests only: the separate /boot partition
+GRUBDIR=$BOOT/grub2
+ENTRIES=$BOOT/loader/entries
+IMGDIR=$BOOT/secure-linux-rollback        # everything of ours on /boot lives here (plus the two files below)
+OURCFG=$GRUBDIR/secure-linux-rollback.cfg
+CUSTOM=$GRUBDIR/custom.cfg
+KEPTF_NAME=secure-linux-rollback.kept     # on /boot; written by keep, removed by newest; never by off
+TOP=${SL_BR_TOP:-/run/secure-linux-boot-rollback/top}
+BOOTMNT=${SL_BR_BOOTMNT:-/run/secure-linux-boot-rollback/boot}
+BEGIN_MARK='### BEGIN secure-linux-boot-rollback ###'
+END_MARK='### END secure-linux-boot-rollback ###'
+MAX_ENTRIES=6
+MAX_KERNELS=2
+# Switched off for the earlier-day session only (kernel command line systemd.mask=, runtime only):
+MASKS="dnf5-automatic.timer packagekit-offline-update.service secure-linux-offline-updates.timer secure-linux-flatpak-update.timer"
+MASKS="$MASKS snapper-timeline.timer snapper-cleanup.timer secure-linux-btrfs-scrub.timer"            # snapshots, scrub
+MASKS="$MASKS secure-linux-boot-rollback.path secure-linux-boot-rollback.timer"                       # this tool's timers
+MASKS="$MASKS systemd-remount-fs.service boot.mount boot-efi.mount"                                   # / stays the memory layer; /boot untouched
+
+DRY=0 QUIET=0 YES=0
+have() { command -v "$1" >/dev/null 2>&1; }
+say() { [ "$QUIET" = 1 ] || printf '%s\n' "$*"; }
+die() { printf '%s\n' "$*" >&2; exit "${2:-1}"; }
+usage() { sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; }
+
+CMD=${1:-status}; [ $# -gt 0 ] && shift
+for a in "$@"; do
+  case "$a" in
+    --dry-run) DRY=1 ;; --quiet) QUIET=1 ;; --yes) YES=1 ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "Unknown option: $a" >&2; usage >&2; exit 2 ;;
+  esac
+done
+case "$CMD" in
+  -h|--help|help) usage; exit 0 ;;
+  status|check|on|off|refresh|keep|newest|tidy|notice) ;;
+  *) echo "Unknown command: $CMD" >&2; usage >&2; exit 2 ;;
+esac
+# Administrator rights: re-run through pkexec (clear prompt from org.securelinux.bootrollback.policy).
+case "$CMD" in
+  on|off|refresh|keep|newest|tidy|check)
+    if [ -z "$P" ] && [ "$(id -u)" -ne 0 ]; then
+      exec pkexec "$SELF" "$CMD" "$@"
+    fi ;;
+esac
+
+# ---------------------------------------------------------------- small helpers
+now() { echo "${SL_BR_NOW:-$(date '+%Y-%m-%d %H:%M')}"; }
+stamp() { echo "${SL_BR_STAMP:-$(date '+%Y%m%d-%H%M%S')}"; }
+cmdline() { cat "${SL_BR_CMDLINE:-$P/proc/cmdline}" 2>/dev/null; }
+cmdarg() { # cmdarg NAME   value of NAME=value on the kernel command line
+  local t; for t in $(cmdline); do case "$t" in "$1="*) echo "${t#*=}"; return 0 ;; esac; done; return 1
+}
+in_session() { local n; n=$(cmdarg rd.securelinux.rollback) && [ -n "$n" ]; }
+day_label() { date -d "$1" '+%a %-d %b' 2>/dev/null || echo "$1"; }
+state_get() { # state_get FILE KEY
+  [ -f "$1" ] || return 1
+  sed -n "s/^$2=//p" "$1" | tail -n 1
+}
+run() { # run CMD...   (dry run: show it, do nothing)
+  if [ "$DRY" = 1 ]; then say "  [dry run] would run: $*"; return 0; fi
+  "$@"
+}
+same_file() { [ -f "$1" ] && [ -f "$2" ] && cmp -s "$1" "$2"; }
+home_mounted() { findmnt -n -o FSTYPE /home >/dev/null 2>&1; }   # is /home a part of its own, mounted right now?
+snap_home_empty() { # snap_home_empty SNAPSHOTDIR   when /home is its own part, a snapshot's /home folder is empty
+  [ -z "$(ls -A "$1/home" 2>/dev/null)" ]
+}
+
+# ---------------------------------------------------------------- layout detection (changes nothing)
+REASONS=() ROOT_FSTYPE="" ROOT_OPTS="" ROOT_UUID="" ROOT_SUBVOL="" BOOT_FSTYPE="" BOOT_UUID=""
+no() { REASONS+=("$1"); }
+detect() {
+  REASONS=()
+  if [ -e "$P/run/ostree-booted" ] || [ -d "$P/ostree/deploy" ] || [ "$(cat "$P/etc/secure-linux/profile" 2>/dev/null)" = atomic ]; then
+    no "This computer uses the image-based system (Kinoite). Its boot menu already offers the previous version, so this tool is not needed."
+    return 1
+  fi
+  if have bootctl && bootctl is-installed >/dev/null 2>&1; then
+    no "This computer starts with systemd-boot, not GRUB. This tool only knows the GRUB layout safely."
+  fi
+  have findmnt || { no "The program findmnt is missing, so the disk layout cannot be checked."; return 1; }
+  ROOT_FSTYPE=$(findmnt -n -o FSTYPE / 2>/dev/null)
+  ROOT_OPTS=$(findmnt -n -o OPTIONS / 2>/dev/null)
+  ROOT_UUID=$(findmnt -n -o UUID / 2>/dev/null)
+  ROOT_SUBVOL=$(printf '%s\n' "$ROOT_OPTS" | tr ',' '\n' | sed -n 's/^subvol=//p' | head -n 1)
+  ROOT_SUBVOL=${ROOT_SUBVOL#/}
+  [ "$ROOT_FSTYPE" = btrfs ] || no "The system part of the disk is not Btrfs (found: ${ROOT_FSTYPE:-unknown}). Snapshots need Btrfs."
+  [ -n "$ROOT_UUID" ] || no "The system part of the disk has no ID (UUID)."
+  case "$ROOT_SUBVOL" in
+    "") no "The system is not started from a named Btrfs part (subvolume)." ;;
+    *.snapshots*|*[!A-Za-z0-9._@/-]*) no "The system is started from an unusual place ($ROOT_SUBVOL). Restart normally first." ;;
+  esac
+  BOOT_FSTYPE=$(findmnt -n -o FSTYPE /boot 2>/dev/null)
+  BOOT_UUID=$(findmnt -n -o UUID /boot 2>/dev/null)
+  case "$BOOT_FSTYPE" in
+    ext4|ext3|ext2|xfs) ;;
+    "") no "There is no separate /boot part. This tool only knows the Fedora layout with a separate /boot." ;;
+    *) no "The /boot part uses $BOOT_FSTYPE. This tool only knows ext4 or xfs for /boot." ;;
+  esac
+  [ -n "$BOOT_UUID" ] || [ -z "$BOOT_FSTYPE" ] || no "The /boot part has no ID (UUID)."
+  if [ ! -f "$GRUBDIR/grub.cfg" ]; then
+    no "The GRUB boot menu file (/boot/grub2/grub.cfg) was not found."
+  else
+    grep -q 'blscfg' "$GRUBDIR/grub.cfg" || no "The boot menu does not use Fedora's standard kernel list (blscfg)."
+    grep -q 'custom\.cfg' "$GRUBDIR/grub.cfg" || no "The boot menu has no place for extra entries (custom.cfg). Nothing was changed."
+  fi
+  [ -n "$(bls_list)" ] || no "No normal start entries were found in /boot/loader/entries."
+  local t; for t in snapper btrfs dracut grub2-script-check grub2-editenv grub2-set-default; do
+    have "$t" || no "The program $t is missing."
+  done
+  if have snapper; then
+    snapper -c root get-config >/dev/null 2>&1 || no "System snapshots (Snapper) are not set up for the system part."
+  fi
+  [ -d "$P/.snapshots" ] || no "The snapshot folder /.snapshots was not found."
+  [ ${#REASONS[@]} -eq 0 ]
+}
+print_reasons() { local r; for r in "${REASONS[@]}"; do echo "  - $r"; done; }
+
+# ---------------------------------------------------------------- normal boot entries (read only)
+bls_list() { # lines: version|id|linux|options   (newest kernel first; rescue entries and missing kernels left out)
+  local f id v l o
+  for f in "$ENTRIES"/*.conf; do
+    [ -f "$f" ] || continue
+    id=${f##*/}; id=${id%.conf}
+    case "$id" in *rescue*) continue ;; esac
+    v=$(sed -n 's/^version[[:space:]]\{1,\}//p' "$f" | head -n 1)
+    l=$(sed -n 's/^linux[[:space:]]\{1,\}//p' "$f" | head -n 1)
+    o=$(sed -n 's/^options[[:space:]]\{1,\}//p' "$f" | head -n 1)
+    case "$v" in ""|*rescue*) continue ;; esac
+    case "$l" in /*) ;; *) continue ;; esac
+    [ -f "$BOOT$l" ] || continue
+    printf '%s|%s|%s|%s\n' "$v" "$id" "$l" "$o"
+  done | sort -t '|' -k1,1 -V -r
+}
+bls_id_for() { # bls_id_for ENTRIESDIR KVER
+  local f v
+  for f in "$1"/*.conf; do
+    [ -f "$f" ] || continue
+    case "$f" in *rescue*) continue ;; esac
+    v=$(sed -n 's/^version[[:space:]]\{1,\}//p' "$f" | head -n 1)
+    [ "$v" = "$2" ] && { f=${f##*/}; echo "${f%.conf}"; return 0; }
+  done
+  return 1
+}
+
+# ---------------------------------------------------------------- snapshots
+snap_list() { # lines: number|date|cleanup  usable snapshots, newest number first
+  local n d c pre desc
+  snapper --csvout --no-headers -c root list --columns number,date,cleanup,pre-number,description 2>/dev/null |
+  while IFS=, read -r n d c pre desc; do
+    case "$n" in ""|0|*[!0-9]*) continue ;; esac
+    [ -z "$pre" ] || continue                     # a "post" snapshot: taken right AFTER a change
+    [ -d "$P/.snapshots/$n/snapshot" ] || continue
+    printf '%s|%s|%s\n' "$n" "${d%%.*}" "$c"
+  done | sort -t '|' -k1,1 -n -r
+}
+kernel_for_snapshot() { # kernel_for_snapshot N   newest normal kernel whose modules are inside the snapshot
+  local v rest
+  while IFS='|' read -r v rest; do
+    [ -d "$P/.snapshots/$1/snapshot/usr/lib/modules/$v" ] && { echo "$v"; return 0; }
+  done <<<"$BLS"
+  return 1
+}
+nested_subvols() { # relative paths of the current nested subvolumes that a snapshot leaves out (not .snapshots, not swap)
+  local line p
+  btrfs subvolume list -o "${1:-/}" 2>/dev/null | while read -r line; do
+    p=${line##* path }; p=${p#"<FS_TREE>/"}
+    case "$p" in "$ROOT_SUBVOL"/*) p=${p#"$ROOT_SUBVOL"/} ;; *) continue ;; esac
+    case "$p" in .snapshots|.snapshots/*|swap|*/swap|*swapfile*) continue ;; esac
+    case "$p" in *[!A-Za-z0-9._/-]*) continue ;; esac
+    echo "$p"
+  done
+}
+
+# ---------------------------------------------------------------- boot menu text
+options_for() { # options_for BASEOPTS SNAPNUM SNAPDATE NESTED   -> kernel options for the earlier-day entry
+  local base=$1 n=$2 when=$3 nested=$4 s="$ROOT_SUBVOL/.snapshots/$2/snapshot" out=() rf=0 t f flags
+  case "$base" in *[!A-Za-z0-9._,:=/+@\$\ -]*) return 1 ;; esac      # quotes, braces, ; ... : refuse that kernel
+  case "$base" in *kernelopts*|"") return 1 ;; esac                   # old-style entries: the root options are hidden
+  for t in $base; do
+    case "$t" in
+      rootflags=*)
+        flags=""
+        for f in $(printf '%s' "${t#rootflags=}" | tr ',' ' '); do
+          case "$f" in subvol=*|subvolid=*) ;; *) flags="$flags${flags:+,}$f" ;; esac
+        done
+        out+=("rootflags=$flags${flags:+,}subvol=$s"); rf=1 ;;
+      ro|rw|rd.securelinux.*|secure_linux.*|systemd.mask=*) ;;
+      *) out+=("$t") ;;
+    esac
+  done
+  [ "$rf" = 1 ] || out+=("rootflags=subvol=$s")
+  out+=(ro "rd.securelinux.rollback=$n" "rd.securelinux.rootsubvol=$ROOT_SUBVOL")
+  [ -n "$nested" ] && out+=("rd.securelinux.nested=$nested")
+  out+=("secure_linux.boot_uuid=$BOOT_UUID" "secure_linux.rollback_date=${when/ /T}")
+  for t in $MASKS; do out+=("systemd.mask=$t"); done
+  echo "${out[*]}"
+}
+title_for() { # title_for KIND DATE   KIND: day | change
+  local day=${2%% *} hm=${2#* } today yday
+  hm=${hm:0:5}; today=$(now); today=${today%% *}; yday=$(date -d "$today -1 day" +%F 2>/dev/null)
+  if [ "$1" = change ]; then echo "Go back to before the last software change ($(day_label "$day"), $hm)"
+  elif [ "$day" = "$yday" ]; then echo "Go back to yesterday ($(day_label "$day"), $hm)"
+  elif [ "$day" = "$today" ]; then echo "Go back to earlier today ($(day_label "$day"), $hm)"
+  else echo "Go back to $(day_label "$day") ($hm)"; fi
+}
+menu_entry() { # menu_entry TITLE N KVER LINUXPATH OPTIONS INDENT
+  local ins="insmod ext2" i=$6
+  [ "$BOOT_FSTYPE" = xfs ] && ins="insmod xfs"
+  cat <<EOF
+${i}menuentry '$1' --class fedora --class gnu-linux --class os --unrestricted --id secure-linux-rollback-$2 {
+${i}	if [ x\$feature_all_video_module = xy ]; then insmod all_video; fi
+${i}	set gfxpayload=keep
+${i}	insmod part_gpt
+${i}	insmod part_msdos
+${i}	$ins
+${i}	search --no-floppy --fs-uuid --set=root $BOOT_UUID
+${i}	echo 'Starting an earlier version of the system. Your own files are not changed.'
+${i}	linux $4 $5
+${i}	initrd /secure-linux-rollback/initramfs-$3.img
+${i}}
+EOF
+}
+
+# ---------------------------------------------------------------- separate start-up files for earlier days
+module_sum() { cat "$FILES"/dracut/90secure-linux-rollback/* 2>/dev/null | md5sum | cut -d' ' -f1; }
+initramfs_ready() { # initramfs_ready KVER   build /boot/secure-linux-rollback/initramfs-KVER.img when needed
+  local k=$1 img="$IMGDIR/initramfs-$1.img" normal="$BOOT/initramfs-$1.img" st="$IMGDIR/initramfs-$1.stamp" want need free
+  want=$(module_sum)
+  if [ -f "$img" ] && [ "$(cat "$st" 2>/dev/null)" = "$want" ] && ! [ "$normal" -nt "$img" ]; then return 0; fi
+  need=$(( $( (wc -c < "$normal") 2>/dev/null || echo 104857600) * 2 / 1024 + 65536 ))   # kB: twice the normal file + 64 MB
+  free=$(df -Pk "$BOOT" 2>/dev/null | awk 'NR==2 {print $4}')
+  case "$free" in ""|*[!0-9]*) free=0 ;; esac
+  if [ "$free" -lt "$need" ]; then
+    SKIPPED+=("Not enough free space on /boot for kernel $k (needs about $((need / 1024)) MB, has $((free / 1024)) MB).")
+    return 1
+  fi
+  if [ "$DRY" = 1 ]; then say "  [dry run] would build the start-up file for kernel $k"; return 0; fi
+  if dracut --force --quiet --add secure-linux-rollback "$img.new" "$k" >/dev/null 2>&1 && [ -s "$img.new" ]; then
+    mv -f "$img.new" "$img" && echo "$want" > "$st" && return 0
+  fi
+  rm -f "$img.new"
+  SKIPPED+=("The start-up file for kernel $k could not be built.")
+  return 1
+}
+
+# ---------------------------------------------------------------- refresh: rebuild the list
+SKIPPED=()
+do_refresh() {
+  local snaps line n d c k i pick_n=() pick_d=() pick_k=() pick_kind=() days=" " kernels=() ok tmp o nested
+  BLS=$(bls_list)
+  snaps=$(snap_list)
+  local today; today=$(now); today=${today%% *}
+  local -a SN=() SD=() SC=() SK=()
+  local homeskip=0
+  while IFS='|' read -r n d c; do
+    [ -n "$n" ] || continue
+    [ -x "$P/.snapshots/$n/snapshot/usr/local/bin/secure-linux-boot-rollback" ] || [ -f "$P/.snapshots/$n/snapshot/usr/local/bin/secure-linux-boot-rollback" ] || continue
+    snap_home_empty "$P/.snapshots/$n/snapshot" || { homeskip=1; continue; }   # personal files inside: never offered
+    k=$(kernel_for_snapshot "$n") || continue
+    SN+=("$n"); SD+=("$d"); SC+=("$c"); SK+=("$k")
+  done <<<"$snaps"
+  [ "$homeskip" = 0 ] || SKIPPED+=("Some earlier versions are not offered because their /home folder holds personal files (going back to them could bring back old files).")
+  # 1) the newest snapshot from before today ("yesterday"), 2) the newest one taken before a software change,
+  # 3) one per earlier day. Newest first, at most MAX_ENTRIES, at most MAX_KERNELS different kernels.
+  for i in "${!SN[@]}"; do
+    [ "${SD[i]%% *}" \< "$today" ] || continue
+    pick_n+=("${SN[i]}"); pick_d+=("${SD[i]}"); pick_k+=("${SK[i]}"); pick_kind+=(day); days="$days${SD[i]%% *} "; break
+  done
+  for i in "${!SN[@]}"; do
+    [ "${SC[i]}" = timeline ] && continue
+    [ "${#pick_n[@]}" -gt 0 ] && [ "${pick_n[0]}" = "${SN[i]}" ] && break
+    pick_n+=("${SN[i]}"); pick_d+=("${SD[i]}"); pick_k+=("${SK[i]}"); pick_kind+=(change); break
+  done
+  if [ "${#pick_n[@]}" -eq 0 ] && [ "${#SN[@]}" -gt 0 ]; then
+    pick_n+=("${SN[0]}"); pick_d+=("${SD[0]}"); pick_k+=("${SK[0]}"); pick_kind+=(day); days="$days${SD[0]%% *} "
+  fi
+  for i in "${!SN[@]}"; do
+    [ "${#pick_n[@]}" -ge "$MAX_ENTRIES" ] && break
+    case "$days" in *" ${SD[i]%% *} "*) continue ;; esac
+    [ "${SD[i]%% *}" \< "$today" ] || continue
+    pick_n+=("${SN[i]}"); pick_d+=("${SD[i]}"); pick_k+=("${SK[i]}"); pick_kind+=(day); days="$days${SD[i]%% *} "
+  done
+  # kernels: keep the first MAX_KERNELS different ones, build their start-up files
+  for k in "${pick_k[@]}"; do
+    case " ${kernels[*]} " in *" $k "*) continue ;; esac
+    [ "${#kernels[@]}" -ge "$MAX_KERNELS" ] && continue
+    kernels+=("$k")
+  done
+  [ "$DRY" = 1 ] || mkdir -p "$IMGDIR"
+  ok=" "
+  for k in "${kernels[@]}"; do initramfs_ready "$k" && ok="$ok$k "; done
+  # our start-up files that are no longer needed
+  for f in "$IMGDIR"/initramfs-*.img; do
+    [ -f "$f" ] || continue
+    k=${f##*/initramfs-}; k=${k%.img}
+    case "$ok" in *" $k "*) continue ;; esac
+    run rm -f "$f" "$IMGDIR/initramfs-$k.stamp"
+  done
+  nested=$(nested_subvols / | paste -sd, -)
+  tmp=$(mktemp)
+  {
+    echo "# Made by secure-linux-boot-rollback (Secure Linux). Do not edit: it is rewritten when snapshots change."
+    echo "# The normal start entries above stay first and stay the default. These entries start an earlier"
+    echo "# snapshot with a memory layer: nothing on the disk changes unless \"Keep this earlier version\" is chosen."
+  } > "$tmp"
+  : > "$tmp.menu"
+  local shown=0 more=0 bl
+  for i in "${!pick_n[@]}"; do
+    k=${pick_k[i]}
+    case "$ok" in *" $k "*) ;; *) continue ;; esac
+    bl=$(awk -F'|' -v k="$k" '$1 == k {print; exit}' <<<"$BLS"); [ -n "$bl" ] || continue
+    o=$(options_for "$(cut -d'|' -f4- <<<"$bl")" "${pick_n[i]}" "${pick_d[i]}" "$nested") || continue
+    t=$(title_for "${pick_kind[i]}" "${pick_d[i]}" | tr -d "'")
+    if [ "$shown" -lt 2 ]; then
+      menu_entry "$t" "${pick_n[i]}" "$k" "$(cut -d'|' -f3 <<<"$bl")" "$o" "" >> "$tmp"
+    else
+      [ "$more" = 0 ] && echo "submenu 'More earlier days' --unrestricted --id secure-linux-rollback-more {" >> "$tmp"
+      more=1
+      menu_entry "$t" "${pick_n[i]}" "$k" "$(cut -d'|' -f3 <<<"$bl")" "$o" "	" >> "$tmp"
+    fi
+    shown=$((shown + 1))
+    echo "$t" >> "$tmp.menu"
+  done
+  [ "$more" = 1 ] && echo "}" >> "$tmp"
+  if ! grub2-script-check "$tmp" >/dev/null 2>&1; then
+    rm -f "$tmp" "$tmp.menu"
+    echo "The new boot menu list did not pass GRUB's own check. The old list was kept." >&2
+    return 1
+  fi
+  if [ "$DRY" = 1 ]; then
+    say "  [dry run] the boot menu would offer $shown earlier version(s):"
+    [ "$QUIET" = 1 ] || sed 's/^/    - /' "$tmp.menu"
+    rm -f "$tmp" "$tmp.menu"; return 0
+  fi
+  if ! same_file "$tmp" "$OURCFG"; then
+    cp "$tmp" "$OURCFG.new" && chmod 0600 "$OURCFG.new" && mv -f "$OURCFG.new" "$OURCFG"
+  fi
+  same_file "$tmp.menu" "$IMGDIR/menu.txt" || { cp "$tmp.menu" "$IMGDIR/menu.txt"; chmod 0644 "$IMGDIR/menu.txt"; }
+  : > "$IMGDIR/skipped.txt"; [ "${#SKIPPED[@]}" -eq 0 ] || printf '%s\n' "${SKIPPED[@]}" > "$IMGDIR/skipped.txt"
+  rm -f "$tmp" "$tmp.menu"
+  say "The boot menu offers $shown earlier version(s)."
+  local s; for s in "${SKIPPED[@]}"; do say "  Note: $s"; done
+  return 0
+}
+
+# ---------------------------------------------------------------- the hook in custom.cfg (GRUB's own place for extras)
+custom_block() {
+  printf '%s\n' "$BEGIN_MARK" \
+    'if [ -f ${config_directory}/secure-linux-rollback.cfg ]; then' \
+    '  source ${config_directory}/secure-linux-rollback.cfg' \
+    'elif [ -z "${config_directory}" -a -f $prefix/secure-linux-rollback.cfg ]; then' \
+    '  source $prefix/secure-linux-rollback.cfg' \
+    'fi' "$END_MARK"
+}
+custom_add() { # returns: sets CUSTOM_CREATED / CUSTOM_ADDED_NL
+  CUSTOM_CREATED=0 CUSTOM_ADDED_NL=0
+  if [ -f "$CUSTOM" ] && grep -qxF "$BEGIN_MARK" "$CUSTOM"; then return 0; fi
+  local tmp; tmp=$(mktemp)
+  if [ -f "$CUSTOM" ]; then
+    cat "$CUSTOM" > "$tmp"
+    if [ -s "$CUSTOM" ] && [ "$(tail -c 1 "$CUSTOM" | od -An -c | tr -d ' ')" != '\n' ]; then echo >> "$tmp"; CUSTOM_ADDED_NL=1; fi
+  else
+    CUSTOM_CREATED=1
+  fi
+  custom_block >> "$tmp"
+  grub2-script-check "$tmp" >/dev/null 2>&1 || { rm -f "$tmp"; echo "GRUB's check did not accept the extra-entries file. Nothing was changed." >&2; return 1; }
+  cp "$tmp" "$CUSTOM.new" && chmod 0600 "$CUSTOM.new" && mv -f "$CUSTOM.new" "$CUSTOM"
+  rm -f "$tmp"
+}
+custom_remove() { # remove exactly our block; restore the file byte for byte
+  [ -f "$CUSTOM" ] || return 0
+  grep -qxF "$BEGIN_MARK" "$CUSTOM" || return 0
+  local tmp; tmp=$(mktemp)
+  awk -v b="$BEGIN_MARK" -v e="$END_MARK" '$0==b {skip=1; next} skip && $0==e {skip=0; next} !skip {print}' "$CUSTOM" > "$tmp"
+  if [ "$(state_get "$IMGDIR/state" CUSTOM_ADDED_NL)" = 1 ] && [ -s "$tmp" ]; then
+    head -c "$(( $(wc -c < "$tmp") - 1 ))" "$tmp" > "$tmp.2" && mv -f "$tmp.2" "$tmp"
+  fi
+  if [ "$(state_get "$IMGDIR/state" CUSTOM_CREATED)" = 1 ] && [ ! -s "$tmp" ]; then
+    rm -f "$CUSTOM" "$tmp"
+  else
+    cat "$tmp" > "$CUSTOM"; rm -f "$tmp"
+  fi
+}
+
+# ---------------------------------------------------------------- on / off
+INSTALLS="dracut/90secure-linux-rollback/module-setup.sh|/usr/lib/dracut/modules.d/90secure-linux-rollback/module-setup.sh|0755
+dracut/90secure-linux-rollback/secure-linux-rollback-overlay.sh|/usr/lib/dracut/modules.d/90secure-linux-rollback/secure-linux-rollback-overlay.sh|0755
+units/secure-linux-boot-rollback-refresh.service|/etc/systemd/system/secure-linux-boot-rollback-refresh.service|0644
+units/secure-linux-boot-rollback.path|/etc/systemd/system/secure-linux-boot-rollback.path|0644
+units/secure-linux-boot-rollback.timer|/etc/systemd/system/secure-linux-boot-rollback.timer|0644
+session/secure-linux-boot-rollback-notice.desktop|/etc/xdg/autostart/secure-linux-boot-rollback-notice.desktop|0644"
+
+do_on() {
+  if in_session; then die "You are using an earlier version right now. Restart normally first." 3; fi
+  if ! detect; then
+    echo "Go back to an earlier day was NOT added. Nothing was changed. Reason:"
+    print_reasons
+    exit 3
+  fi
+  local src dst mode
+  while IFS='|' read -r src dst mode; do
+    [ -f "$FILES/$src" ] || die "A file of this tool is missing: $FILES/$src. Nothing was changed." 1
+    if [ -f "$P$dst" ] && ! same_file "$FILES/$src" "$P$dst" && ! grep -qxF "$dst" "$IMGDIR/installed.list" 2>/dev/null; then
+      die "A different file already exists at $dst. Nothing was changed." 3
+    fi
+  done <<<"$INSTALLS"
+  if [ "$DRY" = 1 ]; then
+    say "Dry run: nothing is changed. 'on' would:"
+    say "  - copy 6 small files (start-up module, 3 timers, 1 notice) and list them in /boot/secure-linux-rollback/installed.list"
+    say "  - add 7 lines to /boot/grub2/custom.cfg (GRUB's own place for extra entries); grub.cfg is not rewritten"
+    say "  - leave the normal start entries and the default start exactly as they are"
+    do_refresh; return 0
+  fi
+  mkdir -p "$IMGDIR" && chmod 0755 "$IMGDIR"
+  [ -f "$IMGDIR/state" ] || printf 'VERSION=1\nON=0\n' > "$IMGDIR/state"
+  while IFS='|' read -r src dst mode; do
+    mkdir -p "$(dirname "$P$dst")"
+    grep -qxF "$dst" "$IMGDIR/installed.list" 2>/dev/null || echo "$dst" >> "$IMGDIR/installed.list"
+    install -m "$mode" "$FILES/$src" "$P$dst"
+  done <<<"$INSTALLS"
+  if [ -z "$P" ] && have restorecon; then
+    restorecon -R /usr/lib/dracut/modules.d/90secure-linux-rollback /etc/systemd/system /etc/xdg/autostart "$IMGDIR" >/dev/null 2>&1
+  fi
+  local had_block=0
+  grep -qxF "$BEGIN_MARK" "$CUSTOM" 2>/dev/null && had_block=1
+  custom_add || exit 1
+  {
+    echo "VERSION=1"; echo "ON=1"
+    echo "ROOT_UUID=$ROOT_UUID"; echo "ROOT_SUBVOL=$ROOT_SUBVOL"
+    echo "BOOT_UUID=$BOOT_UUID"; echo "BOOT_FSTYPE=$BOOT_FSTYPE"
+    if [ "$had_block" = 1 ]; then
+      echo "CUSTOM_CREATED=$(state_get "$IMGDIR/state" CUSTOM_CREATED)"; echo "CUSTOM_ADDED_NL=$(state_get "$IMGDIR/state" CUSTOM_ADDED_NL)"
+    else
+      echo "CUSTOM_CREATED=$CUSTOM_CREATED"; echo "CUSTOM_ADDED_NL=$CUSTOM_ADDED_NL"
+    fi
+  } > "$IMGDIR/state.new" && mv -f "$IMGDIR/state.new" "$IMGDIR/state"
+  systemctl daemon-reload >/dev/null 2>&1
+  if [ "${SL_MODE:-}" = early ]; then systemctl enable secure-linux-boot-rollback.path secure-linux-boot-rollback.timer >/dev/null 2>&1
+  else systemctl enable --now secure-linux-boot-rollback.path secure-linux-boot-rollback.timer >/dev/null 2>&1; fi
+  echo "Go back to an earlier day is ON. The normal start stays first and stays the default."
+  do_refresh || true
+}
+
+do_off() {
+  if in_session; then die "You are using an earlier version right now. Restart normally first, then switch this off." 3; fi
+  if [ ! -f "$IMGDIR/state" ] && [ ! -f "$OURCFG" ] && ! grep -qxF "$BEGIN_MARK" "$CUSTOM" 2>/dev/null; then
+    echo "Go back to an earlier day is already off. Nothing to remove."; return 0
+  fi
+  if [ "$DRY" = 1 ]; then
+    say "Dry run: nothing is changed. 'off' would remove:"
+    say "  - the extra lines in /boot/grub2/custom.cfg, /boot/grub2/secure-linux-rollback.cfg, /boot/secure-linux-rollback/"
+    [ -f "$IMGDIR/installed.list" ] && sed 's/^/  - /' "$IMGDIR/installed.list"
+    say "  Snapshots, your files and the normal start entries are not touched."
+    return 0
+  fi
+  systemctl disable --now secure-linux-boot-rollback.path secure-linux-boot-rollback.timer >/dev/null 2>&1
+  local dst
+  if [ -f "$IMGDIR/installed.list" ]; then
+    while IFS= read -r dst; do
+      case "$dst" in /usr/lib/dracut/modules.d/90secure-linux-rollback/*|/etc/systemd/system/secure-linux-boot-rollback*|/etc/xdg/autostart/secure-linux-boot-rollback-*) rm -f "$P$dst" ;; esac
+    done < "$IMGDIR/installed.list"
+    rmdir "$P/usr/lib/dracut/modules.d/90secure-linux-rollback" 2>/dev/null
+  fi
+  systemctl daemon-reload >/dev/null 2>&1
+  custom_remove
+  rm -f "$OURCFG" "$OURCFG.new"
+  rm -rf "$IMGDIR"
+  echo "Go back to an earlier day is OFF. Its boot menu entries and files are removed."
+  echo "Your snapshots, your files and the normal start entries were not touched."
+  [ -f "$BOOT/$KEPTF_NAME" ] && echo "Note: you kept an earlier version before. 'Return to the newest' still works."
+  return 0
+}
+
+# ---------------------------------------------------------------- keep / newest / tidy (subvolume swap)
+UNDO=()
+undo_all() { local i; for ((i=${#UNDO[@]}-1; i>=0; i--)); do eval "${UNDO[i]}" >/dev/null 2>&1; done; UNDO=(); }
+q() { printf '%q' "$1"; }
+top_mount() { # mount the whole Btrfs disk (all parts) privately
+  mkdir -p "$TOP" || return 1
+  if [ "$DRY" = 1 ]; then mount -o ro,subvolid=5 "/dev/disk/by-uuid/$1" "$TOP"; else mount -o subvolid=5 "/dev/disk/by-uuid/$1" "$TOP"; fi
+}
+top_umount() { umount "$TOP" >/dev/null 2>&1; }
+root_ids() { # root_ids BOOTDIR   -> RS RU from our settings, else the keep record (works after "off"), else the running system
+  RS=$(state_get "$1/secure-linux-rollback/state" ROOT_SUBVOL); RU=$(state_get "$1/secure-linux-rollback/state" ROOT_UUID)
+  [ -n "$RS" ] || RS=$(state_get "$1/$KEPTF_NAME" KEPT_ROOT_SUBVOL)
+  [ -n "$RU" ] || RU=$(state_get "$1/$KEPTF_NAME" KEPT_ROOT_UUID)
+  if [ -z "$RS" ] || [ -z "$RU" ]; then
+    in_session || { detect >/dev/null 2>&1; [ -n "$RS" ] || RS=$ROOT_SUBVOL; [ -n "$RU" ] || RU=$ROOT_UUID; }
+  fi
+  return 0
+}
+boot_dir_now() { # where /boot is right now (in an earlier-day session it is not mounted; mount it privately)
+  if in_session; then
+    local bu; bu=$(cmdarg secure_linux.boot_uuid) || return 1
+    mkdir -p "$BOOTMNT" || return 1
+    if ! mountpoint -q "$BOOTMNT" 2>/dev/null; then mount "UUID=$bu" "$BOOTMNT" >/dev/null 2>&1 || return 1; fi
+    [ -d "$BOOTMNT/loader/entries" ] || return 1
+    echo "$BOOTMNT"
+  else
+    echo "$BOOT"
+  fi
+}
+move_nested() { # move_nested FROM TO   move each nested subvolume of FROM to the same place in TO
+  local from=$1 to=$2 rel m done_list=" "
+  local list; list=$(nested_subvols_raw "$from")
+  while IFS= read -r rel; do
+    [ -n "$rel" ] || continue
+    for m in $done_list; do case "$rel" in "$m"/*) continue 2 ;; esac; done   # inside a part already moved
+    done_list="$done_list$rel "
+    if [ -d "$to/$rel" ]; then
+      rmdir "$to/$rel" 2>/dev/null || { echo "The place $rel in the other copy is not empty; stopping." >&2; return 1; }
+      UNDO+=("mkdir -p $(q "$to/$rel")")
+    fi
+    mkdir -p "$(dirname "$to/$rel")"
+    mv "$from/$rel" "$to/$rel" || { echo "Could not move $rel; stopping." >&2; return 1; }
+    UNDO+=("mv $(q "$to/$rel") $(q "$from/$rel")")
+  done <<<"$list"
+}
+nested_subvols_raw() { # like nested_subvols but for any subvolume path in $TOP, including .snapshots and swap
+  local line p base=${1#"$TOP"/}
+  btrfs subvolume list -o "$1" 2>/dev/null | while read -r line; do
+    p=${line##* path }; p=${p#"<FS_TREE>/"}
+    case "$p" in "$base"/*) p=${p#"$base"/} ;; *) continue ;; esac
+    case "$p" in *[!A-Za-z0-9._/-]*) continue ;; esac
+    echo "$p"
+  done
+}
+
+do_keep() {
+  local n bd rs ru k id prev st old when
+  if ! in_session; then
+    die "Keep only works while you are using an earlier version. Restart, open the boot menu (hold Shift), and choose an earlier day first." 3
+  fi
+  n=$(cmdarg rd.securelinux.rollback); when=$(cmdarg secure_linux.rollback_date | tr 'T' ' ')
+  if [ "$DRY" = 1 ]; then   # a dry run opens nothing (not even /boot): it only explains
+    echo "Keep this earlier version (from ${when:-snapshot $n}):"
+    echo "  - a writable copy of snapshot $n becomes the normal system"
+    echo "  - the newer system is saved aside (\"Return to the newest\" brings it back)"
+    echo "  - snapshots, app store apps and other separate parts move along with the system"
+    echo "  - the normal start uses the kernel that is running now ($(uname -r 2>/dev/null))"
+    echo "  - your home folder is NOT touched"
+    echo "Dry run: nothing was changed and nothing was opened."
+    return 0
+  fi
+  bd=$(boot_dir_now) || die "The /boot part could not be opened. Nothing was changed." 1
+  [ -f "$bd/$KEPTF_NAME" ] && die "You already kept an earlier version. Choose 'Return to the newest' first. Nothing was changed." 3
+  rs=$(state_get "$bd/secure-linux-rollback/state" ROOT_SUBVOL); ru=$(state_get "$bd/secure-linux-rollback/state" ROOT_UUID)
+  [ -n "$rs" ] && [ -n "$ru" ] || die "The settings of this tool were not found on /boot. Nothing was changed." 1
+  k=${SL_BR_KERNEL:-$(uname -r)}
+  id=$(bls_id_for "$bd/loader/entries" "$k") || die "The normal start entry for kernel $k was not found. Nothing was changed." 1
+  prev=$(grub2-editenv "$bd/grub2/grubenv" list 2>/dev/null | sed -n 's/^saved_entry=//p')
+  st=$(stamp); old="$rs.sl-before-keep-$st"
+  if [ "$YES" != 1 ]; then
+    echo "Keep this earlier version (from ${when:-snapshot $n}):"
+    echo "  - a writable copy of snapshot $n becomes the normal system ($rs)"
+    echo "  - the newer system is saved as $old (\"Return to the newest\" brings it back)"
+    echo "  - snapshots, app store apps and other separate parts move along with the system"
+    echo "  - the normal start uses kernel $k from now on (it matches this earlier version)"
+    echo "  - your home folder is NOT touched"
+    [ "$DRY" = 1 ] && { echo "Dry run: nothing was changed."; return 0; }
+    echo "Run again with --yes to do it."; return 3
+  fi
+  ROOT_SUBVOL=$rs
+  top_mount "$ru" || die "The disk could not be opened. Nothing was changed." 1
+  [ -d "$TOP/$rs/.snapshots/$n/snapshot" ] || { top_umount; die "Snapshot $n was not found. Nothing was changed." 1; }
+  snap_home_empty "$TOP/$rs/.snapshots/$n/snapshot" || { top_umount; die "Snapshot $n holds personal files in /home. Keeping it could bring back old files, so nothing was changed." 1; }
+  [ -e "$TOP/$rs.sl-new" ] && { top_umount; die "A half-finished copy ($rs.sl-new) exists. Nothing was changed." 1; }
+  UNDO=()
+  if ! btrfs subvolume snapshot "$TOP/$rs/.snapshots/$n/snapshot" "$TOP/$rs.sl-new" >/dev/null; then
+    top_umount; die "The copy of snapshot $n could not be made. Nothing was changed." 1
+  fi
+  UNDO+=("btrfs subvolume delete $(q "$TOP/$rs.sl-new")")
+  if ! move_nested "$TOP/$rs" "$TOP/$rs.sl-new"; then undo_all; top_umount; die "Stopped. Everything was put back as it was." 1; fi
+  if ! mv "$TOP/$rs" "$TOP/$old"; then undo_all; top_umount; die "Stopped. Everything was put back as it was." 1; fi
+  UNDO+=("mv $(q "$TOP/$old") $(q "$TOP/$rs")")
+  if ! mv "$TOP/$rs.sl-new" "$TOP/$rs"; then undo_all; top_umount; die "Stopped. Everything was put back as it was." 1; fi
+  UNDO=()
+  grub2-set-default --boot-directory="$bd" "$id" >/dev/null 2>&1 || echo "Note: the default start could not be set to kernel $k. Choose it in the boot menu if the newest kernel does not start."
+  printf 'KEPT_SNAPSHOT=%s\nKEPT_DATE=%s\nKEPT_OLD=%s\nKEPT_PREV_DEFAULT=%s\nKEPT_KERNEL=%s\nKEPT_AT=%s\nKEPT_ROOT_SUBVOL=%s\nKEPT_ROOT_UUID=%s\n' \
+    "$n" "$when" "$old" "$prev" "$k" "$st" "$rs" "$ru" > "$bd/$KEPTF_NAME"
+  top_umount
+  echo "Done. Restart the computer to use the kept version every day."
+  echo "Your home folder was not changed. The newer version is saved: 'Return to the newest' brings it back."
+}
+
+do_newest() {
+  local bd rs ru old prev st kept
+  bd=$(boot_dir_now) || die "The /boot part could not be opened. Nothing was changed." 1
+  [ -f "$bd/$KEPTF_NAME" ] || { echo "You are already on the newest version (nothing was kept). Nothing to do."; return 0; }
+  root_ids "$bd"; rs=$RS ru=$RU
+  old=$(state_get "$bd/$KEPTF_NAME" KEPT_OLD); prev=$(state_get "$bd/$KEPTF_NAME" KEPT_PREV_DEFAULT)
+  [ -n "$rs" ] && [ -n "$ru" ] && [ -n "$old" ] || die "The saved settings are incomplete. Nothing was changed." 1
+  st=$(stamp); kept="$rs.sl-kept-$st"
+  if [ "$DRY" = 1 ] || [ "$YES" != 1 ]; then
+    echo "Return to the newest version:"
+    echo "  - the saved newer system ($old) becomes the normal system again"
+    echo "  - the earlier version you kept is saved as $kept (\"tidy\" deletes it later)"
+    echo "  - your home folder is NOT touched"
+    [ "$DRY" = 1 ] && { echo "Dry run: nothing was changed."; return 0; }
+    echo "Run again with --yes to do it."; return 3
+  fi
+  top_mount "$ru" || die "The disk could not be opened. Nothing was changed." 1
+  [ -d "$TOP/$old" ] || { top_umount; die "The saved newer system ($old) was not found. Nothing was changed." 1; }
+  UNDO=()
+  if ! move_nested "$TOP/$rs" "$TOP/$old"; then undo_all; top_umount; die "Stopped. Everything was put back as it was." 1; fi
+  if ! mv "$TOP/$rs" "$TOP/$kept"; then undo_all; top_umount; die "Stopped. Everything was put back as it was." 1; fi
+  UNDO+=("mv $(q "$TOP/$kept") $(q "$TOP/$rs")")
+  if ! mv "$TOP/$old" "$TOP/$rs"; then undo_all; top_umount; die "Stopped. Everything was put back as it was." 1; fi
+  UNDO=()
+  if [ -n "$prev" ] && [ -f "$bd/loader/entries/$prev.conf" ]; then
+    grub2-set-default --boot-directory="$bd" "$prev" >/dev/null 2>&1
+  fi
+  rm -f "$bd/$KEPTF_NAME"
+  top_umount
+  echo "Done. Restart the computer now to use the newest version."
+  echo "Your home folder was not changed. The earlier version is saved as $kept until you choose 'tidy'."
+}
+
+do_tidy() {
+  local bd rs ru keepold d found=()
+  bd=$(boot_dir_now) || die "The /boot part could not be opened. Nothing was changed." 1
+  root_ids "$bd"; rs=$RS ru=$RU
+  [ -n "$rs" ] && [ -n "$ru" ] || die "This tool's settings were not found on /boot. Nothing was changed." 1
+  keepold=$(state_get "$bd/$KEPTF_NAME" KEPT_OLD 2>/dev/null)
+  top_mount "$ru" || die "The disk could not be opened. Nothing was changed." 1
+  for d in "$TOP/$rs".sl-kept-* "$TOP/$rs".sl-before-keep-*; do
+    [ -d "$d" ] || continue
+    [ -n "$keepold" ] && [ "${d##*/}" = "$keepold" ] && continue    # the newer system you may return to: never
+    found+=("$d")
+  done
+  if [ "${#found[@]}" -eq 0 ]; then top_umount; echo "There are no spare system copies to delete."; return 0; fi
+  echo "Spare system copies (your home folder is not among them):"
+  for d in "${found[@]}"; do echo "  - ${d##*/}"; done
+  if [ "$DRY" = 1 ] || [ "$YES" != 1 ]; then
+    top_umount; [ "$DRY" = 1 ] && echo "Dry run: nothing was deleted." || echo "Run again with --yes to delete them."; return 0
+  fi
+  for d in "${found[@]}"; do
+    if [ -n "$(nested_subvols_raw "$d")" ]; then echo "  ${d##*/} still holds other parts; left alone."; continue; fi
+    btrfs subvolume delete "$d" >/dev/null && echo "  deleted ${d##*/}"
+  done
+  top_umount
+}
+
+# ---------------------------------------------------------------- status / notice
+do_status() {
+  local n when
+  if in_session; then
+    n=$(cmdarg rd.securelinux.rollback); when=$(cmdarg secure_linux.rollback_date | tr 'T' ' ')
+    echo "You are using an EARLIER version of the system (from ${when:-snapshot $n})."
+    if home_mounted; then
+      echo "  Files you save in your home folder are kept. Changes to programs and settings are not kept."
+    else
+      echo "  WARNING: your home folder is not open in this earlier version. Files you save now are NOT kept."
+      echo "  Your real files are safe on the disk. Restart the computer to get back to the newest version."
+    fi
+    echo "  To keep this version: secure-linux-boot-rollback keep --yes"
+    echo "  To go back to the newest: just restart the computer."
+    return 0
+  fi
+  if [ -f "$IMGDIR/state" ] && [ "$(state_get "$IMGDIR/state" ON)" = 1 ]; then
+    echo "Go back to an earlier day (boot menu): ON"
+    echo "  The normal start is still first and still the default."
+    if [ -s "$IMGDIR/menu.txt" ]; then
+      echo "  Earlier versions in the boot menu (hold Shift while the computer starts to see the menu):"
+      sed 's/^/    - /' "$IMGDIR/menu.txt"
+    else
+      echo "  No earlier versions are listed yet. They appear after the first daily snapshots."
+    fi
+    [ -s "$IMGDIR/skipped.txt" ] && sed 's/^/  Note: /' "$IMGDIR/skipped.txt"
+  else
+    echo "Go back to an earlier day (boot menu): OFF"
+  fi
+  if [ -f "$BOOT/$KEPTF_NAME" ]; then
+    echo "  You kept an earlier version (from $(state_get "$BOOT/$KEPTF_NAME" KEPT_DATE))."
+    echo "  To return to the newest: secure-linux-boot-rollback newest --yes"
+  fi
+  echo "What goes back: programs and system settings."
+  echo "What does NOT go back: your home folder (documents, photos, personal settings), app store (Flatpak) apps,"
+  echo "  AI models, and the kernel files in /boot."
+}
+
+do_notice() {
+  in_session || return 0
+  local when msg
+  when=$(cmdarg secure_linux.rollback_date | tr 'T' ' ')
+  local files="Your own files (Documents, Pictures and so on) are the real ones. Anything you save there is kept."
+  home_mounted || files="WARNING: your home folder is not open in this earlier version. Files you save now are NOT kept.
+Your real files are safe on the disk. Restart the computer to get back to the newest version."
+  msg="You started an earlier version of the system (from ${when:-an earlier day}).
+
+$files
+Changes to programs and system settings are not kept after a restart.
+
+If this earlier version works well, you can keep it. The newer version is saved too.
+To go back to the newest version instead, just restart the computer."
+  if have kdialog; then
+    kdialog --title "Earlier version" --yes-label "Keep this earlier version" --no-label "Not now" --yesno "$msg" && pkexec "$SELF" keep --yes
+  elif have zenity; then
+    zenity --question --title="Earlier version" --ok-label="Keep this earlier version" --cancel-label="Not now" --text="$msg" && pkexec "$SELF" keep --yes
+  elif have notify-send; then
+    notify-send "Earlier version" "$msg"
+  else
+    printf '%s\n' "$msg"
+  fi
+  return 0
+}
+
+case "$CMD" in
+  status) do_status ;;
+  check)
+    if detect; then echo "This computer's layout is supported. Nothing was changed."; exit 0
+    else echo "This computer's layout is not supported. Nothing was changed. Reason:"; print_reasons; exit 3; fi ;;
+  on) do_on ;;
+  off) do_off ;;
+  refresh)
+    in_session && { say "Using an earlier version right now: the list is not changed."; exit 0; }
+    [ -f "$IMGDIR/state" ] && [ "$(state_get "$IMGDIR/state" ON)" = 1 ] || { say "Go back to an earlier day is off. Nothing to do."; exit 0; }
+    detect || { echo "The layout is no longer one this tool knows. The list was not changed. Reason:"; print_reasons; exit 3; }
+    do_refresh ;;
+  keep) do_keep ;;
+  newest) do_newest ;;
+  tidy) do_tidy ;;
+  notice) do_notice ;;
+esac

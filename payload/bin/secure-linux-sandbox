@@ -1,0 +1,377 @@
+#!/bin/bash
+# secure-linux-sandbox: open a file or a web link you are not sure about in a throw-away sandbox.
+# The sandbox cannot see your own files, and a file opened in it cannot reach the internet.
+# When you close the window, everything inside the sandbox is deleted.
+#
+#   secure-linux-sandbox open FILE    open a copy of FILE safely (your original file is never changed)
+#   secure-linux-sandbox link URL     open a web link in a fresh, empty browser that is deleted afterwards
+#   secure-linux-sandbox check        is the sandbox ready on this computer, and what can it open?
+#   secure-linux-sandbox              (from the menu) asks which file to open
+#   secure-linux-sandbox link         (from the menu) asks for the link to open
+#
+# A file that is a program (or installs one) is never opened, not even in the sandbox.
+#
+# What a link opened here can still reach (said exactly, for the people who check this tool): the throw-away browser
+# has no sound and no microphone (the sound socket is not given to it), and it gets a network of its own (pasta, from
+# the free passt package) that reaches the internet only. It cannot reach this computer's own programs (not even those
+# that listen only on 127.0.0.1: the gateway is never mapped to this computer and no port is forwarded), and it cannot
+# reach other devices on the home network or any other private network (10/8, 172.16/12, 192.168/16, 169.254/16,
+# 100.64/10, and multicast are blocked inside; no IPv6). Names are looked up through pasta's own forwarder, set in the
+# sandbox's own resolv.conf. Without pasta a link is not opened at all (never on this computer's own network).
+set -u
+SB_LC_ALL=${LC_ALL:-}               # the person's own language setting, passed into the sandbox unchanged
+export LC_ALL=${LC_ALL:-C.UTF-8}
+SL_ROOT=${SL_ROOT:-/usr/local/lib/secure-linux}
+SB_SYS=${SL_TEST_SYSROOT:-}          # tests only: where to look for installed programs
+SB_BWRAP=$SB_SYS/usr/bin/bwrap      # bubblewrap, by its full path (never whatever is first in PATH)
+SB_PASTA=$SB_SYS/usr/bin/pasta      # check C4 F6: a link's own network (passt package), by its full path
+SB_IP=$SB_SYS/usr/sbin/ip           # sets the blocks inside that network (iproute)
+[ -x "$SB_IP" ] || SB_IP=$SB_SYS/usr/bin/ip
+SB_NET_ADDR=192.0.2.2               # the link network's own addresses (a documentation range, never a real home
+SB_NET_GW=192.0.2.1                 # network); pasta carries each connection to the internet itself
+SB_DNS=192.0.2.53                   # pasta's name-server forwarder inside that network
+SB_BLOCKED="10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 169.254.0.0/16 100.64.0.0/10 0.0.0.0/8 224.0.0.0/4 240.0.0.0/4"
+SB_MAX_URL=2048
+
+case "${1:-}" in -h|--help|help) sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;; esac
+
+# ---------------------------------------------------------------- messages
+sb_gui() {   # true when started from the menu (no terminal) on a desktop with a dialog program
+  [ "${SL_UI:-}" = plain ] && return 1
+  [ -t 0 ] && [ -t 1 ] && return 1
+  [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ] || return 1
+  command -v kdialog >/dev/null 2>&1 || command -v zenity >/dev/null 2>&1
+}
+sb_dialog() {   # sb_dialog info|error "text"
+  local kind=$1 text=$2
+  sb_gui || return 0
+  if command -v kdialog >/dev/null 2>&1; then
+    if [ "$kind" = error ]; then kdialog --title "Open safely" --sorry "$text" >/dev/null 2>&1
+    else kdialog --title "Open safely" --msgbox "$text" >/dev/null 2>&1; fi
+  else
+    if [ "$kind" = error ]; then zenity --warning --title="Open safely" --width=480 --text="$text" >/dev/null 2>&1
+    else zenity --info --title="Open safely" --width=480 --text="$text" >/dev/null 2>&1; fi
+  fi
+  return 0
+}
+say() { printf '%s\n' "$*"; }
+fail() {   # fail RC "what happened. what to do."
+  printf '%s\n' "$2" >&2
+  sb_dialog error "$2"
+  exit "$1"
+}
+sb_log() { command -v logger >/dev/null 2>&1 && logger -t secure-linux-sandbox "$1" 2>/dev/null; return 0; }
+
+# ---------------------------------------------------------------- what kind of file is it?
+sb_ext() { local n=${1##*/}; case "$n" in *.*) n=${n##*.}; printf '%s' "${n,,}" ;; *) printf '' ;; esac; }
+
+sb_is_program() {   # sb_is_program MIME EXT -> 0 when the file is a program, an installer or a launcher
+  case "$1" in
+    application/x-executable|application/x-pie-executable|application/x-sharedlib|application/x-object) return 0 ;;
+    application/x-mach-binary|application/x-msdownload|application/x-dosexec|application/vnd.microsoft.portable-executable) return 0 ;;
+    application/x-msi|application/x-ms-installer|application/x-ole-storage|application/x-ms-shortcut) return 0 ;;
+    application/x-desktop|application/vnd.appimage|application/x-iso9660-appimage|application/java-archive) return 0 ;;
+    application/x-rpm|application/x-redhat-package-manager|application/vnd.debian.binary-package|application/x-debian-package) return 0 ;;
+    application/vnd.flatpak*|application/x-flatpak*|application/x-executable-script) return 0 ;;
+  esac
+  case "$2" in
+    exe|msi|msp|com|scr|bat|cmd|ps1|vbs|vbe|wsf|jse|hta|lnk|pif|cpl|reg|dll|sys|desktop|appimage|run|bin|jar|apk|rpm|deb|flatpak|flatpakref|elf|so|dmg|pkg) return 0 ;;
+  esac
+  return 1
+}
+
+sb_kind() {   # sb_kind MIME EXT -> prints doc|image|text|office|media|archive|web, or nothing when unknown
+  case "$1" in
+    application/pdf|application/postscript|image/vnd.djvu|image/vnd.djvu+multipage|application/epub+zip) echo doc; return ;;
+    text/html|application/xhtml+xml) echo web; return ;;
+    image/*) echo image; return ;;
+    application/msword|application/rtf|text/rtf|text/csv|application/vnd.ms-excel|application/vnd.ms-powerpoint) echo office; return ;;
+    application/vnd.openxmlformats-officedocument.*|application/vnd.oasis.opendocument.*|application/vnd.ms-*) echo office; return ;;
+    video/*|audio/*) echo media; return ;;
+    application/zip|application/x-7z-compressed|application/x-tar|application/gzip|application/x-gzip|application/x-xz|application/x-bzip2|application/vnd.rar|application/x-rar|application/x-rar-compressed|application/zstd) echo archive; return ;;
+    text/*|application/json|application/xml|application/javascript|application/x-yaml|application/toml) echo text; return ;;
+  esac
+  case "$2" in
+    pdf|ps|djvu|epub) echo doc ;;
+    htm|html|xhtml) echo web ;;
+    png|jpg|jpeg|gif|webp|bmp|tif|tiff|svg|heic|heif|avif|ico) echo image ;;
+    doc|docx|odt|rtf|xls|xlsx|ods|csv|ppt|pptx|odp) echo office ;;
+    mp4|mkv|webm|avi|mov|m4v|mp3|ogg|oga|opus|flac|wav|m4a|aac) echo media ;;
+    zip|7z|tar|gz|tgz|xz|bz2|rar|zst) echo archive ;;
+    txt|log|md|json|xml|yml|yaml|ini|conf|cfg|py|js|sh|toml) echo text ;;
+  esac
+}
+
+sb_programs_for() {   # the programs that can show each kind (first one installed wins)
+  case "$1" in
+    doc)     echo "okular evince papers atril xreader" ;;
+    image)   echo "gwenview eog loupe ristretto okular" ;;
+    text)    echo "kwrite kate gnome-text-editor gedit mousepad xed" ;;
+    office)  echo "libreoffice" ;;
+    media)   echo "haruna vlc mpv celluloid totem showtime" ;;
+    archive) echo "ark file-roller engrampa xarchiver" ;;
+    web)     echo "firefox" ;;
+  esac
+}
+sb_find_program() {   # sb_find_program KIND -> prints the program name
+  local p
+  for p in $(sb_programs_for "$1"); do
+    [ -x "$SB_SYS/usr/bin/$p" ] && { printf '%s' "$p"; return 0; }
+  done
+  return 1
+}
+sb_kind_words() {
+  case "$1" in
+    doc) echo "documents (PDF and e-books)" ;; image) echo "pictures" ;; text) echo "text files" ;;
+    office) echo "office files" ;; media) echo "videos and music" ;; archive) echo "zip and other packed files" ;;
+    web) echo "web pages and links" ;;
+  esac
+}
+
+sb_safe_name() {   # a plain file name for the copy: letters, digits and . _ - ( ) + , space ; never starts with - or .
+  local n=${1##*/} ext base
+  n=$(printf '%s' "$n" | tr -c 'A-Za-z0-9._ ()+,-' '_')
+  case "$n" in -*|.*) n="_${n#?}" ;; esac
+  if [ ${#n} -gt 120 ]; then
+    ext=$(sb_ext "$n"); base=${n:0:100}
+    [ -n "$ext" ] && [ ${#ext} -le 10 ] && n="$base.$ext" || n=$base
+  fi
+  [ -n "$n" ] || n=file
+  printf '%s' "$n"
+}
+
+# ---------------------------------------------------------------- the sandbox
+SB_WORK=""
+sb_cleanup() {   # everything the sandbox saw or saved is deleted
+  [ -n "$SB_WORK" ] && [ -d "$SB_WORK" ] || return 0
+  chmod -R u+rwX "$SB_WORK" 2>/dev/null
+  rm -rf "$SB_WORK" 2>/dev/null
+  if [ -e "$SB_WORK" ]; then
+    printf '%s\n' "Some sandbox files could not be deleted yet. They are in a temporary folder that is emptied when the computer restarts." >&2
+  fi
+  SB_WORK=""
+  return 0
+}
+
+sb_need_ready() {
+  [ "$(id -u)" -ne 0 ] || fail 1 "Please open this as yourself, not as the administrator. A sandbox started by the administrator would not be safe. Nothing was opened."
+  [ -x "$SB_BWRAP" ] || fail 2 "The sandbox program (bubblewrap) is not installed on this computer yet. Connect to the internet and run Secure Linux repair from the Status window, then try again. Nothing was opened."
+}
+
+sb_make_work() {   # a private, empty folder in the computer's memory (XDG_RUNTIME_DIR), or /tmp as a fallback
+  local base=${SL_SANDBOX_BASE:-${XDG_RUNTIME_DIR:-/tmp}}
+  [ -d "$base" ] && [ -w "$base" ] || base=/tmp
+  SB_WORK=$(mktemp -d "$base/secure-linux-sandbox.XXXXXXXXXX") || fail 1 "Could not prepare a sandbox folder. Nothing was opened."
+  trap 'sb_cleanup' EXIT
+  trap 'sb_cleanup; exit 130' INT TERM HUP
+  chmod 0700 "$SB_WORK"
+  mkdir -p "$SB_WORK/home" "$SB_WORK/file" || fail 1 "Could not prepare a sandbox folder. Nothing was opened."
+}
+
+SB_ARGS=()
+sb_base_args() {   # sb_base_args NET(yes|no) SOUND(yes|no)
+  local net=$1 sound=$2 uid rt wl xn xa
+  uid=$(id -u); rt=/run/user/$uid
+  SB_ARGS=(--unshare-all)
+  [ "$net" = yes ] && SB_ARGS+=(--share-net)
+  SB_ARGS+=(--die-with-parent --new-session --cap-drop ALL --clearenv --hostname sandbox)
+  # the system's programs, read-only; Secure Linux's own folder (it holds this computer's settings) stays hidden
+  SB_ARGS+=(--ro-bind /usr /usr --symlink usr/bin /bin --symlink usr/sbin /sbin --symlink usr/lib /lib --symlink usr/lib64 /lib64)
+  [ -L "$SB_SYS/usr/local" ] || SB_ARGS+=(--tmpfs /usr/local)
+  SB_ARGS+=(--ro-bind /etc /etc)
+  [ -d "$SB_SYS/etc/secure-linux" ] && SB_ARGS+=(--tmpfs /etc/secure-linux)
+  SB_ARGS+=(--proc /proc --dev /dev --tmpfs /tmp --tmpfs /var --tmpfs /run --tmpfs /home --dir "$rt")
+  # the sandbox's own home: an empty folder that is deleted afterwards. Your real home is not there.
+  SB_ARGS+=(--bind "$SB_WORK/home" /home/sandbox --ro-bind "$SB_WORK/file" /sandbox)
+  [ "$net" = yes ] && SB_ARGS+=(--ro-bind-try /run/systemd/resolve /run/systemd/resolve)
+  SB_ARGS+=(--setenv HOME /home/sandbox --setenv USER sandbox --setenv PATH /usr/bin:/bin --setenv XDG_RUNTIME_DIR "$rt")
+  SB_ARGS+=(--setenv LANG "${LANG:-C.UTF-8}")
+  [ -n "$SB_LC_ALL" ] && SB_ARGS+=(--setenv LC_ALL "$SB_LC_ALL")
+  # the screen: Wayland only when available (an X11 window could read what you type elsewhere)
+  wl=${WAYLAND_DISPLAY:-}
+  if [ -n "$wl" ]; then
+    case "$wl" in /*) ;; *) wl=${XDG_RUNTIME_DIR:-$rt}/$wl ;; esac
+  fi
+  if [ -n "$wl" ] && [ -e "$wl" ]; then
+    SB_ARGS+=(--ro-bind "$wl" "$rt/wayland-0" --setenv WAYLAND_DISPLAY wayland-0 --setenv XDG_SESSION_TYPE wayland)
+    SB_ARGS+=(--setenv QT_QPA_PLATFORM wayland --setenv GDK_BACKEND wayland --setenv MOZ_ENABLE_WAYLAND 1)
+    SB_ARGS+=(--setenv SDL_VIDEODRIVER wayland --setenv ELECTRON_OZONE_PLATFORM_HINT wayland)
+    SB_SCREEN=wayland
+  elif [ -n "${DISPLAY:-}" ]; then
+    xn=${DISPLAY#*:}; xn=${xn%%.*}
+    case "$xn" in ''|*[!0-9]*) fail 1 "The sandbox could not find this computer's screen. Nothing was opened." ;; esac
+    SB_ARGS+=(--ro-bind "/tmp/.X11-unix/X$xn" "/tmp/.X11-unix/X$xn" --setenv DISPLAY ":$xn" --setenv XDG_SESSION_TYPE x11)
+    xa=${XAUTHORITY:-${HOME:-/nonexistent}/.Xauthority}
+    [ -r "$xa" ] && SB_ARGS+=(--ro-bind "$xa" "$rt/Xauthority" --setenv XAUTHORITY "$rt/Xauthority")
+    SB_SCREEN=x11
+  else
+    fail 1 "The sandbox needs the desktop screen. Open it from the menu while you are logged in. Nothing was opened."
+  fi
+  if [ "$sound" = yes ] && [ -e "${XDG_RUNTIME_DIR:-$rt}/pulse/native" ]; then
+    SB_ARGS+=(--ro-bind "${XDG_RUNTIME_DIR:-$rt}/pulse/native" "$rt/pulse/native" --setenv PULSE_SERVER "unix:$rt/pulse/native")
+  fi
+  SB_ARGS+=(--chdir /home/sandbox)
+}
+
+sb_browser_profile() {   # a fresh, empty browser profile inside the throw-away home
+  mkdir -p "$SB_WORK/home/.browser" "$SB_WORK/home/Downloads"
+  cat > "$SB_WORK/home/.browser/user.js" <<'EOF'
+// Secure Linux throw-away browser: deleted when the window closes
+user_pref("browser.shell.checkDefaultBrowser", false);
+user_pref("browser.aboutwelcome.enabled", false);
+user_pref("browser.startup.homepage_override.mstone", "ignore");
+user_pref("datareporting.policy.dataSubmissionEnabled", false);
+user_pref("datareporting.healthreport.uploadEnabled", false);
+user_pref("toolkit.telemetry.enabled", false);
+user_pref("app.update.auto", false);
+user_pref("signon.rememberSignons", false);
+user_pref("browser.download.dir", "/home/sandbox/Downloads");
+user_pref("browser.download.folderList", 2);
+EOF
+}
+
+sb_command_for() {   # sb_command_for PROGRAM PATH-INSIDE -> SB_CMD
+  local p=$1 f=$2
+  case "$p" in
+    firefox)     SB_CMD=(/usr/bin/firefox --no-remote --new-instance --profile /home/sandbox/.browser "$f") ;;
+    libreoffice) SB_CMD=(/usr/bin/libreoffice --norestore --nologo --view "-env:UserInstallation=file:///home/sandbox/.office" "$f") ;;
+    *)           SB_CMD=("/usr/bin/$p" "$f") ;;
+  esac
+  # a private message bus for the program, so it cannot talk to your desktop
+  [ -x "$SB_SYS/usr/bin/dbus-run-session" ] && SB_CMD=(/usr/bin/dbus-run-session -- "${SB_CMD[@]}")
+  return 0
+}
+
+sb_dns_args() {   # the link network's own name server, wherever /etc/resolv.conf points on this computer
+  local conf=$SB_WORK/resolv.conf target
+  printf 'nameserver %s\noptions edns0\n' "$SB_DNS" > "$conf" || fail 1 "Could not prepare a sandbox folder. Nothing was opened."
+  chmod 0444 "$conf"
+  target=$(readlink -f -- "$SB_SYS/etc/resolv.conf" 2>/dev/null)
+  target=${target#"$SB_SYS"}
+  case "$target" in
+    /run/*) SB_ARGS+=(--dir "${target%/*}") ;;    # a link into /run (systemd-resolved, NetworkManager)
+    *) target=/etc/resolv.conf ;;
+  esac
+  SB_ARGS+=(--ro-bind "$conf" "$target")
+}
+
+# Inside the link network, before the sandbox starts: every private and home range is blocked (fail closed: if a
+# block cannot be set, nothing is opened).
+SB_NET_SCRIPT='ip=$1; shift; while [ "$1" != -- ]; do "$ip" route add prohibit "$1" || exit 97; shift; done; shift; exec "$@"'
+
+sb_run() {   # runs the sandbox and waits until it is closed (a link: inside its own network, through pasta)
+  local rc
+  if [ "${SB_OWN_NET:-}" = yes ]; then
+    "$SB_PASTA" --config-net --quiet --ipv4-only --address "$SB_NET_ADDR" --netmask 24 \
+      --gateway "$SB_NET_GW" --no-map-gw --dns-forward "$SB_DNS" -t none -u none -T none -U none -- \
+      /bin/sh -c "$SB_NET_SCRIPT" sandbox-network "$SB_IP" $SB_BLOCKED -- "$SB_BWRAP" "${SB_ARGS[@]}" "${SB_CMD[@]}" </dev/null
+  else
+    "$SB_BWRAP" "${SB_ARGS[@]}" "${SB_CMD[@]}" </dev/null
+  fi
+  rc=$?
+  sb_cleanup
+  return $rc
+}
+
+# ---------------------------------------------------------------- commands
+cmd_open() {
+  local src=${1:-} mime ext kind prog name size avail
+  if [ -z "$src" ]; then
+    sb_gui || fail 1 "Tell me which file to open, for example: secure-linux-sandbox open ~/Downloads/letter.pdf"
+    if command -v kdialog >/dev/null 2>&1; then src=$(kdialog --title "Open a file safely" --getopenfilename "${HOME:-/}" 2>/dev/null)
+    else src=$(zenity --file-selection --title="Open a file safely" 2>/dev/null); fi
+    [ -n "$src" ] || exit 0
+  fi
+  [ -e "$src" ] || fail 1 "That file could not be found. Nothing was opened."
+  [ -f "$src" ] || fail 1 "That is not a single file (it may be a folder). Choose one file. Nothing was opened."
+  [ -r "$src" ] || fail 1 "You are not allowed to read that file. Nothing was opened."
+  sb_need_ready
+  ext=$(sb_ext "$src")
+  mime=""
+  command -v file >/dev/null 2>&1 && mime=$(file --brief --mime-type -- "$src" 2>/dev/null)
+  if sb_is_program "$mime" "$ext"; then
+    sb_log "Refused to open a program in the sandbox."
+    fail 3 "This file is a program or installs one. Secure Linux never runs a program you are not sure about, not even in the sandbox. Nothing was opened. If you need it, ask someone you trust to check it first."
+  fi
+  kind=$(sb_kind "$mime" "$ext")
+  [ -n "$kind" ] || fail 4 "Secure Linux does not know a safe way to open this kind of file${mime:+ ($mime)}. Nothing was opened."
+  prog=$(sb_find_program "$kind") || fail 5 "No program that can show $(sb_kind_words "$kind") is installed on this computer yet, so nothing was opened."
+  sb_make_work
+  size=$(wc -c < "$src" 2>/dev/null | tr -d ' '); size=${size:-0}
+  avail=$(df -Pk "$SB_WORK" 2>/dev/null | awk 'NR==2 {print $4}')
+  case "$avail" in ''|*[!0-9]*) avail="" ;; esac
+  if [ -n "$avail" ] && [ $((size / 1024 + 10240)) -gt "$avail" ]; then
+    fail 6 "This file is too big to open in the sandbox right now (it needs more free memory). Nothing was opened."
+  fi
+  name=$(sb_safe_name "$src")
+  # a copy: the program in the sandbox only ever sees this copy, read-only. Your original is never changed.
+  cp -- "$src" "$SB_WORK/file/$name" || fail 1 "Could not make a copy of the file for the sandbox. Nothing was opened."
+  chmod 0444 "$SB_WORK/file/$name"
+  [ "$prog" = firefox ] && sb_browser_profile
+  if [ "$kind" = media ]; then sb_base_args no yes; else sb_base_args no no; fi
+  if [ "$prog" = firefox ]; then sb_command_for firefox "file:///sandbox/$name"; else sb_command_for "$prog" "/sandbox/$name"; fi
+  say "Opening a copy of the file in a throw-away sandbox with $prog."
+  say "It cannot see your own files and cannot use the internet. Close its window when you are done."
+  [ "${SB_SCREEN:-}" = x11 ] && say "Good to know: on this computer's older screen system, keep other windows closed while the sandbox is open."
+  sb_log "Opened a file in the throw-away sandbox with $prog."
+  sb_run || fail 7 "The sandbox closed with a problem, so the file may not have been shown. Everything in the sandbox was deleted and your original file was not changed. If this keeps happening, run Secure Linux repair from the Status window."
+  say "The sandbox is closed. Everything in it was deleted. Your original file was not changed."
+  return 0
+}
+
+sb_valid_url() {   # only web links: http:// or https://, no spaces or control characters, not too long
+  local u=$1
+  [ ${#u} -le $SB_MAX_URL ] || return 1
+  case "$u" in http://?*|https://?*) ;; *) return 1 ;; esac
+  case "$u" in *[[:space:][:cntrl:]]*) return 1 ;; esac
+  return 0
+}
+
+cmd_link() {
+  local url=${1:-}
+  if [ -z "$url" ]; then
+    sb_gui || fail 1 "Tell me which link to open, for example: secure-linux-sandbox link https://example.com"
+    if command -v kdialog >/dev/null 2>&1; then url=$(kdialog --title "Open a link safely" --inputbox "Paste the web link you are not sure about:" 2>/dev/null)
+    else url=$(zenity --entry --title="Open a link safely" --width=560 --text="Paste the web link you are not sure about:" 2>/dev/null); fi
+    url=${url%$'\r'}
+    [ -n "$url" ] || exit 0
+  fi
+  case "$url" in www.*) url="https://$url" ;; esac
+  sb_valid_url "$url" || fail 1 "That does not look like a web link (it should start with https://). Nothing was opened."
+  sb_need_ready
+  [ -x "$SB_PASTA" ] && [ -x "$SB_IP" ] || fail 2 "Opening links safely needs the small network helper (passt) that keeps a page away from your home network. It is not installed on this computer yet. Connect to the internet and run Secure Linux repair from the Status window, then try again. Nothing was opened."
+  sb_find_program web >/dev/null || fail 5 "The Firefox web browser is not installed on this computer as a system program, so the link was not opened."
+  sb_make_work
+  sb_browser_profile
+  sb_base_args yes no                 # a link gets the internet but no sound socket: a page never reaches the microphone
+  sb_dns_args                         # check C4 F6: its own network (pasta), so its own name server
+  SB_OWN_NET=yes
+  sb_command_for firefox "$url"
+  say "Opening the link in a fresh, empty browser in a throw-away sandbox."
+  say "It cannot see your own files, passwords or bookmarks. Do not type your passwords there. Close it when you are done."
+  sb_log "Opened a link in the throw-away sandbox."
+  sb_run || fail 7 "The sandbox browser closed with a problem, so the page may not have been shown. Everything from that visit was deleted. If this keeps happening, run Secure Linux repair from the Status window."
+  say "The sandbox is closed. Everything from that visit was deleted."
+  return 0
+}
+
+cmd_check() {
+  local k p ready=0
+  if [ -x "$SB_BWRAP" ]; then say "The sandbox is ready (bubblewrap is installed)."; ready=1
+  else say "The sandbox program (bubblewrap) is not installed yet. Run Secure Linux repair from the Status window."; fi
+  if [ -x "$SB_PASTA" ] && [ -x "$SB_IP" ]; then say "  links open in a network of their own that cannot reach your home network (passt is installed)"
+  else say "  links cannot be opened yet: the network helper (passt) is not installed. Run Secure Linux repair from the Status window."; fi
+  for k in doc image text office media archive web; do
+    if p=$(sb_find_program "$k"); then say "  can open $(sb_kind_words "$k") with $p"
+    else say "  cannot open $(sb_kind_words "$k") yet (no suitable program installed)"; fi
+  done
+  [ $ready = 1 ]
+}
+
+case "${1:-}" in
+  open)  shift; cmd_open "${1:-}" ;;
+  link)  shift; cmd_link "${1:-}" ;;
+  check) cmd_check ;;
+  '')    cmd_open "" ;;
+  *)     fail 1 "Unknown choice: $1. Run secure-linux-sandbox --help to see what it can do." ;;
+esac

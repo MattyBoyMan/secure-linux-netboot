@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<!-- Secure Linux: clear password prompts for secure-linux-kit-update-auto, which re-runs itself for these three
+     commands only ("set" changes the update settings, "undo" goes back to the previous version, "retry"
+     installs the release the person went back from after all).
+     Installed by steps/00-early.sh to /usr/share/polkit-1/actions/. -->
+<policyconfig>
+  <vendor>The Complete Secure Linux Package</vendor>
+  <action id="org.securelinux.kitupdateauto.set">
+    <description>Change how Secure Linux updates its own files</description>
+    <message>Secure Linux needs your password to save how it updates its own files (online checks, automatic installing, release channel)</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/bin/secure-linux-kit-update-auto</annotate>
+    <annotate key="org.freedesktop.policykit.exec.argv1">set</annotate>
+  </action>
+  <action id="org.securelinux.kitupdateauto.undo">
+    <description>Go back to the previous Secure Linux version</description>
+    <message>Secure Linux needs your password to go back to the previous version of its own files (the newer one is kept away until a later release)</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/bin/secure-linux-kit-update-auto</annotate>
+    <annotate key="org.freedesktop.policykit.exec.argv1">undo</annotate>
+  </action>
+  <action id="org.securelinux.kitupdateauto.retry">
+    <description>Install the Secure Linux release you went back from</description>
+    <message>Secure Linux needs your password to install the release you went back from</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/bin/secure-linux-kit-update-auto</annotate>
+    <annotate key="org.freedesktop.policykit.exec.argv1">retry</annotate>
+  </action>
+</policyconfig>

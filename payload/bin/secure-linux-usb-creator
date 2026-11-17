@@ -9,6 +9,7 @@ files; it can never write a physical device.
 
 import argparse
 import base64
+import contextlib
 import datetime
 import errno
 try:
@@ -17,6 +18,7 @@ except ImportError:  # Windows is supported only for regular-file mock tests.
     fcntl = None
 import gzip
 import hashlib
+import importlib.util
 import io
 import json
 import os
@@ -30,12 +32,17 @@ import sys
 import tarfile
 import tempfile
 import time
+import types
 import uuid
 
 _KIT_ROOT = Path(__file__).resolve().parent.parent
 _LIB = _KIT_ROOT / "lib"
 if str(_LIB) not in sys.path:
     sys.path.insert(0, str(_LIB))
+# F9: once installed, the kit's own modules (and drive-builder plug-ins) also live here.
+_FALLBACK_LIB = Path("/usr/local/lib/secure-linux/lib")
+if _FALLBACK_LIB.is_dir() and str(_FALLBACK_LIB) not in sys.path:
+    sys.path.append(str(_FALLBACK_LIB))
 from release_manifest import (  # noqa: E402
     ReleaseError,
     canonical_path,
@@ -71,9 +78,61 @@ FILES_ONLY_KIND = "files-only"
 FILES_ONLY_SKIP_PREFIXES = (
     "linux-setup/scan/",
     "linux-setup/recovery/",
-    "$RECYCLE.BIN/",
-    "System Volume Information/",
+    "$RECYCLE.BIN/", "System Volume Information/",
+    "persistence/",   # one drive's saved changes (live mode): one person's own files (P28a F1, is_saved_changes_file)
+    # A drive's own passport and file list describe that one drive, so a master never keeps them.
+    "SECURE-LINUX-DRIVE-PASSPORT.",
+    "linux-setup/SECURE-LINUX-DRIVE-FILES.json",
 )
+# Drive passport and drive file list (contract C3), written on every drive this tool makes.
+PASSPORT_JSON = "SECURE-LINUX-DRIVE-PASSPORT.json"
+PASSPORT_TXT = "SECURE-LINUX-DRIVE-PASSPORT.txt"
+DRIVE_FILES_LIST = "linux-setup/SECURE-LINUX-DRIVE-FILES.json"
+DRIVE_IDENTITY_FILES = (PASSPORT_JSON, PASSPORT_TXT, DRIVE_FILES_LIST)
+PER_DRIVE_LIST_NAME = "drive-per-drive-files.txt"
+# Used only when linux/setup-data/drive-per-drive-files.txt cannot be read. That file is the reference (each line
+# names the code that makes the file per-drive); a test keeps the two identical.
+DEFAULT_PER_DRIVE_PATTERNS = (
+    "ventoy/script/secure-linux.ks",
+    "ventoy/script/debian-*.cfg",
+    "ventoy/script/debian-sl-*.tar.gz",
+    "ventoy/ventoy.json",
+    "linux-setup/linux/build.conf",
+    "linux-setup/kit/linux/build.conf",
+    "linux-setup/wifi-networks.txt",
+    "linux-setup/backups.txt",
+    "linux-setup/setup.conf",
+    "linux-setup/scan/**",
+    "linux-setup/recovery/**",
+    "linux-setup/private/**",
+    "SECURE-LINUX-DRIVE-PASSPORT.*",
+    "linux-setup/SECURE-LINUX-DRIVE-FILES.json",
+    "CHECK-THIS-DRIVE.sh",
+    "**/*.enc1",
+    "scan/**",
+    "linux-setup/preflight/**",
+    "persistence/**",
+)
+# Per-drive files that are not somebody's own settings (used only for the "this drive is for you" note).
+NOT_PERSONAL_PER_DRIVE = ("ventoy/ventoy.json", "CHECK-THIS-DRIVE.sh") + DRIVE_IDENTITY_FILES
+# Apps go on the drive too (Matthew, Q6 = yes). When the saved master holds no offline app collection, this
+# computer's own copy (unpacked there from the stick by linux/steps/03-offline-packs.sh) is added to the drive.
+DEFAULT_APP_BUNDLE_DIR = Path("/var/cache/secure-linux/offline/app-bundles")
+# Store lock (contract C4): exclusive while the master changes, shared while drives are made or checked.
+STORE_LOCK_NAME = ".store.lock"
+STORE_LOCK_WAIT_SECONDS = 60
+STORE_BUSY_EXIT = 75
+STORE_LOCK_MODES = {
+    "create": True, "sync-master": True,
+    "clone": False, "portable": False, "measure": False, "verify": False, "status": False,
+}
+# The small status file the "My saved master" window reads without a password (gap check HIGH 6).
+MASTER_STATUS_STORE_NAME = "usb-master"
+MASTER_STATUS_RELEASE_RE = re.compile(r"^[A-Za-z0-9._+~-]{1,64}$")
+# Drive-builder plug-ins (contract C17): linux/lib/usbc_<name>.py on the library path.
+PLUGIN_FILE_RE = re.compile(r"^usbc_[a-z0-9_]+\.py$")
+CORE_COMMANDS = ("list", "create", "sync-master", "clone", "portable", "measure", "verify", "status")
+LOADED_PLUGINS = []
 # Personal-storage partitioning: only offered when the drive has more room than the
 # copy needs by this margin. Space is reserved at Ventoy install time (-r MB), then
 # partition #3 is created in the reserved area after the copy verifies.
@@ -104,6 +163,10 @@ class CreatorError(Exception):
 
 class VerificationError(CreatorError):
     """A checksum or full-content mismatch."""
+
+
+class StoreBusy(CreatorError):
+    """Another drive-builder job holds the saved master's lock; nothing was changed."""
 
 
 class Progress:
@@ -541,14 +604,14 @@ def safe_payload_path(value):
     return value
 
 
-def source_file_entries(root, skip_prefixes=()):
+def source_file_entries(root, skip_prefixes=(), left_out=None):
     """Return a complete regular-file inventory; never silently omit symlinks."""
     entries = []
     for base, directories, files in os.walk(root, followlinks=False):
         if skip_prefixes:
             here = Path(base).relative_to(root).as_posix()
             here = "" if here == "." else here + "/"
-            directories[:] = [name for name in directories if not (here + name + "/").startswith(tuple(skip_prefixes))]
+            directories[:] = [name for name in directories if not master_skips(here + name + "/", skip_prefixes, left_out, Path(base) / name)]
         directories.sort()
         files.sort()
         for name in directories:
@@ -557,6 +620,8 @@ def source_file_entries(root, skip_prefixes=()):
                 raise CreatorError(f"finished USB contains a symbolic-link directory, not a regular file tree: {path}")
         for name in files:
             path = Path(base) / name
+            if skip_prefixes and master_skips(here + name, skip_prefixes, left_out):
+                continue
             if path.is_symlink() or not path.is_file():
                 raise CreatorError(f"finished USB payload must contain regular files only: {path}")
             relative = safe_payload_path(path.relative_to(root).as_posix())
@@ -949,7 +1014,7 @@ def create_files_master(args):
     else:
         raise CreatorError("--store must be outside --source-root; otherwise the master would recursively copy itself")
     variant = getattr(args, "variant", "full") or "full"
-    wanted = source_file_entries(source_root, FILES_ONLY_SKIP_PREFIXES)
+    wanted = files_only_entries(source_root)
     if variant == "online-only":
         wanted = [entry for entry in wanted if not entry[0].startswith(ONLINE_ONLY_EXCLUDED_PREFIX)]
     payload_bytes = sum(size for _, _, size in wanted)
@@ -962,6 +1027,8 @@ def create_files_master(args):
         )
     master_id = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%S") + "-" + uuid.uuid4().hex[:12]
     generations = os.path.join(store, "generations")
+    if not os.path.isdir(generations):
+        enable_store_compression(store)      # a new store: on Btrfs, compression is set once before any file is written
     os.makedirs(generations, exist_ok=True)
     for stale in os.listdir(generations):
         stale_path = os.path.join(generations, stale)
@@ -989,7 +1056,7 @@ def create_files_master(args):
             "created_at": utc_now(),
             "release": release_link,
             "source": {"kind": FILES_ONLY_KIND, "root_at_capture": str(source_root), "variant": variant},
-            "portable": portable,
+            "portable": portable, **template_record({"portable": portable}),
         }
         validate_manifest(manifest)
         manifest_raw = json_data(manifest)
@@ -1007,12 +1074,14 @@ def create_files_master(args):
         fsync_directory(generations)
         atomic_write(os.path.join(store, "current"), (master_id + "\n").encode(), 0o600)
         published = True
+        write_master_status(store, manifest)
         say("")
         say(f"SAVED MASTER VERIFIED: {master_id}")
         say(f"Kit release: {release_link['release_id']}")
         say(f"Files-only master ({variant}): {portable['file_count']} files, {portable['payload_bytes']} bytes, every file read back.")
         say("It makes complete bootable drives with the Portable tools copy. Exact whole-device clones need a full master.")
         say("The master is read-only and owner-only (folder 0500, files 0400) because it may contain private data.")
+        report_store_compression(store, final)
         return 0
     finally:
         if not published and os.path.isdir(staging):
@@ -1029,6 +1098,46 @@ KS_PAYLOAD_PATH = "ventoy/script/secure-linux.ks"
 KS_PAYLOAD_BEGIN = b"base64 -d > /tmp/secure-linux.tar.gz <<'SL_TGZ_END'\n"
 KS_PAYLOAD_END = b"\nSL_TGZ_END\n"
 MASTER_LINUX_TREE = "linux-setup/linux"
+# The signed release file list and both signatures, as a verified update keeps them beside the release
+# (secure-linux-kit-update KEPT). The drive's own check proves the Secure Linux files with them (check C6 F1).
+KEPT_SIGNATURES = (".kit-update-release.json.sig", ".kit-update-published-files.json",
+                   ".kit-update-published-files.json.sig")
+MAX_KEPT_SIGNATURE_FILE = 2 * 1024 * 1024
+
+
+def carry_release_signatures(from_tree, linux_tree, old_root=None):
+    """Put this computer's kept release signatures into the master's Secure Linux files; returns how many changed.
+
+    sync_from_tree copies them only when the master already trusted a release key, so a master made in bridge mode
+    that now receives the first key would make drives without them, and every such drive's check would say PROBLEM.
+    They are taken only as a full set, and only when this computer's release.json is byte for byte the master's new
+    one. A file shared with the previous generation is replaced by a private copy first, never written through."""
+    source, target = Path(from_tree), Path(linux_tree)
+    try:
+        if (source / "release.json").read_bytes() != (target / "release.json").read_bytes():
+            return 0
+    except OSError:
+        return 0
+    found = {}
+    for name in KEPT_SIGNATURES:
+        path = source / name
+        if path.is_symlink() or not path.is_file() or path.stat().st_size > MAX_KEPT_SIGNATURE_FILE:
+            return 0
+        found[name] = path.read_bytes()
+    carried = 0
+    for name, data in found.items():
+        destination = target / name
+        if destination.is_file() and not destination.is_symlink():
+            if destination.read_bytes() == data:
+                continue
+            if old_root is not None:
+                private_copy(destination, old_root)
+            os.chmod(destination, 0o600)
+        temporary = destination.with_name(destination.name + ".sync-new")
+        temporary.write_bytes(data)
+        os.replace(temporary, destination)
+        carried += 1
+    return carried
 
 
 def kit_update_module():
@@ -1128,8 +1237,9 @@ def sync_master(args):
     except ReleaseError as exc:
         raise CreatorError(f"this computer's Secure Linux release record cannot be read: {exc}") from exc
     if manifest["release"].get("release_id") == current.get("release_id") and not master_problems(manifest, current_release):
+        write_master_status(store, manifest)
         say(f"MASTER ALREADY CURRENT: {manifest['release']['release_id']}")
-        return 0
+        return sync_done(manifest, from_tree)
     kit_update = kit_update_module()
     old_payload = Path(old_root) / "payload"
     master_id = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%S") + "-" + uuid.uuid4().hex[:12]
@@ -1146,7 +1256,7 @@ def sync_master(args):
     work = tempfile.mkdtemp(prefix="sl-master-sync-")
     try:
         payload = Path(staging) / "payload"
-        old_entries = {entry["path"]: entry for entry in portable["files"]}
+        old_entries = sync_kept_entries(portable["files"])
         for relative, entry in old_entries.items():
             source = old_payload / relative
             size, digest = hash_file(source, entry["size"])
@@ -1167,6 +1277,7 @@ def sync_master(args):
                 if target.is_file():
                     private_copy(target, old_root)
             changed, removed, release_id = kit_update.sync_from_tree(from_tree, linux_tree)
+            carried = carry_release_signatures(from_tree, linux_tree, old_root)
             ks_path = payload / KS_PAYLOAD_PATH
             ks_changed = ks_removed = 0
             if ks_path.is_file():
@@ -1206,7 +1317,7 @@ def sync_master(args):
             "release": release_link,
             "source": {"kind": FILES_ONLY_KIND, "updated_from_master": old_id,
                        "variant": portable.get("captured_variant", "full")},
-            "portable": new_portable,
+            "portable": new_portable, **template_record(manifest),
         }
         validate_manifest(new_manifest)
         manifest_raw = json_data(new_manifest)
@@ -1223,12 +1334,17 @@ def sync_master(args):
         fsync_directory(generations)
         atomic_write(os.path.join(store, "current"), (master_id + "\n").encode(), 0o600)
         published = True
+        write_master_status(store, new_manifest)
         say("")
         say(f"MASTER UPDATED AND VERIFIED: {master_id}")
         say(f"Kit release: {release_id} (was {manifest['release']['release_id']})")
         say(f"Changed: {changed} Linux file(s), {removed} removed; installer script's packed files: {ks_changed} changed, {ks_removed} removed.")
+        if carried:
+            say(f"Release signatures: {carried} file(s) taken from this computer, so drives made from this master can "
+                "prove their Secure Linux files.")
         say(f"Every other file is shared with the previous master ({old_id}), which is kept to go back to.")
-        return 0
+        report_store_compression(store, final)
+        return sync_done(new_manifest, from_tree, Path(final) / "payload" / MASTER_LINUX_TREE, release_id)
     finally:
         shutil.rmtree(work, ignore_errors=True)
         if not published and os.path.isdir(staging):
@@ -1326,6 +1442,8 @@ def create_master(args):
         )
     master_id = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%S") + "-" + uuid.uuid4().hex[:12]
     generations = os.path.join(store, "generations")
+    if not os.path.isdir(generations):
+        enable_store_compression(store)      # a new store: on Btrfs, compression is set once before any file is written
     os.makedirs(generations, exist_ok=True)
     # Hard power loss cannot run finally. Remove only our unpublished staging
     # directories on the next create; immutable published generations stay intact.
@@ -1431,7 +1549,7 @@ def create_master(args):
             },
         }
         if portable:
-            manifest["portable"] = portable
+            manifest.update({"portable": portable, **template_record({"portable": portable})})
             validate_manifest(manifest)
         manifest_raw = json_data(manifest)
         atomic_write(os.path.join(staging, "manifest.json"), manifest_raw, 0o400)
@@ -1462,6 +1580,7 @@ def create_master(args):
         fsync_directory(generations)
         atomic_write(os.path.join(store, "current"), (master_id + "\n").encode(), 0o600)
         published = True
+        write_master_status(store, manifest)
         say("")
         say(f"SAVED MASTER VERIFIED: {master_id}")
         say(f"Kit release: {release_link['release_id']}")
@@ -1469,6 +1588,7 @@ def create_master(args):
         say(f"Full raw SHA-256: {whole.hexdigest()}")
         say("The master is read-only and owner-only (folder 0500, files 0400) because it may contain private data.")
         say("Future clones stream-decompress it and never write to it.")
+        report_store_compression(store, final)
         return 0
     finally:
         if fd is not None:
@@ -1725,20 +1845,24 @@ def clone_master(args):
 
 
 def variant_files(portable, variant):
-    """File entries for a copy variant: the ONLINE-ONLY variant excludes the offline app cache."""
-    if variant == "online-only":
-        return [entry for entry in portable["files"] if not entry["path"].startswith(ONLINE_ONLY_EXCLUDED_PREFIX)]
-    if variant != "full":
+    """File entries for a copy variant: the ONLINE-ONLY variant excludes the offline app cache.
+
+    A drive passport or drive file list kept in an older master describes another drive, so it is never copied.
+    """
+    if variant not in VARIANTS:
         raise CreatorError(f"unknown variant {variant!r}; choose one of: {', '.join(VARIANTS)}")
-    return list(portable["files"])
+    files = [entry for entry in portable["files"] if not is_drive_identity_file(entry["path"])]
+    if variant == "online-only":
+        files = [entry for entry in files if not entry["path"].startswith(ONLINE_ONLY_EXCLUDED_PREFIX)]
+    return files
 
 
-def portable_measurements(manifest, variant="full"):
+def portable_measurements(manifest, variant="full", extra_files=(), files=None):
     portable = manifest.get("portable")
     if portable is None:
         raise VerificationError("this saved master has no portable file manifest; recreate it with --source-root")
     validate_portable_manifest(portable)
-    files = variant_files(portable, variant)
+    files = list(files) if files is not None else variant_files(portable, variant) + list(extra_files)
     if not files:
         raise CreatorError(f"variant {variant!r} has no files to copy")
     payload = sum(entry["size"] for entry in files)
@@ -1837,7 +1961,14 @@ def measure_command(args):
     _, _, _, manifest = load_master(
         args.store, args.master_id, payload=True, show_progress=not args.json, current_release=args.current_release
     )
-    result = portable_measurements(manifest, args.variant)
+    bundle_files = []
+    if manifest.get("portable") is not None:
+        bundle_files, _ = app_collection_for_copy(
+            variant_files(manifest["portable"], args.variant), args.variant,
+            getattr(args, "app_bundle", "auto"), bool(args.mock_devices), with_hashes=False,
+        )
+    result = portable_measurements(manifest, args.variant, bundle_files)
+    result["app_collection_from_computer_bytes"] = sum(entry["size"] for entry in bundle_files)
     online = portable_measurements(manifest, "online-only")
     result["online_only_copy_minimum_bytes"] = online["portable_copy_minimum_bytes"]
     result["online_only_file_count"] = online["portable_file_count"]
@@ -1863,6 +1994,8 @@ def measure_command(args):
     say("MEASURED USB CAPACITY — based on the verified saved file manifest")
     say(f"Variant measured: {result['variant']}")
     say(f"Source used bytes (actual finished tools/files): {result['source_used_bytes']} ({human(result['source_used_bytes'])})")
+    if result["app_collection_from_computer_bytes"]:
+        say(f"Offline app collection from this computer: {result['app_collection_from_computer_bytes']} bytes (counted above)")
     say(f"Filesystem-allocation allowance: {result['allocated_payload_bytes']} bytes")
     say(f"Ventoy/partition overhead: {result['ventoy_partition_overhead_bytes']} bytes")
     say(f"Additional filesystem overhead: {result['filesystem_overhead_bytes']} bytes")
@@ -1980,6 +2113,63 @@ def mount_ventoy_partitions(devices, target, state_root):
     return roots["VENTOY"], roots["VTOYEFI"], mounted
 
 
+# Ventoy2Disk.sh asks "Continue? (y/n)" and then "Double-check. Continue? (y/n)" before it writes, and on any other
+# answer than y it ends with exit status 0 and changes nothing (VentoyWorker.sh). This tool has already asked its own
+# "ERASE <serial>" question and checked the drive again, and the window and usb-multi have no keyboard at all, so the
+# tool gives Ventoy both answers itself (check R1 F-R1-1, C3 HIGH 3). Ventoy refuses -i on a drive that already holds
+# Ventoy, so such a drive is made again with -I. Exit status 0 without both Ventoy partitions is a refusal.
+VENTOY_ANSWERS = "y\ny\n"
+VENTOY_LABELS = frozenset({"VENTOY", "VTOYEFI"})
+VENTOY_REFUSED = ("Ventoy refused: it ended without making its two partitions (Ventoy and VTOYEFI), so nothing was "
+                  "copied and the drive is NOT ready. Check that the drive is plugged in and that the Ventoy package "
+                  "is complete, then make the drive again with --restart.")
+
+
+def ventoy_labels(device):
+    return {str(child.get("label") or "").upper() for child in child_partitions(device)} & VENTOY_LABELS
+
+
+def has_ventoy_layout(device):
+    """True when the drive shows both Ventoy partitions (Ventoy and VTOYEFI)."""
+    return ventoy_labels(device) == VENTOY_LABELS
+
+
+def ventoy_force_needed(device, restart):
+    """-I instead of -i when the drive already holds Ventoy (or part of it), or when the layout is made again."""
+    return bool(restart or ventoy_labels(device))
+
+
+def run_ventoy_installer(command, path, force):
+    """Run the genuine installer on the drive with both of its answers given (after this tool's own ERASE question)."""
+    argv = [("-I" if force else part) if part == "-i" else part for part in command] + [path]
+    return subprocess.run(argv, input=VENTOY_ANSWERS, text=True)
+
+
+def settle_drive_list():
+    """Give the system a moment to list the partitions Ventoy just made (best effort)."""
+    try:
+        subprocess.run(["udevadm", "settle", "--timeout=10"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                       timeout=20)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    time.sleep(1)
+
+
+def check_ventoy_made(devices, target, settle=settle_drive_list, attempts=5):
+    """After Ventoy ended with exit status 0, both of its partitions must be on the drive, or Ventoy refused.
+
+    A test drive list is checked only when its drive row models partitions (it has a "children" entry)."""
+    for _ in range(1 if devices.mock else attempts):
+        if not devices.mock:
+            settle()
+        row = devices.find_path(target["path"])
+        if devices.mock and "children" not in row:
+            return row
+        if has_ventoy_layout(row):
+            return row
+    raise CreatorError(VENTOY_REFUSED)
+
+
 def unmount_ventoy_partitions(mounted):
     for _, mount_root in reversed(mounted):
         result = subprocess.run(["umount", "--", str(mount_root)])
@@ -2038,13 +2228,19 @@ def portable_copy(args):
     )
     portable = manifest["portable"]
     variant = args.variant
-    if variant == "full" and portable.get("captured_variant") == "online-only":
+    files, drive_sources, plan = drive_copy_plan(args, root, manifest, variant_files(portable, variant))
+    # Apps go on the drive too: when the saved master has no offline app collection, this computer's own copy is
+    # added, and its size is part of the space check below.
+    bundle_files, bundle_sources = app_collection_for_copy(
+        files, variant, getattr(args, "app_bundle", "auto"), bool(args.mock_devices)
+    )
+    if variant == "full" and portable.get("captured_variant") == "online-only" and not bundle_files:
         raise CreatorError(
             "this saved master was kept without the offline app collection, so it makes the online-only drive; "
             "choose the online-only copy, or save a full master from a drive that has the collection"
         )
-    files = variant_files(portable, variant)
-    measurements = portable_measurements(manifest, variant)
+    files, sources = files + bundle_files, dict(bundle_sources, **drive_sources)
+    measurements = portable_measurements(manifest, variant, bundle_files, files=files)
     _, installer_command, installer_hashes = validate_ventoy_installer(args.ventoy_installer, bool(args.mock_devices))
     devices = Devices(args.mock_devices)
     rows = devices.scan()
@@ -2064,9 +2260,9 @@ def portable_copy(args):
     matching_receipt = previous and previous.get("mode") == "portable-tools-copy" and previous.get("master_id") == master_id
     if args.resume and not matching_receipt:
         raise CreatorError("no matching interrupted portable copy exists; use --restart to create a new Ventoy layout")
-    can_resume = not args.restart and bool(matching_receipt)
-    if can_resume and previous.get("variant", variant) != variant:
-        raise CreatorError("this interrupted copy used a different variant; rerun without --resume or with the same variant")
+    can_resume = not args.restart and not plan.test_tool and bool(matching_receipt)
+    if can_resume and (previous.get("variant", variant) != variant or previous.get("personal", "mine") != plan.personal):
+        raise CreatorError(resume_mismatch(previous, variant))
     # --- Storage partition: decided UP FRONT (with the erase confirmation), never asked mid-run ---
     surplus = target["size"] - minimum
     storage_plan = None
@@ -2105,6 +2301,12 @@ def portable_copy(args):
     say("PORTABLE TOOLS COPY — a separate option from exact whole-device clone")
     say("This creates a functionally equivalent bootable Ventoy USB; it is not a byte-for-byte exact clone.")
     say(f"Variant: {variant} ({len(files)} files; {measurements['source_used_bytes']} bytes of content)")
+    if bundle_files:
+        say(f"Offline app collection: copied from this computer ({len(bundle_files)} files, "
+            f"{human(sum(entry['size'] for entry in bundle_files))}); its size is counted in the space needed.")
+    # Whose settings the drive carries, the online switch and the drive test, in plain words (ideas 17, 15, 20).
+    for line in copy_summary(plan, carries_personal_settings(files)):
+        say(line)
     say(f"Ventoy/partition overhead: {measurements['ventoy_partition_overhead_bytes']} bytes")
     say(f"Safety margin: {measurements['safety_margin_bytes']} bytes")
     say(f"Required destination bytes: {minimum}; selected target: {target['size']} bytes")
@@ -2139,7 +2341,7 @@ def portable_copy(args):
         "master_id": master_id,
         "master_raw_sha256": master_fingerprint(manifest),
         "portable_tree_sha256": sha256_bytes(json_data(files)),
-        "variant": variant,
+        "variant": variant, "personal": plan.personal,
         "storage": storage_plan,
         "target": {
             "identity": target_id,
@@ -2164,7 +2366,7 @@ def portable_copy(args):
     mounted = []
     completed = False
     try:
-        fd = open_device(refreshed, True, devices.mock)
+        fd = open_after_drive_test(plan, devices, target, target_id, refreshed)
         if can_resume:
             say("Resume: retaining the existing Ventoy layout and re-hashing every already copied file.")
         else:
@@ -2173,11 +2375,16 @@ def portable_copy(args):
             if storage_plan:
                 install_command += ["-r", str(storage_plan["reserve_mb"])]
                 say(f"Reserving {storage_plan['reserve_mb']} MB at the end of the disk for your storage partition.")
-            result = subprocess.run(install_command + [refreshed["path"]])
+            force = ventoy_force_needed(devices.find_path(target["path"]), args.restart)
+            if force:
+                say("This drive already holds Ventoy (or part of it), so Ventoy is told to make it again (-I).")
+            say("Ventoy asks twice before it writes; this tool answers yes, because you typed the ERASE phrase.")
+            result = run_ventoy_installer(install_command, refreshed["path"], force)
             if result.returncode:
                 raise CreatorError(
                     f"Ventoy installer failed with exit status {result.returncode}; target is INCOMPLETE / NOT VERIFIED"
                 )
+            check_ventoy_made(devices, target)
         os.close(fd)
         fd = None
         latest = devices.find_path(target["path"])
@@ -2185,13 +2392,15 @@ def portable_copy(args):
             raise CreatorError("target identity or capacity changed during Ventoy installation")
         data_root, efi_root, mounted = mount_ventoy_partitions(devices, latest, state_root)
         boot_hashes = verify_boot_assets(efi_root)
+        # An earlier passport would claim a check this copy has not passed yet.
+        remove_drive_identity(data_root)
         current = dict(base_state)
         current["phase"] = "copying"
         current["boot_asset_sha256"] = boot_hashes
         save_state(state_path, current)
         progress = Progress("Copying verified tools, release and offline content", sum(entry["size"] for entry in files))
         for index, entry in enumerate(files):
-            source = Path(root) / "payload" / entry["path"]
+            source = sources[entry["path"]] if entry["path"] in sources else Path(root) / "payload" / entry["path"]
             destination = ensure_payload_destination(data_root, entry["path"])
             retained = False
             if can_resume and destination.is_file():
@@ -2207,7 +2416,7 @@ def portable_copy(args):
                 try:
                     digest = hashlib.sha256()
                     count = 0
-                    with open(source, "rb") as incoming, os.fdopen(temporary_fd, "wb") as outgoing:
+                    with open_source(source) as incoming, os.fdopen(temporary_fd, "wb") as outgoing:
                         while True:
                             data = incoming.read(COPY_BLOCK)
                             if not data:
@@ -2258,6 +2467,8 @@ def portable_copy(args):
             storage_plan = dict(storage_plan)
             storage_plan.update(storage_info)
             say(f"Storage partition created: {storage_plan.get('partition')} ({storage_plan['format']}).")
+        # Passport and drive file list (C3): after the copy's own verification, before the success line.
+        passport = passport_and_drive_check(data_root, manifest, master_id, files, tree_hash, plan, latest, store, devices)
         final_state = dict(base_state)
         final_state.update({
             "status": "verified",
@@ -2269,11 +2480,14 @@ def portable_copy(args):
             "verified_tree_sha256": tree_hash,
             "boot_asset_sha256": boot_hashes,
             "storage": storage_plan,
+            "drive_files_list_sha256": passport["list_sha256"],
             "verified_at": utc_now(),
         })
         save_state(state_path, final_state)
         completed = True
+        run_after_copy(data_root, manifest, args, state_path, final_state)
         say("")
+        say(f"Drive passport written: {PASSPORT_JSON} and {DRIVE_FILES_LIST} ({passport['files']} files listed).")
         say(f"VERIFIED PORTABLE TOOLS COPY: all {len(files)} file hashes and every required Ventoy boot asset passed.")
         say("The current release manifest, finished tools/files and offline content were copied from the verified saved master.")
         say("This is functionally equivalent Ventoy content, not a byte-for-byte exact clone.")
@@ -2399,25 +2613,1698 @@ def interactive(args):
                 args.source = input("Exact source whole-drive path: ").strip()
                 args.source_root = input("Finished USB file-tree root for Portable tools copy (for example D:\\): ").strip()
                 args.chunk_size = DEFAULT_CHUNK
-                return create_master(args)
+                return run_locked("create", args, create_master)
             if choice == "5":
                 args.target = input("Optional exact target path for a fit check (blank to skip): ").strip() or None
-                return measure_command(args)
+                return run_locked("measure", args, measure_command)
             args.target = input("Exact target whole-drive path: ").strip()
             if choice == "3":
                 args.resume = False
                 args.restart = False
-                return clone_master(args)
+                return run_locked("clone", args, clone_master)
             if choice == "4":
                 args.ventoy_installer = input("Official Ventoy2Disk.sh path: ").strip()
-                args.resume = False
-                args.restart = False
-                return portable_copy(args)
+                # Who the drive is for, and the copy's other settings (this path had no variant or storage choice).
+                text_menu_copy_choices(args)
+                return run_locked("portable", args, portable_copy)
             if choice == "6":
-                return verify_target(args)
-            return target_status(args)
+                return run_locked("verify", args, verify_target)
+            return run_locked("status", args, target_status)
         except CreatorError as exc:
             say(f"Stopped safely: {exc}")
+
+
+def note(text):
+    """A side note on standard error, so --json output on standard output stays clean."""
+    print(text, file=sys.stderr, flush=True)
+
+
+# ---- Store lock (contract C4) -------------------------------------------------------------------------------
+
+def _store_lock_wait_seconds():
+    """60 seconds. SL_USBC_STORE_LOCK_WAIT can only make the wait shorter (tests use it)."""
+    raw = os.environ.get("SL_USBC_STORE_LOCK_WAIT", "")
+    try:
+        value = float(raw) if raw.strip() else float(STORE_LOCK_WAIT_SECONDS)
+    except ValueError:
+        value = float(STORE_LOCK_WAIT_SECONDS)
+    return min(max(value, 0.0), float(STORE_LOCK_WAIT_SECONDS))
+
+
+def _windows_file_locks():
+    """LockFileEx on Windows, which (unlike msvcrt) has shared and exclusive locks. Only regular-file tests run there."""
+    if os.name != "nt":
+        return None
+    try:
+        import ctypes
+        import msvcrt
+        from ctypes import wintypes
+    except ImportError:
+        return None
+
+    class Overlapped(ctypes.Structure):
+        _fields_ = [("Internal", ctypes.c_size_t), ("InternalHigh", ctypes.c_size_t),
+                    ("Offset", wintypes.DWORD), ("OffsetHigh", wintypes.DWORD), ("hEvent", wintypes.HANDLE)]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    lock_file = kernel32.LockFileEx
+    lock_file.argtypes = (wintypes.HANDLE, wintypes.DWORD, wintypes.DWORD, wintypes.DWORD, wintypes.DWORD,
+                          ctypes.POINTER(Overlapped))
+    lock_file.restype = wintypes.BOOL
+    unlock_file = kernel32.UnlockFileEx
+    unlock_file.argtypes = (wintypes.HANDLE, wintypes.DWORD, wintypes.DWORD, wintypes.DWORD, ctypes.POINTER(Overlapped))
+    unlock_file.restype = wintypes.BOOL
+
+    def try_lock(fd, exclusive):
+        flags = 0x1 | (0x2 if exclusive else 0)        # LOCKFILE_FAIL_IMMEDIATELY | LOCKFILE_EXCLUSIVE_LOCK
+        return bool(lock_file(msvcrt.get_osfhandle(fd), flags, 0, 1, 0, ctypes.byref(Overlapped())))
+
+    def release(fd):
+        unlock_file(msvcrt.get_osfhandle(fd), 0, 1, 0, ctypes.byref(Overlapped()))
+
+    return try_lock, release
+
+
+def _try_store_lock(fd, exclusive):
+    if fcntl is not None:
+        try:
+            fcntl.flock(fd, (fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH) | fcntl.LOCK_NB)
+            return True
+        except OSError as exc:
+            if exc.errno in (errno.EAGAIN, errno.EACCES, errno.EWOULDBLOCK):
+                return False
+            raise
+    windows = _windows_file_locks()
+    if windows:
+        return windows[0](fd, exclusive)
+    return True
+
+
+def _release_store_lock(fd):
+    try:
+        if fcntl is not None:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        else:
+            windows = _windows_file_locks()
+            if windows:
+                windows[1](fd)
+    except OSError:
+        pass
+    os.close(fd)
+
+
+def _open_store_lock(store):
+    path = os.path.join(store, STORE_LOCK_NAME)
+    flags = getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    try:
+        return os.open(path, os.O_RDWR | os.O_CREAT | flags, 0o600)
+    except OSError:
+        try:
+            return os.open(path, os.O_RDONLY | flags)
+        except OSError:
+            return None        # the store cannot be read either; the command itself reports that plainly
+
+
+@contextlib.contextmanager
+def store_lock(store, exclusive, wait=None):
+    """Hold <store>/.store.lock: exclusive while the master changes, shared while drives are made or checked.
+
+    A second job waits up to 60 seconds, then stops with StoreBusy (exit 75) and changes nothing.
+    """
+    if not store or not os.path.isdir(store):
+        yield
+        return
+    fd = _open_store_lock(store)
+    if fd is None:
+        yield
+        return
+    try:
+        wait = _store_lock_wait_seconds() if wait is None else min(max(float(wait), 0.0), float(STORE_LOCK_WAIT_SECONDS))
+        deadline = time.monotonic() + wait
+        told = False
+        while not _try_store_lock(fd, exclusive):
+            if time.monotonic() >= deadline:
+                raise StoreBusy(
+                    "the saved master is busy with another drive-builder job. "
+                    "Try again in a few minutes. Nothing was changed."
+                )
+            if not told:
+                note(f"The saved master is busy with another job. Waiting up to {round(wait)} seconds...")
+                told = True
+            time.sleep(0.2)
+    except BaseException:
+        os.close(fd)
+        raise
+    try:
+        yield
+    finally:
+        _release_store_lock(fd)
+
+
+def store_for_lock(args, command=None):
+    """The store folder to lock, or None. A first `create` makes the store folder (owner-only) so it can be locked."""
+    command = command or args.command
+    raw = getattr(args, "store", None)
+    if not raw:
+        return None
+    store = os.path.abspath(raw)
+    if os.path.isdir(store):
+        return store
+    if command != "create":
+        return None
+    source_root = getattr(args, "source_root", None)
+    if source_root:
+        try:
+            Path(store).resolve().relative_to(Path(source_root).expanduser().resolve())
+            return None        # create refuses this store itself, before anything is written
+        except ValueError:
+            pass
+    try:
+        os.makedirs(store, mode=0o700, exist_ok=True)
+    except OSError:
+        return None
+    return store
+
+
+def run_locked(command, args, function):
+    with store_lock(store_for_lock(args, command), STORE_LOCK_MODES[command]):
+        return function(args)
+
+
+# ---- Btrfs compression for the master store (idea 39) ---------------------------------------------------------
+
+def store_filesystem(path):
+    """The file-system type holding path ("btrfs", "ext4", ...), or "" when unknown."""
+    if not sys.platform.startswith("linux"):
+        return ""
+    result = run_quiet(["stat", "-f", "-c", "%T", str(path)], timeout=10)
+    if result is None or result.returncode != 0:
+        return ""
+    return result.stdout.strip().lower()
+
+
+def run_quiet(command, timeout=60):
+    try:
+        return subprocess.run(command, text=True, capture_output=True, timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+
+def tool_available(name):
+    return shutil.which(name)
+
+
+def enable_store_compression(store):
+    """A new store on Btrfs: turn on zstd compression once, before any file is written. Elsewhere nothing is run.
+
+    Compression is transparent: file contents, hashes and hard links stay exactly the same.
+    """
+    if store_filesystem(store) != "btrfs":
+        return False
+    result = run_quiet(["btrfs", "property", "set", str(store), "compression", "zstd"])
+    if result is None or result.returncode != 0:
+        say("Note: compression could not be turned on for the saved master, so it is saved uncompressed.")
+        return False
+    say("Compression is on for the saved master (Btrfs zstd), so it takes less space on this computer.")
+    return True
+
+
+def report_store_compression(store, generation):
+    if store_filesystem(store) != "btrfs":
+        return
+    if tool_available("compsize"):
+        result = run_quiet(["compsize", "-x", str(generation)], timeout=900)
+        if result is not None and result.returncode == 0:
+            for line in result.stdout.splitlines():
+                parts = line.split()
+                if len(parts) >= 4 and parts[0] == "TOTAL":
+                    say(f"Space saved by compression: the saved master uses {parts[2]} on disk "
+                        f"for {parts[3]} of files ({parts[1]} of their full size).")
+                    return
+    say("Compression is on for the saved master.")
+
+
+# ---- Readable master status for the "My saved master" window (gap check HIGH 6) ---------------------------------
+
+def write_master_status(store, manifest):
+    """Next to a store named usb-master, write <store>-status (0644): only the release and the kind, nothing private."""
+    store = os.path.abspath(store)
+    if os.path.basename(store) != MASTER_STATUS_STORE_NAME:
+        return
+    release = str(manifest.get("release", {}).get("release_id", ""))
+    if not MASTER_STATUS_RELEASE_RE.fullmatch(release):
+        return
+    text = f"Release: {release}\nFiles only: {'yes' if is_files_only(manifest) else 'no'}\n"
+    try:
+        atomic_write(store + "-status", text.encode("ascii"), 0o644)
+    except OSError:
+        note("Note: the saved master's small status file could not be written; the window will ask for a password.")
+
+
+# ---- Per-drive files, drive file list and passport (contract C3) ------------------------------------------------
+
+def is_drive_identity_file(path):
+    return path.lower() in {name.lower() for name in DRIVE_IDENTITY_FILES}
+
+
+def per_drive_patterns():
+    """Globs from linux/setup-data/drive-per-drive-files.txt (installed copy as fallback), else the built-in list."""
+    for base in (_KIT_ROOT / "setup-data", Path("/usr/local/lib/secure-linux/setup-data")):
+        path = base / PER_DRIVE_LIST_NAME
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except (OSError, UnicodeDecodeError):
+            continue
+        patterns = tuple(line.split("#", 1)[0].strip() for line in lines)
+        patterns = tuple(pattern for pattern in patterns if pattern)
+        if patterns:
+            return patterns
+    return DEFAULT_PER_DRIVE_PATTERNS
+
+
+def _glob_regex(pattern):
+    """`**` crosses folders, `*` and `?` stay inside one name; case is ignored (Ventoy drives are exFAT/FAT)."""
+    parts = []
+    index = 0
+    while index < len(pattern):
+        if pattern.startswith("**/", index):
+            parts.append("(?:[^/]*/)*")
+            index += 3
+        elif pattern.startswith("**", index):
+            parts.append(".*")
+            index += 2
+        elif pattern[index] == "*":
+            parts.append("[^/]*")
+            index += 1
+        elif pattern[index] == "?":
+            parts.append("[^/]")
+            index += 1
+        else:
+            parts.append(re.escape(pattern[index]))
+            index += 1
+    return re.compile("".join(parts) + r"\Z", re.IGNORECASE)
+
+
+def per_drive_matcher(patterns=None):
+    """Every pattern is matched from the drive's top; `**/` at the start means "in any folder, the top included"."""
+    compiled = [_glob_regex(pattern) for pattern in (patterns or per_drive_patterns())]
+
+    def matches(path):
+        return any(regex.match(path) for regex in compiled)
+
+    return matches
+
+
+def drive_file_list(files, patterns=None):
+    """{"schema": 1, "shared": {...}, "per_drive": {...}}: per-drive files are the ones the patterns name."""
+    matches = per_drive_matcher(patterns)
+    listing = {"schema": 1, "shared": {}, "per_drive": {}}
+    for entry in files:
+        group = "per_drive" if matches(entry["path"]) else "shared"
+        listing[group][entry["path"]] = {"sha256": entry["sha256"], "size": entry["size"]}
+    return listing
+
+
+def carries_personal_settings(files, patterns=None):
+    matches = per_drive_matcher(patterns)
+    return any(matches(entry["path"]) and entry["path"] not in NOT_PERSONAL_PER_DRIVE for entry in files)
+
+
+def remove_drive_identity(data_root):
+    for relative in DRIVE_IDENTITY_FILES:
+        path = Path(data_root) / relative
+        try:
+            if path.is_symlink() or path.is_file():
+                path.unlink()
+        except OSError as exc:
+            raise CreatorError(f"an old drive passport could not be removed: {relative}") from exc
+
+
+def write_checked_file(path, data):
+    """Write, flush to the drive, then read back: the bytes must be exactly the ones written."""
+    path = Path(path)
+    temporary_fd, temporary = tempfile.mkstemp(prefix=".secure-linux-copy-", dir=path.parent)
+    try:
+        with os.fdopen(temporary_fd, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        atomic_replace(temporary, path)
+        fsync_directory(path.parent)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise
+    if path.is_symlink() or path.read_bytes() != data:
+        raise VerificationError(f"the drive passport did not read back correctly: {path.name}")
+
+
+def passport_text(passport):
+    return (
+        "Secure Linux drive passport\n"
+        "\n"
+        "This drive was made by the Linux drive builder from a saved master and checked file by file.\n"
+        f"Release: {passport['release_id']}\n"
+        f"Made: {passport['made_at']}\n"
+        f"Saved master: {passport['master_id']}\n"
+        f"Check: {passport['check']}\n"
+        f"Files checked: {passport['files']}\n"
+        f"Made for: {PASSPORT_MADE_FOR.get(passport['personal'], passport['personal'])}\n"
+        f"Drive file list: {DRIVE_FILES_LIST} (SHA-256 {passport['list_sha256']})\n"
+    )
+
+
+def write_drive_passport(data_root, manifest, master_id, files, check, personal="mine"):
+    """Write linux-setup/SECURE-LINUX-DRIVE-FILES.json, then the passport (.json exactly as C3, plus a plain .txt).
+
+    Neither file holds a personal value: only release, master and file names with their hashes.
+    """
+    listing_raw = json_data(drive_file_list(files))
+    write_checked_file(ensure_payload_destination(data_root, DRIVE_FILES_LIST), listing_raw)
+    passport = {
+        "schema": 1,
+        "release_id": manifest["release"]["release_id"],
+        "made_at": utc_now(),
+        "master_id": master_id,
+        "made_by": "linux-creator",
+        "personal": personal,
+        "check": check,
+        "files": len(files),
+        "list_sha256": sha256_bytes(listing_raw),
+    }
+    write_checked_file(ensure_payload_destination(data_root, PASSPORT_JSON), json_data(passport))
+    write_checked_file(ensure_payload_destination(data_root, PASSPORT_TXT), passport_text(passport).encode("utf-8"))
+    return passport
+
+
+# ---- Who is this drive for? (idea 17, gap check HIGH 3) ---------------------------------------------------------
+# "mine":  the saved master's own per-drive files, byte for byte (the owner's account, Wi-Fi and home-server settings).
+# "none":  a drive for someone else that carries nobody's settings. Its installer asks for the name, login and
+#          password on the setup screen (the network installer's account step, linux/lib/ks_account_step.py).
+# "other": a drive for someone else that carries only the values given in their person file. Nothing is made up.
+# The new installer script is made again from the installer template the drive was built from (the master keeps it in
+# linux-setup/kit/templates/fedora.ks), so every value the drive maker filled in is known and only public ones return.
+
+PERSONAL_CHOICES = ("mine", "none", "other")
+MASTER_TEMPLATE_PATH = "linux-setup/kit/templates/fedora.ks"
+LAUNCHER_PATH = "CHECK-THIS-DRIVE.sh"
+LAUNCHER_SOURCE = "linux-setup/linux/files/drive/CHECK-THIS-DRIVE.sh"      # contract C5: the drive's own launcher
+# Lists about the owner's own computers, saved onto the stick after it was made: save-apps-mac.sh and save-apps.ps1
+# run from the stick's top write scan/apps-<computer>.json, save-wifi.ps1 -ThenPreflight writes
+# linux-setup/preflight/<computer>/ (the Windows user's own folder, winget and conda lists). The owner's own drive
+# keeps them; a drive for someone else never carries them.
+OWNER_COMPUTER_LISTS = ("scan/**", "linux-setup/preflight/**")
+# Files the owner put on the stick by hand (documents, a backup folder...; I2 OPEN 4, P10 OPEN 4). A drive for someone
+# else carries only what the drive builders make: the folders and top files below (make-usb.ps1 $StickFolders,
+# $StickTextFiles and its stick root, this tool, linux/lib/usbc_live.py and the NOMAD drive files) and boot images at
+# the top. Anything else at the drive's top is the owner's own and stays off, unless the owner names it with
+# --keep-own-file. Privacy-safe default; files inside the builders' folders are not looked at by this rule.
+KIT_TOP_FOLDERS = frozenset({"iso", "ventoy", "linux-setup", "setup-app", "setup-app-mac", "for-macs",
+                             "securelinux-rescue", "securelinux-nomad", "nomad-anywhere"})
+KIT_TOP_FILES = frozenset({"check-this-drive.sh", "autorun", "start-here-if-it-wont-boot.txt", "save-this-pc.cmd",
+                           "build-usb.cmd", "save-apps.ps1", "save-apps-mac.sh", "save-apps.cmd", "start-nomad.sh",
+                           "start-nomad.cmd", "start-nomad.command", "start-nomad-linux.sh",
+                           "nomad-on-any-computer.txt", "secure-linux-drive-passport.json",
+                           "secure-linux-drive-passport.txt"})
+BOOT_IMAGE_SUFFIXES = (".iso", ".img", ".wim", ".vhd", ".vhdx", ".efi", ".vtoy")
+SHOW_LEFT_OFF = 5
+
+
+def owner_added_file(relative):
+    """True for a file the drive builders never make (so the owner put it there)."""
+    parts = relative.split("/")
+    top = parts[0].lower()
+    if len(parts) > 1:
+        return top not in KIT_TOP_FOLDERS
+    return top not in KIT_TOP_FILES and not top.endswith(BOOT_IMAGE_SUFFIXES)
+VENTOY_CONFIG = "ventoy/ventoy.json"
+BUILD_CONF_PATHS = ("linux-setup/linux/build.conf", "linux-setup/kit/linux/build.conf")
+DEBIAN_PRESEED_RE = re.compile(r"^ventoy/script/debian-[^/]*\.cfg$", re.IGNORECASE)
+DEBIAN_ARCHIVE_RE = re.compile(r"^ventoy/script/debian-sl-[^/]*\.tar\.gz$", re.IGNORECASE)
+DEBIAN_PERSONAL_MEMBERS = ("sl/wifi-records.txt", "sl/backups.txt")
+DEBIAN_BUILD_CONF_MEMBER = "sl/payload/build.conf"
+PLACEHOLDER_RE = re.compile(r"__[A-Z0-9_]+__")
+BUILD_LINE_RE = re.compile(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=(.*)$")
+# build.conf keys about the release, the place and the kit, never about a person (make-usb.ps1 writes these).
+NON_PERSONAL_BUILD_KEYS = ("BUILD_DATE", "FEDORA_VERSION", "TIMEZONE", "REGDOM", "MODEL_FILE", "MODEL_SHA256", "MODEL_URL")
+# make-usb.ps1's own personal keys stay as empty lines, exactly like the network installer's build.conf. Every other
+# key (HOME_SHARE_*, settings added later) is left out of a drive for someone else.
+EMPTIED_BUILD_KEYS = ("SL_USER", "SL_FULLNAME", "IMMICH_URL", "HOME_WIFI_SSID", "HOME_SUBNET")
+SOMEONE_ELSE_BUILD_HEADER = ("# Made by the Linux drive builder for someone else: no names, passwords, Wi-Fi or "
+                             "home-server settings of the person who made it.")
+# make-usb.ps1's own words for a stick without saved Wi-Fi are only recognised, never written: in the installer an
+# if-block holding nothing but a comment is a shell syntax error, so a drive for someone else gets a no-op command
+# there, as the network installer does (netboot/render-netboot.sh).
+MAKE_USB_NO_WIFI = ("# (no Wi-Fi saved on the stick: wired / USB tethering is used)", "# (no Wi-Fi pre-configured)")
+NO_WIFI_PRE = ("# (no Wi-Fi saved on this drive: the setup screen's Wi-Fi question or a cable is used)\n"
+               ": # nothing saved to set up here")
+NO_WIFI_BLOCK = "# (no Wi-Fi saved on this drive: the first start asks)"
+PERSONAL_PLACEHOLDER_BLANKS = {
+    "__WIFI_PRE__": NO_WIFI_PRE,
+    "__WIFI_BLOCK__": NO_WIFI_BLOCK,
+    "__HOME_WIFI_SSID_B64__": "",
+    "__WIFI_RECORDS__": "",
+    "__BACKUP_RECORDS__": "",
+}
+ACCOUNT_PLACEHOLDERS = ("__USERNAME__", "__FULLNAME__", "__PASSWORD_HASH__")
+# The installer's other user-name places, worded as the network installer has them (netboot/render-netboot.sh, steps
+# 7 and 7b): the login name typed on the setup screen is read from the choices file, never baked in.
+ASKED_ACCOUNT_SUBSTITUTIONS = (
+    ("echo '__USERNAME__' > /etc/secure-linux/user",
+     "# the login name was asked on the setup screen and carried over in the choices file\n"
+     "sed -n 's/^sl_username=//p' /etc/secure-linux/choices | head -n 1 > /etc/secure-linux/user\n"
+     "[ -s /etc/secure-linux/user ] || echo owner > /etc/secure-linux/user"),
+    ('  PASS_DEST="$SYSROOT/home/__USERNAME__/Documents/Import-These-Passwords"',
+     '  SL_INSTALL_USER=$(sed -n \'s/^sl_username=//p\' "$SYSROOT/etc/secure-linux/choices" | head -n 1)\n'
+     '  [ -n "$SL_INSTALL_USER" ] || SL_INSTALL_USER=owner\n'
+     '  PASS_DEST="$SYSROOT/home/$SL_INSTALL_USER/Documents/Import-These-Passwords"'),
+    ('''if [ -d /home/__USERNAME__/Documents/Import-These-Passwords ]; then
+  chown -R __USERNAME__:__USERNAME__ /home/__USERNAME__/Documents/Import-These-Passwords
+  restorecon -R /home/__USERNAME__/Documents/Import-These-Passwords 2>/dev/null
+fi''',
+     '''SL_INSTALL_USER=$(sed -n 's/^sl_username=//p' /etc/secure-linux/choices | head -n 1)
+[ -n "$SL_INSTALL_USER" ] || SL_INSTALL_USER=owner
+if [ -d "/home/$SL_INSTALL_USER/Documents/Import-These-Passwords" ]; then
+  chown -R "$SL_INSTALL_USER:$SL_INSTALL_USER" "/home/$SL_INSTALL_USER/Documents/Import-These-Passwords"
+  restorecon -R "/home/$SL_INSTALL_USER/Documents/Import-These-Passwords" 2>/dev/null
+fi'''),
+)
+PRESEED_USER = "d-i passwd/username string "
+PRESEED_FULLNAME = "d-i passwd/user-fullname string "
+PRESEED_BUILDER_NOTE = "# (builder: -FullName and -Username replace the two lines above)"
+PERSON_KEYS = ("SL_USER", "SL_FULLNAME", "PASSWORD_HASH")
+PERSON_USER_RE = re.compile(r"^[a-z_][a-z0-9_-]{0,31}$")
+PERSON_NAME_RE = re.compile(r"^[^\x00-\x1f\x7f:\"\\$`]{1,100}$")
+CRYPT_HASH_RE = re.compile(r"^\$6\$(?:rounds=[0-9]{1,9}\$)?[./A-Za-z0-9]{1,16}\$[./A-Za-z0-9]{86}$")
+RELEASE_DATE_RE = re.compile(r"^secure-linux-([0-9]{4}\.[0-9]{2}\.[0-9]{2})-[0-9a-f]+$")
+OLD_TIP_LABEL_RE = re.compile(r"^Release [0-9]{4}\.[0-9]{2}\.[0-9]{2}\. ")
+OLD_ALIAS_LABEL_RE = re.compile(r" - Release [0-9]{4}\.[0-9]{2}\.[0-9]{2}$")
+NOT_FOR_SOMEONE_ELSE = ("Make the drive for yourself (--personal mine), or make a new drive for them with the drive "
+                        "maker on another computer.")
+DRIVE_TEST_TOOL = "secure-linux-drive-test"         # contract C6 (P11)
+FIXER_TOOL = "secure-linux-usb-fixer"
+TEMPLATE_CHANGED_WARNING = (
+    "Note: the kit's installer has changed since this saved master was made. Drives made from this master install "
+    "fine but miss the newest installer steps. Re-make the master from a new drive to get them."
+)
+# The kit's own pure-Python SHA-512 crypt hasher (tests/sha512crypt.py, byte for byte; a test keeps them identical).
+# The account step writes it into the installer, because the installer's Python has no crypt module.
+SHA512CRYPT_PY = r'''"""Pure-Python SHA-512 crypt ($6$), written from Ulrich Drepper's specification
+(https://www.akkadia.org/drepper/SHA-crypt.txt). Used only to cross-check the
+openssl hash that make-usb.ps1 produces. Python 3.13 removed the crypt module.
+
+    python sha512crypt.py PASSWORD SALT [ROUNDS]
+"""
+import hashlib
+import sys
+
+B64 = "./0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+
+
+def _b64_from_24bit(b2, b1, b0, n):
+    w = (b2 << 16) | (b1 << 8) | b0
+    out = ""
+    for _ in range(n):
+        out += B64[w & 0x3F]
+        w >>= 6
+    return out
+
+
+def sha512_crypt(password: bytes, salt: bytes, rounds: int = 5000) -> str:
+    custom_rounds = rounds != 5000
+    rounds = max(1000, min(rounds, 999999999))
+    salt = salt[:16]
+    pl, sl = len(password), len(salt)
+
+    b = hashlib.sha512(password + salt + password).digest()
+    a = hashlib.sha512(password + salt)
+    n = pl
+    while n > 64:
+        a.update(b)
+        n -= 64
+    a.update(b[:n])
+    n = pl
+    while n > 0:
+        a.update(b if n & 1 else password)
+        n >>= 1
+    a = a.digest()
+
+    dp = hashlib.sha512(password * pl).digest()
+    p = (dp * (pl // 64 + 1))[:pl]
+    ds = hashlib.sha512(salt * (16 + a[0])).digest()
+    s = (ds * (sl // 64 + 1))[:sl]
+
+    c = a
+    for i in range(rounds):
+        h = hashlib.sha512()
+        h.update(p if i & 1 else c)
+        if i % 3:
+            h.update(s)
+        if i % 7:
+            h.update(p)
+        h.update(c if i & 1 else p)
+        c = h.digest()
+
+    order = [(0, 21, 42), (22, 43, 1), (44, 2, 23), (3, 24, 45), (25, 46, 4), (47, 5, 26),
+             (6, 27, 48), (28, 49, 7), (50, 8, 29), (9, 30, 51), (31, 52, 10), (53, 11, 32),
+             (12, 33, 54), (34, 55, 13), (56, 14, 35), (15, 36, 57), (37, 58, 16), (59, 17, 38),
+             (18, 39, 60), (40, 61, 19), (62, 20, 41)]
+    enc = "".join(_b64_from_24bit(c[x], c[y], c[z], 4) for x, y, z in order)
+    enc += _b64_from_24bit(0, 0, c[63], 2)
+    prefix = "$6$" + (f"rounds={rounds}$" if custom_rounds else "")
+    return prefix + salt.decode("ascii") + "$" + enc
+
+
+def _selftest():
+    # Test vectors from the specification
+    vectors = [
+        (b"Hello world!", b"saltstring", 5000,
+         "$6$saltstring$svn8UoSVapNtMuq1ukKS4tPQd8iKwSMHWjl/O817G3uBnIFNjnQJuesI68u4OTLiBFdcbYEdFCoEOfaS35inz1"),
+        (b"Hello world!", b"saltstringsaltstring", 10000,
+         "$6$rounds=10000$saltstringsaltst$OW1/O6BYHV6BcXZu8QVeXbDWra3Oeqh0sbHbbMCVNSnCM/UrjmM0Dp8vOuZeHBy/YTBmSK6H9qs/y3RnOaw5v."),
+    ]
+    for pw, salt, rounds, want in vectors:
+        got = sha512_crypt(pw, salt, rounds)
+        assert got == want, (got, want)
+
+
+if __name__ == "__main__":
+    _selftest()
+    r = int(sys.argv[3]) if len(sys.argv) > 3 else 5000
+    print(sha512_crypt(sys.argv[1].encode("utf-8"), sys.argv[2].encode("ascii"), r))'''
+
+
+def release_date(release_id):
+    match = RELEASE_DATE_RE.fullmatch(str(release_id or ""))
+    return match.group(1) if match else None
+
+
+def payload_bytes(root, entry):
+    """A saved master file's bytes, checked against its manifest hash once more."""
+    data = (Path(root) / "payload" / entry["path"]).read_bytes()
+    if len(data) != entry["size"] or sha256_bytes(data) != entry["sha256"]:
+        raise VerificationError(f"saved master file failed SHA-256: {entry['path']}")
+    return data
+
+
+# ---- Installer template: every value the drive maker filled in, read back ----------------------------------------
+
+def render_installer(template, values):
+    """Fill every __NAME__ of the template in one pass. A name without a value stops the job; nothing is guessed."""
+    missing = sorted({name for name in PLACEHOLDER_RE.findall(template) if name not in values})
+    if missing:
+        raise CreatorError("the installer template has a value this drive builder does not know: " + ", ".join(missing))
+    return PLACEHOLDER_RE.sub(lambda match: values[match.group(0)], template)
+
+
+def unrender_installer(template, rendered):
+    """The value the drive maker put in for each __NAME__ of the template, or None when the two do not fit.
+
+    The template's own text must appear in order; every repeated name must have the same value; and filling the
+    template with the values found must give back the installer exactly, byte for byte.
+    """
+    literals = PLACEHOLDER_RE.split(template)
+    names = PLACEHOLDER_RE.findall(template)
+    if not names or not rendered.startswith(literals[0]):
+        return None
+    position = len(literals[0])
+    values = {}
+    for index, name in enumerate(names):
+        after = literals[index + 1]
+        if name in values:
+            end = position + len(values[name])
+            if rendered[position:end] != values[name]:
+                return None
+        elif index == len(names) - 1:
+            end = len(rendered) - len(after)
+            if end < position:
+                return None
+        elif not after:
+            return None                    # two names side by side cannot be told apart
+        else:
+            end = rendered.find(after, position)
+            if end < 0:
+                return None
+        values.setdefault(name, rendered[position:end])
+        if rendered[end:end + len(after)] != after:
+            return None
+        position = end + len(after)
+    if position != len(rendered):
+        return None
+    try:
+        if render_installer(template, values) != rendered:
+            return None
+    except CreatorError:
+        return None
+    return values
+
+
+def installer_template_candidates(root, by_path):
+    """The template this drive was made from (kept in the master), then the kit's own one beside this tool."""
+    candidates = []
+    entry = by_path.get(MASTER_TEMPLATE_PATH)
+    if entry:
+        candidates.append(("the saved master", payload_bytes(root, entry)))
+    if _REPOSITORY_ROOT is not None:
+        path = _REPOSITORY_ROOT / "templates" / "fedora.ks"
+        if path.is_file() and not path.is_symlink():
+            candidates.append(("this kit", path.read_bytes()))
+    return candidates
+
+
+def ks_quote(text):
+    """make-usb.ps1's Ks-Quote: a Kickstart double-quoted string."""
+    return '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def asked_account_template(template):
+    """The installer template with the network installer's "your login" step (P10b) and its user-name places."""
+    sys.dont_write_bytecode = True
+    try:
+        from ks_account_step import AccountStepError, apply_account_step
+    except ImportError as exc:
+        raise CreatorError("the account step (linux/lib/ks_account_step.py) is missing beside this tool, so a drive "
+                           "that asks for the name and password cannot be made. " + NOT_FOR_SOMEONE_ELSE) from exc
+    try:
+        text = apply_account_step(template)
+    except AccountStepError as exc:
+        raise CreatorError("this saved master's installer is too old to ask for a name and password ("
+                           f"{exc}). " + NOT_FOR_SOMEONE_ELSE) from exc
+    for old, new in ASKED_ACCOUNT_SUBSTITUTIONS:
+        if text.count(old) != 1:
+            raise CreatorError("this saved master's installer does not have the user-name lines this drive builder "
+                               "knows, so it cannot ask for a login safely. " + NOT_FOR_SOMEONE_ELSE)
+        text = text.replace(old, new)
+    for line in SHA512CRYPT_PY.split("\n"):
+        if line.startswith("%") or line == "SHA512CRYPT_END":
+            raise CreatorError("the password hasher has a line that would break the installer script")
+    return text
+
+
+def installer_for_someone_else(choice, owner_text, candidates, person):
+    """(new installer text, the values the drive maker had filled in for the owner)."""
+    for _, raw in candidates:
+        try:
+            template = raw.decode("utf-8").replace("\r\n", "\n")
+        except UnicodeDecodeError:
+            continue
+        found = unrender_installer(template, owner_text)
+        if found is None and re.search(r"(?m)^SL_SEALED=yes$", owner_text):
+            # P19: a locked installer fits the locked template (linux/lib/usbc_seal.py sealed_template)
+            sys.dont_write_bytecode = True
+            try:
+                from usbc_seal import sealed_template
+            except ImportError:
+                sealed_template = None
+            locked = sealed_template(template) if sealed_template else None
+            found = unrender_installer(locked, owner_text) if locked else None
+            if found is not None:
+                found = dict(found)
+                found.pop("__SHA512CRYPT_PY__", None)
+        if found is None:
+            continue
+        values = dict(found)
+        values.update(PERSONAL_PLACEHOLDER_BLANKS)
+        if choice == "none":
+            text = asked_account_template(template)
+            for name in ACCOUNT_PLACEHOLDERS:
+                values.pop(name, None)
+            values["__SHA512CRYPT_PY__"] = SHA512CRYPT_PY
+        else:
+            text = template
+            values.update({"__USERNAME__": person["SL_USER"], "__FULLNAME__": ks_quote(person["SL_FULLNAME"]),
+                           "__PASSWORD_HASH__": person["PASSWORD_HASH"]})
+        return render_installer(text, values), found
+    raise CreatorError("this saved master's installer script cannot be matched with the installer template it was "
+                       "made from, so its owner's settings cannot be taken out safely. Nothing was written. "
+                       + NOT_FOR_SOMEONE_ELSE)
+
+
+# ---- build.conf, packed blocks, Debian files ------------------------------------------------------------------------
+
+def build_conf_for(text, choice, person=None, never_online=False):
+    """build.conf for this drive. "mine" keeps every line (only KIT_UPDATE_ONLINE changes when asked)."""
+    lines = text.replace("\r\n", "\n").split("\n")
+    if lines and lines[-1] == "":
+        lines.pop()
+    if choice == "mine":
+        if not never_online:
+            return text
+        kept = [line for line in lines if not (BUILD_LINE_RE.match(line)
+                                               and BUILD_LINE_RE.match(line).group(1) == "KIT_UPDATE_ONLINE")]
+        return "\n".join(kept + ["KIT_UPDATE_ONLINE=no"]) + "\n"
+    output = [SOMEONE_ELSE_BUILD_HEADER]
+    seen = set()
+    for line in lines:
+        match = BUILD_LINE_RE.match(line)
+        if not match:
+            continue                       # comments may hold anything, so none is carried over
+        key = match.group(1)
+        if key in seen:
+            continue
+        if key in NON_PERSONAL_BUILD_KEYS:
+            output.append(line)
+            seen.add(key)
+        elif key in EMPTIED_BUILD_KEYS:
+            output.append(key + "=")
+            seen.add(key)
+    if choice == "other":
+        for key, value in (("SL_USER", person["SL_USER"]), ("SL_FULLNAME", person["SL_FULLNAME"])):
+            if key in seen:
+                output[output.index(key + "=")] = key + "=" + value
+            else:
+                output.append(key + "=" + value)
+    if never_online:
+        output.append("KIT_UPDATE_ONLINE=no")
+    return "\n".join(output) + "\n"
+
+
+def build_conf_values(text):
+    values = {}
+    for line in text.replace("\r\n", "\n").split("\n"):
+        match = BUILD_LINE_RE.match(line)
+        if match:
+            values.setdefault(match.group(1), match.group(2).strip())
+    return values
+
+
+def tar_key(name):
+    return (name[2:] if name.startswith("./") else name).rstrip("/")
+
+
+def read_tar_members(data, what):
+    """[(TarInfo, bytes or None for a folder)] in archive order. Links, special files and unsafe paths stop the job."""
+    import zlib
+    members = []
+    try:
+        with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as archive:
+            for member in archive.getmembers():
+                parts = tar_key(member.name).split("/")
+                if member.name.startswith("/") or "\\" in member.name or ".." in parts:
+                    raise CreatorError(f"{what} contains an unsafe path, so it was left unchanged")
+                if member.isdir():
+                    members.append((member, None))
+                elif member.isfile():
+                    handle = archive.extractfile(member)
+                    members.append((member, handle.read() if handle else b""))
+                else:
+                    raise CreatorError(f"{what} contains a link or special file, so it was left unchanged")
+    except (tarfile.TarError, OSError, EOFError, zlib.error) as exc:
+        raise CreatorError(f"{what} could not be read: {exc}") from exc
+    return members
+
+
+def write_tar_members(members):
+    """The same names, kinds and permissions, packed the same way every time (no dates, no owners)."""
+    packed = io.BytesIO()
+    with gzip.GzipFile(fileobj=packed, mode="wb", mtime=0) as zipped:
+        with tarfile.open(fileobj=zipped, mode="w", format=tarfile.GNU_FORMAT) as archive:
+            for member, data in members:
+                info = tarfile.TarInfo(member.name)
+                info.mtime = 0
+                info.uid = info.gid = 0
+                info.uname = info.gname = "root"
+                info.mode = (member.mode & 0o777) or (0o755 if data is None else 0o644)
+                if data is None:
+                    info.type = tarfile.DIRTYPE
+                    archive.addfile(info)
+                else:
+                    info.size = len(data)
+                    archive.addfile(info, io.BytesIO(data))
+    return packed.getvalue()
+
+
+def packed_block_span(ks_bytes):
+    if ks_bytes.count(KS_PAYLOAD_BEGIN) != 1:
+        raise CreatorError("the installer script has no single packed Secure Linux block, so it was left unchanged")
+    start = ks_bytes.index(KS_PAYLOAD_BEGIN) + len(KS_PAYLOAD_BEGIN)
+    end = ks_bytes.find(KS_PAYLOAD_END, start)
+    if end < 0:
+        raise CreatorError("the installer script's packed Secure Linux block has no end marker, so it was left unchanged")
+    return start, end
+
+
+def packed_block_members(ks_bytes):
+    start, end = packed_block_span(ks_bytes)
+    try:
+        archive = base64.b64decode(ks_bytes[start:end], validate=False)
+    except ValueError as exc:
+        raise CreatorError("the installer script's packed Secure Linux block is not valid base64") from exc
+    return read_tar_members(archive, "the installer script's packed Secure Linux block")
+
+
+def rewrite_packed_build_conf(ks_bytes, choice, person, never_online):
+    """The installer script with build.conf inside its packed block made for this drive; every other byte stays."""
+    start, end = packed_block_span(ks_bytes)
+    members = packed_block_members(ks_bytes)
+    changed = False
+    rebuilt = []
+    for member, data in members:
+        if data is not None and tar_key(member.name) == "build.conf":
+            new = build_conf_for(data.decode("utf-8", "replace"), choice, person, never_online).encode("utf-8")
+            changed = changed or new != data
+            data = new
+        rebuilt.append((member, data))
+    if not changed:
+        return ks_bytes
+    encoded = base64.b64encode(write_tar_members(rebuilt))
+    wrapped = b"\n".join(encoded[index:index + 76] for index in range(0, len(encoded), 76))
+    return ks_bytes[:start] + wrapped + ks_bytes[end:]
+
+
+def preseed_for(text, choice, person):
+    """A Debian answer file: the login and name lines are left out ("none", so the installer asks) or set from the
+    person file ("other")."""
+    counts = {PRESEED_USER: 0, PRESEED_FULLNAME: 0}
+    output = []
+    for line in text.replace("\r\n", "\n").split("\n"):
+        prefix = next((key for key in counts if line.startswith(key)), None)
+        if prefix is None:
+            if not (choice == "none" and line == PRESEED_BUILDER_NOTE):
+                output.append(line)
+            continue
+        counts[prefix] += 1
+        if choice == "other":
+            value = person["SL_USER"] if prefix == PRESEED_USER else re.sub(r"[\r\n$\\]", "", person["SL_FULLNAME"])
+            output.append(prefix + value)
+    if any(count != 1 for count in counts.values()):
+        raise CreatorError("a Debian answer file on this master does not have exactly one login line and one name line, "
+                           "so it cannot be changed safely. Nothing was written. " + NOT_FOR_SOMEONE_ELSE)
+    return "\n".join(output)
+
+
+def debian_archive_for(data, choice, person, never_online, what):
+    members = read_tar_members(data, what)
+    rebuilt = []
+    for member, body in members:
+        key = tar_key(member.name)
+        if body is not None and choice != "mine" and key in DEBIAN_PERSONAL_MEMBERS:
+            continue
+        if body is not None and key == DEBIAN_BUILD_CONF_MEMBER:
+            body = build_conf_for(body.decode("utf-8", "replace"), choice, person, never_online).encode("utf-8")
+        rebuilt.append((member, body))
+    return write_tar_members(rebuilt)
+
+
+# ---- The boot menu shows the release ---------------------------------------------------------------------------------
+
+def _json_string_tokens(text, key):
+    """(start, end, decoded value) of every "key": "..." string in raw JSON text."""
+    tokens = []
+    for match in re.finditer(r'"' + re.escape(key) + r'"\s*:\s*"((?:[^"\\]|\\.)*)"', text):
+        try:
+            tokens.append((match.start(1), match.end(1), json.loads('"' + match.group(1) + '"')))
+        except ValueError:
+            continue
+    return tokens
+
+
+def label_boot_menu(raw, release_id):
+    """ventoy.json with "Release YYYY.MM.DD" once in the main entry's tip (or its title when it has no tip).
+
+    Only those characters change; every other byte stays as it was. Without a main entry the file is left alone.
+    """
+    date = release_date(release_id)
+    if not date:
+        return raw
+    try:
+        text = raw.decode("utf-8")
+        config = json.loads(text)
+    except (UnicodeDecodeError, ValueError):
+        return raw
+    if not isinstance(config, dict):
+        return raw
+    label = "Release " + date
+    main = None
+    for item in config.get("auto_install") or []:
+        if isinstance(item, dict) and any(str(name).endswith("/" + KS_PAYLOAD_PATH.split("/")[-1])
+                                          for name in (item.get("template") or [])):
+            main = item.get("image")
+            break
+    tips = (config.get("menu_tip") or {}).get("tips") if isinstance(config.get("menu_tip"), dict) else None
+    aliases = config.get("menu_alias") if isinstance(config.get("menu_alias"), list) else []
+    if main is None and aliases and isinstance(aliases[0], dict):
+        main = aliases[0].get("image")
+    if main is None:
+        return raw
+    for key, entries, old_label, add in (
+            ("tip", tips or [], OLD_TIP_LABEL_RE, lambda token: label + ". " + token),
+            ("alias", aliases, OLD_ALIAS_LABEL_RE, lambda token: token + " - " + label)):
+        wanted = [entry.get(key) for entry in entries if isinstance(entry, dict) and entry.get("image") == main]
+        if len(wanted) != 1 or not isinstance(wanted[0], str):
+            continue
+        tokens = [token for token in _json_string_tokens(text, key) if token[2] == wanted[0]]
+        if len(tokens) != 1:
+            continue
+        start, end, _ = tokens[0]
+        new_token = add(old_label.sub("", text[start:end]))
+        changed = text[:start] + new_token + text[end:]
+        try:
+            json.loads(changed)
+        except ValueError:
+            return raw
+        if changed.count(label) != 1:
+            return raw
+        return changed.encode("utf-8")
+    return raw
+
+
+# ---- The person file ("other") --------------------------------------------------------------------------------------
+
+def read_person_file(path):
+    """SL_USER, SL_FULLNAME and PASSWORD_HASH from a small KEY=value file. A plain password is never accepted."""
+    if not path:
+        raise CreatorError("--personal other needs --person-file: a small text file with the lines SL_USER=..., "
+                           "SL_FULLNAME=... and PASSWORD_HASH=... for the person the drive is for")
+    try:
+        raw = Path(path).expanduser().read_bytes()
+    except OSError as exc:
+        raise CreatorError(f"the person file cannot be read: {exc.strerror or exc}") from exc
+    if len(raw) > 65536:
+        raise CreatorError("the person file is too big to be a person file")
+    try:
+        text = raw.decode("utf-8-sig")
+    except UnicodeDecodeError as exc:
+        raise CreatorError("the person file is not plain text (UTF-8)") from exc
+    values = {}
+    for number, line in enumerate(text.splitlines(), 1):
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        key, separator, value = stripped.partition("=")
+        key = key.strip()
+        if not separator or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key):
+            raise CreatorError(f"line {number} of the person file is not a KEY=value line")
+        if key not in PERSON_KEYS:
+            if any(word in key.upper() for word in ("PASS", "PSK", "KEY", "SECRET")):
+                raise CreatorError(f"the person file holds a password or key ({key}). A plain password is never put "
+                                   "on a drive: give PASSWORD_HASH, a SHA-512 crypt hash ($6$...) made from their "
+                                   "password, or use --personal none so they type it when they install")
+            raise CreatorError(f"the person file has a setting this drive builder does not use: {key}. "
+                               "Use only SL_USER, SL_FULLNAME and PASSWORD_HASH")
+        if key in values:
+            raise CreatorError(f"the person file gives {key} twice")
+        values[key] = value.strip()
+    missing = [key for key in PERSON_KEYS if not values.get(key)]
+    if missing:
+        raise CreatorError("the person file must give " + ", ".join(missing) + ". Nothing is ever made up. To let "
+                           "the person type their own name and password when they install, use --personal none")
+    if not PERSON_USER_RE.fullmatch(values["SL_USER"]):
+        raise CreatorError("SL_USER in the person file must be a login name: small letters, digits, '-' and '_', "
+                           "starting with a letter, 32 characters at most")
+    if not PERSON_NAME_RE.fullmatch(values["SL_FULLNAME"]):
+        raise CreatorError("SL_FULLNAME in the person file must be a plain name (no colons, quotes, backslashes or "
+                           "dollar signs, 100 characters at most)")
+    if not CRYPT_HASH_RE.fullmatch(values["PASSWORD_HASH"]):
+        raise CreatorError("PASSWORD_HASH in the person file must be a SHA-512 crypt hash ($6$...). A plain "
+                           "password is never put on a drive")
+    return values
+
+
+# ---- The drive's files for this copy ---------------------------------------------------------------------------------
+
+def owner_secrets(found, payload_texts):
+    """Long owner values that must never reach a drive for someone else (a last check after the files are made)."""
+    secrets = []
+    if found:
+        secrets.append(("password hash", found.get("__PASSWORD_HASH__", "")))
+        if found.get("__WIFI_PRE__", NO_WIFI_PRE) not in (NO_WIFI_PRE,) + MAKE_USB_NO_WIFI:
+            secrets.append(("Wi-Fi setting", found["__WIFI_PRE__"]))
+        if found.get("__WIFI_BLOCK__", NO_WIFI_BLOCK) not in (NO_WIFI_BLOCK,) + MAKE_USB_NO_WIFI:
+            secrets.append(("Wi-Fi setting", found["__WIFI_BLOCK__"]))
+        secrets.append(("Wi-Fi name", found.get("__HOME_WIFI_SSID_B64__", "")))
+        for name, what in (("__WIFI_RECORDS__", "saved Wi-Fi"), ("__BACKUP_RECORDS__", "backup record")):
+            for line in found.get(name, "").split("\n"):
+                secrets.append((what, line))
+                if name == "__WIFI_RECORDS__":
+                    secrets.append((what, line.split("|")[-1]))
+    for relative, text in payload_texts.items():
+        if relative.lower().endswith("build.conf"):
+            for key, value in build_conf_values(text).items():
+                if key.startswith("HOME_SHARE_") or key == "IMMICH_URL":
+                    secrets.append(("home-server setting", value))
+        elif relative.lower().endswith(("wifi-networks.txt", "backups.txt")):
+            for line in text.split("\n"):
+                secrets.append(("saved Wi-Fi" if "wifi" in relative.lower() else "backup record", line.strip()))
+                if "wifi" in relative.lower():
+                    secrets.append(("saved Wi-Fi", line.strip().split("|")[-1]))
+    return [(what, value) for what, value in secrets if len(value) >= 8]
+
+
+def drive_blobs(relative, data):
+    """The bytes of a new per-drive file, and of every file packed inside it."""
+    yield relative, data
+    lowered = relative.lower()
+    try:
+        if lowered == KS_PAYLOAD_PATH and data.count(KS_PAYLOAD_BEGIN) == 1:
+            for member, body in packed_block_members(data):
+                if body is not None:
+                    yield relative + " (packed " + tar_key(member.name) + ")", body
+        elif DEBIAN_ARCHIVE_RE.match(relative):
+            for member, body in read_tar_members(data, relative):
+                if body is not None:
+                    yield relative + " (packed " + tar_key(member.name) + ")", body
+    except CreatorError:
+        return
+
+
+def privacy_check(secrets, person, made):
+    person_values = set((person or {}).values())
+    wanted = [(what, value.encode("utf-8")) for what, value in secrets
+              if value and value not in person_values and not any(value in mine for mine in person_values)]
+    for relative, data in made.items():
+        for where, blob in drive_blobs(relative, data):
+            for what, value in wanted:
+                if value in blob:
+                    raise CreatorError(f"privacy check: the owner's {what} would still be on this drive ({where}), "
+                                       "so nothing was written. " + NOT_FOR_SOMEONE_ELSE)
+
+
+def drive_files_for(choice, root, manifest, files, person=None, never_online=False, keep_own=(), left_off=None,
+                    saved_left_off=None):
+    """(file entries for this drive, {path: new bytes or source path}) for every file that differs from the master.
+
+    "mine" keeps every per-drive file exactly as saved. "none" and "other" get a new installer script and new
+    build.conf and Debian files, and every other per-drive file of the owner is left out, as is every file the owner
+    put on the stick by hand (owner_added_file) unless keep_own names it; those are added to left_off. One drive's
+    saved changes (is_saved_changes_file, at any depth: persistence/, *persistence*.dat or .img) are always left out
+    of "none" and "other", whatever keep_own says; those are added to saved_left_off (check R1 F-R1-3, C3 F2).
+    """
+    if choice not in PERSONAL_CHOICES:
+        raise CreatorError(f"unknown choice {choice!r} for whose settings the drive carries; choose mine, none or other")
+    matches = per_drive_matcher(tuple(per_drive_patterns()) + OWNER_COMPUTER_LISTS)
+    kept_own = per_drive_matcher(tuple(keep_own)) if keep_own else (lambda path: False)
+    by_path = {entry["path"]: entry for entry in files}
+    release_id = manifest["release"]["release_id"]
+    output, sources, made, payload_texts = [], {}, {}, {}
+    found = None
+
+    def replaced(entry, data):
+        if data == payload_bytes(root, entry):
+            return entry
+        sources[entry["path"]] = data
+        made[entry["path"]] = data
+        return {"path": entry["path"], "size": len(data), "sha256": sha256_bytes(data)}
+
+    for entry in files:
+        relative = entry["path"]
+        lowered = relative.lower()
+        if lowered == VENTOY_CONFIG:
+            output.append(replaced(entry, label_boot_menu(payload_bytes(root, entry), release_id)))
+        elif lowered == KS_PAYLOAD_PATH:
+            owner = payload_bytes(root, entry)
+            if choice == "mine":
+                new = rewrite_packed_build_conf(owner, choice, person, never_online) if never_online else owner
+            else:
+                try:
+                    owner_text = owner.decode("utf-8")
+                except UnicodeDecodeError as exc:
+                    raise CreatorError("this saved master's installer script is not plain text. " + NOT_FOR_SOMEONE_ELSE) from exc
+                text, found = installer_for_someone_else(choice, owner_text, installer_template_candidates(root, by_path),
+                                                         person)
+                packed = dict((tar_key(member.name), body) for member, body in packed_block_members(owner)
+                              if body is not None)
+                if "build.conf" in packed:
+                    payload_texts[relative + " build.conf"] = packed["build.conf"].decode("utf-8", "replace")
+                new = rewrite_packed_build_conf(text.encode("utf-8"), choice, person, never_online)
+                made[relative] = new
+            output.append(replaced(entry, new))
+        elif lowered in BUILD_CONF_PATHS:
+            owner = payload_bytes(root, entry)
+            if choice != "mine":
+                payload_texts[relative] = owner.decode("utf-8", "replace")
+            new = build_conf_for(owner.decode("utf-8", "replace"), choice, person, never_online).encode("utf-8") \
+                if (choice != "mine" or never_online) else owner
+            if choice != "mine":
+                made[relative] = new
+            output.append(replaced(entry, new))
+        elif DEBIAN_PRESEED_RE.match(relative) and choice != "mine":
+            new = preseed_for(payload_bytes(root, entry).decode("utf-8", "replace"), choice, person).encode("utf-8")
+            made[relative] = new
+            output.append(replaced(entry, new))
+        elif DEBIAN_ARCHIVE_RE.match(relative) and (choice != "mine" or never_online):
+            new = debian_archive_for(payload_bytes(root, entry), choice, person, never_online, relative)
+            made[relative] = new
+            output.append(replaced(entry, new))
+        elif choice != "mine" and is_saved_changes_file(relative):
+            if saved_left_off is not None:
+                saved_left_off.append(relative)
+            continue                       # one person's saved changes: never on a drive for someone else
+        elif choice != "mine" and matches(relative) and lowered != LAUNCHER_PATH.lower():
+            if lowered.endswith((".txt", ".conf")) and lowered.startswith("linux-setup/"):
+                try:
+                    payload_texts[relative] = payload_bytes(root, entry).decode("utf-8")
+                except UnicodeDecodeError:
+                    pass
+            continue                       # the owner's own file: never on a drive for someone else
+        elif choice != "mine" and owner_added_file(relative) and not kept_own(relative):
+            if left_off is not None:
+                left_off.append(relative)
+            continue                       # put on the stick by hand: stays on the owner's own drive
+        else:
+            output.append(entry)
+    launcher = by_path.get(LAUNCHER_SOURCE)
+    if launcher:
+        output = [entry for entry in output if entry["path"].lower() != LAUNCHER_PATH.lower()]
+        output.append({"path": LAUNCHER_PATH, "size": launcher["size"], "sha256": launcher["sha256"]})
+        sources[LAUNCHER_PATH] = Path(root) / "payload" / LAUNCHER_SOURCE
+    if choice != "mine":
+        privacy_check(owner_secrets(found, payload_texts), person, made)
+    return output, sources
+
+
+def personal_summary(choice):
+    if choice == "none":
+        return ("This drive is for someone else: it carries none of your own settings (no account, Wi-Fi or "
+                "home-server details). When they install, the setup screen asks for their name, login and password.")
+    if choice == "other":
+        return ("This drive is for someone else: it carries only the name, login and password hash from their person "
+                "file, and none of your own settings.")
+    return ("This drive is for you: it carries your own settings from the saved master "
+            "(your account, Wi-Fi and home-server details). Do not give it to someone else.")
+
+
+# ---- Helpers that run beside this tool: the drive test (C6) and the separate drive check (C) ------------------------
+
+def helper_tool(name, mock_variable, mock):
+    """A sibling Secure Linux tool. Test runs (--mock-devices) only ever use a stand-in named by an environment value."""
+    if mock:
+        value = os.environ.get(mock_variable)
+        return Path(value) if value else None
+    for directory in (Path(__file__).resolve().parent, Path("/usr/local/bin")):
+        path = (directory / name)
+        if path.is_file():
+            return path.resolve()
+    return None
+
+
+def helper_command(path):
+    try:
+        with open(path, "rb") as handle:
+            first = handle.readline(200)
+    except OSError:
+        first = b""
+    if path.suffix == ".py" or (first.startswith(b"#!") and b"python" in first):
+        return [sys.executable, str(path)]
+    if first.startswith(b"#!") and b"sh" in first:
+        return [shutil.which("bash") or "/bin/bash", str(path)]
+    return [str(path)]
+
+
+def run_drive_test(tool, target, depth):
+    """C6: secure-linux-drive-test with the drive's own serial. It erases the drive, so it runs after ERASE was typed."""
+    command = helper_command(tool) + ["--device", target["path"], "--confirm", "TEST " + identity_label(target)]
+    if depth == "quick":
+        command.append("--quick")
+    say("Testing the drive first (its real size and its blocks). This erases it, as you confirmed.")
+    try:
+        result = subprocess.run(command, stdin=subprocess.DEVNULL)
+    except OSError as exc:
+        raise CreatorError(f"the drive test could not start ({exc.strerror or exc}); nothing was copied") from exc
+    if result.returncode == 0:
+        say("Drive test passed.")
+        return
+    if result.returncode == 2:
+        raise VerificationError("the drive test found a problem with this drive (see above). Do not use it: it may "
+                                "be fake or failing. Nothing was copied.")
+    raise CreatorError("the drive test could not test this drive (see above). Nothing was copied.")
+
+
+def check_drive_after_copy(target, data_root, store, master_id, mock):
+    """The drive repair tool's read-only check of the new drive, its verdict shown. 0 passed, 2 problem, None skipped."""
+    tool = helper_tool(FIXER_TOOL, "SL_USBC_MOCK_FIXER", mock)
+    if tool is None:
+        say("Separate drive check: skipped, because the drive repair tool is not on this computer. "
+            "The copy passed its own file-by-file check.")
+        return None
+    command = helper_command(tool) + ["check-drive", "--device", target["path"], "--drive-root", str(data_root),
+                                      "--master-store", str(store), "--master-id", master_id, "--non-interactive"]
+    say("Separate drive check: the drive repair tool now reads the new drive and compares it (it changes nothing).")
+    try:
+        result = subprocess.run(command, stdin=subprocess.DEVNULL, timeout=6 * 3600)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        say(f"Separate drive check: it could not run ({type(exc).__name__}). The copy passed its own file-by-file check.")
+        return None
+    if result.returncode == 0:
+        say("Separate drive check: PASSED. Every file on the drive is the one it should be.")
+        return 0
+    if result.returncode == 2:
+        say("Separate drive check: it found a problem (shown above).")
+        return 2
+    say("Separate drive check: it could not check this drive (shown above). The copy passed its own file-by-file check.")
+    return None
+
+
+# ---- sync-master: what is new, and an older installer template -------------------------------------------------------
+
+def release_notes_lines(tree, release_id):
+    """The release's own notes (contract C2), as plain lines. Nothing when the release has none."""
+    date = release_date(release_id)
+    path = Path(tree) / "files" / "release-notes" / "release-notes.json"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, UnicodeDecodeError):
+        return []
+    if not date or not isinstance(data, dict) or data.get("schema_version") != 1:
+        return []
+
+    def clean(value):
+        return "".join(character for character in str(value) if character.isprintable()).strip()
+
+    for release in data.get("releases") or []:
+        if isinstance(release, dict) and release.get("version") == date:
+            title = clean(release.get("title") or "")
+            lines = [f"What is new in release {date}" + (f": {title}" if title else ":")]
+            for item in release.get("notes") or []:
+                if isinstance(item, str) and clean(item):
+                    lines.append("  - " + clean(item))
+            return lines
+    return []
+
+
+def master_template_sha256(manifest):
+    value = manifest.get("template_sha256")
+    if isinstance(value, str) and HASH_RE.fullmatch(value):
+        return value
+    for entry in (manifest.get("portable") or {}).get("files") or []:
+        if entry.get("path") == MASTER_TEMPLATE_PATH:
+            return entry.get("sha256")
+    return None
+
+
+def kit_template_sha256(from_tree):
+    """The installer template of the kit this computer runs, when it is reachable from here."""
+    tree = Path(from_tree)
+    candidates = [tree / "templates" / "fedora.ks", tree.parent / "templates" / "fedora.ks",
+                  tree.parent / "kit" / "templates" / "fedora.ks"]
+    if _REPOSITORY_ROOT is not None:
+        candidates.append(_REPOSITORY_ROOT / "templates" / "fedora.ks")
+    for path in candidates:
+        if path.is_file() and not path.is_symlink():
+            return hash_file(path)[1]
+    return None
+
+
+def warn_if_template_changed(manifest, from_tree):
+    saved = master_template_sha256(manifest)
+    current = kit_template_sha256(from_tree)
+    if saved and current and saved != current:
+        say(TEMPLATE_CHANGED_WARNING)
+        return True
+    return False
+
+
+# ---- How a Portable tools copy uses the above (kept here so the lines above keep their numbers) ----------------------
+
+PASSPORT_MADE_FOR = {
+    "mine": "the person who made it (their own settings are on it)",
+    "none": "someone else (no personal settings; the installer asks for their name, login and password)",
+    "other": "someone else (only the values from their person file)",
+}
+COPY_MADE_FOR = {
+    "mine": "Made for: you (your own settings are on it).",
+    "none": "Made for: someone else (no personal settings; their installer asks for their name, login and password).",
+    "other": "Made for: someone else (only the values from their person file).",
+}
+
+
+def drive_copy_plan(args, root, manifest, files):
+    """(the drive's files, {path: new bytes or source path}, plan) for a Portable tools copy.
+
+    The plan says whose settings the drive carries, whether its computers check online, and whether the drive is
+    tested first. Every refusal here happens before anything is written.
+    """
+    plan = types.SimpleNamespace(
+        personal=getattr(args, "personal", None) or "mine",
+        never_online=bool(getattr(args, "never_check_online", False)),
+        test_depth=getattr(args, "test_drive", None),
+        test_tool=None,
+        person=None,
+        keep_own=tuple(getattr(args, "keep_own_file", None) or ()),
+        left_off=[],
+        saved_left_off=[],
+    )
+    person_file = getattr(args, "person_file", None)
+    if plan.personal not in PERSONAL_CHOICES:
+        raise CreatorError(f"unknown choice {plan.personal!r} for whose settings the drive carries; "
+                           "choose mine, none or other")
+    if person_file and plan.personal != "other":
+        raise CreatorError("--person-file is used only with --personal other")
+    if plan.keep_own and plan.personal == "mine":
+        raise CreatorError("--keep-own-file is used only with --personal none or other (your own drive keeps every file)")
+    for pattern in plan.keep_own:
+        if not pattern or pattern.startswith("/") or "\\" in pattern or ".." in pattern.split("/"):
+            raise CreatorError(f"--keep-own-file needs a path on the drive, for example \"Documents/**\" (not {pattern!r})")
+    if plan.personal == "other":
+        plan.person = read_person_file(person_file)
+    if plan.test_depth:
+        if getattr(args, "resume", False):
+            raise CreatorError("a drive test erases the drive, so it cannot be combined with --resume; nothing was written")
+        plan.test_tool = helper_tool(DRIVE_TEST_TOOL, "SL_USBC_MOCK_DRIVE_TEST", bool(getattr(args, "mock_devices", None)))
+        if plan.test_tool is None:
+            raise CreatorError("the drive test (secure-linux-drive-test) is not on this computer yet, so --test-drive "
+                               "cannot be used; nothing was written")
+    files, sources = drive_files_for(plan.personal, root, manifest, files, plan.person, plan.never_online,
+                                     plan.keep_own, plan.left_off, plan.saved_left_off)
+    return files, sources, plan
+
+
+def copy_summary(plan, carries_personal):
+    lines = []
+    if plan.personal != "mine" or carries_personal:
+        lines.append(personal_summary(plan.personal))
+    if plan.never_online:
+        lines.append("Computers set up from this drive never check online for Secure Linux updates "
+                     "(KIT_UPDATE_ONLINE=no).")
+    if plan.test_tool:
+        lines.append("The drive is tested first, which also erases it; then Ventoy is installed.")
+    left_off = sorted(getattr(plan, "left_off", None) or ())
+    if left_off:
+        shown = ", ".join(left_off[:SHOW_LEFT_OFF]) + (", ..." if len(left_off) > SHOW_LEFT_OFF else "")
+        lines.append(f"Left off this drive: {len(left_off)} file(s) you put on your own drive yourself (they are not "
+                     f"part of Secure Linux): {shown}. A drive for someone else never carries them. To take one along, "
+                     "add --keep-own-file \"PATH\" (for a folder: \"FOLDER/**\").")
+    saved = sorted(getattr(plan, "saved_left_off", None) or ())
+    if saved:
+        lines.append(f"Left off this drive: {len(saved)} saved-changes file(s) of your own drive ({', '.join(saved)}). "
+                     "Saved changes hold one person's own files and settings, so a drive for someone else never "
+                     "carries them.")
+    return lines
+
+
+def resume_mismatch(previous, variant):
+    if previous.get("variant", variant) != variant:
+        return "this interrupted copy used a different variant; rerun without --resume or with the same variant"
+    return ("this interrupted copy was made with a different choice of whose settings it carries; "
+            "rerun with --restart instead of --resume")
+
+
+def open_after_drive_test(plan, devices, target, target_id, refreshed):
+    """Test the drive first when asked (it is checked to be the same drive afterwards), then open it for Ventoy."""
+    if plan.test_tool:
+        run_drive_test(plan.test_tool, refreshed, plan.test_depth)
+        tested = devices.find_path(target["path"])
+        if identity(tested) != target_id or tested["size"] != target["size"]:
+            raise CreatorError("target identity or capacity changed during the drive test; nothing was copied")
+    return open_device(refreshed, True, devices.mock)
+
+
+def open_source(source):
+    """A file of the drive: new bytes made for this drive, or a saved file read from its place."""
+    return io.BytesIO(source) if isinstance(source, bytes) else open(source, "rb")
+
+
+def passport_and_drive_check(data_root, manifest, master_id, files, tree_hash, plan, target, store, devices):
+    """Passport and drive file list (C3), then the separate read-only drive check. A problem it finds makes the copy
+    NOT VERIFIED, and the passport then says so."""
+    passport = write_drive_passport(data_root, manifest, master_id, files, "passed" if tree_hash else "failed",
+                                    plan.personal)
+    if check_drive_after_copy(target, data_root, store, master_id, devices.mock) == 2:
+        write_drive_passport(data_root, manifest, master_id, files, "failed", plan.personal)
+        raise VerificationError("the separate drive check found a problem with the new drive, so it is NOT VERIFIED. "
+                                "Run the same copy again with --resume, or try another drive.")
+    say(COPY_MADE_FOR[plan.personal])
+    return passport
+
+
+def template_record(manifest):
+    """{"template_sha256": ...}: the installer template the saved drive was made from, when the master holds it."""
+    value = master_template_sha256(manifest)
+    return {"template_sha256": value} if value else {}
+
+
+def sync_done(manifest, from_tree, tree=None, release_id=None):
+    """After sync-master: the new release's notes (C2), and a plain warning when the kit's installer has moved on."""
+    if tree is not None:
+        for line in release_notes_lines(tree, release_id):
+            say(line)
+    warn_if_template_changed(manifest, from_tree)
+    return 0
+
+
+def ask_who_the_drive_is_for():
+    """The text menu's question before a Portable tools copy: (choice, person file or None)."""
+    say("Who is this drive for?")
+    say("  1) You: it carries your own settings (your account, Wi-Fi and home-server details)")
+    say("  2) Someone else: nothing of yours is on it; they type their own name, login and password when they install")
+    say("  3) Someone else, from a person file (their login name, their name and a password hash)")
+    while True:
+        answer = input("Choose 1, 2 or 3: ").strip()
+        if answer == "1":
+            return "mine", None
+        if answer == "2":
+            return "none", None
+        if answer == "3":
+            return "other", input("Person file path: ").strip() or None
+        say("Please choose 1, 2 or 3.")
+
+
+def text_menu_copy_choices(args):
+    args.personal, args.person_file = ask_who_the_drive_is_for()
+    args.variant = "full"
+    args.storage = "auto"
+    args.storage_format = None
+    args.app_bundle = "auto"
+    args.never_check_online = False
+    args.test_drive = None
+    args.resume = False
+    args.restart = False
+
+
+# ---- Offline app collection from this computer (Matthew: apps go on the drive too) ------------------------------
+
+def app_collection_for_copy(files, variant, choice, mock, with_hashes=True):
+    """Extra file entries (and their source paths) for this computer's offline app collection.
+
+    Used only for the full variant when the saved master holds no collection. `auto` reads this computer's own
+    copy (never in --mock-devices tests); `none` leaves it out; a folder must hold current.json and its version.
+    """
+    if variant != "full" or choice == "none":
+        return [], {}
+    if any(entry["path"].startswith(ONLINE_ONLY_EXCLUDED_PREFIX) for entry in files):
+        return [], {}        # the saved master holds the collection; it is copied from there
+    explicit = choice not in (None, "", "auto")
+    if explicit:
+        directory = Path(choice).expanduser().resolve()
+    elif mock:
+        return [], {}
+    else:
+        directory = DEFAULT_APP_BUNDLE_DIR
+    current_path = directory / "current.json"
+    try:
+        if not explicit and not current_path.exists():
+            return [], {}
+        if current_path.is_symlink() or not current_path.is_file():
+            raise CreatorError("it has no current.json")
+        try:
+            current = json.loads(current_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, UnicodeDecodeError) as exc:
+            raise CreatorError("its current.json cannot be read") from exc
+        version = current.get("bundle_version") if isinstance(current, dict) else None
+        if not isinstance(version, str) or not ID_RE.fullmatch(version):
+            raise CreatorError("its current.json names no valid version")
+        version_root = directory / version
+        if version_root.is_symlink() or not version_root.is_dir():
+            raise CreatorError(f"its folder {version} is missing")
+        sources = {ONLINE_ONLY_EXCLUDED_PREFIX + "current.json": current_path}
+        for relative, path, _ in source_file_entries(version_root):
+            sources[safe_payload_path(ONLINE_ONLY_EXCLUDED_PREFIX + version + "/" + relative)] = path
+        bundle = []
+        for drive_path, path in sources.items():
+            if with_hashes:
+                size, digest = hash_file(path)
+            else:
+                size, digest = path.stat().st_size, ""
+            bundle.append({"path": drive_path, "size": size, "sha256": digest})
+    except (CreatorError, OSError) as exc:
+        if explicit:
+            raise CreatorError(f"the offline app collection in {directory} cannot be used: {exc}") from exc
+        note(f"Note: this computer's offline app collection cannot be used ({exc}), so the drive gets none.")
+        return [], {}
+    return bundle, sources
+
+
+# ---- Drive-builder plug-ins (contract C17) ----------------------------------------------------------------------
+
+def plugin_note(name, text):
+    note(f"Note: the drive-builder add-on {name} {text}")
+
+
+def plugin_directories():
+    seen = []
+    for directory in (_LIB, _FALLBACK_LIB):
+        try:
+            resolved = directory.resolve()
+        except OSError:
+            continue
+        if directory.is_dir() and resolved not in seen:
+            seen.append(resolved)
+    return seen
+
+
+def plugin_file_problem(path):
+    """Run as administrator, an add-on must belong to the administrator and be changeable by nobody else."""
+    if not hasattr(os, "geteuid") or os.geteuid() != 0:
+        return None
+    info = path.stat()
+    folder = path.parent.stat()
+    if info.st_uid != 0 or folder.st_uid != 0:
+        return "is not owned by the administrator"
+    if info.st_mode & 0o022 or folder.st_mode & 0o022:
+        return "can be changed by other users"
+    return None
+
+
+def load_plugins():
+    """Load every usbc_<name>.py on the library path. A broken one costs one plain line and nothing else."""
+    found = {}
+    for directory in plugin_directories():
+        try:
+            names = sorted(os.listdir(directory))
+        except OSError:
+            continue
+        for name in names:
+            if PLUGIN_FILE_RE.fullmatch(name) and name not in found and (directory / name).is_file():
+                found[name] = directory / name
+    plugins = []
+    for name, path in found.items():
+        try:
+            problem = plugin_file_problem(path)
+            if problem:
+                plugin_note(name, f"{problem}, so it was not loaded. Everything else works as normal.")
+                continue
+            sys.dont_write_bytecode = True
+            spec = importlib.util.spec_from_file_location("secure_linux_" + name[:-3], str(path))
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            if not callable(getattr(module, "register", None)) or not callable(getattr(module, "run", None)):
+                plugin_note(name, "has no register() and run(), so it was not loaded. Everything else works as normal.")
+                continue
+            plugins.append((name, module))
+        except (Exception, SystemExit) as exc:
+            plugin_note(name, f"could not be loaded ({type(exc).__name__}), so it was skipped. "
+                              "Everything else works as normal.")
+    return plugins
+
+
+def register_plugins(subparsers, plugins):
+    """Each add-on adds its own commands inside its own try. A core command can never be replaced."""
+    commands = {}
+    for name, module in plugins:
+        before = dict(subparsers.choices)
+        try:
+            names = list(module.register(subparsers) or [])
+            if not names or not all(isinstance(command, str) and command for command in names):
+                raise ValueError("register() returned no command names")
+            taken = [command for command in names if command in CORE_COMMANDS or command in commands]
+            if taken or any(subparsers.choices.get(core) is not before.get(core) for core in before):
+                raise ValueError("it tried to use a command name that is already taken: " + ", ".join(taken))
+            missing = [command for command in names if command not in subparsers.choices]
+            if missing:
+                raise ValueError("register() named commands it did not add: " + ", ".join(missing))
+        except (Exception, SystemExit) as exc:
+            for added in [key for key in subparsers.choices if key not in before]:
+                del subparsers.choices[added]
+            for core, parser in before.items():
+                subparsers.choices[core] = parser
+            plugin_note(name, f"could not add its commands ({type(exc).__name__}: {exc}), so they are not available. "
+                              "Everything else works as normal.")
+            continue
+        for command in names:
+            commands[command] = module
+    return commands
+
+
+def free_space_ok(path, needed):
+    probe = Path(path).expanduser().absolute()
+    while not probe.exists() and probe.parent != probe:
+        probe = probe.parent
+    try:
+        return shutil.disk_usage(probe).free >= int(needed)
+    except OSError:
+        return False
+
+
+def verify_file(path, expected):
+    try:
+        path = Path(path)
+        if path.is_symlink() or not path.is_file():
+            return False
+        return hash_file(path)[1] == str(expected).lower()
+    except OSError:
+        return False
+
+
+def require_raw_access(args):
+    if not getattr(args, "mock_devices", None) and hasattr(os, "geteuid") and os.geteuid() != 0:
+        raise CreatorError("administrator rights are required for raw USB access; rerun with sudo, or use the app launcher")
+
+
+def plugin_api():
+    """The drive builder's own safe helpers, handed to every add-on (C17)."""
+    return types.SimpleNamespace(
+        load_master=load_master,
+        store_lock=store_lock,
+        free_space_ok=free_space_ok,
+        verify_file=verify_file,
+        say=say,
+        CreatorError=CreatorError,
+        VerificationError=VerificationError,
+        StoreBusy=StoreBusy,
+        require_raw_access=require_raw_access,
+        app=APP,
+        version=VERSION,
+    )
+
+
+def run_plugin_command(module, args):
+    """An add-on command follows the core raw-access rule unless the add-on lists it in NO_DEVICE_COMMANDS."""
+    if args.command not in tuple(getattr(module, "NO_DEVICE_COMMANDS", ()) or ()):
+        require_raw_access(args)
+    try:
+        result = module.run(args, plugin_api())
+    except (CreatorError, KeyboardInterrupt, EOFError, OSError):
+        raise
+    except Exception as exc:
+        raise CreatorError(f"the add-on command {args.command} stopped: {type(exc).__name__}: {exc}") from exc
+    return result if isinstance(result, int) else 0
+
+
+def run_after_copy(target_root, manifest, args, state_path=None, final_state=None):
+    """Called once after a verified portable copy. An add-on that fails here never undoes the verified copy."""
+    for name, module in LOADED_PLUGINS:
+        hook = getattr(module, "after_copy", None)
+        if not callable(hook):
+            continue
+        try:
+            hook(Path(target_root), manifest, args, plugin_api())
+        except (Exception, SystemExit) as exc:
+            plugin_note(name, f"stopped after the copy ({type(exc).__name__}). The drive itself is verified.")
+    if state_path is not None and final_state is not None:
+        refresh_copy_record_list(target_root, state_path, final_state)
+
+
+def refresh_copy_record_list(target_root, state_path, final_state):
+    """An add-on (live mode, linux/lib/usbc_live.py) may refresh the drive file list and passport after the copy
+    record was saved (P28a finding F2). The record then names the list now on the drive, but only when the drive's
+    passport and its file list agree; otherwise the record is left as it was and Check this drive reports the drive."""
+    try:
+        listing_hash = sha256_bytes((Path(target_root) / DRIVE_FILES_LIST).read_bytes())
+        passport = json.loads((Path(target_root) / PASSPORT_JSON).read_bytes())
+    except (OSError, ValueError):
+        return
+    if not isinstance(passport, dict) or passport.get("list_sha256") != listing_hash:
+        return
+    if final_state.get("drive_files_list_sha256") == listing_hash:
+        return
+    updated = dict(final_state)
+    updated["drive_files_list_sha256"] = listing_hash
+    try:
+        save_state(state_path, updated)
+    except OSError:
+        pass   # the verified copy stands; the record keeps the list hash taken before the add-on ran
 
 
 def add_mock(parser):
@@ -2439,7 +4326,13 @@ def add_store(parser):
     add_mock(parser)
 
 
-def build_parser():
+APP_BUNDLE_HELP = (
+    "offline app collection to put on the drive when the saved master has none: "
+    "auto (this computer's own copy), none, or a folder holding current.json"
+)
+
+
+def build_parser(plugins=()):
     parser = argparse.ArgumentParser(prog="secure-linux-usb-creator", description=APP)
     parser.add_argument("--version", action="version", version=VERSION)
     sub = parser.add_subparsers(dest="command")
@@ -2508,11 +4401,36 @@ def build_parser():
         help="auto asks up front when the drive has 5+ GB spare (interactive only); remaining always creates a storage partition when possible; none never does",
     )
     portable.add_argument("--storage-format", help="filesystem for the storage partition (ntfs/exfat/fat32/ext4/btrfs/xfs/f2fs as available)")
+    portable.add_argument("--app-bundle", default="auto", help=APP_BUNDLE_HELP)
+    portable.add_argument(
+        "--personal", choices=PERSONAL_CHOICES, default="mine",
+        help="whose settings the drive carries: mine (yours, as saved), none (nobody's: the installer asks for the "
+             "name, login and password) or other (only what --person-file gives)",
+    )
+    portable.add_argument(
+        "--person-file",
+        help="with --personal other: a text file with SL_USER=, SL_FULLNAME= and PASSWORD_HASH= ($6$ hash) lines; "
+             "nothing else is used and nothing is made up",
+    )
+    portable.add_argument(
+        "--keep-own-file", action="append", metavar="PATH",
+        help="with --personal none or other: also copy this file (or FOLDER/**) that you put on your own drive "
+             "yourself; without it such files stay off a drive for someone else",
+    )
+    portable.add_argument(
+        "--never-check-online", action="store_true",
+        help="computers set up from this drive never check online for Secure Linux updates (KIT_UPDATE_ONLINE=no)",
+    )
+    portable.add_argument(
+        "--test-drive", nargs="?", const="full", choices=("full", "quick"),
+        help="test the drive first with secure-linux-drive-test (this erases it): full (default) or quick",
+    )
     measure = sub.add_parser("measure", help="report source used bytes and exact/portable minimum destination sizes")
     measure.add_argument("--variant", choices=VARIANTS, default="full", help="variant to report as the primary minimum")
     add_store(measure)
     measure.add_argument("--target", help="optional target for a read-only fit check")
     measure.add_argument("--json", action="store_true")
+    measure.add_argument("--app-bundle", default="auto", help=APP_BUNDLE_HELP)
     verify = sub.add_parser("verify", help="read-only full-content verification of an exact-clone target")
     add_store(verify)
     verify.add_argument("--target", required=True)
@@ -2521,15 +4439,95 @@ def build_parser():
     add_store(status_parser)
     status_parser.add_argument("--target", required=True)
     status_parser.add_argument("--json", action="store_true")
+    parser.plugin_commands = register_plugins(sub, plugins)
     return parser
 
 
+def run_store_command(args):
+    """The core commands that use the saved master; the caller already holds the store lock."""
+    if args.command == "create":
+        return create_master(args)
+    if args.command == "sync-master":
+        return sync_master(args)
+    if args.command == "clone":
+        try:
+            return clone_master(args)
+        except KeyboardInterrupt:
+            raise
+        except Exception:
+            retry_guidance()
+            raise
+    if args.command == "portable":
+        try:
+            return portable_copy(args)
+        except KeyboardInterrupt:
+            raise
+        except Exception:
+            portable_retry_guidance()
+            raise
+    if args.command == "measure":
+        return measure_command(args)
+    if args.command == "verify":
+        return verify_target(args)
+    return target_status(args)
+
+
+# ---- one drive's saved changes never go into a saved master (P28a finding F1, privacy) ----------------------------
+# The same files linux/lib/usbc_live.py (PERSISTENCE_GLOBS) leaves out of a master: the live drive's own
+# persistence/ folder and any Ventoy saved-changes file (*persistence*.dat or .img) anywhere on the drive.
+SAVED_CHANGES_GLOBS = (re.compile(r"^persistence/", re.I), re.compile(r"(^|/)[^/]*persistence[^/]*\.(dat|img)$", re.I))
+
+
+def is_saved_changes_file(relative):
+    return any(regex.search(relative) for regex in SAVED_CHANGES_GLOBS)
+
+
+def master_skips(relative, skip_prefixes, left_out=None, folder=None):
+    """True for a file (or a folder, ending in /) a files-only master never keeps. Saved-changes files left out are
+    added to left_out (when given), so the person is told; a skipped folder is listed file by file."""
+    saved = is_saved_changes_file(relative)
+    if not (saved or relative.startswith(tuple(skip_prefixes))):
+        return False
+    if saved and left_out is not None:
+        if folder is None:
+            left_out.append(relative)
+        else:
+            for base, _, names in os.walk(folder, followlinks=False):
+                left_out.extend(relative + (Path(base) / name).relative_to(folder).as_posix() for name in sorted(names))
+    return True
+
+
+def say_saved_changes_left_out(left_out):
+    if left_out:
+        say(f"Left out: {len(left_out)} saved-changes file(s) of one drive ({', '.join(sorted(left_out))}). "
+            "One person's saved changes never go into a saved master.")
+
+
+def files_only_entries(source_root):
+    """Every file a files-only master keeps (FILES_ONLY_SKIP_PREFIXES and saved changes left out), said once."""
+    left_out = []
+    entries = source_file_entries(source_root, FILES_ONLY_SKIP_PREFIXES, left_out)
+    say_saved_changes_left_out(left_out)
+    return entries
+
+
+def sync_kept_entries(files):
+    """sync-master's starting list: every saved file except saved changes an older master may still hold."""
+    left_out = [entry["path"] for entry in files if is_saved_changes_file(entry["path"])]
+    say_saved_changes_left_out(left_out)
+    return {entry["path"]: entry for entry in files if entry["path"] not in left_out}
+
+
 def main(argv=None):
-    parser = build_parser()
+    global LOADED_PLUGINS
+    LOADED_PLUGINS = load_plugins()
+    parser = build_parser(LOADED_PLUGINS)
     args = parser.parse_args(argv)
     try:
         if args.command is None:
             return interactive(args)
+        if args.command in parser.plugin_commands:
+            return run_plugin_command(parser.plugin_commands[args.command], args)
         if args.command == "list":
             rows = Devices(args.mock_devices).scan()
             if args.json:
@@ -2541,33 +4539,13 @@ def main(argv=None):
         if (args.command in ("create", "clone", "portable", "verify") and not files_only_create and not args.mock_devices
                 and hasattr(os, "geteuid") and os.geteuid() != 0):
             raise CreatorError("administrator rights are required for raw USB access; rerun with sudo, or use the app launcher")
-        if args.command == "create":
-            return create_master(args)
-        if args.command == "sync-master":
-            return sync_master(args)
-        if args.command == "clone":
-            try:
-                return clone_master(args)
-            except KeyboardInterrupt:
-                raise
-            except Exception:
-                retry_guidance()
-                raise
-        if args.command == "portable":
-            try:
-                return portable_copy(args)
-            except KeyboardInterrupt:
-                raise
-            except Exception:
-                portable_retry_guidance()
-                raise
-        if args.command == "measure":
-            return measure_command(args)
-        if args.command == "verify":
-            return verify_target(args)
-        if args.command == "status":
-            return target_status(args)
-        parser.error("unknown command")
+        if args.command not in STORE_LOCK_MODES:
+            parser.error("unknown command")
+        with store_lock(store_for_lock(args), STORE_LOCK_MODES[args.command]):
+            return run_store_command(args)
+    except StoreBusy as exc:
+        say(f"STOPPED SAFELY: {exc}")
+        return STORE_BUSY_EXIT
     except VerificationError as exc:
         say(f"VERIFICATION FAILED: {exc}")
         return 2

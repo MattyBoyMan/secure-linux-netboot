@@ -1,0 +1,280 @@
+#!/usr/bin/env bash
+# secure-linux-nomad - Project NOMAD (offline library, maps, private AI) on this computer.
+#   secure-linux-nomad start [options]  start NOMAD. With the Secure Linux drive plugged in it uses the drive's
+#                                       SecureLinux-NOMAD folder (works with no internet); without the drive it
+#                                       downloads the same pinned apps (internet needed once) and keeps them here.
+#   secure-linux-nomad stop             stop NOMAD (do this before unplugging the drive)
+#   secure-linux-nomad check            can this computer run NOMAD? (changes nothing)
+#   secure-linux-nomad status           is NOMAD running, and where from
+#   secure-linux-nomad code             show the access code for other devices at home (asks for your password)
+#   secure-linux-nomad setup [--auto]   get this computer ready for NOMAD (run by setup; the App Library uses it too)
+# Options for start go to start-nomad.sh: --share home, --lite, --no-ai, --store computer, --new-code, ...
+# --pause (start/stop): wait for Enter at the end, so a window opened from the app menu stays readable.
+set -u
+HERE=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd -P)
+SEARCH=${NOMAD_SEARCH_DIRS:-"/run/media/*/* /media/*/* /media/* /mnt/*"}
+RUN=${NOMAD_RUN_DIR:-/run/nomad}
+STATE_DIR=${NOMAD_STATE_DIR:-/var/lib/secure-linux}
+APPS_DIR=${NOMAD_APPS_DIR:-/usr/local/share/applications}
+FOLDER=SecureLinux-NOMAD
+# What "can handle NOMAD" means. Memory, processor type and virtual machines are checked by start-nomad.sh itself
+# (one place for those numbers): x86_64 only, at least 3584 MB memory (a "4 GB" computer), 7168 MB turns the AI on,
+# no virtual machine for the full NOMAD. Added here:
+MIN_CPUS=2        # upstream minimum: a dual-core processor (README "Minimum Specs")
+MIN_FREE_GB=10    # free space on this computer's disk: upstream "plan for 10 GB to install comfortably"
+AI_FREE_GB=25     # upstream: with the AI Assistant the install is "roughly 25 GB" (only a note; the drive can hold it)
+
+say() { printf '%s\n' "$*"; }
+usage() { sed -n '2,12p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+
+kit_version() { sed -n 's/^KIT_VERSION="\([0-9-]*\)".*/\1/p' "$1" 2>/dev/null | head -n1; }
+
+drive_kit() {    # the SecureLinux-NOMAD folder on a plugged-in drive (the same place START-NOMAD.sh looks)
+  local d
+  for d in $SEARCH; do
+    if [ -f "$d/$FOLDER/start-nomad.sh" ] && [ -f "$d/$FOLDER/images/fetch-log.jsonl" ]; then
+      printf '%s\n' "$d/$FOLDER"; return 0
+    fi
+  done
+  return 1
+}
+
+cpus() { [ -n "${NOMAD_FAKE_CPUS:-}" ] && { echo "$NOMAD_FAKE_CPUS"; return; }; nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1; }
+free_gb() {
+  [ -n "${NOMAD_FAKE_FREE_GB:-}" ] && { echo "$NOMAD_FAKE_FREE_GB"; return; }
+  df -Pk "${NOMAD_DISK:-/}" 2>/dev/null | awk 'NR==2{print int($4/1048576)}'
+}
+
+# The launcher's own check, used only when start-nomad.sh --check gives no clear answer (exit 0 without its
+# "Result: OK for" line: an old, damaged or replaced copy). Then the full NOMAD never starts on a computer that
+# would fail the real check. The numbers are read from start-nomad.sh (MIN_RAM_MB, AI_RAM_MB: one place for them);
+# 3584 and 7168 are used only when that file has none, and a test keeps them equal to start-nomad.sh.
+FALLBACK_MIN_RAM_MB=3584
+FALLBACK_AI_RAM_MB=7168
+script_number() {  # script_number NAME DEFAULT
+  local v
+  v=$(sed -n "s/^$1=\([0-9][0-9]*\).*/\1/p" "$HERE/start-nomad.sh" 2>/dev/null | head -n1)
+  echo "${v:-$2}"
+}
+own_check() {     # sets HW_RC (0, 3, 4 or 5) and HW_TEXT, like start-nomad.sh --check would
+  local arch mem virt
+  arch=${NOMAD_FAKE_ARCH:-$(uname -m)}
+  if [ -n "${NOMAD_FAKE_MEM_KB:-}" ]; then mem=$(( NOMAD_FAKE_MEM_KB / 1024 ))
+  else mem=$(awk '/^MemTotal:/{print int($2/1024)}' /proc/meminfo 2>/dev/null); fi
+  mem=${mem:-0}
+  if [ -n "${NOMAD_FAKE_VIRT:-}" ]; then virt=$NOMAD_FAKE_VIRT
+  else
+    virt=$(systemd-detect-virt --vm 2>/dev/null || true)
+    if [ -z "$virt" ] || [ "$virt" = none ]; then
+      if grep -qw hypervisor /proc/cpuinfo 2>/dev/null; then virt=hypervisor; else virt=none; fi
+    fi
+  fi
+  HW_TEXT="Processor type: $arch | Memory: $(( mem / 1024 )) GB ($mem MB) | Virtual machine: $virt"
+  case "$arch" in x86_64|amd64) ;; *) HW_RC=3; return ;; esac
+  if [ "$virt" != none ]; then HW_RC=4; return; fi
+  if [ "$mem" -lt "$(script_number MIN_RAM_MB "$FALLBACK_MIN_RAM_MB")" ]; then HW_RC=5; return; fi
+  HW_RC=0
+  if [ "$mem" -ge "$(script_number AI_RAM_MB "$FALLBACK_AI_RAM_MB")" ]; then
+    HW_TEXT="$HW_TEXT
+Result: OK for NOMAD with the AI assistant."
+  else
+    HW_TEXT="$HW_TEXT
+Result: OK for NOMAD."
+  fi
+}
+
+# HW_RC: 0 full NOMAD, 3 wrong processor, 4 virtual machine, 5 too little memory, 10 too few cores, 11 too little disk
+hardware() {
+  local out n f
+  out=$(NOMAD_RUN_DIR="$RUN" bash "$HERE/start-nomad.sh" --check 2>&1); HW_RC=$?
+  HW_TEXT=$out
+  if [ "$HW_RC" = 0 ] && ! printf '%s\n' "$out" | grep -q '^Result: OK for'; then
+    own_check   # no clear answer from the start script: decide here, never assume the computer can
+  fi
+  n=$(cpus); f=$(free_gb); f=${f:-0}
+  HW_AI=no; case "$HW_TEXT" in *"with the AI assistant"*) HW_AI=yes ;; esac
+  if [ "$HW_RC" = 0 ] && [ "$n" -lt "$MIN_CPUS" ]; then
+    HW_RC=10; HW_WHY="it has $n processor core; NOMAD needs at least $MIN_CPUS"
+  elif [ "$HW_RC" = 0 ] && [ "$f" -lt "$MIN_FREE_GB" ]; then
+    HW_RC=11; HW_WHY="its disk has only $f GB free; NOMAD needs at least $MIN_FREE_GB GB"
+  else
+    case "$HW_RC" in
+      0) HW_WHY="" ;;
+      3) HW_WHY="its processor type is not a normal PC processor (x86_64)" ;;
+      4) HW_WHY="it is a virtual machine" ;;
+      5) HW_WHY="it has less than 4 GB of memory" ;;
+      *) HW_WHY="the computer check did not finish" ;;
+    esac
+  fi
+  HW_CPUS=$n HW_FREE=$f
+}
+
+as_root() { if [ "$(id -u)" = 0 ] || [ "${NOMAD_TEST:-}" = 1 ]; then "$@"; else sudo -- "$@"; fi; }
+
+pause() { [ "$PAUSE" = yes ] && [ -t 0 ] && { printf '\nPress Enter to close this window. '; read -r _; }; return 0; }
+
+cmd_check() {
+  hardware
+  printf '%s\n' "$HW_TEXT"
+  say "Processor cores: $HW_CPUS | Free on this computer's disk: $HW_FREE GB"
+  case "$HW_RC" in
+    0) [ "$HW_FREE" -lt "$AI_FREE_GB" ] && [ "$HW_AI" = yes ] && \
+         say "Note: the AI downloads need about $AI_FREE_GB GB; with the drive plugged in they are kept on the drive."
+       say "This computer can run NOMAD." ;;
+    3) say "This computer cannot run NOMAD: $HW_WHY." ;;
+    *) say "This computer is not suited to the full NOMAD: $HW_WHY."
+       say "It can still use the offline library on its own (secure-linux-nomad start --lite)." ;;
+  esac
+  return "$HW_RC"
+}
+
+cmd_start() {
+  local kit script args=("$@") a has_store=no has_lite=no mine theirs url
+  for a in "${args[@]}"; do case "$a" in --store|--store=*) has_store=yes ;; --lite|--content-only) has_lite=yes ;; esac; done
+  hardware
+  if [ "$HW_RC" = 3 ]; then
+    say "NOMAD cannot run on this computer: $HW_WHY. Nothing was changed."; return 3
+  fi
+  if [ "$HW_RC" != 0 ] && [ "$has_lite" = no ]; then
+    say "This computer is not suited to the full NOMAD ($HW_WHY), so only the offline library starts."
+    args+=(--lite)
+  fi
+  if kit=$(drive_kit); then
+    # Offline: books, maps, AI model and apps come from the drive, but only as DATA. The programs that run as the
+    # administrator are always this computer's own: a drive can be anyone's, and its scripts are never run. The
+    # computer's start-nomad.sh checks every app file, book, map and model from the drive against this computer's own
+    # lists (images/fetch-log.jsonl, content-pins.txt) before using it; without those lists nothing starts.
+    if [ ! -s "$HERE/images/fetch-log.jsonl" ] || [ ! -f "$HERE/content-pins.txt" ]; then
+      say "This computer's list of NOMAD's files is missing, so the files on the drive cannot be checked. NOMAD was not started."
+      say "Run 'Repair setup' from Secure Linux Status, then start NOMAD again."
+      return 12
+    fi
+    mine=$(kit_version "$HERE/start-nomad.sh"); theirs=$(kit_version "$kit/start-nomad.sh")
+    if [ -n "$theirs" ] && { [ -z "$mine" ] || [ "$theirs" \> "$mine" ]; }; then
+      say "Note: the drive has a newer NOMAD start program ($theirs). For safety this computer always uses its own (${mine:-older}); update Secure Linux to get the newer one."
+    fi
+    script=$HERE/start-nomad.sh; args+=(--kit "$kit")
+    say "Starting NOMAD with this computer's own start program, using the books, maps and apps on the drive (each one is checked first): $kit"
+  else
+    # No drive: the same pinned apps are downloaded once (internet needed) and kept on this computer.
+    script=$HERE/start-nomad.sh; args+=(--kit "$HERE")
+    [ "$has_store" = yes ] || args+=(--store computer)
+    say "The Secure Linux drive with the $FOLDER folder is not plugged in."
+    say "Starting NOMAD from this computer (the first time this needs the internet; later starts work without it)."
+  fi
+  as_root bash "$script" "${args[@]}"; local rc=$?
+  if [ "$rc" = 0 ] && [ "$(id -u)" != 0 ] && { [ -n "${DISPLAY:-}" ] || [ -n "${WAYLAND_DISPLAY:-}" ]; } \
+     && command -v xdg-open >/dev/null 2>&1; then
+    url=$(cat "$RUN/url" 2>/dev/null); url=${url:-http://localhost:8080}
+    case "$url" in http://*) xdg-open "$url" >/dev/null 2>&1 & ;; esac
+    say "NOMAD opens in your web browser. You can close this window; NOMAD keeps running until you stop it."
+  fi
+  return "$rc"
+}
+
+cmd_stop() {   # always this computer's own stop script (never one from a drive, whatever started NOMAD)
+  as_root bash "$HERE/stop-nomad.sh" "$@"
+}
+
+cmd_status() {
+  local kit
+  if [ -f "$RUN/state" ]; then say "NOMAD is running. Address: $(cat "$RUN/url" 2>/dev/null || echo http://localhost:8080)"
+  else say "NOMAD is not running."; fi
+  if kit=$(drive_kit); then say "NOMAD on a plugged-in drive: $kit"; else say "No drive with $FOLDER is plugged in."; fi
+  [ -f "$STATE_DIR/nomad-status" ] && say "Set-up result: $(cat "$STATE_DIR/nomad-status")"
+  return 0
+}
+
+cmd_code() {
+  local f
+  for f in "$RUN/data/share-code" "${NOMAD_COMPUTER_DATA:-/opt/project-nomad}/share-code" "$RUN/lite/share-code"; do
+    if as_root test -s "$f"; then
+      say "Access code for other devices at home: $(as_root cat "$f" | tr -cd '0-9' | sed 's/^\(....\)/\1-/')"
+      return 0
+    fi
+  done
+  say "No access code yet. It is made when NOMAD is started with:  secure-linux-nomad start --share home"
+  return 1
+}
+
+engine_ready() { command -v podman >/dev/null 2>&1 || command -v docker >/dev/null 2>&1; }
+
+install_missing() {  # online only; a failure is reported but never stops the computer's setup
+  local want=() p
+  engine_ready || want+=(podman)
+  command -v nft >/dev/null 2>&1 || want+=(nftables)
+  command -v python3 >/dev/null 2>&1 || want+=(python3)
+  [ ${#want[@]} -gt 0 ] || return 0
+  if [ -e /run/ostree-booted ]; then say "NOMAD needs: ${want[*]} (this system cannot add programs here)."; return 1; fi
+  if ! curl -s --max-time 10 -o /dev/null https://ghcr.io/v2/ 2>/dev/null; then   # any answer means online
+    say "NOMAD still needs: ${want[*]}. They are added the next time setup runs with internet."
+    return 1
+  fi
+  say "Adding what NOMAD needs: ${want[*]}"
+  # NOMAD_PKG: the setup step says which package tool this system uses (dnf on Fedora, apt on Debian)
+  local pkg=${NOMAD_PKG:-}
+  if [ -z "$pkg" ]; then
+    if [ -f /etc/debian_version ] && command -v apt-get >/dev/null 2>&1; then pkg=apt
+    elif command -v dnf >/dev/null 2>&1; then pkg=dnf; fi
+  fi
+  case "$pkg" in
+    dnf) dnf -y install "${want[@]}" ;;
+    apt) DEBIAN_FRONTEND=noninteractive apt-get install -y "${want[@]}" ;;
+    *) say "No package tool found; install ${want[*]} with your system's software tool."; return 1 ;;
+  esac
+}
+
+write_status() { mkdir -p "$STATE_DIR"; printf '%s|%s\n' "$1" "$2" > "$STATE_DIR/nomad-status"; chmod 644 "$STATE_DIR/nomad-status"; }
+
+add_menu_entry() {
+  mkdir -p "$APPS_DIR"
+  install -m 0644 "$HERE/secure-linux-nomad.desktop" "$APPS_DIR/secure-linux-nomad.desktop"
+}
+
+cmd_setup() {
+  local auto=no
+  [ "${1:-}" = --auto ] && auto=yes
+  if [ "$(id -u)" != 0 ] && [ "${NOMAD_TEST:-}" != 1 ]; then exec sudo -- bash "$HERE/secure-linux-nomad" setup "$@"; fi
+  hardware
+  say "Checking whether this computer can run NOMAD (offline library, maps, private AI):"
+  say "  processor and memory: $(printf '%s\n' "$HW_TEXT" | sed -n 's/^Processor type: //p')"
+  say "  processor cores: $HW_CPUS (needs $MIN_CPUS) | free disk: $HW_FREE GB (needs $MIN_FREE_GB)"
+  if [ "$HW_RC" = 3 ]; then
+    say "NOMAD cannot run on this computer: $HW_WHY. Nothing was added."
+    write_status unsupported "$HW_WHY"
+    return 0
+  fi
+  if [ "$HW_RC" != 0 ] && [ "$auto" = yes ]; then
+    say "NOMAD was not set up on this computer: $HW_WHY."
+    say "It stays available in the App Library. On this computer it can run the offline library only."
+    write_status not-suitable "$HW_WHY"
+    return 0
+  fi
+  install_missing || true
+  add_menu_entry
+  if [ "$HW_RC" = 0 ]; then
+    write_status ready "full NOMAD$( [ "$HW_AI" = yes ] && echo ' with the AI assistant')"
+    say "NOMAD is ready: open it from the app menu (NOMAD Offline Library). With the Secure Linux drive plugged in it"
+    say "works with no internet; without the drive it downloads the same pinned apps once."
+  else
+    write_status library-only "$HW_WHY"
+    say "NOMAD is in the app menu; on this computer it runs the offline library only ($HW_WHY)."
+  fi
+  engine_ready || say "Before the first start NOMAD needs Podman: connect to the internet and run: sudo secure-linux-nomad setup"
+  return 0
+}
+
+PAUSE=no
+cmd=${1:-help}; [ $# -gt 0 ] && shift
+rest=()
+for a in "$@"; do [ "$a" = --pause ] && PAUSE=yes || rest+=("$a"); done
+case "$cmd" in
+  start) cmd_start ${rest[@]+"${rest[@]}"}; rc=$?; pause; exit "$rc" ;;
+  stop) cmd_stop ${rest[@]+"${rest[@]}"}; rc=$?; pause; exit "$rc" ;;
+  check) cmd_check; exit $? ;;
+  status) cmd_status ;;
+  code) cmd_code; exit $? ;;
+  setup) cmd_setup ${rest[@]+"${rest[@]}"} ;;
+  -h|--help|help) usage ;;
+  *) say "I don't know '$cmd'. Try: secure-linux-nomad --help"; exit 64 ;;
+esac

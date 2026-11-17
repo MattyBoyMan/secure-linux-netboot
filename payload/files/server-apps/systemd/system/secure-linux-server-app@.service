@@ -1,0 +1,18 @@
+# Starts one home-server app (Nextcloud, Paperless-ngx, ...) after a restart, on this computer's home address.
+# Turned on by "secure-linux-server-apps install|start APP" and off by "secure-linux-server-apps stop|remove APP".
+[Unit]
+Description=Secure Linux home-server app %i
+Wants=network-online.target
+After=network-online.target docker.service podman.service firewalld.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/secure-linux-server-apps start %i --boot
+ExecStop=/usr/local/bin/secure-linux-server-apps stop %i --boot
+Restart=on-failure
+RestartSec=60
+TimeoutStartSec=10min
+
+[Install]
+WantedBy=multi-user.target

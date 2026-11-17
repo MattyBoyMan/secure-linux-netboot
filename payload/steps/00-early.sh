@@ -67,6 +67,10 @@ done
 for _sys_f in "$SL_ROOT"/files/system/polkit/*.policy; do
   [ -f "$_sys_f" ] && _sys_put "$_sys_f" "/usr/share/polkit-1/actions/${_sys_f##*/}" 0644
 done
+# home server folder (files/homeshare/polkit): its own clear password prompts
+for _sys_f in "$SL_ROOT"/files/homeshare/polkit/*.policy; do
+  [ -f "$_sys_f" ] && _sys_put "$_sys_f" "/usr/share/polkit-1/actions/${_sys_f##*/}" 0644
+done
 
 # SELinux labels for the new files (harmless if SELinux is off)
 if [ -z "$_sys_d" ] && command -v restorecon >/dev/null 2>&1; then
@@ -88,6 +92,18 @@ for _sys_list in "$SL_ROOT"/files/*/enable-user.list; do
   [ -f "$_sys_list" ] || continue
   while IFS= read -r _sys_u; do try systemctl --global enable "$_sys_u"; done < <(_sys_units "$_sys_list")
 done
+
+# --- home-server password from a locked drive (P19; I2 OPEN 1). templates/fedora.ks gives it to the home-share helper
+# during the install and removes it. If the file is still here (that install step could not use it), the helper uses
+# it once now and removes it itself (secure-linux-home-share from-install). Never in the installer chroot.
+if [ "$SL_MODE" != early ] && [ -s "$SL_ETC/home-share/password-from-install" ] \
+   && [ -x "$_sys_d/usr/local/bin/secure-linux-home-share" ]; then
+  "$_sys_d/usr/local/bin/secure-linux-home-share" from-install >/dev/null 2>&1
+  case $? in
+    0|5) echo "Home server: the password from the drive is saved for the shared folder (root only)." ;;
+    *) echo "Home server: the password from the drive could not be used; it is asked once at first login." ;;
+  esac
+fi
 
 unset _sys_f _sys_area _sys_list _sys_u _sys_apps
 return 0

@@ -1,0 +1,782 @@
+#!/usr/bin/env python3
+"""Secure Linux TV cleanup: tidy a Chromecast / Google TV you own, over adb, with an undo.
+
+Plain rules this tool follows:
+  * It does nothing to the TV unless you add --apply. Without it you only see a plan.
+  * It only talks to the one address you type, and you must type it twice.
+  * It only HIDES apps (pm disable-user). It never removes system apps.
+  * A never-touch list always wins, even if you ask for the app by name.
+  * Everything it changes is saved first, and `undo` puts the saved state back.
+  * Nothing here costs money or needs an account.
+"""
+from __future__ import annotations
+
+import argparse
+import fnmatch
+import hashlib
+import ipaddress
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+HOME_INTENT = ("-a", "android.intent.action.MAIN", "-c", "android.intent.category.HOME")
+ABI_ORDER = ("arm64-v8a", "armeabi-v7a")
+
+
+class Refused(Exception):
+    """A safety rule stopped the tool. Nothing was changed by this step."""
+
+
+class Failed(Exception):
+    """Something went wrong talking to the TV."""
+
+
+# ----------------------------------------------------------------------------
+# data files
+# ----------------------------------------------------------------------------
+
+def data_dir() -> Path:
+    here = Path(__file__).resolve().parent
+    candidates = []
+    if os.environ.get("SL_TVCLEANUP_DATA"):
+        candidates.append(Path(os.environ["SL_TVCLEANUP_DATA"]))
+    candidates += [
+        here.parent / "files" / "tvcleanup",
+        Path("/usr/local/share/secure-linux/tvcleanup"),
+        Path("/usr/local/lib/secure-linux/files/tvcleanup"),
+    ]
+    for item in candidates:
+        if (item / "never-touch.list").is_file() and (item / "allow-list.json").is_file():
+            return item
+    raise Failed("The tool's list files were not found. Looked in: " + ", ".join(str(c) for c in candidates))
+
+
+def load_never_touch(folder: Path) -> list[tuple[str, str]]:
+    patterns = []
+    for raw in (folder / "never-touch.list").read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        pattern, _, reason = line.partition(" # ")
+        patterns.append((pattern.strip(), reason.strip()))
+    return patterns
+
+
+def never_touch_reason(package: str, patterns: list[tuple[str, str]]) -> str | None:
+    for pattern, reason in patterns:
+        if fnmatch.fnmatchcase(package, pattern):
+            return reason or pattern
+    return None
+
+
+def load_json(folder: Path, name: str) -> dict:
+    return json.loads((folder / name).read_text(encoding="utf-8"))
+
+
+# ----------------------------------------------------------------------------
+# output helpers
+# ----------------------------------------------------------------------------
+
+def say(text: str = "") -> None:
+    print(text, flush=True)
+
+
+class Session:
+    """One run: the typed address, the adb helper and whether we may change things."""
+
+    def __init__(self, args: argparse.Namespace):
+        self.args = args
+        self.apply = bool(getattr(args, "apply", False))
+        self.folder = data_dir()
+        self.never = load_never_touch(self.folder)
+        self.address = ""
+        self.state: Path | None = None
+
+    # --- adb -----------------------------------------------------------
+    def adb_path(self) -> str:
+        wanted = os.environ.get("SL_ADB") or "adb"
+        found = shutil.which(wanted)
+        if not found:
+            raise Failed("The 'adb' program was not found. On Fedora install it with: sudo dnf install android-tools")
+        return found
+
+    def adb(self, *words: str, timeout: int = 120, check: bool = True) -> subprocess.CompletedProcess:
+        command = [self.adb_path(), "-s", self.address, *words]
+        done = subprocess.run(command, capture_output=True, text=True, timeout=timeout)
+        if check and done.returncode != 0:
+            raise Failed("The TV did not accept: adb " + " ".join(words) + "\n" + (done.stderr or done.stdout).strip())
+        return done
+
+    def shell(self, *words: str, check: bool = True) -> str:
+        done = self.adb("shell", *words, check=check)
+        return (done.stdout or "") + (done.stderr or "")
+
+    # --- connecting ------------------------------------------------------
+    def confirm_address(self) -> None:
+        raw = (getattr(self.args, "device", None) or "").strip()
+        again = (getattr(self.args, "confirm_address", None) or "").strip()
+        if not raw:
+            raise Refused("Tell me the TV's address with --device, for example --device 192.168.1.50 (see 'guide' to find it). I will not search the network.")
+        if not again and sys.stdin.isatty():
+            try:
+                again = input("Type the TV's address again to confirm it is the right one: ").strip()
+            except EOFError:
+                again = ""
+        if not again:
+            raise Refused("I need you to confirm the address by typing it a second time with --confirm-address. Nothing was contacted.")
+        first = normalise_address(raw)
+        second = normalise_address(again)
+        if first != second:
+            raise Refused(f"The two addresses do not match ({raw} and {again}). Nothing was contacted.")
+        self.address = first
+
+    def connect(self) -> None:
+        self.confirm_address()
+        say(f"Connecting to the TV at {self.address} (this only reads; it changes nothing).")
+        done = subprocess.run([self.adb_path(), "connect", self.address], capture_output=True, text=True, timeout=60)
+        text = ((done.stdout or "") + (done.stderr or "")).strip()
+        if done.returncode != 0 or "failed" in text.lower() or "unable" in text.lower():
+            raise Failed(
+                f"I could not connect to {self.address}: {text}\n"
+                "Check that Developer options > USB debugging (or Wireless debugging) is ON, that the TV and this computer are on the same Wi-Fi, "
+                "and that you pressed Allow on the TV screen. Run the 'guide' command for the steps."
+            )
+        probe = self.adb("shell", "getprop", "ro.product.model", check=False)
+        probe_text = ((probe.stdout or "") + (probe.stderr or "")).lower()
+        if probe.returncode != 0 or "unauthorized" in probe_text:
+            raise Failed("The TV has not allowed this computer yet. Look at the TV screen, choose 'Always allow' and try again.")
+
+    # --- device facts ------------------------------------------------------
+    def prop(self, name: str) -> str:
+        return self.shell("getprop", name, check=False).strip()
+
+    def device_facts(self) -> dict:
+        return {
+            "model": self.prop("ro.product.model"),
+            "device": self.prop("ro.product.device"),
+            "manufacturer": self.prop("ro.product.manufacturer"),
+            "android": self.prop("ro.build.version.release"),
+            "abi_list": self.prop("ro.product.cpu.abilist") or self.prop("ro.product.cpu.abi"),
+            "fingerprint": self.prop("ro.build.fingerprint"),
+        }
+
+    def check_model(self, facts: dict) -> None:
+        devices = load_json(self.folder, "devices.json")
+        known = devices["known"]
+        codes = {item["device"]: item["name"] for item in known}
+        if facts["device"] in codes:
+            say(f"This looks like: {codes[facts['device']]} (model {facts['model']}).")
+            return
+        for item in devices.get("known_models", []):
+            if facts["model"].strip() == item["model"] and facts["manufacturer"].strip().lower() == item["manufacturer"].lower():
+                say(f"This looks like: {item['name']} (model {facts['model']}, Android {facts['android']}).")
+                return
+        typed = (getattr(self.args, "confirm_model", None) or "").strip()
+        if typed and typed.lower() == facts["model"].strip().lower():
+            say(f"This device ({facts['model']}, code name {facts['device']}) is not on my list of known devices, but you confirmed it.")
+            return
+        raise Refused(
+            f"This TV reports itself as '{facts['model']}' (code name '{facts['device']}'). I only work on devices I know without being told: "
+            + ", ".join(codes.values()) + ".\n"
+            f"If you are sure it is a Google TV or Android TV device you own, run the command again and add: --confirm-model \"{facts['model']}\"\n"
+            "Nothing was changed."
+        )
+
+    # --- packages ----------------------------------------------------------
+    def package_lists(self) -> dict:
+        def read(*flags: str) -> list[str]:
+            text = self.shell("pm", "list", "packages", *flags)
+            return sorted({line.split(":", 1)[1].strip() for line in text.splitlines() if line.startswith("package:")})
+        return {"all": read(), "enabled": read("-e"), "disabled": read("-d")}
+
+    def home_now(self) -> str:
+        return self.shell("cmd", "package", "resolve-activity", "--brief", *HOME_INTENT, check=False).strip()
+
+    # --- state folder ------------------------------------------------------
+    def state_folder(self) -> Path:
+        if self.state is None:
+            override = getattr(self.args, "state_dir", None) or os.environ.get("SL_TVCLEANUP_STATE")
+            if override:
+                base = Path(override)
+            else:
+                base = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local" / "state") / "secure-linux" / "tv-cleanup"
+            self.state = base / re.sub(r"[^0-9A-Za-z._-]", "_", self.address)
+            self.state.mkdir(parents=True, exist_ok=True)
+        return self.state
+
+    def log_action(self, kind: str, **fields) -> None:
+        entry = {"time": time.strftime("%Y-%m-%d %H:%M:%S"), "kind": kind, **fields}
+        with (self.state_folder() / "actions.jsonl").open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(entry, sort_keys=True) + "\n")
+
+    def actions(self) -> list[dict]:
+        path = self.state_folder() / "actions.jsonl"
+        if not path.is_file():
+            return []
+        return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+    def installed_by_us(self) -> list[str]:
+        packages: list[str] = []
+        for entry in self.actions():
+            if entry["kind"] == "installed" and entry["package"] not in packages:
+                packages.append(entry["package"])
+            if entry["kind"] == "removed" and entry["package"] in packages:
+                packages.remove(entry["package"])
+        return packages
+
+    # --- backup ------------------------------------------------------------
+    def make_backup(self, facts: dict | None = None, label: str = "backup") -> Path:
+        facts = facts or self.device_facts()
+        lists = self.package_lists()
+        record = {
+            "format": 1,
+            "address": self.address,
+            "created": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "device": facts,
+            "all": lists["all"],
+            "enabled": lists["enabled"],
+            "disabled": lists["disabled"],
+            "home": self.home_now(),
+        }
+        folder = self.state_folder()
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        saved = folder / f"{label}-{stamp}.json"
+        index = 1
+        while saved.exists():
+            index += 1
+            saved = folder / f"{label}-{stamp}-{index}.json"
+        text = json.dumps(record, indent=2, sort_keys=True)
+        saved.write_text(text, encoding="utf-8")
+        first = folder / "first-backup.json"
+        if not first.exists():
+            first.write_text(text, encoding="utf-8")
+        (folder / "enabled-packages.txt").write_text("\n".join(record["enabled"]) + "\n", encoding="utf-8")
+        return saved
+
+    def first_backup(self) -> dict | None:
+        path = self.state_folder() / "first-backup.json"
+        return json.loads(path.read_text(encoding="utf-8")) if path.is_file() else None
+
+    # --- doing things ------------------------------------------------------
+    def step(self, words: str, *command: str) -> bool:
+        """Say what is about to happen in plain English, then do it only with --apply."""
+        if self.apply:
+            say(f"  Doing: {words}")
+            return True
+        say(f"  Would do: {words}   (dry run, not done)")
+        return False
+
+
+def normalise_address(text: str) -> str:
+    host, _, port = text.strip().partition(":")
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        raise Refused(f"'{host}' is not a number-style address like 192.168.1.50. I only talk to an address you type, not to names.")
+    if ip.version != 4 or not (ip.is_private or ip.is_link_local) or ip.is_loopback:
+        raise Refused(f"{host} is not a home-network address (it must look like 192.168.x.x, 10.x.x.x or 172.16-31.x.x). I will not contact it.")
+    if port:
+        if not port.isdigit() or not (1 <= int(port) <= 65535):
+            raise Refused(f"'{port}' is not a valid port number.")
+    return f"{host}:{port or '5555'}"
+
+
+def sha256_of(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+# ----------------------------------------------------------------------------
+# commands
+# ----------------------------------------------------------------------------
+
+GUIDE = """\
+CLEAN UP MY CHROMECAST / GOOGLE TV - the steps, in plain English
+
+What this does: hides the pre-installed apps you do not use, can swap the busy home
+screen for a plain one, and can add an ad-reducing YouTube app. Every change is saved
+first and can be undone. It cannot promise a TV with no ads at all.
+
+1. On the TV, open Settings > System > About. Press OK on "Android TV OS build" about
+   seven times until it says "You are now a developer".
+2. Go back to Settings > System > Developer options. Turn on USB debugging. On newer
+   models also turn on Wireless debugging.
+3. Find the TV's address: Settings > Network & Internet > your Wi-Fi name. It looks like
+   192.168.1.50. Write it down. I never search your network; you type it.
+4. On this computer, in a terminal, run this to see the TV and its details:
+       secure-linux-tv-cleanup info --device 192.168.1.50 --confirm-address 192.168.1.50
+   The first time, the TV shows "Allow USB debugging?". Choose "Always allow".
+   (On models that use Wireless debugging, first run: adb pair <address:pairing-port>
+   with the pairing code the TV shows. The tool does not do the pairing for you.)
+5. Make a safe copy of what is on the TV now:
+       secure-linux-tv-cleanup backup --device 192.168.1.50 --confirm-address 192.168.1.50
+6. See what would be hidden (nothing changes yet):
+       secure-linux-tv-cleanup hide-clutter --device 192.168.1.50 --confirm-address 192.168.1.50
+   Add --apply to really do it.
+7. To put everything back exactly as saved:
+       secure-linux-tv-cleanup undo --device 192.168.1.50 --confirm-address 192.168.1.50 --apply
+8. When you are finished, turn USB debugging OFF again in Developer options. While it is
+   on, anyone on your home Wi-Fi who knows the address could try to connect.
+
+Optional steps: launcher-install / launcher-on / launcher-off (plain home screen) and
+youtube-install / youtube-remove (SmartTube). Run each with --help to read about it.
+Needs the adb program. On Fedora: sudo dnf install android-tools
+"""
+
+
+def cmd_guide(args: argparse.Namespace) -> int:
+    say(GUIDE)
+    return 0
+
+
+def prepare(args: argparse.Namespace, need_known_model: bool = True) -> tuple[Session, dict]:
+    session = Session(args)
+    session.connect()
+    facts = session.device_facts()
+    if need_known_model:
+        session.check_model(facts)
+    return session, facts
+
+
+def cmd_info(args: argparse.Namespace) -> int:
+    session, facts = prepare(args, need_known_model=False)
+    say("The TV says:")
+    say(f"  Model:        {facts['model']}")
+    say(f"  Code name:    {facts['device']}")
+    say(f"  Maker:        {facts['manufacturer']}")
+    say(f"  Android:      {facts['android']}")
+    say(f"  Processor:    {facts['abi_list']}")
+    known = {item["device"]: item["name"] for item in load_json(session.folder, "devices.json")["known"]}
+    say("  Known to this tool: " + (known[facts["device"]] if facts["device"] in known else "no (you will have to confirm the model before any change)"))
+    say("Nothing was changed.")
+    return 0
+
+
+def cmd_backup(args: argparse.Namespace) -> int:
+    session, facts = prepare(args)
+    saved = session.make_backup(facts)
+    say(f"Saved the list of apps and the home screen to: {saved}")
+    say("The very first save is also kept as first-backup.json. 'undo' uses it.")
+    return 0
+
+
+def ensure_backup(session: Session, facts: dict) -> None:
+    if session.first_backup() is None:
+        say("No saved copy exists yet, so I am making one first.")
+    saved = session.make_backup(facts, label="before-change")
+    say(f"Saved a copy before changing anything: {saved}")
+
+
+def apply_disable(session: Session, packages: list[str], purpose: str) -> list[str]:
+    """Hide packages one at a time, then check the TV really shows them as hidden."""
+    failed = []
+    for package in packages:
+        done = session.adb("shell", "pm", "disable-user", "--user", "0", package, check=False)
+        text = (done.stdout or "") + (done.stderr or "")
+        if done.returncode != 0 or "exception" in text.lower() or "error" in text.lower():
+            say(f"    The TV refused to hide {package}: {text.strip()[:160]}")
+            failed.append(package)
+    now = set(session.package_lists()["disabled"])
+    for package in packages:
+        if package not in now and package not in failed:
+            say(f"    {package}: the TV said OK but it is not listed as hidden, so I am counting it as NOT hidden.")
+            failed.append(package)
+    for package in packages:
+        if package not in failed:
+            session.log_action("disabled", package=package, purpose=purpose)
+    return failed
+
+
+def choose_clutter(session: Session, args: argparse.Namespace, lists: dict) -> tuple[list[dict], list[str]]:
+    allow = load_json(session.folder, "allow-list.json")["entries"]
+    by_name = {item["package"]: item for item in allow}
+    groups = set(args.group or ["google"])
+    refused: list[str] = []
+    wanted: list[dict] = []
+    asked = list(args.package or [])
+    for name in asked:
+        reason = never_touch_reason(name, session.never)
+        if reason:
+            refused.append(f"{name}: REFUSED - on the never-touch list ({reason}).")
+        elif name not in by_name:
+            refused.append(f"{name}: REFUSED - not on the list of apps checked as safe to hide.")
+        else:
+            wanted.append(by_name[name])
+    if not asked:
+        for item in allow:
+            if item["group"] not in groups:
+                continue
+            if item["confidence"] == "one-source" and not args.include_single_source:
+                continue
+            wanted.append(item)
+    chosen: list[dict] = []
+    for item in wanted:
+        reason = never_touch_reason(item["package"], session.never)
+        if reason:
+            refused.append(f"{item['package']}: REFUSED - on the never-touch list ({reason}).")
+            continue
+        if item["package"] not in lists["all"]:
+            continue
+        if item["package"] in lists["disabled"]:
+            continue
+        chosen.append(item)
+    return chosen, refused
+
+
+def cmd_hide(args: argparse.Namespace) -> int:
+    session, facts = prepare(args)
+    lists = session.package_lists()
+    chosen, refused = choose_clutter(session, args, lists)
+    for line in refused:
+        say("  " + line)
+    if not chosen:
+        say("Nothing to hide: every checked app is already hidden or not on this TV." if not refused else "Nothing was hidden.")
+        return 2 if refused else 0
+    say(f"HIDE THE CLUTTER - {len(chosen)} app(s). Hiding is not removing: each one can be turned back on.")
+    for item in chosen:
+        say(f"  - {item['what']}  [{item['package']}]")
+        say(f"      If you need it later: {item['risk']}")
+    if not session.apply:
+        for item in chosen:
+            session.step(f"hide {item['package']}")
+        say("DRY RUN: nothing was changed. Add --apply to do it. A saved copy is made first.")
+        return 0
+    ensure_backup(session, facts)
+    for item in chosen:
+        session.step(f"hide {item['package']}")
+    failed = apply_disable(session, [item["package"] for item in chosen], "hide-clutter")
+    done = len(chosen) - len(failed)
+    say(f"Hidden: {done} of {len(chosen)}. Restart the TV from its menu so the change takes full effect.")
+    say("Undo any time with: secure-linux-tv-cleanup undo --device ... --confirm-address ... --apply")
+    return 1 if failed else 0
+
+
+def restore_plan(backup: dict, lists: dict) -> tuple[list[str], list[str]]:
+    present = set(lists["all"])
+    turn_on = [p for p in backup["enabled"] if p in present and p in set(lists["disabled"])]
+    turn_off = [p for p in backup["disabled"] if p in present and p in set(lists["enabled"])]
+    return turn_on, turn_off
+
+
+def cmd_undo(args: argparse.Namespace) -> int:
+    session, facts = prepare(args, need_known_model=False)
+    folder = session.state_folder()
+    backup_path = Path(args.from_file) if args.from_file else folder / "first-backup.json"
+    if not backup_path.is_file():
+        raise Refused(f"There is no saved copy at {backup_path}. Nothing was changed. (A saved copy is made the first time you use 'backup' or any change.)")
+    backup = json.loads(backup_path.read_text(encoding="utf-8"))
+    if backup.get("address") != session.address:
+        raise Refused(f"That saved copy belongs to {backup.get('address')}, not {session.address}. Nothing was changed.")
+    lists = session.package_lists()
+    turn_on, turn_off = restore_plan(backup, lists)
+    ours = [] if args.keep_apps else [p for p in session.installed_by_us() if p in lists["all"]]
+    say(f"UNDO: put the TV back to the copy saved on {backup['created']} ({backup_path.name}).")
+    for package in turn_on:
+        session.step(f"turn {package} back on")
+    for package in turn_off:
+        session.step(f"hide {package} again (it was hidden in the saved copy)")
+    for package in ours:
+        session.step(f"remove {package}, an app this tool installed (use --keep-apps to keep it)")
+    if not (turn_on or turn_off or ours):
+        say("The TV already matches the saved copy. Nothing to do.")
+        return 0
+    if not session.apply:
+        say("DRY RUN: nothing was changed. Add --apply to do it.")
+        return 0
+    for package in turn_on:
+        done = session.adb("shell", "pm", "enable", package, check=False)
+        if done.returncode != 0:
+            say(f"    The TV did not turn {package} on: {(done.stderr or done.stdout).strip()[:160]}")
+    for package in turn_off:
+        session.adb("shell", "pm", "disable-user", "--user", "0", package, check=False)
+    session.adb("shell", "input", "keyevent", "KEYCODE_HOME", check=False)
+    for package in ours:
+        done = session.adb("uninstall", package, check=False)
+        if done.returncode == 0 and "success" in (done.stdout or "").lower():
+            session.log_action("removed", package=package, why="undo")
+        else:
+            say(f"    The TV did not remove {package}: {(done.stdout or done.stderr).strip()[:160]}")
+    after = session.package_lists()
+    mismatch = [p for p in backup["enabled"] if p in after["all"] and p not in after["enabled"]]
+    mismatch += [p for p in backup["disabled"] if p in after["all"] and p not in after["disabled"]]
+    if mismatch:
+        say("Not everything matches the saved copy yet: " + ", ".join(sorted(set(mismatch))))
+        return 1
+    say("Done. The TV matches the saved copy exactly (apps that are on the TV now but were not in the saved copy are left alone unless this tool installed them).")
+    return 0
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    session, facts = prepare(args, need_known_model=False)
+    backup = session.first_backup()
+    lists = session.package_lists()
+    say(f"TV: {facts['model']} at {session.address}")
+    if backup is None:
+        say("No saved copy yet. Nothing has been changed by this tool.")
+    else:
+        turn_on, turn_off = restore_plan(backup, lists)
+        say(f"Saved copy: {backup['created']}. Apps hidden since then: {len(turn_on)}. Apps turned back on since: {len(turn_off)}.")
+    say("Apps installed by this tool: " + (", ".join(session.installed_by_us()) or "none"))
+    say("Home screen now: " + (session.home_now().replace("\n", " | ") or "unknown"))
+    return 0
+
+
+# --- downloads ---------------------------------------------------------------
+
+def pick_file(session: Session, spec: dict, abi_list: str) -> tuple[str, dict]:
+    files = spec["files"]
+    if "any" in files:
+        return "any", files["any"]
+    for abi in ABI_ORDER:
+        if abi in [a.strip() for a in abi_list.split(",")] and abi in files:
+            return abi, files[abi]
+    return "universal", files["universal"]
+
+
+def fetch_pinned(session: Session, entry: dict, name: str) -> Path:
+    target_dir = session.state_folder() / "downloads"
+    target_dir.mkdir(parents=True, exist_ok=True)
+    target = target_dir / name
+    curl = shutil.which("curl")
+    if not curl:
+        raise Failed("The 'curl' program was not found, so I cannot download. Install it, or download the file yourself and use --apk FILE.")
+    say(f"  Downloading from {entry['url']}")
+    done = subprocess.run([curl, "-fL", "--proto", "=https", "--tlsv1.2", "-o", str(target), entry["url"]], capture_output=True, text=True, timeout=900)
+    if done.returncode != 0 or not target.is_file():
+        raise Failed("The download failed: " + (done.stderr or "").strip()[:200])
+    got = sha256_of(target)
+    if got != entry["sha256"]:
+        target.unlink(missing_ok=True)
+        raise Refused(f"The downloaded file's fingerprint ({got}) does not match the one this kit expects ({entry['sha256']}). I deleted it and installed nothing.")
+    say("  The download matches the fingerprint written down in this kit.")
+    return target
+
+
+def get_apk(session: Session, args: argparse.Namespace, spec: dict, abi_list: str, name: str) -> Path:
+    abi, entry = pick_file(session, spec, abi_list)
+    say(f"  Version {spec['version']} for this TV's processor ({abi}); expected fingerprint (SHA-256): {entry['sha256']}")
+    if args.apk:
+        path = Path(args.apk)
+        if not path.is_file():
+            raise Refused(f"The file {path} does not exist. Nothing was installed.")
+        got = sha256_of(path)
+        pins = {item["sha256"] for item in spec["files"].values()}
+        if got in pins:
+            say("  Your file matches an official fingerprint this kit knows.")
+        elif args.allow_unpinned_file:
+            say(f"  WARNING: your file ({got}) is not one this kit knows. You said to use it anyway.")
+        else:
+            raise Refused(f"Your file's fingerprint is {got}. It is not one of the official ones this kit knows, so I did not install it. (If you checked it yourself, add --allow-unpinned-file.)")
+        return path
+    if not args.download:
+        raise Refused("Choose where the app comes from: --download (official source, fingerprint checked) or --apk FILE (a file you already have).")
+    return fetch_pinned(session, entry, name)
+
+
+def install_app(session: Session, args: argparse.Namespace, key: str, label: str, facts: dict) -> int:
+    spec = load_json(session.folder, "downloads.json")[key]
+    say(f"{label}: {spec['name']} {spec['version']} (licence {spec['licence']}) from {spec['project']}")
+    if spec.get("notice"):
+        say("  Please read: " + spec["notice"])
+    if not session.apply:
+        abi, entry = pick_file(session, spec, facts["abi_list"])
+        say(f"  Would do: download {entry['url']} and check it is exactly {entry['sha256']}   (dry run, not done)")
+        say(f"  Would do: install it on the TV with adb   (dry run, not done)")
+        say("DRY RUN: nothing was changed. Add --apply to do it, plus --download or --apk FILE.")
+        return 0
+    ensure_backup(session, facts)
+    path = get_apk(session, args, spec, facts["abi_list"], spec["download_name"])
+    say("  Doing: install on the TV")
+    done = session.adb("install", "-r", str(path), timeout=900, check=False)
+    text = ((done.stdout or "") + (done.stderr or "")).strip()
+    if done.returncode != 0 or "success" not in text.lower():
+        raise Failed("The TV did not install it: " + text[:300])
+    if spec["package"] not in session.package_lists()["all"]:
+        raise Failed("The TV said Success but the app is not listed, so I am counting it as NOT installed.")
+    session.log_action("installed", package=spec["package"], version=spec["version"], sha256=sha256_of(path))
+    say(f"Installed {spec['name']}. Find it in the TV's app list.")
+    return 0
+
+
+def cmd_launcher_install(args: argparse.Namespace) -> int:
+    session, facts = prepare(args)
+    code = install_app(session, args, "launcher", "PLAIN HOME SCREEN", facts)
+    if code == 0 and session.apply:
+        say("Next: on the TV open FLauncher from the app list, let it start, and check your remote's arrows and OK work.")
+        say("Then run 'launcher-on' to make it the home screen. The stock home screen is NOT switched off until you do.")
+    return code
+
+
+def cmd_youtube_install(args: argparse.Namespace) -> int:
+    session, facts = prepare(args)
+    say("About this app: SmartTube plays YouTube with fewer ads and can skip sponsor segments. It is not made by YouTube or Google. It reduces ads; it does not promise none, and YouTube may change things and break it. It is for people who accept that.")
+    code = install_app(session, args, "youtube", "AD-REDUCING YOUTUBE APP", facts)
+    if code == 0 and session.apply:
+        say("Undo: secure-linux-tv-cleanup youtube-remove ... --apply")
+    return code
+
+
+def cmd_youtube_remove(args: argparse.Namespace) -> int:
+    session, facts = prepare(args)
+    spec = load_json(session.folder, "downloads.json")["youtube"]
+    package = spec["package"]
+    lists = session.package_lists()
+    if package not in lists["all"]:
+        say(f"{spec['name']} is not on this TV. Nothing to remove.")
+        return 0
+    if package not in session.installed_by_us():
+        raise Refused(f"I did not install {package}, so I will not remove it. Remove it yourself from the TV: Settings > Apps.")
+    session.step(f"remove {spec['name']} ({package}), an app this tool installed")
+    if not session.apply:
+        say("DRY RUN: nothing was changed. Add --apply to do it.")
+        return 0
+    done = session.adb("uninstall", package, check=False)
+    if done.returncode != 0 or "success" not in (done.stdout or "").lower():
+        raise Failed("The TV did not remove it: " + ((done.stdout or "") + (done.stderr or "")).strip()[:200])
+    session.log_action("removed", package=package, why="youtube-remove")
+    say("Removed.")
+    return 0
+
+
+def home_owner_text(session: Session) -> str:
+    return session.home_now()
+
+
+def cmd_launcher_on(args: argparse.Namespace) -> int:
+    session, facts = prepare(args)
+    spec = load_json(session.folder, "downloads.json")
+    launcher = spec["launcher"]["package"]
+    stock = spec["stock_launcher"]["packages_to_turn_off"]
+    lists = session.package_lists()
+    if launcher not in lists["all"]:
+        raise Refused(f"{launcher} is not on the TV. Run 'launcher-install' first. Nothing was changed.")
+    if launcher in lists["disabled"]:
+        raise Refused(f"{launcher} is hidden on the TV. Turn it on first. Nothing was changed.")
+    present = [p for p in stock if p in lists["all"]]
+    if stock[0] not in present:
+        raise Refused("This TV does not have the Google TV home screen package I know how to switch off, so I will not try. Nothing was changed.")
+    say("MAKE THE PLAIN HOME SCREEN THE HOME SCREEN")
+    say(f"  Step 1: hide the stock home screen and the setup helper that would otherwise grab the Home button: {', '.join(present)}")
+    say("  Step 2: check that the Home button now opens the plain home screen. If it does not, I turn both back on by myself.")
+    say("  The way back: 'launcher-off' (or 'undo'). If the screen ever goes black, this computer can still reach the TV: run launcher-off.")
+    if not session.apply:
+        for package in present:
+            session.step(f"hide {package}")
+        say("DRY RUN: nothing was changed. Before the real run: open FLauncher on the TV, check the remote works in it, then add --apply --confirm-launcher-works.")
+        return 0
+    if not args.confirm_launcher_works:
+        raise Refused("Please open FLauncher on the TV first and check your remote's arrows and OK button work in it. Then run again with --confirm-launcher-works. Nothing was changed.")
+    ensure_backup(session, facts)
+    for package in present:
+        session.step(f"hide {package}")
+        done = session.adb("shell", "pm", "disable-user", "--user", "0", package, check=False)
+        text = (done.stdout or "") + (done.stderr or "")
+        if done.returncode != 0 or "exception" in text.lower():
+            say(f"    The TV refused to hide {package}: {text.strip()[:160]}")
+    session.adb("shell", "input", "keyevent", "KEYCODE_HOME", check=False)
+    owner = session.home_now()
+    if launcher in owner:
+        session.log_action("launcher-on", packages=present)
+        say("The Home button now opens the plain home screen. Restart the TV once and press Home to be sure.")
+        return 0
+    say("The Home button does NOT open the plain home screen. Putting the stock home screen back now.")
+    for package in present:
+        session.adb("shell", "pm", "enable", package, check=False)
+    session.adb("shell", "input", "keyevent", "KEYCODE_HOME", check=False)
+    raise Failed("Rolled back: the stock home screen is turned on again. Nothing is left changed. This TV may need a different method.")
+
+
+def cmd_launcher_off(args: argparse.Namespace) -> int:
+    session, facts = prepare(args, need_known_model=False)
+    stock = load_json(session.folder, "downloads.json")["stock_launcher"]["packages_to_turn_off"]
+    lists = session.package_lists()
+    targets = [p for p in stock if p in lists["disabled"]]
+    say("GO BACK TO THE STOCK HOME SCREEN")
+    for package in targets:
+        session.step(f"turn {package} back on")
+    if not targets:
+        say("The stock home screen is already on. Nothing to do.")
+        return 0
+    if not session.apply:
+        say("DRY RUN: nothing was changed. Add --apply to do it.")
+        return 0
+    for package in targets:
+        session.adb("shell", "pm", "enable", package, check=False)
+    session.adb("shell", "input", "keyevent", "KEYCODE_HOME", check=False)
+    session.log_action("launcher-off", packages=targets)
+    say("Done. Press Home on the remote to check.")
+    return 0
+
+
+# ----------------------------------------------------------------------------
+# argument parsing
+# ----------------------------------------------------------------------------
+
+def build_parser() -> argparse.ArgumentParser:
+    parent = argparse.ArgumentParser(add_help=False)
+    parent.add_argument("--device", help="the TV's address on your home network, like 192.168.1.50")
+    parent.add_argument("--confirm-address", help="type the same address again to confirm it")
+    parent.add_argument("--confirm-model", help="only for devices the tool does not know: type the model the TV reports")
+    parent.add_argument("--apply", action="store_true", help="really do it (without this you only see the plan)")
+    parent.add_argument("--state-dir", help="where saved copies are kept")
+    parser = argparse.ArgumentParser(
+        prog="secure-linux-tv-cleanup",
+        description="Tidy a Chromecast / Google TV you own. Safe by default: it shows a plan and changes nothing unless you add --apply.",
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+    sub.add_parser("guide", help="the steps, in plain English")
+    sub.add_parser("info", parents=[parent], help="show the TV's model (changes nothing)")
+    sub.add_parser("status", parents=[parent], help="what this tool has changed so far")
+    sub.add_parser("backup", parents=[parent], help="save the list of apps and the home screen")
+    hide = sub.add_parser("hide-clutter", parents=[parent], help="hide apps from the checked-safe list (not remove)")
+    hide.add_argument("--group", action="append", choices=("google", "tracking"), help="which group of apps (default: google)")
+    hide.add_argument("--include-single-source", action="store_true", help="also hide apps only one public list recommends")
+    hide.add_argument("--package", action="append", help="hide one named app (must be on the checked-safe list)")
+    undo = sub.add_parser("undo", parents=[parent], help="put the TV back exactly as saved")
+    undo.add_argument("--from-file", help="a saved copy to use instead of the first one")
+    undo.add_argument("--keep-apps", action="store_true", help="do not remove apps this tool installed")
+    for name, text in (("launcher-install", "install the plain home screen app (FLauncher)"), ("youtube-install", "install SmartTube, an ad-reducing YouTube app")):
+        item = sub.add_parser(name, parents=[parent], help=text)
+        item.add_argument("--download", action="store_true", help="download the official file (fingerprint checked)")
+        item.add_argument("--apk", help="use a file you already have (fingerprint checked)")
+        item.add_argument("--allow-unpinned-file", action="store_true", help="use a file whose fingerprint this kit does not know")
+    on = sub.add_parser("launcher-on", parents=[parent], help="make the plain home screen the home screen")
+    on.add_argument("--confirm-launcher-works", action="store_true", help="you opened it on the TV and the remote works")
+    sub.add_parser("launcher-off", parents=[parent], help="go back to the stock home screen")
+    sub.add_parser("youtube-remove", parents=[parent], help="remove the YouTube app this tool installed")
+    return parser
+
+
+COMMANDS = {
+    "guide": cmd_guide, "info": cmd_info, "status": cmd_status, "backup": cmd_backup,
+    "hide-clutter": cmd_hide, "undo": cmd_undo,
+    "launcher-install": cmd_launcher_install, "launcher-on": cmd_launcher_on, "launcher-off": cmd_launcher_off,
+    "youtube-install": cmd_youtube_install, "youtube-remove": cmd_youtube_remove,
+}
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    try:
+        return COMMANDS[args.command](args)
+    except Refused as exc:
+        say("STOPPED (nothing was changed by this step): " + str(exc))
+        return 2
+    except Failed as exc:
+        say("PROBLEM: " + str(exc))
+        return 1
+    except subprocess.TimeoutExpired:
+        say("PROBLEM: the TV did not answer in time. Check it is on and on the same Wi-Fi.")
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

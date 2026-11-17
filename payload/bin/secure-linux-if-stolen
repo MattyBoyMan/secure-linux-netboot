@@ -1,0 +1,389 @@
+#!/usr/bin/env python3
+"""secure-linux-if-stolen: what to do if this computer is lost or stolen, and an "if found" message for the lock screen.
+
+  secure-linux-if-stolen                     show the checklist (change passwords, other computers, report the serial)
+  secure-linux-if-stolen --pause             same, then wait for Enter (for the menu entry)
+  secure-linux-if-stolen save [FILE]         save the checklist as a text file to print (default: Documents folder)
+  secure-linux-if-stolen serial              show this computer's serial number, to write down NOW
+  secure-linux-if-stolen message set TEXT... put YOUR "if found" words on the lock screen (KDE Plasma)
+  secure-linux-if-stolen message show        show the saved message
+  secure-linux-if-stolen message clear       take the message off the lock screen again
+  secure-linux-if-stolen --help              this page
+
+Honest limits: Secure Linux cannot lock or wipe a stolen computer from far away. A stolen computer is not on your
+home network, so nothing here can reach it. What protects you is the encrypted disk and what you do from another
+device (the checklist). The lock-screen message is only words that you type: anyone can read it, so give a phone
+number or email that is not your home address. Nothing is sent anywhere.
+"""
+import os
+import re
+import shutil
+import subprocess
+import sys
+
+MAX_MESSAGE = 240
+ASK_BACK = "secure-linux-if-stolen"
+
+
+def home():
+    return os.environ.get("HOME") or os.environ.get("USERPROFILE") or os.path.expanduser("~")
+
+
+def state_dir():
+    return os.environ.get("SL_STATE", "/var/lib/secure-linux")
+
+
+def etc_dir():
+    return os.environ.get("SL_ETC", "/etc/secure-linux")
+
+
+def config_dir():
+    return os.path.join(home(), ".config", "secure-linux")
+
+
+def message_file():
+    return os.path.join(config_dir(), "if-found.txt")
+
+
+def svg_file():
+    return os.path.join(home(), ".local", "share", "secure-linux", "if-found-lockscreen.svg")
+
+
+def read_text(path):
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            return fh.read()
+    except OSError:
+        return ""
+
+
+def write_text(path, text):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write(text)
+
+
+def profile():
+    value = read_text(os.path.join(etc_dir(), "profile")).strip()
+    return value if value in ("full", "lite") else "full"
+
+
+# ---------------------------------------------------------------- facts about this computer
+def dmi(field):
+    """A value from the firmware tables. The serial number may be readable by root only; then this is empty."""
+    sysfs = os.environ.get("SL_TEST_SYSFS", "/sys")
+    value = read_text(os.path.join(sysfs, "class", "dmi", "id", field)).strip()
+    if value.lower() in ("", "to be filled by o.e.m.", "default string", "none", "not specified",
+                         "system serial number", "default", "n/a"):
+        return ""
+    return value
+
+
+def serial_number():
+    return dmi("product_serial") or dmi("chassis_serial") or dmi("board_serial")
+
+
+def disk_encrypted():
+    """True / False / None (unknown) from the last health check (row 'encryption')."""
+    for ln in read_text(os.path.join(state_dir(), "checks")).splitlines():
+        parts = ln.split("|")
+        if len(parts) >= 3 and parts[0].strip() == "encryption":
+            return parts[1].strip() == "ok"
+    return None
+
+
+def fleet_names():
+    names = []
+    for ln in read_text(os.path.join(config_dir(), "fleet")).splitlines():
+        parts = ln.split()
+        if len(parts) >= 2 and not ln.lstrip().startswith("#"):
+            names.append(parts[0])
+    return names
+
+
+# ---------------------------------------------------------------- the checklist
+def checklist():
+    enc = disk_encrypted()
+    serial = serial_number()
+    model = " ".join(x for x in (dmi("sys_vendor"), dmi("product_name")) if x)
+    fleet = fleet_names()
+    out = []
+    out.append("IF MY COMPUTER IS STOLEN OR LOST")
+    out.append("=" * 32)
+    out.append("")
+    out.append("Stay calm. Work through the steps below, from another device (your phone or a friend's computer).")
+    out.append("")
+    if enc is True:
+        out.append("Your files: this computer's disk is encrypted. Without your disk password, someone who takes the")
+        out.append("disk out cannot read your files. This protects best while the computer was switched off or locked.")
+    elif enc is False:
+        out.append("Your files: the last health check did NOT find an encrypted disk, so treat everything on this")
+        out.append("computer as readable by whoever has it. Do the steps below quickly.")
+    else:
+        out.append("Your files: I could not confirm whether this disk is encrypted (no health check result yet).")
+        out.append("If it was encrypted at setup, a thief cannot read your files without your disk password.")
+    out.append("Secure Linux cannot lock or wipe this computer from far away. A stolen computer is not on your")
+    out.append("home network, so nothing can reach it. The steps below protect your accounts instead.")
+    out.append("")
+    out.append("1. Change your passwords, most important first")
+    out.append("   Email first (it can reset every other password), then banking, then your Google, Apple or")
+    out.append("   Microsoft account, then social media and shopping. Turn on two-step sign-in. If a site has")
+    out.append("   'sign out of all devices', use it.")
+    out.append("   If you keep passwords in KeePassXC or another password manager on this computer, change the")
+    out.append("   important ones too, and the password manager's own main password.")
+    out.append("")
+    out.append("2. Other computers and your home network")
+    if fleet:
+        out.append("   This computer looked after: %s." % ", ".join(fleet))
+    out.append("   - If this computer looked after other Secure Linux computers, go to each one and delete the line")
+    out.append("     ending in 'secure-linux-fleet' from ~/.ssh/authorized_keys. That stops the stolen computer")
+    out.append("     from logging in to them.")
+    out.append("   - If another of your computers looks after this one, on that computer run:")
+    out.append("       secure-linux-fleet remove NAME")
+    out.append("     (NAME is what 'secure-linux-fleet list' shows).")
+    out.append("   - If this computer had your home Wi-Fi saved, change the Wi-Fi password on your router.")
+    out.append("   - If it made backups to a home server or drive, change that password or key as well.")
+    out.append("")
+    out.append("3. Report it")
+    out.append("   Tell the police and ask for a report number. Your insurer will want it.")
+    if model:
+        out.append("   Make and model: %s" % model)
+    if serial:
+        out.append("   Serial number: %s" % serial)
+    else:
+        out.append("   Serial number: not readable without the administrator password. It is on the sticker under")
+        out.append("   the laptop, on the box or receipt, or run: sudo dmidecode -s system-serial-number")
+    out.append("   Give the serial number to the police. It stays on this page; it is never sent anywhere.")
+    out.append("")
+    out.append("4. Stay safe")
+    out.append("   Do not try to get the computer back yourself, and do not meet strangers alone.")
+    out.append("")
+    out.append("DO THIS NOW, BEFORE ANYTHING HAPPENS")
+    out.append("   - Write down the serial number (run: %s serial) and keep the note somewhere else." % ASK_BACK)
+    out.append("   - Print this page or keep a copy on your phone (run: %s save). A copy that lives only on this" % ASK_BACK)
+    out.append("     computer is gone with it.")
+    out.append("   - Put your own 'if found' words on the lock screen (run: %s message set ...)." % ASK_BACK)
+    return "\n".join(out) + "\n"
+
+
+def cmd_checklist(args):
+    sys.stdout.write(checklist())
+    return 0
+
+
+def cmd_save(args):
+    target = args[0] if args else None
+    if not target:
+        docs = os.path.join(home(), "Documents")
+        target = os.path.join(docs if os.path.isdir(docs) else home(), "If-my-computer-is-stolen.txt")
+    try:
+        write_text(target, checklist())
+    except OSError as exc:
+        print("I could not save the checklist to %s (%s)." % (target, exc.strerror or exc))
+        return 1
+    print("Saved: %s" % target)
+    print("Print it, or copy it to your phone. A copy that stays only on this computer is gone if it is stolen.")
+    return 0
+
+
+def cmd_serial(args):
+    serial = serial_number()
+    if serial:
+        print("This computer's serial number: %s" % serial)
+        print("Write it down and keep the note somewhere else. It is not sent anywhere.")
+        return 0
+    print("The serial number is not readable without the administrator password.")
+    print("It is on the sticker under the laptop, or on the box or receipt. Or run: sudo dmidecode -s system-serial-number")
+    return 1
+
+
+# ---------------------------------------------------------------- the "if found" message
+def clean_message(words):
+    text = " ".join(words)
+    text = re.sub(r"[\x00-\x08\x0b-\x1f\x7f]", "", text.replace("\r", ""))
+    lines = [re.sub(r"[ \t]+", " ", ln).strip() for ln in text.split("\n")]
+    return "\n".join(ln for ln in lines if ln)[:MAX_MESSAGE]
+
+
+def xml_escape(text):
+    return (text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;"))
+
+
+def wrap(text, width=56):
+    lines = []
+    for para in text.split("\n"):
+        cur = ""
+        for word in para.split(" "):
+            if cur and len(cur) + 1 + len(word) > width:
+                lines.append(cur)
+                cur = word
+            else:
+                cur = (cur + " " + word).strip()
+        lines.append(cur)
+    return lines
+
+
+def make_svg(text):
+    lines = ["IF FOUND, PLEASE HELP"] + [""] + wrap(text)
+    parts = ['<?xml version="1.0" encoding="UTF-8"?>',
+             '<svg xmlns="http://www.w3.org/2000/svg" width="1920" height="1080" viewBox="0 0 1920 1080">',
+             '<rect width="1920" height="1080" fill="#14213d"/>']
+    y = 330
+    for i, ln in enumerate(lines):
+        size = 64 if i == 0 else 48
+        weight = "bold" if i == 0 else "normal"
+        parts.append('<text x="960" y="%d" font-family="sans-serif" font-size="%d" font-weight="%s" fill="#ffffff" '
+                     'text-anchor="middle">%s</text>' % (y, size, weight, xml_escape(ln)))
+        y += 80 if i == 0 else 64
+    parts.append("</svg>")
+    return "\n".join(parts) + "\n"
+
+
+def kde_tool(name):
+    for suffix in ("6", "5"):
+        found = shutil.which(name + suffix)
+        if found:
+            return found
+    return None
+
+
+def kde_get(*groups_key):
+    tool = kde_tool("kreadconfig")
+    if not tool:
+        return None
+    cmd = [tool, "--file", "kscreenlockerrc"]
+    for g in groups_key[:-1]:
+        cmd += ["--group", g]
+    cmd += ["--key", groups_key[-1]]
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return res.stdout.strip() if res.returncode == 0 else None
+
+
+def kde_set(groups, key, value):
+    tool = kde_tool("kwriteconfig")
+    if not tool:
+        return False
+    cmd = [tool, "--file", "kscreenlockerrc"]
+    for g in groups:
+        cmd += ["--group", g]
+    cmd += ["--key", key]
+    cmd += ["--delete"] if value is None else [value]
+    try:
+        return subprocess.run(cmd, capture_output=True, timeout=20).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+IMG_GROUPS = ["Greeter", "Wallpaper", "org.kde.image", "General"]
+
+
+def our_image_url():
+    return "file://" + svg_file().replace("\\", "/")
+
+
+def apply_lock_message(text):
+    """Returns (applied, plain-English line saying exactly what happened)."""
+    if profile() == "lite":
+        return False, ("The lock screen on the Lite version cannot show a message that I can set from here, so the "
+                       "message is saved but NOT shown on the lock screen. It is on your checklist, and you can also "
+                       "stick a label on the lid.")
+    if not kde_tool("kwriteconfig"):
+        return False, ("I could not find the tool that sets the lock screen, so the message is saved but NOT shown "
+                       "on the lock screen.")
+    current = kde_get(*IMG_GROUPS, "Image")
+    if current is None and kde_tool("kreadconfig") is None:
+        return False, "I could not read the lock screen settings, so I left them alone. The message is only saved."
+    if current and current != our_image_url():
+        return False, ("Your lock screen already uses a picture you chose, so I left it alone. The message is saved; "
+                       "run '%s message clear' and set it again if you want it on the lock screen instead." % ASK_BACK)
+    write_text(svg_file(), make_svg(text))
+    ok = kde_set(["Greeter"], "WallpaperPlugin", "org.kde.image") and kde_set(IMG_GROUPS, "Image", our_image_url())
+    if not ok:
+        return False, "I could not change the lock screen settings, so the message is saved but NOT shown there."
+    return True, "The message is now on your lock screen (it shows the next time the screen locks)."
+
+
+def remove_lock_message():
+    """Take our picture off the lock screen, but only if it is ours."""
+    if profile() == "lite" or not kde_tool("kwriteconfig"):
+        return False
+    if kde_get(*IMG_GROUPS, "Image") != our_image_url():
+        return False
+    kde_set(IMG_GROUPS, "Image", None)
+    kde_set(["Greeter"], "WallpaperPlugin", None)
+    try:
+        os.remove(svg_file())
+    except OSError:
+        pass
+    return True
+
+
+def cmd_message(args):
+    sub = args[0] if args else "show"
+    if sub == "show":
+        text = read_text(message_file()).strip()
+        if not text:
+            print("No 'if found' message is saved. Set one with: %s message set YOUR WORDS" % ASK_BACK)
+            return 1
+        print(text)
+        return 0
+    if sub == "clear":
+        had = bool(read_text(message_file()).strip())
+        removed = remove_lock_message()
+        try:
+            os.remove(message_file())
+        except OSError:
+            pass
+        print("Your saved message was deleted." if had else "There was no saved message.")
+        if removed:
+            print("It is off the lock screen again.")
+        return 0
+    if sub == "set":
+        text = clean_message(args[1:])
+        if not text:
+            print("Type the words after 'set'. Example:")
+            print('  %s message set "If found, please call 555 0100 or email lost@example.org. Thank you."' % ASK_BACK)
+            return 2
+        write_text(message_file(), text + "\n")
+        print("Saved your message:")
+        for ln in text.split("\n"):
+            print("  " + ln)
+        print("Anyone who picks up the computer can read it. Use a phone number or email that is not your home")
+        print("address, and never put a password in it.")
+        applied, line = apply_lock_message(text)
+        print(line)
+        return 0
+    print("Unknown message option: %s (use set, show or clear)" % sub, file=sys.stderr)
+    return 2
+
+
+def main(argv):
+    args = argv[1:]
+    if args and args[0] in ("-h", "--help", "help"):
+        print(__doc__.strip())
+        return 0
+    pause = False
+    if args and args[0] == "--pause":
+        pause = True
+        args = args[1:]
+    cmd = args[0] if args else "checklist"
+    rest = args[1:]
+    handlers = {"checklist": cmd_checklist, "show": cmd_checklist, "save": cmd_save, "serial": cmd_serial,
+                "message": cmd_message}
+    if cmd not in handlers:
+        print("Unknown option: %s (see --help)" % cmd, file=sys.stderr)
+        return 2
+    code = handlers[cmd](rest)
+    if pause:
+        try:
+            input("\nPress Enter to close. ")
+        except EOFError:
+            pass
+    return code
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

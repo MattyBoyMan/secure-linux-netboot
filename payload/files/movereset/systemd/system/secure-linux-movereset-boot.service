@@ -1,0 +1,18 @@
+# Secure Linux (movereset): finish a desktop-settings reset, its undo, or moved desktop settings at start-up,
+# before anyone logs in (the desktop would otherwise write its old settings back when it closes).
+# Runs only when someone asked for it (a request file in their own home folder); the work itself runs as that
+# person (runuser), never with administrator rights on their files.
+[Unit]
+Description=Secure Linux: finish a settings reset or a moved setup before anyone logs in
+After=local-fs.target
+RequiresMountsFor=/home
+Before=display-manager.service systemd-user-sessions.service
+ConditionPathExistsGlob=/home/*/.local/state/secure-linux/movereset/*.pending
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/secure-linux-reset boot
+TimeoutStartSec=15min
+
+[Install]
+WantedBy=multi-user.target

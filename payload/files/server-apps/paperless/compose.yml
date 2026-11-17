@@ -1,0 +1,83 @@
+# Paperless-ngx for Secure Linux: turns paper letters, bills and receipts into searchable files. Home network only.
+# Started only by secure-linux-server-apps, which fills in the SL_* values from this computer (see app.conf).
+# Images pinned by version AND digest (checked on Docker Hub, 2026-11-16), following Paperless-ngx's own
+# PostgreSQL compose file: paperless-ngx 3.4.2, postgres 18.7-alpine, valkey 9.1.3-alpine (the job queue).
+# Passwords and the secret key are files made on this computer; Paperless reads them with its *_FILE settings.
+# Text recognition (OCR) runs on this computer; documents never leave it. Drop scans into the "consume" folder.
+services:
+  broker:
+    image: docker.io/valkey/valkey:9.1.3-alpine@sha256:bf09d58e96d6b4524a15396b65b242bbe18beebbcc15a04d8ee75ddac62fae0b
+    restart: unless-stopped
+    networks:
+      - backend
+    volumes:
+      - "${SL_DATA:?data folder missing}/broker:/data:Z"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - NET_RAW
+      - MKNOD
+
+  db:
+    image: docker.io/library/postgres:18.7-alpine@sha256:b6972e1115a4ff8eba5d7f7d19184926d1e16d7d1136ae1e1a7ebf286da0f015
+    restart: unless-stopped
+    networks:
+      - backend
+    volumes:
+      - "${SL_DATA:?data folder missing}/db:/var/lib/postgresql:Z"
+      - "${SL_DATA:?data folder missing}/secrets/db_password:/run/secrets/db_password:ro,z"
+    environment:
+      POSTGRES_DB: paperless
+      POSTGRES_USER: paperless
+      POSTGRES_PASSWORD_FILE: /run/secrets/db_password
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - NET_RAW
+      - MKNOD
+
+  webserver:
+    image: docker.io/paperlessngx/paperless-ngx:3.4.2@sha256:d704e84f88300eb6ab001ab15720a2330ff99169cf9f94d6b8fcc44b63a84c84
+    restart: unless-stopped
+    depends_on:
+      - db
+      - broker
+    networks:
+      - backend
+      - frontend
+    ports:
+      - "${SL_BIND:?home address missing}:${SL_PORT:?port missing}:8000"
+    volumes:
+      - "${SL_DATA:?data folder missing}/data:/usr/src/paperless/data:Z"
+      - "${SL_DATA:?data folder missing}/media:/usr/src/paperless/media:Z"
+      - "${SL_DATA:?data folder missing}/export:/usr/src/paperless/export:Z"
+      - "${SL_DATA:?data folder missing}/consume:/usr/src/paperless/consume:Z"
+      - "${SL_DATA:?data folder missing}/secrets/db_password:/run/secrets/db_password:ro,z"
+      - "${SL_DATA:?data folder missing}/secrets/secret_key:/run/secrets/secret_key:ro,z"
+      - "${SL_DATA:?data folder missing}/secrets/admin_user:/run/secrets/admin_user:ro,z"
+      - "${SL_DATA:?data folder missing}/secrets/admin_password:/run/secrets/admin_password:ro,z"
+    environment:
+      PAPERLESS_REDIS: redis://broker:6379
+      PAPERLESS_DBENGINE: postgresql
+      PAPERLESS_DBHOST: db
+      PAPERLESS_DBNAME: paperless
+      PAPERLESS_DBUSER: paperless
+      PAPERLESS_DBPASS_FILE: /run/secrets/db_password
+      PAPERLESS_SECRET_KEY_FILE: /run/secrets/secret_key
+      PAPERLESS_ADMIN_USER_FILE: /run/secrets/admin_user
+      PAPERLESS_ADMIN_PASSWORD_FILE: /run/secrets/admin_password
+      PAPERLESS_ALLOWED_HOSTS: "${SL_BIND:?home address missing},${SL_HOSTNAME:-localhost}.local,localhost"
+      PAPERLESS_CSRF_TRUSTED_ORIGINS: "http://${SL_BIND:?home address missing}:${SL_PORT:?port missing},http://${SL_HOSTNAME:-localhost}.local:${SL_PORT:?port missing}"
+      PAPERLESS_TIME_ZONE: "${SL_TZ:-UTC}"
+      USERMAP_UID: "${SL_UID:?user missing}"
+      USERMAP_GID: "${SL_GID:?group missing}"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - NET_RAW
+      - MKNOD
+
+networks:
+  backend:
+    internal: true
+  frontend: {}

@@ -6,6 +6,8 @@
 #   secure-linux-explain --search WORDS   search the guide (no AI needed), e.g. --search printer wifi
 #   secure-linux-explain --no-ai [TEXT]   skip the AI and search the guide with the words from the error
 #   secure-linux-explain --print [TEXT]   print the answer here instead of opening a window
+#   secure-linux-explain --update         explain, in plain words, the update that was just installed
+#                                         (uses the kit's own written notes; works with no AI too)
 # The AI is "Ollama" running on THIS computer: your error text never leaves it. If Ollama (or a model) isn't
 # there, you still get the best matching guide pages. AI answers can be wrong: it says so, and it never
 # runs anything for you.
@@ -14,7 +16,7 @@ SL_ROOT=${SL_ROOT:-/usr/local/lib/secure-linux}
 . "$SL_ROOT/lib/common.sh"
 . "$SL_ROOT/files/comfort/comfort-lib.sh"
 SELF=$(readlink -f "$0")
-usage() { sed -n '2,12p' "$SELF" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,14p' "$SELF" | sed 's/^# \{0,1\}//'; }
 OLLAMA_URL=${OLLAMA_URL:-http://127.0.0.1:11434}
 MAX_CHARS=3500
 
@@ -130,10 +132,11 @@ pick_model() {   # first of the user's chosen models that is installed, else any
   for m in ${want//,/ }; do printf '%s\n' "$have" | grep -qx "$m" && { echo "$m"; return 0; }; done
   printf '%s\n' "$have" | grep -v -i 'embed' | head -1
 }
-ask_ai() {   # ask_ai MODEL "text"  -> the answer, or nothing
-  local model=$1 text=$2 body
-  body=$(python3 -I - "$model" "$text" <<'PY'
+ask_ai() {   # ask_ai MODEL "text" [update] -> the answer, or nothing
+  local model=$1 text=$2 mode=${3:-error} body
+  body=$(python3 -I - "$model" "$text" "$mode" <<'PY'
 import json, sys
+mode = sys.argv[3]
 system = ("You help a beginner who has just switched from Windows or Mac to Linux (Fedora). "
           "Explain the error message in plain, calm Australian English, in three short parts: "
           "1) What it means, in one or two sentences, with no jargon. "
@@ -141,8 +144,16 @@ system = ("You help a beginner who has just switched from Windows or Mac to Linu
           "Never blame the person. Never tell them to disable the firewall, Secure Boot, SELinux or the disk "
           "encryption. If a step needs a command, say what it does before showing it, and prefer undoable steps. "
           "If you are not sure, say so. Keep it under 200 words.")
+prompt = "Here is the error message:\n\n" + sys.argv[2]
+if mode == "update":
+    system = ("You help a beginner who uses Secure Linux (Fedora). Their computer's kit has just been updated. "
+              "Using ONLY the notes below, explain in plain, calm Australian English what changed and what it means "
+              "for them. Use short sentences and no jargon. Do not add anything that is not in the notes: no "
+              "invented features, numbers, dates or settings. If the notes are thin, say so. Say that nothing "
+              "needs doing unless the notes say otherwise. Keep it under 150 words.")
+    prompt = "Here are the update notes:\n\n" + sys.argv[2]
 print(json.dumps({"model": sys.argv[1], "system": system,
-                  "prompt": "Here is the error message:\n\n" + sys.argv[2],
+                  "prompt": prompt,
                   "stream": False, "options": {"temperature": 0.2, "num_ctx": 4096}}))
 PY
   ) || return 1
@@ -169,11 +180,13 @@ show() {   # show "text"
 }
 
 # ---------------------------------------------------------------- main
-PRINT=""; NOAI=""; SEARCH=""; TEXT=""; HAVE_TEXT=""
+PRINT=""; NOAI=""; SEARCH=""; TEXT=""; HAVE_TEXT=""; UPDATE=""; TREE=""
 while [ $# -gt 0 ]; do
   case $1 in
     -h|--help|help) usage; exit 0 ;;
     --print) PRINT=1 ;;
+    --update) UPDATE=1 ;;
+    --tree) [ $# -ge 2 ] || { usage; exit 2; }; TREE=$2; shift ;;
     --no-ai) NOAI=1 ;;
     --search) SEARCH=1; shift; TEXT="$*"; HAVE_TEXT=1; break ;;
     -) TEXT=$(cat); HAVE_TEXT=1 ;;
@@ -186,6 +199,51 @@ done
 if [ -n "$SEARCH" ]; then
   [ -n "$TEXT" ] || { echo "Type some words to search for, e.g.: secure-linux-explain --search printer" >&2; exit 2; }
   show "$(guide_section "$TEXT")"
+  exit 0
+fi
+
+# ---------------------------------------------------------------- --update: explain the update that was just installed
+update_notes() {   # the kit's own written notes and file counts (read-only: it does not mark the note as seen)
+  local wn="" d
+  for d in "$(dirname "$SELF")" "$SL_ROOT/bin"; do [ -f "$d/secure-linux-whats-new" ] && { wn="$d/secure-linux-whats-new"; break; }; done
+  [ -n "$wn" ] || return 1
+  # no update recorded: say so (there is nothing for the AI to explain)
+  python3 -I "$wn" --json --tree "${TREE:-$SL_ROOT}" 2>/dev/null | grep -q '"updated": true' || return 1
+  python3 -I "$wn" --no-mark --tree "${TREE:-$SL_ROOT}" 2>/dev/null
+}
+if [ -n "$UPDATE" ]; then
+  NOTES=$(update_notes) || NOTES=""
+  if [ -z "${NOTES//[[:space:]]/}" ]; then
+    show "No update has been applied to this kit yet, so there is nothing to explain."
+    exit 0
+  fi
+  NOTES=$(tidy_text "$NOTES")
+  ANSWER=""; NOTE=""
+  if [ -n "$NOAI" ]; then NOTE="(AI switched off.) Here are the update notes as they were written."
+  elif ! cf_have ollama; then NOTE="The private AI (Ollama) isn't installed on this computer, so here are the update notes as they were written."
+  elif ! ai_up; then NOTE="The private AI isn't running right now, so here are the update notes as they were written."
+  else
+    MODEL=$(pick_model) || MODEL=""
+    if [ -z "$MODEL" ]; then NOTE="The private AI has no model downloaded yet, so here are the update notes as they were written."
+    else
+      cf_notify "Explain This Update" "Thinking... this can take a minute on a laptop. Nothing leaves this computer."
+      ANSWER=$(ask_ai "$MODEL" "$NOTES" update) || ANSWER=""
+      [ -n "$ANSWER" ] || NOTE="The AI didn't give an answer this time, so here are the update notes as they were written."
+    fi
+  fi
+  if [ -n "$ANSWER" ]; then
+    OUT="$ANSWER
+
+----
+This explanation was written by an AI running on this computer. It can be wrong, so check it against the notes below. Nothing was sent anywhere.
+
+$NOTES"
+  else
+    OUT="$NOTE
+
+$NOTES"
+  fi
+  show "$OUT"
   exit 0
 fi
 

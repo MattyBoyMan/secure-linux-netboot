@@ -1,0 +1,472 @@
+#!/usr/bin/env python3
+"""secure-linux-offline-library: offline libraries for the Kiwix reader (Wikipedia and more), never automatic.
+
+  secure-linux-offline-library list             show the libraries you can get, with their real sizes
+  secure-linux-offline-library get NAME         download one library (shows the size first and asks you)
+  secure-linux-offline-library status           show the libraries already on this computer
+  secure-linux-offline-library verify FILE      check a library file against its published checksum
+  secure-linux-offline-library where            show the folders this tool uses
+
+Options for get:
+  --dest DIR       save in this folder (default: Offline-Library in your home folder)
+  --yes            answer yes to the question (for a script; a library over 10 GB also needs --yes-big)
+  --yes-big        also allow a library over 10 GB when --yes is used
+  --max-gb N       refuse a library bigger than N gigabytes
+
+Nothing here starts by itself. Setup and repair never call it. A library is only downloaded when you ask for it.
+Every download is checked against the checksum the Kiwix project publishes next to it. A file that does not match
+is thrown away. If the home-server folder holds the same file, it is copied from there instead of the internet.
+Exit codes: 0 done, 1 problem, 2 wrong use, 3 you said no, 4 not enough space, 5 checksum did not match, 6 no internet.
+"""
+import hashlib
+import http.client
+import os
+import re
+import shutil
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+
+PROG = "secure-linux-offline-library"
+GIB = 1024 ** 3
+BIG_BYTES = GIB            # from here the question asks you to type a word
+HUGE_BYTES = 10 * GIB      # from here a script also needs --yes-big
+HEADROOM = GIB             # free space kept spare
+DEFAULT_BASE = "https://download.kiwix.org/zim"
+HOME_SHARE_DEFAULT = "/media/homeserver/Offline-Library"
+
+# name -> (folder on the Kiwix server, start of the file name, plain description, size shown when offline)
+COLLECTIONS = {
+    "simple": ("wikipedia", "wikipedia_en-simple_all_nopic_", "Simple English Wikipedia, no pictures. Short, plain articles.", "about 1 GB"),
+    "medicine": ("wikipedia", "wikipedia_en_medicine_nopic_", "Wikipedia's medical articles, no pictures.", "about 1 GB"),
+    "maths": ("wikipedia", "wikipedia_en_mathematics_nopic_", "Wikipedia's maths articles, no pictures.", "about 0.3 GB"),
+    "computing": ("wikipedia", "wikipedia_en_computer_nopic_", "Wikipedia's computer articles, no pictures.", "about 0.4 GB"),
+    "top": ("wikipedia", "wikipedia_en_top_nopic_", "The most-read Wikipedia articles, no pictures.", "about 2 GB"),
+    "intro": ("wikipedia", "wikipedia_en_all_mini_", "Every English Wikipedia article, first paragraph only.", "about 13 GB"),
+    "wikipedia": ("wikipedia", "wikipedia_en_all_nopic_", "All of English Wikipedia without pictures.", "about 49 GB"),
+}
+ORDER = ["simple", "medicine", "maths", "computing", "top", "intro", "wikipedia"]
+FILE_RE = re.compile(r"^[a-z0-9_.-]+\.zim$")
+HASH_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+def say(msg=""):
+    print(msg)
+
+
+def err(msg):
+    print(msg, file=sys.stderr)
+
+
+class Problem(Exception):
+    def __init__(self, text, code=1):
+        Exception.__init__(self, text)
+        self.text = text
+        self.code = code
+
+
+def human(n):
+    n = float(n)
+    for unit in ("bytes", "KB", "MB", "GB", "TB"):
+        if n < 1000 or unit == "TB":
+            return ("%d bytes" % n) if unit == "bytes" else ("%.1f %s" % (n, unit))
+        n /= 1000.0
+    return "%.1f TB" % n
+
+
+# ---------------------------------------------------------------- places
+def base_url():
+    base = os.environ.get("SL_OL_BASE", DEFAULT_BASE).rstrip("/")
+    p = urllib.parse.urlparse(base)
+    local = p.hostname in ("127.0.0.1", "localhost", "::1")
+    if p.scheme != "https" and not (p.scheme == "http" and local):
+        raise Problem("The library address must start with https. It was left alone.", 1)
+    return base
+
+
+def dest_dir(cli_dest=None):
+    d = cli_dest or os.environ.get("SL_OL_DEST") or os.path.join(os.path.expanduser("~"), "Offline-Library")
+    return os.path.abspath(d)
+
+
+def home_dir():
+    return os.environ.get("SL_OL_HOME_DIR", HOME_SHARE_DEFAULT)
+
+
+def free_bytes(path):
+    forced = os.environ.get("SL_OL_FREE_BYTES")
+    if forced and forced.isdigit():
+        return int(forced)
+    probe = path
+    while probe and not os.path.exists(probe):
+        parent = os.path.dirname(probe)
+        if parent == probe:
+            break
+        probe = parent
+    return shutil.disk_usage(probe or ".").free
+
+
+# ---------------------------------------------------------------- network (https only; redirects must stay https)
+class _SafeRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        old = urllib.parse.urlparse(req.full_url)
+        new = urllib.parse.urlparse(newurl)
+        local = new.hostname in ("127.0.0.1", "localhost", "::1") and old.hostname == new.hostname
+        if new.scheme != "https" and not local:
+            raise urllib.error.HTTPError(newurl, code, "redirect to a non-https address refused", headers, fp)
+        return urllib.request.HTTPRedirectHandler.redirect_request(self, req, fp, code, msg, headers, newurl)
+
+
+def _opener():
+    return urllib.request.build_opener(_SafeRedirect)
+
+
+def _open(url, headers=None, method="GET", timeout=60):
+    req = urllib.request.Request(url, headers=dict({"User-Agent": PROG}, **(headers or {})), method=method)
+    try:
+        return _opener().open(req, timeout=timeout)
+    except urllib.error.HTTPError as e:
+        raise Problem("The server said no (%s) for %s" % (e.code, url.rsplit("/", 1)[-1]), 1 if e.code != 416 else 1)
+    except (urllib.error.URLError, OSError) as e:
+        raise Problem("Could not reach the internet. Check your connection and try again.", 6)
+
+
+def fetch_text(url):
+    with _open(url) as r:
+        return r.read(8 * 1024 * 1024).decode("utf-8", "replace")
+
+
+def remote_size(url):
+    with _open(url, method="HEAD") as r:
+        n = r.headers.get("Content-Length", "")
+    if not n.isdigit():
+        raise Problem("The server did not say how big the file is, so nothing was downloaded.", 1)
+    return int(n)
+
+
+def newest_file(name):
+    folder, prefix, _d, _s = COLLECTIONS[name]
+    listing = fetch_text("%s/%s/" % (base_url(), folder))
+    found = sorted(set(m for m in re.findall(r'href="([^"/?]+\.zim)"', listing)
+                       if m.startswith(prefix) and FILE_RE.match(m)
+                       and re.match(r"^\d{4}-\d{2}\.zim$", m[len(prefix):])))
+    if not found:
+        raise Problem("The library '%s' is not on the server just now. Try again later." % name, 1)
+    return folder, found[-1]
+
+
+def published_sha256(folder, fname):
+    try:
+        text = fetch_text("%s/%s/%s.sha256" % (base_url(), folder, fname))
+    except Problem as e:
+        if e.code == 6:
+            raise
+        raise Problem("The Kiwix project has not published a checksum for %s, so nothing was downloaded." % fname, 5)
+    for line in text.splitlines():
+        parts = line.strip().split()
+        if len(parts) >= 1 and HASH_RE.match(parts[0].lower()):
+            if len(parts) == 1 or parts[-1].lstrip("*") == fname:
+                return parts[0].lower()
+    raise Problem("The published checksum for %s could not be read, so nothing was kept." % fname, 5)
+
+
+def sha256_file(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while True:
+            b = f.read(1024 * 1024)
+            if not b:
+                break
+            h.update(b)
+    return h.hexdigest()
+
+
+# ---------------------------------------------------------------- asking
+def interactive():
+    if os.environ.get("SL_OL_ALLOW_PIPE") == "1":   # for the tests: read the answer from a pipe
+        return True
+    return sys.stdin is not None and sys.stdin.isatty()
+
+
+def confirm(size, free, fname, args):
+    say("")
+    say("Library:    %s" % fname)
+    say("Size:       %s (%s)" % (human(size), "%d bytes" % size))
+    say("Free space: %s" % human(free))
+    big = size >= BIG_BYTES
+    if args["yes"]:
+        if size >= HUGE_BYTES and not args["yes_big"]:
+            raise Problem("This library is over 10 GB. A script must also say --yes-big. Nothing was downloaded.", 3)
+        return
+    if not interactive():
+        raise Problem("Nothing was downloaded. Run this in a terminal and answer the question, or add --yes.", 3)
+    try:
+        if big:
+            say("This is a big download. It can take hours and use a lot of data.")
+            ans = input("Type the word download to start, or press Enter to cancel: ").strip().lower()
+            ok = ans == "download"
+        else:
+            ans = input("Download it now? Type yes or no: ").strip().lower()
+            ok = ans in ("y", "yes")
+    except EOFError:
+        ok = False   # no one answered
+    if not ok:
+        raise Problem("Cancelled. Nothing was downloaded.", 3)
+
+
+# ---------------------------------------------------------------- download and copy
+def download(url, part_path, total):
+    """Download with resume. Returns when part_path holds `total` bytes."""
+    tries = 0
+    while True:
+        have = os.path.getsize(part_path) if os.path.exists(part_path) else 0
+        if have > total:
+            os.remove(part_path)
+            have = 0
+        if have == total:
+            return
+        hdr = {"Range": "bytes=%d-" % have} if have else {}
+        try:
+            r = _open(url, headers=hdr)
+        except Problem as e:
+            tries += 1
+            if tries >= 5 or e.code == 6 and tries >= 3:
+                raise
+            continue
+        with r:
+            mode = "ab"
+            if have and getattr(r, "status", 200) != 206:
+                mode = "wb"   # the server ignored the resume request: start again
+            try:
+                with open(part_path, mode) as out:
+                    last = -1
+                    while True:
+                        chunk = r.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        out.write(chunk)
+                        done = out.tell()
+                        pct = int(done * 100 / total) if total else 100
+                        if pct != last and sys.stdout.isatty():
+                            sys.stdout.write("\r  %3d%%  %s of %s" % (pct, human(done), human(total)))
+                            sys.stdout.flush()
+                            last = pct
+            except (OSError, ConnectionError, http.client.HTTPException):
+                pass
+        if sys.stdout.isatty():
+            sys.stdout.write("\n")
+        now = os.path.getsize(part_path) if os.path.exists(part_path) else 0
+        if now == total:
+            return
+        tries += 1
+        if tries >= 5:
+            raise Problem("The download stopped. Run the same command again: it carries on where it stopped.", 6)
+
+
+def copy_with_resume(src, part_path, total):
+    have = os.path.getsize(part_path) if os.path.exists(part_path) else 0
+    if have > total:
+        have = 0
+    with open(src, "rb") as s, open(part_path, "ab" if have else "wb") as d:
+        s.seek(have)
+        shutil.copyfileobj(s, d, 1024 * 1024)
+
+
+# ---------------------------------------------------------------- commands
+def cmd_list(_args):
+    say("Libraries for the Kiwix reader. Nothing is downloaded by this list.")
+    say("")
+    base_url()
+    online = True
+    for name in ORDER:
+        folder, prefix, desc, approx = COLLECTIONS[name]
+        size_txt = approx
+        fname = ""
+        try:
+            folder, fname = newest_file(name)
+            size_txt = human(remote_size("%s/%s/%s" % (base_url(), folder, fname)))
+        except Problem:
+            online = False
+        say("  %-10s %-12s %s" % (name, size_txt, desc))
+    say("")
+    if not online:
+        say("Some sizes are rough because the internet could not be reached just now.")
+    say("Get one with:  %s get NAME     (it shows the exact size and asks you first)" % PROG)
+    return 0
+
+
+def parse_get(argv):
+    args = {"yes": False, "yes_big": False, "dest": None, "max_gb": None, "name": None}
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--yes":
+            args["yes"] = True
+        elif a == "--yes-big":
+            args["yes_big"] = True
+        elif a in ("--dest", "--max-gb"):
+            i += 1
+            if i >= len(argv):
+                raise Problem("%s needs a value." % a, 2)
+            if a == "--dest":
+                args["dest"] = argv[i]
+            else:
+                if not re.match(r"^\d{1,5}(\.\d{1,4})?$", argv[i]):
+                    raise Problem("--max-gb needs a number of gigabytes.", 2)
+                args["max_gb"] = float(argv[i])
+        elif a.startswith("-"):
+            raise Problem("I do not know the option %s. Try --help." % a, 2)
+        elif args["name"] is None:
+            args["name"] = a
+        else:
+            raise Problem("Give one library name at a time.", 2)
+        i += 1
+    if not args["name"]:
+        raise Problem("Which library? Run '%s list' to see the names." % PROG, 2)
+    if args["name"] not in COLLECTIONS:
+        raise Problem("There is no library called '%s'. Run '%s list' to see the names." % (args["name"], PROG), 2)
+    return args
+
+
+def cmd_get(argv):
+    args = parse_get(argv)
+    name = args["name"]
+    folder, fname = newest_file(name)
+    base = base_url()
+    url = "%s/%s/%s" % (base, folder, fname)
+    size = remote_size(url)
+    dest = dest_dir(args["dest"])
+    final = os.path.join(dest, fname)
+    if args["max_gb"] is not None and size > args["max_gb"] * 1e9:
+        raise Problem("%s is %s, which is more than your limit of %s GB. Nothing was downloaded."
+                      % (fname, human(size), ("%g" % args["max_gb"])), 3)
+    want = published_sha256(folder, fname)       # no published checksum, no download
+    if os.path.exists(final):
+        say("You already have %s. Checking it..." % fname)
+        if sha256_file(final) == want:
+            say("It is complete and matches the published checksum. Nothing to do.")
+            return 0
+        say("The copy you have is not complete or does not match. It will be fetched again.")
+    free = free_bytes(dest)
+    if size + HEADROOM > free:
+        raise Problem("Not enough free space: %s needs %s and only %s is free. Nothing was downloaded."
+                      % (fname, human(size + HEADROOM), human(free)), 4)
+    confirm(size, free, fname, args)
+    os.makedirs(dest, exist_ok=True)
+    part = final + ".part"
+    home_copy = os.path.join(home_dir(), fname)
+    if os.path.isfile(home_copy) and os.path.getsize(home_copy) == size and os.path.abspath(home_copy) != os.path.abspath(final):
+        say("Found it in your home-server folder. Copying from there (no internet used)...")
+        copy_with_resume(home_copy, part, size)
+    else:
+        say("Downloading from the Kiwix project...")
+        download(url, part, size)
+    got = sha256_file(part)
+    if got != want:
+        try:
+            os.remove(part)
+        except OSError:
+            pass
+        raise Problem("The file did not match the published checksum, so it was thrown away. Try again; if it happens "
+                      "again, tell the person who looks after this computer.", 5)
+    os.replace(part, final)
+    say("")
+    say("Done. Saved: %s" % final)
+    say("The checksum matches the one published by the Kiwix project.")
+    say("Open Kiwix, choose 'Open file', and pick that file.")
+    say("If Kiwix cannot see the folder, give it access to the folder in Flatseal.")
+    return 0
+
+
+def cmd_status(_argv):
+    d = dest_dir()
+    found = []
+    for base in (d, home_dir()):
+        if os.path.isdir(base):
+            for f in sorted(os.listdir(base)):
+                if FILE_RE.match(f):
+                    found.append((os.path.join(base, f), os.path.getsize(os.path.join(base, f))))
+    if not found:
+        say("No offline libraries yet. See what is available:  %s list" % PROG)
+        return 0
+    for p, n in found:
+        say("  %-12s %s" % (human(n), p))
+    return 0
+
+
+def cmd_verify(argv):
+    if len(argv) != 1:
+        raise Problem("Usage: %s verify FILE" % PROG, 2)
+    path = argv[0]
+    fname = os.path.basename(path)
+    if not os.path.isfile(path):
+        raise Problem("I cannot find %s." % path, 1)
+    if not FILE_RE.match(fname):
+        raise Problem("That does not look like a Kiwix library file (.zim).", 2)
+    folder = None
+    for _n, (fo, prefix, _d, _s) in COLLECTIONS.items():
+        if fname.startswith(prefix):
+            folder = fo
+    side = path + ".sha256"
+    want = None
+    if folder:
+        try:
+            want = published_sha256(folder, fname)
+        except Problem as e:
+            if e.code == 6:
+                want = None
+            else:
+                raise
+    if want is None and os.path.isfile(side):
+        for line in open(side, encoding="utf-8", errors="replace"):
+            t = line.strip().split()
+            if t and HASH_RE.match(t[0].lower()):
+                want = t[0].lower()
+                break
+        if want:
+            say("No internet: using the checksum file saved next to the library.")
+    if want is None:
+        raise Problem("There is no published checksum to compare with. Connect to the internet and try again.", 6)
+    if sha256_file(path) == want:
+        say("OK: %s matches the published checksum." % fname)
+        return 0
+    err("NOT OK: %s does not match the published checksum. Do not use it." % fname)
+    return 5
+
+
+def cmd_where(_argv):
+    say("Libraries are saved in:   %s" % dest_dir())
+    say("Home-server folder:       %s  (copied from there when the file is in it)" % home_dir())
+    say("Downloaded from:          %s" % base_url())
+    return 0
+
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        text = __doc__.strip("\n")
+        print(text)
+        return 0
+    cmd, rest = argv[0], argv[1:]
+    try:
+        if cmd == "list":
+            return cmd_list(rest)
+        if cmd == "get":
+            return cmd_get(rest)
+        if cmd == "status":
+            return cmd_status(rest)
+        if cmd == "verify":
+            return cmd_verify(rest)
+        if cmd == "where":
+            return cmd_where(rest)
+        raise Problem("I do not know '%s'. Try --help." % cmd, 2)
+    except Problem as e:
+        err(e.text)
+        return e.code
+    except KeyboardInterrupt:
+        err("Stopped. Run the same command again to carry on.")
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

@@ -1,0 +1,8 @@
+[Unit]
+Description=Secure Linux: back up your home folder (only when you turned backups on)
+
+[Service]
+Type=oneshot
+Nice=19
+IOSchedulingClass=idle
+ExecStart=/usr/local/bin/secure-linux-backup run --scheduled

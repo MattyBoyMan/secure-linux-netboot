@@ -1,0 +1,592 @@
+#!/usr/bin/env python3
+"""secure-linux-release-verify: is this Secure Linux release really from the kit's maker?
+
+A release is two small text files: release.json (the release ID and the fingerprint of the whole source)
+and payload-files.json (the SHA-256 of every file an update may fetch). Each one carries a detached
+signature beside it (release.json.sig, payload-files.json.sig) made with the maker's private key on the
+maker's own computer. This tool checks those signatures against the PUBLIC keys shipped in the kit
+(share/secure-linux-release-keys/*.asc), so it does not matter where the files came from (GitHub,
+a home server, a USB stick): a release is accepted only if the signatures verify.
+
+  Answer          exit  meaning
+  verified         0    signed by a trusted key that has not been withdrawn; not older than the local one
+  refused          1    tampered, unsigned, signed by an unknown or withdrawn key, older, or mixed releases
+  usage error      2    the command was typed wrong
+  not set up yet   3    no public release key is in this kit yet: callers keep their existing behaviour
+
+Key rotation: several *.asc keys may be trusted at once (any one valid signature is enough), and a key is
+withdrawn by listing its fingerprint in revoked.txt in the same folder. Only tools Fedora Workstation already
+ships are used (python3 and gpgv from gnupg2). No network, no account, no cost.
+
+A signed file list may never leave out the withdrawn-keys list, this checker or the update tool when the
+computer already has them (--local-tree): installing such a list would delete them.
+Other signed files (the release history, the channel record) are checked with verify_detached(): the same
+rule, one good signature over exactly those bytes from a trusted key that has not been withdrawn.
+
+  secure-linux-release-verify status [--keys DIR]
+  secure-linux-release-verify check --from DIR [--local-release FILE] [--local-file-list FILE]
+                                    [--local-tree DIR] [--keys DIR]
+  secure-linux-release-verify check --release FILE [--signature FILE] [--file-list FILE]
+                                    [--file-list-signature FILE] [--local-release FILE]
+                                    [--local-file-list FILE] [--local-tree DIR] [--keys DIR]
+"""
+from __future__ import annotations
+
+import argparse
+import base64
+import datetime
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+
+HERE = Path(__file__).resolve().parent
+KEYS_FOLDER = "secure-linux-release-keys"
+DEFAULT_KEYS = HERE.parent / "share" / KEYS_FOLDER
+REVOKED_NAME = "revoked.txt"
+RELEASE_NAME = "release.json"
+FILE_LIST_NAME = "payload-files.json"
+SIG_SUFFIX = ".sig"
+RELEASE_ID_RE = re.compile(r"^secure-linux-([0-9]{4})\.([0-9]{2})\.([0-9]{2})-[0-9a-f]{16}$")
+KEY_IN_LIST_RE = re.compile(r"^share/" + KEYS_FOLDER + r"/[^/]+\.asc$")
+# Files a signed list must still name when the computer has them: without revoked.txt a withdrawn key would be
+# trusted again; without the checker or the update tool no later update could be checked (gap check LOW 14).
+MUST_KEEP = (f"share/{KEYS_FOLDER}/{REVOKED_NAME}", "bin/secure-linux-release-verify", "bin/secure-linux-kit-update")
+FPR_RE = re.compile(r"^[0-9A-F]{40}$|^[0-9A-F]{64}$")
+MAX_RECORD = 65536
+MAX_FILE_LIST = 2 * 1024 * 1024
+MAX_SIGNATURE = 65536
+MAX_KEY = 262144
+STRONG_HASHES = {"8", "9", "10", "11"}      # SHA-256, SHA-384, SHA-512, SHA-224 (never SHA-1 or MD5)
+PUBLIC_PACKETS = {2, 6, 12, 13, 14, 17}       # signature, public key, trust, user ID, public subkey, picture
+SECRET_PACKETS = {5, 7}                       # secret key, secret subkey: must never be in the kit
+GPGV_TIMEOUT = 60
+
+VERIFIED, REFUSED, NOT_SET_UP = "verified", "refused", "not-set-up"
+EXIT = {VERIFIED: 0, REFUSED: 1, NOT_SET_UP: 3}
+NOT_SET_UP_TEXT = ("signing not set up yet - no release key is in this kit, so releases are checked "
+                   "the way they always were (each file's SHA-256 against the published list)")
+
+
+class Refuse(Exception):
+    """A reason to refuse the release, in plain words."""
+
+
+class Verdict:
+    def __init__(self, state: str, message: str, release_id: str = "", signers: list[str] | None = None):
+        self.state = state
+        self.message = message
+        self.release_id = release_id
+        self.signers = signers or []
+
+    @property
+    def exit_code(self) -> int:
+        return EXIT[self.state]
+
+    def line(self) -> str:
+        if self.state == VERIFIED:
+            return f"RELEASE SIGNATURE: verified - {self.message}"
+        if self.state == NOT_SET_UP:
+            return f"RELEASE SIGNATURE: {NOT_SET_UP_TEXT}."
+        return f"RELEASE SIGNATURE: refused - {self.message}. Nothing was changed."
+
+
+# ------------------------------------------------------------------ OpenPGP reading (no gpg needed)
+def crc24(data: bytes) -> int:
+    crc = 0xB704CE
+    for byte in data:
+        crc ^= byte << 16
+        for _ in range(8):
+            crc <<= 1
+            if crc & 0x1000000:
+                crc ^= 0x1864CFB
+    return crc & 0xFFFFFF
+
+
+def dearmor(data: bytes, what: str) -> bytes:
+    """Binary OpenPGP data from one or more ASCII-armored blocks (or the bytes unchanged if already binary)."""
+    if data[:1] and data[0] & 0x80:
+        return data
+    try:
+        text = data.decode("ascii")
+    except UnicodeDecodeError as exc:
+        raise Refuse(f"{what} is not readable text") from exc
+    out = b""
+    blocks = 0
+    lines = text.replace("\r\n", "\n").split("\n")
+    i = 0
+    while i < len(lines):
+        if not re.match(r"^-----BEGIN PGP [A-Z ,0-9/]+-----\s*$", lines[i]):
+            i += 1
+            continue
+        i += 1
+        while i < len(lines) and lines[i].strip() and ":" in lines[i]:      # armor headers
+            i += 1
+        body, checksum = [], None
+        while i < len(lines) and not lines[i].startswith("-----END PGP "):
+            line = lines[i].strip()
+            if line.startswith("=") and len(line) == 5:
+                checksum = line[1:]
+            elif line:
+                body.append(line)
+            i += 1
+        if i >= len(lines):
+            raise Refuse(f"{what} is cut short (no END line)")
+        try:
+            chunk = base64.b64decode("".join(body), validate=True)
+        except ValueError as exc:
+            raise Refuse(f"{what} is damaged (not valid base64)") from exc
+        if checksum is not None:
+            try:
+                expected = int.from_bytes(base64.b64decode(checksum, validate=True), "big")
+            except ValueError as exc:
+                raise Refuse(f"{what} is damaged (bad checksum line)") from exc
+            if crc24(chunk) != expected:
+                raise Refuse(f"{what} is damaged (checksum does not match)")
+        out += chunk
+        blocks += 1
+        i += 1
+    if not blocks or not out:
+        raise Refuse(f"{what} holds no OpenPGP data")
+    return out
+
+
+def packets(data: bytes, what: str) -> list[tuple[int, bytes]]:
+    """Split binary OpenPGP data into (tag, body) packets. Anything malformed is refused."""
+    found: list[tuple[int, bytes]] = []
+    pos = 0
+    while pos < len(data):
+        head = data[pos]
+        if not head & 0x80:
+            raise Refuse(f"{what} is not OpenPGP data")
+        if head & 0x40:                       # new format
+            tag = head & 0x3F
+            pos += 1
+            if pos >= len(data):
+                raise Refuse(f"{what} is cut short")
+            first = data[pos]
+            if first < 192:
+                length, pos = first, pos + 1
+            elif first < 224:
+                if pos + 1 >= len(data):
+                    raise Refuse(f"{what} is cut short")
+                length, pos = ((first - 192) << 8) + data[pos + 1] + 192, pos + 2
+            elif first == 255:
+                if pos + 5 > len(data):
+                    raise Refuse(f"{what} is cut short")
+                length, pos = int.from_bytes(data[pos + 1:pos + 5], "big"), pos + 5
+            else:
+                raise Refuse(f"{what} uses partial-length packets, which a key or signature never needs")
+        else:                                 # old format
+            tag = (head >> 2) & 0x0F
+            kind = head & 0x03
+            pos += 1
+            if kind == 3:
+                raise Refuse(f"{what} uses an indeterminate length, which a key or signature never needs")
+            size = (1, 2, 4)[kind]
+            if pos + size > len(data):
+                raise Refuse(f"{what} is cut short")
+            length, pos = int.from_bytes(data[pos:pos + size], "big"), pos + size
+        if pos + length > len(data):
+            raise Refuse(f"{what} is cut short")
+        found.append((tag, data[pos:pos + length]))
+        pos += length
+    if not found:
+        raise Refuse(f"{what} is empty")
+    return found
+
+
+def fingerprint(body: bytes) -> str:
+    """OpenPGP fingerprint of a public key packet body (v4: SHA-1; v5/v6: SHA-256)."""
+    version = body[0] if body else 0
+    if version == 4:
+        return hashlib.sha1(b"\x99" + len(body).to_bytes(2, "big") + body).hexdigest().upper()
+    if version == 5:
+        return hashlib.sha256(b"\x9a" + len(body).to_bytes(4, "big") + body).hexdigest().upper()
+    if version == 6:
+        return hashlib.sha256(b"\x9b" + len(body).to_bytes(4, "big") + body).hexdigest().upper()
+    raise Refuse("a release key uses an old OpenPGP version that is no longer safe")
+
+
+class Key:
+    def __init__(self, path: Path, binary: bytes, primary: str, subkeys: list[str], name: str):
+        self.path, self.binary, self.primary, self.subkeys, self.name = path, binary, primary, subkeys, name
+
+    @property
+    def fingerprints(self) -> set[str]:
+        return {self.primary, *self.subkeys}
+
+
+def read_key(path: Path) -> Key:
+    what = f"the release key {path.name}"
+    if path.is_symlink() or not path.is_file():
+        raise Refuse(f"{what} is not a plain file")
+    raw = path.read_bytes()
+    if len(raw) > MAX_KEY:
+        raise Refuse(f"{what} is larger than any public key")
+    binary = dearmor(raw, what)
+    parts = packets(binary, what)
+    if any(tag in SECRET_PACKETS for tag, _ in parts):
+        raise Refuse(f"{path.name} holds a PRIVATE key. Only public keys may ever be in the kit; "
+                     "remove that file and keep the private key on the maker's own computer")
+    if any(tag not in PUBLIC_PACKETS for tag, _ in parts):
+        raise Refuse(f"{what} holds something that is not a public key")
+    primaries = [body for tag, body in parts if tag == 6]
+    if len(primaries) != 1 or parts[0][0] != 6:
+        raise Refuse(f"{what} must hold exactly one public key (found {len(primaries)})")
+    names = [body.decode("utf-8", "replace") for tag, body in parts if tag == 13]
+    return Key(path, binary, fingerprint(primaries[0]), [fingerprint(body) for tag, body in parts if tag == 14],
+               names[0] if names else path.stem)
+
+
+def read_revoked(folder: Path) -> set[str]:
+    path = folder / REVOKED_NAME
+    if not path.exists():
+        return set()
+    if path.is_symlink() or not path.is_file():
+        raise Refuse("the withdrawn-keys list (revoked.txt) is not a plain file")
+    revoked = set()
+    for number, line in enumerate(path.read_text(encoding="utf-8-sig").splitlines(), 1):
+        value = line.split("#", 1)[0].replace(" ", "").strip().upper()
+        if not value:
+            continue
+        if not FPR_RE.match(value):
+            raise Refuse(f"the withdrawn-keys list (revoked.txt) line {number} is not a key fingerprint")
+        revoked.add(value)
+    return revoked
+
+
+class Trust:
+    def __init__(self, folder: Path):
+        self.folder = folder
+        self.keys: list[Key] = []
+        self.revoked: set[str] = set()
+        self.withdrawn: list[Key] = []
+        if folder.is_dir():
+            self.revoked = read_revoked(folder)
+            for path in sorted(folder.glob("*.asc")):
+                key = read_key(path)
+                (self.withdrawn if key.fingerprints & self.revoked else self.keys).append(key)
+
+    @property
+    def configured(self) -> bool:
+        """Signing is set up once any public key, or any withdrawn fingerprint, is in the kit."""
+        return bool(self.keys or self.withdrawn or self.revoked)
+
+
+def signing_configured(keys_dir: Path) -> bool:
+    """True when releases must be signed. A damaged key folder counts as set up (it fails closed)."""
+    try:
+        return Trust(Path(keys_dir)).configured
+    except Refuse:
+        return True
+    except OSError:
+        return True
+
+
+# ------------------------------------------------------------------ checking one signature
+def gpgv_program() -> str:
+    for name in ("gpgv", "gpgv2"):
+        found = shutil.which(name)
+        if found:
+            return found
+    raise Refuse("the signature checker (gpgv, part of gnupg2) is not installed on this computer")
+
+
+def check_signature(data: bytes, signature: bytes | None, trust: Trust, label: str) -> list[str]:
+    """Fingerprints of the trusted keys that made a good signature over exactly `data`."""
+    if signature is None:
+        raise Refuse(f"{label} is not signed (no {label}{SIG_SUFFIX})")
+    if len(signature) > MAX_SIGNATURE:
+        raise Refuse(f"the signature for {label} is larger than any signature")
+    binary = dearmor(signature, f"the signature for {label}")
+    first = binary[0] if binary else 0
+    if (first & 0x3F if first & 0x40 else (first >> 2) & 0x0F) != 2:
+        raise Refuse(f"the signature for {label} is not a plain detached signature")
+    parts = packets(binary, f"the signature for {label}")
+    if any(tag != 2 for tag, _ in parts):           # a detached signature holds signature packets only
+        raise Refuse(f"the signature for {label} is not a plain detached signature")
+    program = gpgv_program()
+    work = Path(tempfile.mkdtemp(prefix="sl-release-verify-"))
+    try:
+        (work / "home").mkdir(mode=0o700)
+        (work / "trusted.gpg").write_bytes(b"".join(key.binary for key in trust.keys))
+        (work / "data").write_bytes(data)
+        (work / "data.sig").write_bytes(binary)
+        # Relative names with cwd=work: no path ever reaches gpgv's resource-URL parsing.
+        try:
+            result = subprocess.run(
+                [program, "--homedir", "home", "--status-fd", "1", "--keyring", "./trusted.gpg",
+                 "data.sig", "data"],
+                cwd=work, capture_output=True, text=True, timeout=GPGV_TIMEOUT,
+                env={**os.environ, "LC_ALL": "C", "LANG": "C"})
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise Refuse(f"the signature checker could not run ({type(exc).__name__})") from exc
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+    return judge(result.stdout, trust, label)
+
+
+def judge(status: str, trust: Trust, label: str) -> list[str]:
+    signatures: list[dict] = []
+    for line in status.splitlines():
+        if not line.startswith("[GNUPG:] "):
+            continue
+        fields = line.split()[1:]
+        if not fields:
+            continue
+        if fields[0] == "NEWSIG" or not signatures:
+            signatures.append({"codes": set(), "valid": None})
+            if fields[0] == "NEWSIG":
+                continue
+        signatures[-1]["codes"].add(fields[0])
+        if fields[0] == "VALIDSIG" and len(fields) >= 10:
+            signatures[-1]["valid"] = fields
+    trusted = {fpr for key in trust.keys for fpr in key.fingerprints}
+    good: list[str] = []
+    expired = False
+    for sig in signatures:
+        if "BADSIG" in sig["codes"]:
+            raise Refuse(f"{label} has been changed after it was signed (the signature does not match)")
+        if sig["codes"] & {"EXPKEYSIG", "EXPSIG"}:
+            expired = True                            # good signature, but the key (or signature) has run out
+            continue
+        valid = sig["valid"]
+        if not valid or "GOODSIG" not in sig["codes"]:
+            continue                                  # unknown key (NO_PUBKEY), expired or broken: not counted
+        if sig["codes"] & {"EXPSIG", "EXPKEYSIG", "REVKEYSIG"}:
+            continue
+        signer = valid[1].upper()
+        primary = valid[10].upper() if len(valid) > 10 else signer
+        if {signer, primary} & trust.revoked:
+            continue
+        if signer not in trusted and primary not in trusted:
+            continue
+        if valid[9] not in ("00", "0"):              # must be a signature over a file's exact bytes
+            continue
+        if valid[8] not in STRONG_HASHES:
+            continue
+        good.append(primary)
+    if good:
+        return good
+    if trust.withdrawn and not trust.keys:
+        raise Refuse(f"{label} is signed, but every release key in this kit has been withdrawn")
+    if expired:
+        raise Refuse(f"{label} is signed by a release key whose end date has passed (the key expired); "
+                     "the key's end date must be moved on and the release signed again")
+    raise Refuse(f"{label} is not signed by a release key this kit trusts (unknown or withdrawn key)")
+
+
+# ------------------------------------------------------------------ the release policy
+def parse_json(raw: bytes, label: str) -> dict:
+    try:
+        value = json.loads(raw.decode("utf-8-sig"))
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise Refuse(f"{label} is not readable") from exc
+    if not isinstance(value, dict):
+        raise Refuse(f"{label} is not readable")
+    return value
+
+
+def release_id_in(record: dict, label: str) -> str:
+    value = record.get("release_id")
+    if not isinstance(value, str) or not RELEASE_ID_RE.match(value):
+        raise Refuse(f"{label} has no valid release ID")
+    return value
+
+
+def release_date(release_id: str) -> tuple[int, int, int]:
+    match = RELEASE_ID_RE.match(release_id)
+    assert match
+    return int(match.group(1)), int(match.group(2)), int(match.group(3))
+
+
+def created_at(file_list: dict) -> datetime.datetime | None:
+    try:
+        value = datetime.datetime.fromisoformat(str(file_list.get("created_at")))
+    except ValueError:
+        return None
+    return value if value.tzinfo else value.replace(tzinfo=datetime.timezone.utc)
+
+
+def verify_release(record_raw: bytes | None, signature_raw: bytes | None,
+                   file_list_raw: bytes | None, file_list_signature_raw: bytes | None,
+                   keys_dir: Path, local_record_raw: bytes | None = None,
+                   local_file_list_raw: bytes | None = None, source: str = "this release",
+                   must_list=()) -> Verdict:
+    """The whole policy in one call. Works on bytes, so the source (GitHub, home server, stick) never matters.
+    must_list: paths the signed file list has to name (the MUST_KEEP files the computer already has)."""
+    try:
+        trust = Trust(Path(keys_dir))
+    except (Refuse, OSError) as exc:
+        return Verdict(REFUSED, f"the kit's release key folder is not usable: {exc}")
+    if not trust.configured:
+        return Verdict(NOT_SET_UP, NOT_SET_UP_TEXT)
+    try:
+        if record_raw is None:
+            raise Refuse(f"{source} has no {RELEASE_NAME}")
+        if len(record_raw) > MAX_RECORD:
+            raise Refuse(f"{RELEASE_NAME} is larger than any release record")
+        signers = check_signature(record_raw, signature_raw, trust, RELEASE_NAME)
+        release_id = release_id_in(parse_json(record_raw, RELEASE_NAME), RELEASE_NAME)
+        if file_list_raw is not None or file_list_signature_raw is not None:
+            if file_list_raw is None:
+                raise Refuse(f"{source} has a signature for {FILE_LIST_NAME} but not the file itself")
+            if len(file_list_raw) > MAX_FILE_LIST:
+                raise Refuse(f"{FILE_LIST_NAME} is larger than allowed")
+            signers += [s for s in check_signature(file_list_raw, file_list_signature_raw, trust, FILE_LIST_NAME)
+                        if s not in signers]
+            file_list = parse_json(file_list_raw, FILE_LIST_NAME)
+            if file_list.get("release_id") != release_id:
+                raise Refuse(f"{RELEASE_NAME} and {FILE_LIST_NAME} belong to different releases")
+            listed = file_list.get("files")
+            if not isinstance(listed, dict) or not any(KEY_IN_LIST_RE.match(str(name)) for name in listed):
+                # An update removes local files the list does not name: without a key it would switch signing off.
+                raise Refuse(f"{FILE_LIST_NAME} names no release key, so installing it would switch signing off")
+            left_out = [name for name in must_list if name not in listed]
+            if left_out:
+                raise Refuse(f"{FILE_LIST_NAME} leaves out {left_out[0]}, which is already here; installing it "
+                             "would delete it")
+        else:
+            file_list = None
+        if local_record_raw is not None:
+            try:
+                local_id = release_id_in(parse_json(local_record_raw, "the local release record"),
+                                         "the local release record")
+            except Refuse:
+                local_id = None                       # an unreadable local record never blocks a signed release
+            if local_id and release_date(release_id) < release_date(local_id):
+                raise Refuse(f"{release_id} is older than the release already here ({local_id})")
+        if file_list is not None and local_file_list_raw is not None:
+            try:
+                local_created = created_at(parse_json(local_file_list_raw, "the local file list"))
+            except Refuse:
+                local_created = None
+            remote_created = created_at(file_list)
+            if local_created and remote_created and remote_created < local_created:
+                raise Refuse(f"{release_id} was published before the release already here")
+    except Refuse as exc:
+        return Verdict(REFUSED, str(exc))
+    covered = f"{RELEASE_NAME} and {FILE_LIST_NAME}" if file_list is not None else RELEASE_NAME
+    return Verdict(VERIFIED, f"{release_id} ({covered}) is signed by {signed_by(trust, signers)}", release_id, signers)
+
+
+def signed_by(trust: Trust, signers: list[str]) -> str:
+    names = {fpr: key.name for key in trust.keys for fpr in key.fingerprints}
+    return ", ".join(f"{names.get(fpr, 'release key')} (key {fpr[-16:]})" for fpr in signers)
+
+
+DETACHED_LABEL = "this file"          # verify_detached's words when the caller names no file (C1 form)
+
+
+def verify_detached(data: bytes | None, signature: bytes | None, keys_dir: Path,
+                    label: str = DETACHED_LABEL) -> Verdict:
+    """C1 (P09): one file and its detached signature, for example the release history or the channel record.
+    Same rule as a release: one good signature over exactly these bytes, by a trusted key that has not been
+    withdrawn, binary-document class, SHA-2. No key in the kit: not set up (callers keep their old behaviour)."""
+    try:
+        trust = Trust(Path(keys_dir))
+    except (Refuse, OSError) as exc:
+        return Verdict(REFUSED, f"the kit's release key folder is not usable: {exc}")
+    if not trust.configured:
+        return Verdict(NOT_SET_UP, NOT_SET_UP_TEXT)
+    try:
+        if data is None:
+            raise Refuse(f"{label} is missing")
+        if signature is None and label == DETACHED_LABEL:   # not "(no this file.sig)"
+            raise Refuse(f"{DETACHED_LABEL} is not signed (no signature came with it)")
+        signers = check_signature(data, signature, trust, label)
+    except Refuse as exc:
+        return Verdict(REFUSED, str(exc))
+    return Verdict(VERIFIED, f"{label} is signed by {signed_by(trust, signers)}", "", signers)
+
+
+def must_keep(tree: Path | None) -> list[str]:
+    """The MUST_KEEP files that a local Secure Linux folder holds (a signed list has to name each one)."""
+    if tree is None:
+        return []
+    return [name for name in MUST_KEEP if Path(tree, *name.split("/")).is_file()]
+
+
+# ------------------------------------------------------------------ command line
+def read_optional(path: Path | None, limit: int) -> bytes | None:
+    if path is None or not path.is_file():
+        return None
+    with open(path, "rb") as handle:
+        return handle.read(limit + 1)
+
+
+def status(keys_dir: Path) -> int:
+    try:
+        trust = Trust(keys_dir)
+    except (Refuse, OSError) as exc:
+        print(f"RELEASE KEYS: the key folder is not usable - {exc}.")
+        return 1
+    if not trust.configured:
+        print(f"RELEASE SIGNATURE: {NOT_SET_UP_TEXT}.")
+        return EXIT[NOT_SET_UP]
+    print(f"RELEASE KEYS: {len(trust.keys)} trusted, {len(trust.withdrawn)} withdrawn ({keys_dir})")
+    for key in trust.keys:
+        print(f"  trusted    {key.primary}  {key.name}")
+    for key in trust.withdrawn:
+        print(f"  withdrawn  {key.primary}  {key.name}")
+    if not trust.keys:
+        print("No trusted key is left, so every release will be refused until a new key is installed.")
+        return 1
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="secure-linux-release-verify",
+                                     description="Check that a Secure Linux release is signed by the kit's maker.")
+    parser.add_argument("--keys", type=Path, default=Path(os.environ.get("SL_RELEASE_KEYS_DIR", DEFAULT_KEYS)),
+                        help="folder of trusted public keys (*.asc) and revoked.txt")
+    commands = parser.add_subparsers(dest="command", required=True)
+    commands.add_parser("status", help="list the trusted and withdrawn release keys")
+    check = commands.add_parser("check", help="verify a release")
+    check.add_argument("--from", dest="source", type=Path, help="folder holding release.json and its signatures")
+    check.add_argument("--release", type=Path)
+    check.add_argument("--signature", type=Path)
+    check.add_argument("--file-list", type=Path)
+    check.add_argument("--file-list-signature", type=Path)
+    check.add_argument("--local-release", type=Path, help="the release record already here (older ones are refused)")
+    check.add_argument("--local-file-list", type=Path, help="the file list already applied here")
+    check.add_argument("--local-tree", type=Path,
+                       help="the Secure Linux folder already here: the list must still name its revoked.txt, "
+                            "this checker and the update tool")
+    args = parser.parse_args(argv)
+    keys = args.keys.expanduser()
+    if args.command == "status":
+        return status(keys)
+    if (args.source is None) == (args.release is None):
+        parser.error("give either --from DIR or --release FILE")
+    if args.source is not None:
+        folder = args.source.expanduser()
+        release = folder / RELEASE_NAME
+        signature = folder / (RELEASE_NAME + SIG_SUFFIX)
+        file_list = folder / FILE_LIST_NAME
+        file_list_signature = folder / (FILE_LIST_NAME + SIG_SUFFIX)
+        where = f"the release in {folder}"
+    else:
+        release = args.release
+        signature = args.signature or Path(str(release) + SIG_SUFFIX)
+        file_list = args.file_list
+        file_list_signature = args.file_list_signature or (Path(str(file_list) + SIG_SUFFIX) if file_list else None)
+        where = f"the release record {release}"
+    verdict = verify_release(read_optional(release, MAX_RECORD), read_optional(signature, MAX_SIGNATURE),
+                             read_optional(file_list, MAX_FILE_LIST),
+                             read_optional(file_list_signature, MAX_SIGNATURE), keys,
+                             read_optional(args.local_release, MAX_RECORD),
+                             read_optional(args.local_file_list, MAX_FILE_LIST), where,
+                             must_list=must_keep(args.local_tree.expanduser() if args.local_tree else None))
+    print(verdict.line())
+    return verdict.exit_code
+
+
+if __name__ == "__main__":
+    sys.exit(main())

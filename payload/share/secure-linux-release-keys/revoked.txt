@@ -1,0 +1,2 @@
+# Withdrawn Secure Linux release keys: one full key fingerprint per line, then an optional # note.
+# A release signed only by a key listed here is refused. Added by: signing-tools/sign-release.sh retire KEY

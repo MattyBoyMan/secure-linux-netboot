@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=How is my computer today?
+GenericName=Daily summary
+Comment=One line: backups, updates, disk and security. It says "All good" or the one thing to do.
+Exec=/usr/local/bin/secure-linux-daily-summary --pause
+Icon=security-high
+Terminal=true
+Categories=System;Utility;
+Keywords=summary;health;status;today;backups;updates;disk;security;
+StartupNotify=false

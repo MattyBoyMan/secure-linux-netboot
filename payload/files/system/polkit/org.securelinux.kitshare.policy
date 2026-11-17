@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<!-- Secure Linux: clear password prompts for secure-linux-kit-share, which re-runs itself for these two
+     commands only ("start" turns sharing updates on, "stop" turns it off).
+     Installed by steps/00-early.sh to /usr/share/polkit-1/actions/. -->
+<policyconfig>
+  <vendor>The Complete Secure Linux Package</vendor>
+  <action id="org.securelinux.kitshare.start">
+    <description>Share updates with the other Secure Linux computers at home</description>
+    <message>Secure Linux needs your password to share its checked updates with the other Secure Linux computers on your home network</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/bin/secure-linux-kit-share</annotate>
+    <annotate key="org.freedesktop.policykit.exec.argv1">start</annotate>
+  </action>
+  <action id="org.securelinux.kitshare.stop">
+    <description>Stop sharing updates with other computers</description>
+    <message>Secure Linux needs your password to stop sharing its updates with the other computers at home</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/bin/secure-linux-kit-share</annotate>
+    <annotate key="org.freedesktop.policykit.exec.argv1">stop</annotate>
+  </action>
+</policyconfig>

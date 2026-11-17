@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<!-- Secure Linux VeraCrypt helper: password prompts for installing and removing it.
+     Installed by steps/00-early.sh to /usr/share/polkit-1/actions/. Each action is tied to the program path and to
+     its first word, so the prompt says exactly what is being asked. -->
+<policyconfig>
+  <vendor>The Complete Secure Linux Package</vendor>
+  <action id="org.securelinux.veracrypt.install">
+    <description>Install VeraCrypt</description>
+    <message>Secure Linux needs your password to install VeraCrypt (the package is checked by its fingerprint and signature first)</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/bin/secure-linux-veracrypt-install</annotate>
+    <annotate key="org.freedesktop.policykit.exec.argv1">install</annotate>
+  </action>
+  <action id="org.securelinux.veracrypt.remove">
+    <description>Remove VeraCrypt</description>
+    <message>Secure Linux needs your password to remove VeraCrypt (your encrypted containers are not touched)</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/bin/secure-linux-veracrypt-install</annotate>
+    <annotate key="org.freedesktop.policykit.exec.argv1">remove</annotate>
+  </action>
+</policyconfig>

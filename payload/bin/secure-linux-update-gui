@@ -41,17 +41,101 @@ show_log() {
   else zenity --text-info --title="$TITLE" --width=820 --height=540 --filename="$1"
   fi
 }
+ask() {
+  if [ "$UI" = kdialog ]; then kdialog --title "$TITLE" --yes-label "$2" --no-label "Cancel" --yesno "$1"
+  else zenity --question --no-markup --title="$TITLE" --width=560 --ok-label="$2" --cancel-label="Cancel" --text="$1"
+  fi
+}
+
+# "Go back": Secure Linux's own files go back to the release from before the last update, through the automatic
+# update's own password prompt (polkit action org.securelinux.kitupdateauto.undo: this path and "undo" only).
+# Offered only when the update tool says going back is possible.
+GOBACK="Go back to the earlier version"
+KIT_TREE=/usr/local/lib/secure-linux
+UNDO_OK=no
+KITSTATUS=$(secure-linux-kit-update status --tree "$KIT_TREE" --json 2>/dev/null </dev/null || true)
+case "$KITSTATUS" in *'"undo_available": true'*) UNDO_OK=yes ;; esac
+go_back() {
+  ask "Go back to the earlier Secure Linux version?
+
+Secure Linux puts back its own files from before the last update and checks each one. Your own files are not touched. That update is not installed again until a newer release comes out." "Go back" || exit 0
+  GOT=$(pkexec /usr/local/bin/secure-linux-kit-update-auto undo </dev/null 2>&1)
+  GRC=$?
+  REASON=$(printf '%s\n' "$GOT" | sed -n 's/^KIT UPDATE: //p' | tail -n 1)
+  case "$GRC" in
+    0) info "Secure Linux went back to the earlier version. That update is not installed again until a newer release comes out." ;;
+    75) info "Another update is running, so nothing was changed. Try again in a few minutes." ;;
+    126|127) info "Nothing was changed." ;;
+    *) error "Going back was not finished. Your own files were not touched.${REASON:+ The update tool said: $REASON} Open Secure Linux Status & Fixes for help." ;;
+  esac
+  exit 0
+}
+
+# "Try it again": the release the person went back from is installed after all, through the automatic update's
+# own password prompt (polkit action org.securelinux.kitupdateauto.retry: this path and "retry" only).
+RETRY="Install it after all"
+try_again() {
+  ask "Install the Secure Linux release you went back from after all?
+
+Secure Linux downloads it again and checks every file, exactly like a normal update. Your own files are not touched." "Install it" || exit 0
+  GOT=$(pkexec /usr/local/bin/secure-linux-kit-update-auto retry </dev/null 2>&1)
+  GRC=$?
+  SAID=$(printf '%s\n' "$GOT" | sed -e 's/^KIT UPDATE: //' -e '/^[[:space:]]*$/d' | tail -n 1)
+  case "$GRC" in
+    0) info "${SAID:-Secure Linux installed the release you went back from.}" ;;
+    75) info "Another update is running, so nothing was changed. Try again in a few minutes." ;;
+    126|127) info "Nothing was changed." ;;
+    *) error "The release you went back from was not installed. Your own files were not touched.${SAID:+ The update tool said: $SAID} Open Secure Linux Status & Fixes for help." ;;
+  esac
+  exit 0
+}
 
 TEXT="Check for and install system and app updates now?
 
 Your existing update tools will be used. Administrator permission may be requested.
 No restart is triggered by this launcher. Save your work before installing updates."
+KITNOTE=$(secure-linux-kit-update-auto status --text 2>/dev/null || true)
+[ -n "$KITNOTE" ] && TEXT="$TEXT
+
+$KITNOTE"
+# The update settings that matter here: online checks on or off, and a release held back after going back.
+KITSET=$(secure-linux-kit-update-auto status --settings 2>/dev/null || true)
+[ -n "$KITSET" ] && TEXT="$TEXT
+
+$KITSET"
 if ! [ -x /usr/local/bin/secure-linux-update-now ] && have apt-get; then
   TEXT="$TEXT
 
 On this Debian computer, packages that are no longer needed may be removed by the normal apt autoremove step."
 fi
-if [ "$UI" = kdialog ]; then
+RETRY_OK=no
+case "$KITSET" in *"Held back:"*) RETRY_OK=yes ;; esac
+if [ "$UNDO_OK" = yes ] || [ "$RETRY_OK" = yes ]; then
+  [ "$UNDO_OK" = yes ] && TEXT="$TEXT
+
+You can also go back to the Secure Linux version from before the last update."
+  [ "$RETRY_OK" = yes ] && TEXT="$TEXT
+
+You can also install the release you went back from after all."
+  if [ "$UI" = kdialog ]; then
+    # kdialog has one spare button: going back wins when both are possible
+    if [ "$UNDO_OK" = yes ]; then OTHER=$GOBACK; else OTHER=$RETRY; fi
+    kdialog --title "$TITLE" --yes-label "Install updates" --no-label "$OTHER" --cancel-label "Cancel" --yesnocancel "$TEXT"
+    case $? in 0) ;; 1) if [ "$OTHER" = "$GOBACK" ]; then go_back; else try_again; fi ;; *) exit 0 ;; esac
+  else
+    EXTRA=()
+    [ "$UNDO_OK" = yes ] && EXTRA+=(--extra-button="$GOBACK")
+    [ "$RETRY_OK" = yes ] && EXTRA+=(--extra-button="$RETRY")
+    PRESSED=$(zenity --question --no-markup --title="$TITLE" --width=620 --ok-label="Install updates" --cancel-label="Cancel" \
+      "${EXTRA[@]}" --text="$TEXT")
+    ZRC=$?
+    if [ "$ZRC" -ne 0 ]; then
+      [ "$PRESSED" = "$GOBACK" ] && go_back
+      [ "$PRESSED" = "$RETRY" ] && try_again
+      exit 0
+    fi
+  fi
+elif [ "$UI" = kdialog ]; then
   kdialog --title "$TITLE" --yes-label "Install updates" --no-label "Cancel" --yesno "$TEXT" || exit 0
 else
   zenity --question --no-markup --title="$TITLE" --width=620 --ok-label="Install updates" --cancel-label="Cancel" --text="$TEXT" || exit 0
@@ -80,17 +164,30 @@ fi
 LOG=$(mktemp "${TMPDIR:-/tmp}/secure-linux-updates.XXXXXX") || exit 1
 trap 'rm -f "$LOG"' EXIT
 if [ "$UI" = zenity ]; then
-  pkexec /usr/local/bin/secure-linux-update-now 2>&1 | tee "$LOG" | zenity --progress --pulsate --auto-close --no-cancel \
+  # No one can type an answer here, so the helper's stdin is empty: firmware is then only mentioned, never installed.
+  pkexec /usr/local/bin/secure-linux-update-now </dev/null 2>&1 | tee "$LOG" | zenity --progress --pulsate --auto-close --no-cancel \
     --title="$TITLE" --width=560 --text="Installing updates. Please keep the computer on and connected."
   RC=${PIPESTATUS[0]}
 else
   kdialog --title "$TITLE" --passivepopup "Installing updates. Please keep the computer on and connected." 20 >/dev/null 2>&1 &
-  pkexec /usr/local/bin/secure-linux-update-now >"$LOG" 2>&1
+  pkexec /usr/local/bin/secure-linux-update-now </dev/null >"$LOG" 2>&1
   RC=$?
 fi
 
 if [ "$RC" -eq 0 ]; then
-  info "Updates finished successfully. If a restart is needed, you can choose when to do it."
+  DONE="Updates finished successfully. If a restart is needed, you can choose when to do it."
+  # When Secure Linux's own files were not changed (refused, held back, clock wrong, another update running, or
+  # an update that did not pass its safety check and was undone at once), the helper says so and why; that
+  # reason is shown here too, so "finished" never hides it.
+  if grep -q "The newest Secure Linux update did not pass its safety check (see above)" "$LOG" 2>/dev/null; then
+    # It did not pass its safety check and could not be undone: never "finished successfully" alone.
+    WHY=$(grep -m1 -E "^The newest Secure Linux update did not pass its safety check and could not be undone" "$LOG" 2>/dev/null)
+    DONE="System and app updates finished successfully. ${WHY:-The newest Secure Linux update did not pass its safety check. Open Secure Linux Status & Fixes and choose Repair setup.} If a restart is needed, you can choose when to do it."
+  elif grep -q "Secure Linux's own files were not changed" "$LOG" 2>/dev/null; then
+    WHY=$(grep -m1 -E "^(A newer Secure Linux release could not be checked safely|You went back to the earlier Secure Linux release|This computer's clock seems wrong|Another update is running|The newest Secure Linux update did not pass its safety check)" "$LOG" 2>/dev/null)
+    DONE="System and app updates finished successfully. Secure Linux's own files were not changed this time.${WHY:+ $WHY} If a restart is needed, you can choose when to do it."
+  fi
+  info "$DONE"
   exit 0
 fi
 show_log "$LOG"

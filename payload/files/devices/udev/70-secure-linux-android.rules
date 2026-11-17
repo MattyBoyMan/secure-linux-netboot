@@ -1,0 +1,6 @@
+# Secure Linux (devices): let the person who is logged in talk to their own Android phone over USB (adb, scrcpy,
+# secure-linux-phone-backup) without a password and without joining any group. TAG+="uaccess" gives access to the person
+# sitting at this computer only, and only while the phone is plugged in. The phone itself still asks "Allow USB debugging?"
+# and only the person holding it can say yes. Installed to /etc/udev/rules.d/ by steps/53-device-extras.sh.
+# ff/42/01 is the USB interface class every adb-capable phone uses (vendor specific, adb, adb protocol).
+ACTION!="remove", SUBSYSTEM=="usb", ENV{ID_USB_INTERFACES}=="*:ff4201:*", TAG+="uaccess"

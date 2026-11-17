@@ -1,0 +1,140 @@
+#!/usr/bin/env python3
+"""secure-linux-leak-check: has this password been in a known data leak?
+
+Only the FIRST 5 CHARACTERS of the password's SHA-1 fingerprint ever leave this computer. That is far too little to
+work out your password: thousands of different passwords share the same 5 characters. The check against the full
+fingerprint happens here, on your computer. The password is typed (nothing shows on screen) and is never saved,
+never written to a log, and never put on the command line.
+
+  secure-linux-leak-check            type a password when asked (it does not show as you type)
+  secure-linux-leak-check --pause    same, then wait for Enter so a window does not close at once
+  secure-linux-leak-check --explain  say in plain words what is sent and what is not
+  secure-linux-leak-check --help     this page
+
+Exit code: 0 = not found in any known leak, 1 = FOUND in leaks (stop using it), 2 = could not check.
+The service used is the free "Pwned Passwords" range lookup (api.pwnedpasswords.com). It needs the internet.
+"""
+import getpass
+import hashlib
+import http.client
+import os
+import re
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+
+API_DEFAULT = "https://api.pwnedpasswords.com/range/"
+PREFIX_LEN = 5
+
+EXPLAIN = """What this check does, in plain words:
+  1. You type a password. Nothing shows on screen. It is not saved anywhere and not written to any log.
+  2. This computer turns it into a fingerprint (SHA-1), a long string of letters and numbers.
+  3. Only the first 5 characters of that fingerprint are sent to the free Pwned Passwords service.
+     Your password and the rest of the fingerprint never leave this computer.
+  4. The service sends back every leaked fingerprint that starts with those 5 characters (hundreds of them).
+  5. This computer looks through that list by itself. The service never learns whether there was a match.
+Nothing here costs money and there is no account."""
+
+
+def api_base():
+    """The service address. A test may point it at a made-up local address; nothing else is accepted."""
+    base = os.environ.get("SL_LEAK_CHECK_API", API_DEFAULT)
+    parsed = urllib.parse.urlparse(base)
+    local = parsed.scheme == "http" and parsed.hostname in ("127.0.0.1", "localhost", "::1")
+    if parsed.scheme != "https" and not local:
+        return API_DEFAULT
+    return base if base.endswith("/") else base + "/"
+
+
+def fingerprint(password):
+    """Return (first 5 characters, the rest) of the upper-case SHA-1 of the password."""
+    digest = hashlib.sha1(password.encode("utf-8")).hexdigest().upper()  # nosec: required by the lookup service
+    return digest[:PREFIX_LEN], digest[PREFIX_LEN:]
+
+
+def fetch_range(prefix, base=None):
+    """Ask the service for the list that matches this 5-character prefix. Sends nothing else."""
+    if not re.fullmatch(r"[0-9A-F]{5}", prefix):
+        raise ValueError("prefix must be exactly 5 hex characters")
+    req = urllib.request.Request(
+        (base or api_base()) + prefix,
+        headers={"User-Agent": "secure-linux-leak-check", "Add-Padding": "true", "Accept": "text/plain"},
+        method="GET",
+    )
+    with urllib.request.urlopen(req, timeout=15) as resp:  # noqa: S310 (https or loopback only, see api_base)
+        return resp.read(8_000_000).decode("ascii", "replace")
+
+
+def count_in_list(listing, suffix):
+    """How many times the leak list says this fingerprint ending was seen (0 = not found)."""
+    for line in listing.splitlines():
+        part, _, num = line.strip().partition(":")
+        if part.upper() == suffix:
+            try:
+                return int(num.strip() or "0")
+            except ValueError:
+                return 0
+    return 0
+
+
+def read_password():
+    if sys.stdin.isatty():
+        return getpass.getpass("Type the password to check (nothing will show as you type): ")
+    return sys.stdin.readline().rstrip("\r\n")  # piped in by a script: still never on the command line
+
+
+def say(text):
+    print(text)
+
+
+def main(argv):
+    pause = False
+    for arg in argv:
+        if arg in ("-h", "--help"):
+            print(__doc__.strip())
+            return 0
+        if arg == "--explain":
+            print(EXPLAIN)
+            return 0
+        if arg == "--pause":
+            pause = True
+        else:
+            print("I don't know '%s'. Run secure-linux-leak-check --help. (Never type a password on this line.)" % ("option" if arg.startswith("-") else "that word"))
+            return 2
+    code = 2
+    try:
+        say("Leaked-password check. Only 5 characters of a fingerprint are sent; your password stays here.")
+        password = read_password()
+        if not password:
+            say("Nothing was typed, so there is nothing to check.")
+        else:
+            prefix, suffix = fingerprint(password)
+            password = ""
+            try:
+                listing = fetch_range(prefix)
+            except (urllib.error.URLError, http.client.HTTPException, OSError, ValueError):
+                say("I could not reach the check service. Is this computer online? Nothing was decided about your password.")
+                listing = None
+            if listing is not None:
+                n = count_in_list(listing, suffix)
+                if n > 0:
+                    say("FOUND: this password appears in known data leaks (%s times). Do not use it anywhere. "
+                        "Change it on every site that has it, and use a new one from your password manager." % format(n, ","))
+                    code = 1
+                else:
+                    say("Good news: this password was not found in any known leak. "
+                        "That does not make it strong, so keep using a long, different password for every site.")
+                    code = 0
+    except (KeyboardInterrupt, EOFError):
+        say("Stopped. Nothing was sent.")
+    if pause:
+        try:
+            input("Press Enter to close. ")
+        except (EOFError, KeyboardInterrupt):
+            pass
+    return code
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

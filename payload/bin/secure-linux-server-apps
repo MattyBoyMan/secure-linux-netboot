@@ -1,0 +1,679 @@
+#!/bin/bash
+# secure-linux-server-apps: home-server apps (Nextcloud, Paperless-ngx and more) on this computer. Home network only.
+#   secure-linux-server-apps                              a simple menu: pick an app, then what to do
+#   secure-linux-server-apps list                         the apps you can add, and which ones are set up
+#   secure-linux-server-apps install APP                  set it up and start it (asks for your password once)
+#   secure-linux-server-apps start APP | stop APP         switch it on or off (when on, it also starts after a restart)
+#   secure-linux-server-apps status [APP]                 is it running, and which address to open
+#   secure-linux-server-apps open APP                     open it in your web browser
+#   secure-linux-server-apps login APP                    show the first sign-in name and password
+#   secure-linux-server-apps update APP                   make a backup first, then move to the version this kit checked
+#   secure-linux-server-apps backup APP [--to FOLDER]     copy everything the app keeps into one private file
+#   secure-linux-server-apps remove APP [--delete-data]   take it away; your data is kept unless you confirm twice
+# Each app listens only on this computer's home-network address, and the firewall opens its port in the "home"
+# zone only. Apps are set up, started and moved to a new address only while the computer is on a network you marked
+# as home (secure-linux-zone); elsewhere they stay off and the tool says why. Nothing is opened to the internet. Passwords and keys are made on this computer, kept in files only
+# the system can read, and never written to a log. Data lives under /srv/secure-linux/<app>.
+# Docker or Podman, whichever this computer has. Apps come from files/server-apps/<app>/: a compose.yml plus either an
+# app.conf or an "x-secure-linux:" block inside compose.yml (one recipe file). Adding an app never needs an edit here.
+set -u
+export LC_ALL=C
+
+P=${SL_TEST_PREFIX:-}                       # tests only: a fake root for /srv, /var
+SL_ROOT=${SL_ROOT:-/usr/local/lib/secure-linux}
+DATA_ROOT=$P/srv/secure-linux
+STATE_DIR=$P/var/lib/secure-linux/server-apps
+LOG=$P/var/log/secure-linux/server-apps.log
+HERE=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
+SELF=/usr/local/bin/secure-linux-server-apps; [ -x "$SELF" ] || SELF=$(readlink -f "$0")   # polkit names /usr/local/bin
+
+say() { printf '%s\n' "$*"; }
+stop() { say "$*"; say "Nothing was changed."; exit 1; }     # before any change
+fail() { say "$*"; exit 1; }                                 # after a change: the message says what is left
+log() {
+  mkdir -p "${LOG%/*}" 2>/dev/null || return 0
+  ( umask 077; printf '%s %s\n' "$(date '+%F %T')" "$*" >> "$LOG" ) 2>/dev/null
+  return 0
+}
+logged() { # run a command; its output goes to the private log only
+  log "run: $*"
+  ( umask 077; "$@" >> "$LOG" 2>&1 )
+}
+
+case "${1:-}" in -h|--help|help) sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;; esac
+
+# ---------------------------------------------------------------- the app folders (contract C12)
+apps_dir() {
+  local d
+  for d in ${SL_SERVERAPPS_DIR:+"$SL_SERVERAPPS_DIR"} "$HERE/../files/server-apps" "$SL_ROOT/files/server-apps" \
+           /usr/local/lib/secure-linux/files/server-apps; do
+    [ -d "$d" ] && { (cd "$d" && pwd); return 0; }
+  done
+  return 1
+}
+valid_name() { case "${1:-}" in ''|*[!a-z0-9-]*|-*) return 1 ;; esac; [ ${#1} -le 40 ]; }
+kv_get() { # kv_get KEY < key=value lines: the value of KEY (the lines are read, never run)
+  local line k
+  while IFS= read -r line || [ -n "$line" ]; do
+    line=${line%$'\r'}
+    case $line in ''|'#'*) continue ;; esac
+    k=${line%%=*}
+    [ "$k" = "$1" ] && { printf '%s' "${line#*=}"; return 0; }
+  done
+  return 1
+}
+conf_get() { [ -r "$1" ] && kv_get "$2" < "$1"; }
+meta() { # meta APPDIR: the recipe settings as key=value lines (app.conf, else the x-secure-linux: block of compose.yml)
+  if [ -f "$1/app.conf" ]; then cat "$1/app.conf"
+  else awk '
+    /^x-secure-linux:[ \t]*$/ { on = 1; next }
+    on && /^[^ \t#]/ { on = 0 }
+    on && /^[ \t]+[a-z_]+:/ {
+      l = $0; sub(/^[ \t]+/, "", l); k = l; sub(/:.*/, "", k); v = l; sub(/^[a-z_]+:[ \t]*/, "", v)
+      sub(/[ \t]+#.*$/, "", v); if (v ~ /^".*"$/ || v ~ /^\047.*\047$/) v = substr(v, 2, length(v) - 2); print k "=" v }' "$1/compose.yml"
+  fi
+}
+meta_get() { meta "$1" | kv_get "$2"; }
+is_recipe() { [ -f "$1/compose.yml" ] && { [ -f "$1/app.conf" ] || grep -q '^x-secure-linux:[[:space:]]*$' "$1/compose.yml"; }; }
+words_ok() { # every word is a-z, 0-9, _ or -
+  local w
+  for w in $1; do case $w in *[!a-z0-9_-]*) return 1 ;; esac; done
+  return 0
+}
+paths_ok() { # backup paths: inside the app folder only (no leading /, no ..)
+  local w
+  set -f
+  for w in $1; do case $w in /*|*..*|*[!A-Za-z0-9_./*-]*) set +f; return 1 ;; esac; done
+  set +f; return 0
+}
+ports_ok() { # extra ports: 7359/udp 8443/tcp
+  local w
+  for w in $1; do [[ $w =~ ^[0-9]{2,5}/(tcp|udp)$ ]] || return 1; done
+  return 0
+}
+all_apps() {
+  local d n
+  APPS=$(apps_dir) || return 0
+  for d in "$APPS"/*/; do
+    n=${d%/}; n=${n##*/}
+    valid_name "$n" && is_recipe "$d" && printf '%s\n' "$n"
+  done
+}
+
+# check_compose FILE: prints one line per thing that is not allowed (empty output = fine).
+# Every port must be tied to the home address (${SL_BIND:?...}:...), every image pinned by version AND digest,
+# every folder kept in the app's own data folder (${SL_DATA:?...}/...; private keys read-only), and no host network,
+# privileged mode, engine socket, host namespaces, devices, host files, switched-off safety guards, outside networks,
+# home-made images or extra compose files. YAML forms this line-by-line check cannot follow are refused as well:
+# one-line maps and lists, anchors, aliases, tags, quoted keys, values on a later line, multi-line values (except for
+# command, entrypoint and test), quoted values that run over several lines, backslash escapes, and filled-in values
+# other than the tool's own SL_* ones. This is a line check with a deny list, not a full YAML reader: keep recipes
+# plain (one setting per line), as the shipped ones are.
+check_compose() {
+  if [ -n "$(tr -dc '\r' < "$1")" ]; then echo "Windows line ends: the file must use plain line ends"; return 0; fi
+  awk '
+    function trim(s) { sub(/^[ \t]+/, "", s); sub(/[ \t]+$/, "", s); return s }
+    function unq(s) { gsub(/"/, "", s); gsub(/\047/, "", s); return s }
+    function val(s) { sub(/^[^:]*:[ \t]*/, "", s); sub(/[ \t]+#.*$/, "", s); return trim(unq(s)) }
+    /\r/ { print "Windows line ends: the file must use plain line ends"; exit }
+    /^[ \t]*#/ { next }
+    {
+      match($0, /^[ \t]*/); ind = RLENGTH; t = trim($0)
+      if (t == "") next
+      if (inblk) { if (ind > blkind) next; inblk = 0 }   # inside an allowed multi-line command: plain text, skipped
+      if (t ~ /^(---|\.\.\.)/ || t ~ /^[?]/ || t ~ /^(- +)?["\047][^"\047]*["\047][ \t]*:/ || t ~ /^(- +)?[A-Za-z0-9_.-]+[ \t]+:([ \t]|$)/) {
+        print "written in a form this tool does not accept: " t; next }
+      if (t ~ /<<[ \t]*:/ || t ~ /:[ \t]+[&*!]/ || t ~ /^(- +)?[&*!]/) { print "anchors, aliases and tags are not accepted: " t; next }
+      if ((t ~ /:[ \t]+\{/ && t !~ /:[ \t]+\{\}$/) || t ~ /^- +\{/) { print "one-line maps are not accepted (one setting per line): " t; next }
+      if (t ~ /:[ \t]+\[/ && t !~ /:[ \t]+\[\]$/ && t !~ /^(test|command|entrypoint):/) { print "one-line lists are not accepted (one item per line): " t; next }
+      if (t ~ /\\/) { print "backslashes are not accepted: " t; next }
+      q = t; sub(/^- +/, "", q); if (q ~ /^[A-Za-z0-9_.-]+:([ \t]|$)/) sub(/^[A-Za-z0-9_.-]+:[ \t]*/, "", q); sub(/[ \t]+#[^"\047]*$/, "", q)
+      if ((q ~ /^"/ && q !~ /^"[^"]*"$/) || (q ~ /^\047/ && q !~ /^\047([^\047]|\047\047)*\047$/)) { print "a quoted value must end on the same line: " t; next }
+      chk = t; gsub(/\$\$/, "", chk); gsub(/\$\{SL_(BIND|PORT|DATA|UID|GID|TZ|HOSTNAME)(:?[-?][^}$]*)?\}/, "", chk)
+      if (chk ~ /\$/) { print "only the values this tool fills in (SL_...) may be used: " t; next }
+      if (t ~ /^(- +)?[A-Za-z0-9_.-]+:[ \t]+[|>]/) {
+        if (ind > 0 && t ~ /^(command|entrypoint|test):[ \t]+[|>]-?[ \t]*$/) { inblk = 1; blkind = ind; next }
+        print "multi-line values are only accepted for command, entrypoint and test: " t; next }
+      if (t == "-" || (t !~ /^- / && t !~ /^[A-Za-z0-9_.-]+:([ \t]|$)/)) { print "a value must be on the same line as its name: " t; next }
+      if (t ~ /^(network_mode|pid|ipc|uts|userns_mode|cgroup|privileged|image):/ && (val(t) == "" || t ~ /\$/)) print "must be one plain value on the same line: " t
+      if (t ~ /unconfined|label[:=]disable|spc_t/) print "turns off a safety guard: " t
+      if (t ~ /docker\.sock|podman\.sock|containerd\.sock/) print "container engine socket mounted: " t   # checked on every line, lists too
+      if (inports) {
+        if (ind <= portind && t !~ /^- /) inports = 0
+        else if (ind < portind) inports = 0
+        else {
+          if (t ~ /^- /) { item = t; sub(/^- +/, "", item); item = unq(item)
+            if (item !~ /^\$\{SL_BIND:\?[^}]*\}:/) print "port not tied to the home address: " t }
+          else print "port written in a form this tool does not accept: " t
+          next
+        }
+      }
+      if (invol) {
+        if (ind < volind || (ind == volind && t !~ /^- /)) invol = 0
+        else {
+          if (t ~ /^- /) { v = t; sub(/^- +/, "", v); sub(/[ \t]+#.*$/, "", v); v = trim(unq(v)); src = v; sub(/^\$\{SL_DATA:\?[^}]*\}/, "", src); sub(/:.*/, "", src)
+            # a named folder inside the data folder of the app: every part a plain name (never empty, ".", ".." or hidden),
+            # so neither the whole data folder nor its settings file can be handed to the app
+            if (v !~ /^\$\{SL_DATA:\?[^}]*\}\// || src !~ /^(\/[A-Za-z0-9_-][A-Za-z0-9_.-]*)+$/ || src ~ /\.\.|\$/) print "folder outside the app data folder: " t
+            else if (src ~ /^\/secrets(\/|$)/ && v !~ /:ro(,[zZ])?$/) print "private key not read-only: " t }
+          else print "folder written in a form this tool does not accept: " t
+          next
+        }
+      }
+      if (incap) {
+        if (ind < capind || (ind == capind && t !~ /^- /)) incap = 0
+        else { c = t; sub(/^- +/, "", c); sub(/[ \t]+#.*$/, "", c); c = toupper(trim(unq(c)))   # a comment never hides the right
+          if (t ~ /\$/) print "filled-in value in an extra right: " t
+          if (c !~ /^[A-Z_]+$/) print "extra right written in a form this tool does not accept: " t
+          if (c ~ /^(CAP_)?(ALL|SYS_ADMIN|NET_ADMIN|SYS_MODULE|SYS_PTRACE|SYS_RAWIO|DAC_READ_SEARCH|SYS_BOOT|SYS_TIME|BPF|PERFMON|MAC_ADMIN|MAC_OVERRIDE|SYSLOG)$/) print "dangerous extra right: " t
+          next }
+      }
+      if (insec) {
+        if (ind < secind || (ind == secind && t !~ /^- /)) insec = 0
+        else { if (t ~ /\$/) print "filled-in value in a safety option: " t
+          s = t; sub(/^- +/, "", s); sub(/[ \t]+#.*$/, "", s); s = trim(unq(s))
+          if (s !~ /^no-new-privileges(:true)?$/) print "safety option not allowed (only no-new-privileges): " t
+          next }
+      }
+      if (ind == 0) {
+        innet = (t ~ /^networks:/)
+        if (t !~ /^(services|networks|volumes|include|x-[A-Za-z0-9_-]+):/) print "not allowed at the top of a checked recipe: " t
+      } else if (innet) {
+        k = t; sub(/:.*/, "", k)
+        if (k == "external" && val(t) !~ /^(false|False)$/) print "joins a network outside the app: " t
+        if (k == "driver" && val(t) != "bridge") print "network type not allowed (only the normal one): " t
+        if (k == "name" || k == "driver_opts") print "network setting not allowed: " t
+      }
+      if (t ~ /^ports:/) { inports = 1; portind = ind; if (t !~ /^ports:[ \t]*$/) print "ports must be a list: " t; next }
+      if (t ~ /^volumes:/) {
+        if (ind == 0) { print "named volumes keep data outside /srv/secure-linux: " t; next }
+        invol = 1; volind = ind; if (t !~ /^volumes:[ 	]*$/) print "volumes must be a list: " t; next }
+      if (t ~ /^(build|extends):/ || (ind == 0 && t ~ /^include:/)) print "not allowed in a checked recipe: " t
+      if (ind > 0 && t ~ /^(devices|device_cgroup_rules|env_file|volumes_from|cgroup_parent|gpus|runtime):/) print "reaches outside the app (not allowed): " t
+      if (t ~ /^security_opt:[ \t]*$/) { insec = 1; secind = ind; next }
+      if (t ~ /^cap_add:/) { incap = 1; capind = ind; if (t !~ /^cap_add:[ \t]*$/) print "cap_add must be a list: " t; next }
+      if (t ~ /^image:/) {
+        img = t; sub(/^image:[ \t]*/, "", img); img = unq(img)
+        at = index(img, "@sha256:"); dig = (at ? substr(img, at + 8) : "")
+        if (at == 0 || length(dig) != 64 || dig !~ /^[0-9a-f]+$/ || substr(img, 1, at - 1) !~ /^[a-z0-9.\/_-]+:[A-Za-z0-9._-]+$/ || img ~ /:latest@/)
+          print "image not pinned by version and digest: " t
+      }
+      if (t ~ /^network_mode:/ && unq(t) ~ /host/) print "uses the host network: " t
+      # only the network of the app itself: never that of another container ("container:...", "service:...") or the host
+      if (t ~ /^network_mode:/ && val(t) != "bridge" && val(t) != "none") print "joins another container or the host network: " t
+      if (t ~ /^(pid|ipc|userns_mode|uts|cgroup):/ && unq(t) ~ /host/) print "shares the host: " t
+      if (t ~ /^(pid|ipc|userns_mode|uts|cgroup):/ && !((t ~ /^ipc:/ && (val(t) == "private" || val(t) == "shareable")) || (t ~ /^cgroup:/ && val(t) == "private")))
+        print "shares the host or another container: " t
+      if (t ~ /^privileged:/ && val(t) !~ /^(false|False|FALSE)$/) print "privileged container: " t
+    }' "$1"
+}
+
+# load_app APP: reads and checks the recipe; sets APPDIR TITLE ABOUT PORT EXTRA_PORTS DATA_DIRS USER_DIRS SECRETS SECRET_UID
+# MIN_GB B_INCLUDE B_EXCLUDE FIRST_SIGNIN D ENVF STATEF UNIT
+load_app() {
+  APP=$1
+  valid_name "$APP" || stop "'$APP' is not an app name. See the apps with: secure-linux-server-apps list"
+  APPS=$(apps_dir) || stop "The home-server app files are not on this computer. Run 'Repair setup' from Secure Linux Status."
+  APPDIR=$APPS/$APP
+  is_recipe "$APPDIR" || stop "There is no app called '$APP'. See the apps with: secure-linux-server-apps list"
+  local m bad
+  m=$(meta "$APPDIR")
+  TITLE=$(kv_get title <<<"$m") || TITLE=""
+  ABOUT=$(kv_get about <<<"$m") || ABOUT=""
+  PORT=$(kv_get port <<<"$m") || PORT=""
+  EXTRA_PORTS=$(kv_get extra_ports <<<"$m") || EXTRA_PORTS=""
+  DATA_DIRS=$(kv_get data_dirs <<<"$m") || DATA_DIRS=""
+  USER_DIRS=$(kv_get user_dirs <<<"$m") || USER_DIRS=""
+  SECRETS=$(kv_get secrets <<<"$m") || SECRETS=""
+  SECRET_UID=$(kv_get secret_uid <<<"$m") || SECRET_UID=0
+  MIN_GB=$(kv_get min_free_gb <<<"$m") || MIN_GB=2
+  B_INCLUDE=$(kv_get backup_include <<<"$m") || B_INCLUDE=""
+  B_EXCLUDE=$(kv_get backup_exclude <<<"$m") || B_EXCLUDE=""
+  FIRST_SIGNIN=$(kv_get first_signin <<<"$m") || FIRST_SIGNIN=""   # plain text to show, never run (an app's own public first sign-in)
+  [ -n "$TITLE" ] || stop "The app files for '$APP' are damaged (no title). Run 'Repair setup' from Secure Linux Status."
+  [ "$(kv_get lan_only <<<"$m")" = yes ] || stop "$TITLE is not marked as home-network-only, so this tool will not set it up."
+  case $PORT in ''|*[!0-9]*) stop "The app files for $TITLE are damaged (bad port)." ;; esac
+  { [ "$PORT" -ge 1024 ] && [ "$PORT" -le 65535 ]; } || stop "The app files for $TITLE are damaged (bad port)."
+  case $SECRET_UID in ''|*[!0-9]*) stop "The app files for $TITLE are damaged (bad secret owner)." ;; esac
+  case $MIN_GB in ''|*[!0-9]*) MIN_GB=2 ;; esac
+  words_ok "$DATA_DIRS $USER_DIRS $SECRETS" || stop "The app files for $TITLE are damaged (bad folder or secret name)."
+  paths_ok "$B_INCLUDE $B_EXCLUDE" || stop "The app files for $TITLE are damaged (bad backup path)."
+  ports_ok "$EXTRA_PORTS" || stop "The app files for $TITLE are damaged (bad extra port)."
+  [ -n "$DATA_DIRS" ] || stop "The app files for $TITLE are damaged (no data folders)."
+  bad=$(check_compose "$APPDIR/compose.yml")
+  if [ -n "$bad" ]; then
+    say "$TITLE is not set up: its container file breaks the home-network-only rules:"
+    printf '%s\n' "$bad" | sed 's/^/  - /'
+    stop "Run 'Repair setup' from Secure Linux Status to get the checked files back."
+  fi
+  D=$DATA_ROOT/$APP
+  ENVF=$D/.compose.env
+  STATEF=$STATE_DIR/$APP.state
+  UNIT=secure-linux-server-app@$APP.service
+}
+installed() { [ -f "$STATEF" ]; }
+
+# ---------------------------------------------------------------- this computer
+private_ip() {
+  local a=${1:-} part oldifs
+  case $a in ''|*[!0-9.]*) return 1 ;; esac
+  oldifs=$IFS; IFS=.; set -- $a; IFS=$oldifs
+  [ $# -eq 4 ] || return 1
+  for part in "$@"; do case $part in ''|*[!0-9]*) return 1 ;; esac; [ "$part" -le 255 ] || return 1; done
+  case "$1.$2" in 192.168|172.1[6-9]|172.2[0-9]|172.3[01]) return 0 ;; esac
+  [ "$1" = 10 ]
+}
+home_address() {
+  local a
+  if [ -n "${SL_SERVERAPPS_BIND+x}" ]; then a=$SL_SERVERAPPS_BIND   # set (even empty): the only source
+  else a=$(ip -4 route get 1.1.1.1 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p' | head -n 1); fi
+  private_ip "$a" || return 1
+  printf '%s' "$a"
+}
+main_ids() { # uid:gid of the person who asked (never the administrator account)
+  local u g
+  if [ -n "${SL_SERVERAPPS_RUN_AS:-}" ]; then printf '%s' "$SL_SERVERAPPS_RUN_AS"; return 0; fi
+  u=${PKEXEC_UID:-${SUDO_UID:-}}
+  [ -n "$u" ] || u=$(conf_get "$STATEF" RUNAS 2>/dev/null | cut -d: -f1)
+  case $u in ''|*[!0-9]*) return 1 ;; esac
+  g=$(getent passwd "$u" 2>/dev/null | cut -d: -f4)
+  case $g in ''|*[!0-9]*) return 1 ;; esac
+  printf '%s:%s' "$u" "$g"
+}
+user_name() { # login name for uid $1, if it is a plain one
+  local n
+  n=$(getent passwd "$1" 2>/dev/null | cut -d: -f1)
+  case $n in ''|[!a-z_]*|*[!a-z0-9_-]*) return 1 ;; esac
+  printf '%s' "$n"
+}
+time_zone() {
+  local z
+  z=$(timedatectl show -p Timezone --value 2>/dev/null) || z=""
+  [ -n "$z" ] || z=$(readlink /etc/localtime 2>/dev/null | sed -n 's|.*/zoneinfo/||p')
+  case $z in ''|*[!A-Za-z0-9_/+-]*) z=UTC ;; esac
+  printf '%s' "$z"
+}
+host_name() {
+  local h
+  h=$(hostname -s 2>/dev/null) || h=$(uname -n 2>/dev/null) || h=""
+  h=${h%%.*}
+  case $h in ''|*[!A-Za-z0-9-]*|-*) h=localhost ;; esac
+  printf '%s' "$h"
+}
+random_text() { # random_text LENGTH: letters and digits from the system's random source
+  local s
+  s=$(LC_ALL=C tr -dc 'A-Za-z0-9' < /dev/urandom 2>/dev/null | head -c "$1")
+  [ ${#s} -eq "$1" ] || return 1
+  printf '%s' "$s"
+}
+free_kb() { df -Pk "$1" 2>/dev/null | awk 'NR==2 {print $4}'; }
+# at_home: the network this computer is on now is one the person marked as home (secure-linux-zone status --short,
+# the same check the AI page and remote access use). Anything else - away, no network yet, no zone tool - is "no":
+# a private address alone (a cafe, an office, a hotel) is never enough to open the apps to the people around.
+at_home() {
+  local zt z=""
+  zt=$(command -v secure-linux-zone 2>/dev/null) || { [ -z "$P" ] && [ -x /usr/local/bin/secure-linux-zone ] && zt=/usr/local/bin/secure-linux-zone; }
+  [ -n "$zt" ] && z=$("$zt" status --short 2>/dev/null | tail -n 1)
+  [ "$z" = home ]
+}
+NOT_HOME="this network is not marked as your home network, so nothing is opened to the people around this computer"
+HOME_HOW="If this is your home network, mark it once with: secure-linux-zone set-home   then try again."
+
+pick_engine() {
+  if [ -n "${SL_SERVERAPPS_ENGINE:-}" ]; then ENGINE=$SL_SERVERAPPS_ENGINE
+  elif command -v docker >/dev/null 2>&1; then ENGINE=docker
+  elif command -v podman >/dev/null 2>&1; then ENGINE=podman
+  else stop "No container tool (Docker or Podman) was found. Turn on Docker in Home & Server Helper first, then try again."; fi
+  case $ENGINE in docker|podman) : ;; *) stop "Unknown container tool '$ENGINE'." ;; esac
+}
+has_compose() { "$ENGINE" compose version >/dev/null 2>&1; }
+NO_COMPOSE_MSG="The 'compose' part of the container tool is missing. Turn on Docker in Home & Server Helper (it adds it), then try again."
+why() { # why MESSAGE: after a failed compose step, name the plain cause when it is a missing compose part
+  if has_compose; then fail "$1"; else fail "$NO_COMPOSE_MSG"; fi
+}
+compose() { "$ENGINE" compose --env-file "$ENVF" -p "sl-$APP" -f "$APPDIR/compose.yml" "$@"; }
+running_count() {
+  "$ENGINE" ps --filter "label=com.docker.compose.project=sl-$APP" --format '{{.Names}}' 2>/dev/null | grep -c .
+}
+
+fw() { if firewall-cmd --state >/dev/null 2>&1; then firewall-cmd --permanent "$@"; else firewall-offline-cmd "$@"; fi; }
+fw_open() { # the home zone only, never the public (away) zone
+  local pp
+  command -v firewall-cmd >/dev/null 2>&1 || { say "Note: no firewall tool found. $TITLE still listens only on your home-network address."; return 0; }
+  for pp in "$PORT/tcp" $EXTRA_PORTS; do
+    fw --zone=home --query-port="$pp" >/dev/null 2>&1 || logged fw --zone=home --add-port="$pp"
+  done
+  firewall-cmd --state >/dev/null 2>&1 && logged firewall-cmd --reload
+  return 0
+}
+fw_close() {
+  local pp
+  command -v firewall-cmd >/dev/null 2>&1 || return 0
+  for pp in "$PORT/tcp" $EXTRA_PORTS; do
+    fw --zone=home --query-port="$pp" >/dev/null 2>&1 && logged fw --zone=home --remove-port="$pp"
+  done
+  firewall-cmd --state >/dev/null 2>&1 && logged firewall-cmd --reload
+  return 0
+}
+
+write_env() { # the values compose fills in. No passwords here: those stay in the secret files.
+  ( umask 077
+    { printf 'SL_BIND=%s\n' "$BIND"; printf 'SL_PORT=%s\n' "$PORT"; printf 'SL_DATA=%s\n' "$D"
+      printf 'SL_UID=%s\n' "${RUNAS%%:*}"; printf 'SL_GID=%s\n' "${RUNAS##*:}"
+      printf 'SL_TZ=%s\n' "$(time_zone)"; printf 'SL_HOSTNAME=%s\n' "$(host_name)"; } > "$ENVF.new" && mv -f "$ENVF.new" "$ENVF"
+  ) || fail "Could not write the settings file for $TITLE ($ENVF)."
+}
+write_state() { # who and where, for list/open/status. Readable by everyone: it holds no secrets.
+  mkdir -p "$STATE_DIR" && chmod 755 "$STATE_DIR" 2>/dev/null
+  { printf 'TITLE=%s\n' "$TITLE"; printf 'BIND=%s\n' "$BIND"; printf 'PORT=%s\n' "$PORT"; printf 'ENGINE=%s\n' "$ENGINE"
+    printf 'RUNAS=%s\n' "$RUNAS"; printf 'URL=http://%s:%s\n' "$BIND" "$PORT"; } > "$STATEF.new" && mv -f "$STATEF.new" "$STATEF" ||
+    fail "Could not save the settings for $TITLE."
+  chmod 644 "$STATEF" 2>/dev/null
+  return 0
+}
+make_folders() {
+  local d
+  mkdir -p "$DATA_ROOT" "$D" || stop "Could not make the data folder $D."
+  chmod 755 "$DATA_ROOT" "$D" 2>/dev/null
+  for d in $DATA_DIRS; do mkdir -p "$D/$d" || stop "Could not make the data folder $D/$d."; done
+  for d in $USER_DIRS; do
+    mkdir -p "$D/$d" || stop "Could not make the folder $D/$d."
+    [ -n "$P" ] || chown "$RUNAS" "$D/$d" 2>/dev/null
+  done
+}
+make_secrets() { # made once; kept on later runs (the app's data already uses them)
+  local s f v name
+  mkdir -p "$D/secrets" || stop "Could not make the private folder for $TITLE."
+  chmod 700 "$D/secrets"
+  [ -n "$P" ] || chown 0:0 "$D/secrets"
+  for s in $SECRETS; do
+    f=$D/secrets/$s
+    [ -s "$f" ] && continue
+    case $s in
+      admin_user) name=$(user_name "${RUNAS%%:*}") || name=admin; v=$name ;;
+      admin_password) v=$(random_text 24) || stop "Could not make a random password." ;;
+      *) v=$(random_text 48) || stop "Could not make a random key." ;;
+    esac
+    ( umask 077; printf '%s' "$v" > "$f.new" ) && mv -f "$f.new" "$f" || stop "Could not save a private key for $TITLE."
+  done
+  for s in $SECRETS; do
+    f=$D/secrets/$s
+    [ -n "$P" ] || chown "$SECRET_UID:0" "$f"
+    chmod 400 "$f"
+  done
+  v=""; log "secrets ready for $APP (values not logged)"
+}
+need_installed() { installed || stop "$TITLE is not set up. Set it up with: secure-linux-server-apps install $APP"; }
+need_root() { [ -n "$P" ] || [ "$(id -u)" -eq 0 ] || exec pkexec "$SELF" "$@"; }
+
+# ---------------------------------------------------------------- commands
+cmd_list() {
+  local a any=no c
+  APPS=$(apps_dir) || fail "The home-server app files are not on this computer. Run 'Repair setup' from Secure Linux Status."
+  say "Home-server apps you can add (home network only, free):"
+  for a in $(all_apps); do
+    any=yes; c=$APPS/$a
+    if [ -f "$STATE_DIR/$a.state" ]; then
+      say "  $a  - $(meta_get "$c" title) [set up: $(conf_get "$STATE_DIR/$a.state" URL)]"
+    else
+      say "  $a  - $(meta_get "$c" title): $(meta_get "$c" about)"
+    fi
+  done
+  [ "$any" = yes ] || { say "  (none found - run 'Repair setup' from Secure Linux Status)"; return 0; }
+  say "Set one up with: secure-linux-server-apps install NAME"
+}
+
+cmd_install() {
+  load_app "$1"; pick_engine
+  has_compose || stop "$NO_COMPOSE_MSG"
+  at_home || stop "$TITLE was not set up: $NOT_HOME. $HOME_HOW"
+  BIND=$(home_address) || stop "Could not find this computer's home-network address. Connect to your home network (Wi-Fi or cable at home) and try again."
+  RUNAS=$(main_ids) || stop "Could not work out who you are. Run this from your own account, not the administrator account."
+  [ "${RUNAS%%:*}" != 0 ] || stop "$TITLE will not be set up for the administrator account. Run this from your own account."
+  if ! installed && command -v ss >/dev/null 2>&1 && [ -n "$(ss -Hltn "sport = :$PORT" 2>/dev/null)" ]; then
+    stop "Another program on this computer already uses port $PORT, which $TITLE needs."
+  fi
+  mkdir -p "$DATA_ROOT" 2>/dev/null
+  local free; free=$(free_kb "$DATA_ROOT")
+  case $free in ''|*[!0-9]*) : ;; *) [ "$free" -ge $((MIN_GB * 1024 * 1024)) ] ||
+    stop "$TITLE needs at least $MIN_GB GB of free space on this computer; there is less. Free some space first." ;; esac
+  log "install $APP bind=$BIND port=$PORT engine=$ENGINE"
+  make_folders; make_secrets; write_env
+  say "Setting up $TITLE. It downloads the version this kit has checked, which can take a few minutes..."
+  logged compose pull || why "Could not download $TITLE. Check the internet connection, then run the same command again. Your data folder ($D) is kept."
+  logged compose up -d || why "$TITLE would not start. Try again, or see: secure-linux-server-apps status $APP"
+  write_state
+  logged systemctl enable "$UNIT" || say "Note: could not set $TITLE to start by itself after a restart. Start it with: secure-linux-server-apps start $APP"
+  fw_open
+  say ""
+  say "Done. $TITLE is running on this computer, for your home network only. Nothing is opened to the internet."
+  say "  Open it in a browser on any device at home: http://$BIND:$PORT   (or: secure-linux-server-apps open $APP)"
+  case " $SECRETS " in *" admin_password "*)
+    say "  First sign-in: see your sign-in name and password with: secure-linux-server-apps login $APP" ;; esac
+  [ -z "$FIRST_SIGNIN" ] || say "  IMPORTANT, do this now: $FIRST_SIGNIN"
+  say "  It can take a few minutes the first time before the page appears."
+  say "  Your data stays in $D. Back it up with: secure-linux-server-apps backup $APP"
+  say "Tip: ask your router to always give this computer the same address, so other devices keep finding it."
+}
+
+cmd_start() {
+  local boot=$2 old
+  load_app "$1"; need_installed; pick_engine
+  if ! at_home; then
+    # at start-up the container tool may already have brought the app back by itself ("restart: unless-stopped"):
+    # away from home it is stopped again, on its old address, and the start-up unit tries again later
+    if [ "$boot" = boot ] && [ -f "$ENVF" ]; then logged compose stop || :; fi
+    log "start $APP refused: not on the home network"
+    fail "$TITLE was not started: $NOT_HOME. It starts by itself when this computer is back on your home network. $HOME_HOW"
+  fi
+  BIND=$(home_address) || fail "Could not find this computer's home-network address yet. $TITLE starts when the home network is back."
+  RUNAS=$(conf_get "$STATEF" RUNAS) || RUNAS=""
+  [[ $RUNAS =~ ^[1-9][0-9]*:[0-9]+$ ]] || fail "The saved settings for $TITLE are damaged. Set it up again with: secure-linux-server-apps install $APP"
+  old=$(conf_get "$STATEF" BIND) || old=""
+  [ -n "$old" ] && [ "$old" != "$BIND" ] && say "This computer's home address changed from $old to $BIND. $TITLE now uses the new one."
+  write_env
+  logged compose up -d || why "$TITLE would not start. Try again in a minute."
+  write_state
+  if [ "$boot" != boot ]; then
+    logged systemctl enable "$UNIT" || :
+    fw_open
+    say "$TITLE is on: http://$BIND:$PORT  (it also starts by itself after a restart)"
+  fi
+}
+
+cmd_stop() {
+  local boot=$2
+  load_app "$1"; need_installed; pick_engine
+  [ -f "$ENVF" ] || fail "The settings file for $TITLE is missing. Set it up again with: secure-linux-server-apps install $APP"
+  if [ "$boot" != boot ]; then logged systemctl disable --now "$UNIT" || :; fi
+  logged compose stop || why "$TITLE did not stop cleanly. Try again in a minute."
+  [ "$boot" = boot ] || say "$TITLE is switched off. Your data is kept. Switch it on with: secure-linux-server-apps start $APP"
+}
+
+cmd_status() {
+  local a any=no n
+  if [ -n "${1:-}" ]; then set -- "$1"; else set -- $(all_apps); fi
+  for a in "$@"; do
+    load_app "$a"
+    installed || { [ $# -eq 1 ] && say "$TITLE is not set up. Set it up with: secure-linux-server-apps install $APP"; continue; }
+    any=yes; pick_engine
+    n=$(running_count)
+    if [ "${n:-0}" -gt 0 ]; then say "$TITLE is running. Open it at: $(conf_get "$STATEF" URL)  (home network only)"
+    else say "$TITLE is switched off. Switch it on with: secure-linux-server-apps start $APP"; fi
+  done
+  [ "$any" = yes ] || [ $# -eq 1 ] || say "No home-server apps are set up yet. See them with: secure-linux-server-apps list"
+  return 0
+}
+
+cmd_open() {
+  load_app "$1"; need_installed
+  local url; url=$(conf_get "$STATEF" URL) || url=""
+  case $url in http://[0-9]*:[0-9]*) : ;; *) fail "The saved address for $TITLE is damaged. Run: secure-linux-server-apps start $APP" ;; esac
+  if command -v xdg-open >/dev/null 2>&1 && xdg-open "$url" >/dev/null 2>&1; then say "Opening $TITLE in your browser: $url"
+  else say "Open this address in your browser: $url"; fi
+}
+
+cmd_login() {
+  load_app "$1"; need_installed
+  if ! { [ -s "$D/secrets/admin_user" ] && [ -s "$D/secrets/admin_password" ]; }; then
+    [ -z "$FIRST_SIGNIN" ] || say "$FIRST_SIGNIN"
+    fail "$TITLE has no sign-in made by this tool. Use the account you made in its web page."
+  fi
+  say "First sign-in for $TITLE ($(conf_get "$STATEF" URL)):"
+  say "  Name:     $(cat "$D/secrets/admin_user")"
+  say "  Password: $(cat "$D/secrets/admin_password")"
+  say "This is the password made at setup. If you changed it in the app since then, use your own."
+}
+
+do_backup() { # do_backup TARGET_FOLDER -> sets OUT
+  local dest=$1 need free was stamp
+  need=$(du -sk "$D" 2>/dev/null | awk '{print $1}'); case $need in ''|*[!0-9]*) need=0 ;; esac
+  free=$(free_kb "$dest")
+  case $free in ''|*[!0-9]*) : ;; *) [ "$free" -gt "$need" ] || fail "Not enough free space in $dest for a backup of $TITLE (needs about $((need / 1024 + 1)) MB). Nothing was changed." ;; esac
+  was=$(running_count)
+  if [ "${was:-0}" -gt 0 ]; then
+    say "Pausing $TITLE for a moment, so the copy is complete..."
+    logged compose stop || why "$TITLE could not be paused, so no backup was made. Nothing was changed."
+  fi
+  stamp=$(date '+%Y%m%d-%H%M%S')
+  OUT=$dest/$APP-$stamp.tar.gz
+  local inc=() exc=() x part
+  part=$(mktemp "$dest/.$APP-backup.XXXXXX") || fail "Could not write in $dest. Nothing was changed."
+  set -f
+  if [ -n "$B_INCLUDE" ]; then # only these folders, plus the private keys and settings the app needs to come back
+    for x in $B_INCLUDE secrets .compose.env; do [ -e "$D/$x" ] && inc+=("$APP/$x"); done
+  else inc=("$APP"); fi
+  for x in $B_EXCLUDE; do exc+=("--exclude=$APP/$x"); done
+  set +f
+  chmod 600 "$part"
+  ( umask 077; tar -C "$DATA_ROOT" "${exc[@]}" -czf "$part" "${inc[@]}" ) 2>>"$LOG"
+  local rc=$?
+  if [ "${was:-0}" -gt 0 ]; then logged compose start || say "Note: $TITLE did not start again. Start it with: secure-linux-server-apps start $APP"; fi
+  if [ $rc -ne 0 ]; then rm -f "$part"; fail "The backup of $TITLE did not finish (see $LOG). Your app and data are unchanged."; fi
+  mv -f "$part" "$OUT" && chmod 600 "$OUT"
+  log "backup $APP -> $OUT"
+}
+
+cmd_backup() {
+  local app=$1 dest=""; shift
+  while [ $# -gt 0 ]; do
+    case $1 in --to) [ $# -ge 2 ] || stop "--to needs a folder."; dest=$2; shift ;; *) stop "I don't know '$1'." ;; esac; shift
+  done
+  load_app "$app"; need_installed; pick_engine
+  if [ -n "$dest" ]; then
+    case $dest in /*) : ;; *) stop "Give the full folder path after --to (it starts with /)." ;; esac
+    [ -d "$dest" ] || stop "The folder '$dest' does not exist. Plug in and open the drive first, or check the spelling."
+    dest=$(cd "$dest" && pwd)
+    case $dest/ in "$D"/*) stop "Pick a folder outside $TITLE's own data folder ($D)." ;; esac
+  else
+    dest=$DATA_ROOT/backups; mkdir -p "$dest" && chmod 700 "$dest" || stop "Could not make the backup folder $dest."
+  fi
+  [ -f "$ENVF" ] || fail "The settings file for $TITLE is missing. Set it up again with: secure-linux-server-apps install $APP"
+  do_backup "$dest"
+  say "Backup saved: $OUT"
+  say "It holds your $TITLE data and its private keys. Keep it somewhere safe and private."
+}
+
+cmd_update() {
+  load_app "$1"; need_installed; pick_engine
+  [ -f "$ENVF" ] || fail "The settings file for $TITLE is missing. Set it up again with: secure-linux-server-apps install $APP"
+  at_home || stop "$TITLE was not updated: $NOT_HOME. $HOME_HOW"
+  local dest=$DATA_ROOT/backups
+  mkdir -p "$dest" && chmod 700 "$dest" || stop "Could not make the backup folder $dest."
+  say "Making a backup of $TITLE first..."
+  do_backup "$dest"
+  say "Backup saved: $OUT"
+  BIND=$(home_address) || fail "Could not find this computer's home-network address. Connect at home and try again. The backup is kept."
+  RUNAS=$(conf_get "$STATEF" RUNAS) || RUNAS=""
+  write_env
+  say "Getting the version of $TITLE this kit has checked..."
+  logged compose pull || why "Could not download the new version. Check the internet connection. $TITLE is unchanged."
+  logged compose up -d || why "$TITLE did not start after the update. Your backup is in $OUT."
+  write_state
+  say "$TITLE is up to date and running: http://$BIND:$PORT"
+}
+
+cmd_remove() {
+  local app=$1 del=no a1 a2; shift
+  while [ $# -gt 0 ]; do
+    case $1 in --delete-data) del=yes ;; *) stop "I don't know '$1'." ;; esac; shift
+  done
+  load_app "$app"
+  installed || [ -d "$D" ] || stop "$TITLE is not set up, so there is nothing to remove."
+  pick_engine
+  if [ "$del" = yes ]; then
+    say "This will PERMANENTLY delete everything $TITLE keeps in $D (files, accounts, settings)."
+    say "Make a backup first if you might want it back: secure-linux-server-apps backup $APP"
+    printf 'Type DELETE to continue: ' >&2; IFS= read -r a1 || a1=""
+    [ "$a1" = DELETE ] || stop "Cancelled."
+    printf 'Last check. Type the app name (%s) to delete its data: ' "$APP" >&2; IFS= read -r a2 || a2=""
+    [ "$a2" = "$APP" ] || stop "Cancelled."
+  fi
+  say "Removing $TITLE..."
+  log "remove $APP delete_data=$del"
+  logged systemctl disable --now "$UNIT" || :
+  if [ ! -f "$ENVF" ]; then # compose needs the values to read its file; the address is never used for "down"
+    BIND=$(conf_get "$STATEF" BIND 2>/dev/null) || BIND=192.168.0.1
+    RUNAS=$(conf_get "$STATEF" RUNAS 2>/dev/null) || RUNAS=1000:1000
+    mkdir -p "$D" && write_env
+  fi
+  logged compose down --remove-orphans || say "Note: some parts of $TITLE may still be there; they are not running from now on."
+  fw_close
+  rm -f "$STATEF"
+  if [ "$del" = yes ]; then
+    case $D in "$DATA_ROOT"/?*) rm -rf -- "$D" ;; esac
+    say "Removed. Everything $TITLE kept was deleted."
+  else
+    say "Removed. Your data was kept in $D, so setting $TITLE up again finds it."
+  fi
+}
+
+cmd_menu() {
+  local apps=() a i=0 pick act
+  APPS=$(apps_dir) || fail "The home-server app files are not on this computer. Run 'Repair setup' from Secure Linux Status."
+  while IFS= read -r a; do [ -n "$a" ] && apps+=("$a"); done < <(all_apps)
+  [ ${#apps[@]} -gt 0 ] || fail "No home-server apps were found. Run 'Repair setup' from Secure Linux Status."
+  say "Home-server apps - for your home network only, free, kept on this computer."
+  for a in "${apps[@]}"; do i=$((i + 1)); say "  $i. $(meta_get "$APPS/$a" title) - $(meta_get "$APPS/$a" about)"; done
+  printf 'Pick an app (number), then Enter: ' >&2
+  IFS= read -r pick || fail "No answer received. Nothing was changed."
+  case $pick in ''|*[!0-9]*) fail "No app picked. Nothing was changed." ;; esac
+  { [ "$pick" -ge 1 ] && [ "$pick" -le ${#apps[@]} ]; } || fail "There is no app number $pick. Nothing was changed."
+  a=${apps[$((pick - 1))]}
+  say "What would you like to do?"
+  say "  1. Set it up (or start it)   2. Is it running?   3. Open it   4. Show the first sign-in"
+  say "  5. Back it up                6. Update it        7. Switch it off   8. Remove it (keeps your data)"
+  printf 'Pick 1-8, then Enter: ' >&2
+  IFS= read -r act || fail "No answer received. Nothing was changed."
+  case $act in
+    1) if [ -f "$STATE_DIR/$a.state" ]; then set -- start "$a"; else set -- install "$a"; fi ;;
+    2) set -- status "$a" ;; 3) set -- open "$a" ;; 4) set -- login "$a" ;; 5) set -- backup "$a" ;;
+    6) set -- update "$a" ;; 7) set -- stop "$a" ;; 8) set -- remove "$a" ;;
+    *) fail "No choice made. Nothing was changed." ;;
+  esac
+  bash "$(readlink -f "$0")" "$@"
+  local rc=$?
+  printf 'Press Enter to close. ' >&2; IFS= read -r _ || :
+  return $rc
+}
+
+# ---------------------------------------------------------------- main
+cmd=${1:-menu}; [ $# -gt 0 ] && shift
+case $cmd in
+  install|start|stop|status|login|update|backup|remove) need_root "$cmd" "$@" ;;
+esac
+needapp() { [ -n "${1:-}" ] || stop "Say which app, for example: secure-linux-server-apps $cmd nextcloud   (see: secure-linux-server-apps list)"; }
+case $cmd in
+  menu) cmd_menu ;;
+  list) cmd_list ;;
+  install) needapp "${1:-}"; [ $# -eq 1 ] || stop "Use: secure-linux-server-apps install APP"; cmd_install "$1" ;;
+  start|stop)
+    needapp "${1:-}"; b=""
+    [ "${2:-}" = --boot ] && b=boot
+    [ $# -le 1 ] || [ -n "$b" ] && [ $# -le 2 ] || stop "Use: secure-linux-server-apps $cmd APP"
+    "cmd_$cmd" "$1" "$b" ;;
+  status) [ $# -le 1 ] || stop "Use: secure-linux-server-apps status [APP]"; cmd_status "${1:-}" ;;
+  open|login|update) needapp "${1:-}"; [ $# -eq 1 ] || stop "Use: secure-linux-server-apps $cmd APP"; "cmd_$cmd" "$1" ;;
+  backup|remove) needapp "${1:-}"; "cmd_$cmd" "$@" ;;
+  *) sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+esac

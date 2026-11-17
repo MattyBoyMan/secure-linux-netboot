@@ -1,0 +1,12 @@
+# Secure Linux boot rollback: refresh the boot menu list after start-up and every hour (so "yesterday" stays right).
+[Unit]
+Description=Secure Linux: hourly refresh of the boot menu "go back" list
+ConditionKernelCommandLine=!rd.securelinux.rollback
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=1h
+Unit=secure-linux-boot-rollback-refresh.service
+
+[Install]
+WantedBy=timers.target

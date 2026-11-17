@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<!-- Secure Linux safety extras: travel mode and the panic lock. Installed by steps/00-early.sh to
+     /usr/share/polkit-1/actions/. Each action is tied to its one program path.
+     Travel mode changes system settings, so it asks for the password every time.
+     The panic lock never asks: it only locks things (screens, the home server folder, remembered passwords),
+     and only for the person sitting at the computer. Under pkexec it refuses every request except its own. -->
+<policyconfig>
+  <vendor>The Complete Secure Linux Package</vendor>
+  <action id="org.securelinux.safety.travel">
+    <description>Switch travel mode on or off</description>
+    <message>Secure Linux needs your password to switch travel mode on or off.</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/bin/secure-linux-travel</annotate>
+  </action>
+  <action id="org.securelinux.safety.panic-lock">
+    <description>Lock this computer now</description>
+    <message>Secure Linux is locking this computer.</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>yes</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/bin/secure-linux-panic-lock</annotate>
+  </action>
+</policyconfig>

@@ -1,0 +1,32 @@
+# Secure Linux (movereset): the desktop look that "Move my setup" carries to another computer. Look only: nothing
+# that starts a program (no start-up entries, no custom shortcuts that run commands, no terminal profiles), and any
+# line naming a program (Exec=, Command=, TerminalApplication= and the like) is left out when it is brought in.
+# One path per line, relative to the home folder; a folder line covers everything inside it.
+# Never listed here: anything in never-touch.list (files, keys, passwords, browsers, messages, app data).
+#
+# KDE Plasma: colours, fonts, icons, panels and widgets, window behaviour, keyboard layout, mouse and touchpad,
+# screen lock and power settings
+.config/kdeglobals
+.config/kwinrc
+.config/plasmarc
+.config/plasma-org.kde.plasma.desktop-appletsrc
+.config/kxkbrc
+.config/kcminputrc
+.config/kscreenlockerrc
+.config/powerdevilrc
+.config/breezerc
+.config/kcmfonts
+.local/share/color-schemes
+# Everyday KDE apps: view settings
+.config/dolphinrc
+.config/katerc
+.config/gwenviewrc
+.config/okularpartrc
+# Toolkit look shared by every desktop, and the file manager's bookmarks
+.config/gtk-3.0/settings.ini
+.config/gtk-4.0/settings.ini
+.config/gtk-3.0/bookmarks
+# Xfce and LXQt look
+.config/xfce4/xfconf/xfce-perchannel-xml/xsettings.xml
+.config/xfce4/xfconf/xfce-perchannel-xml/xfwm4.xml
+.config/lxqt/lxqt.conf

@@ -1,0 +1,12 @@
+[Unit]
+Description=Secure Linux: notice when the computer arrives home or leaves home (home server folder)
+# Only on the owner's computer, after the owner typed the home server password once.
+ConditionPathExists=/etc/secure-linux/home-share/ready
+
+[Path]
+# The network dispatcher writes home, away or offline here whenever the network changes.
+PathChanged=/run/secure-linux/location
+Unit=secure-linux-home-share.service
+
+[Install]
+WantedBy=paths.target

@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Backups
+GenericName=Home folder backups
+Comment=Optional encrypted, compressed and checked backups of your home folder to your home server or a USB drive
+Exec=/usr/local/bin/secure-linux-backup-gui
+Icon=drive-harddisk
+Terminal=false
+Categories=Utility;Archiving;
+Keywords=backup;restore;home server;USB;Borg;encrypted;
+StartupNotify=true

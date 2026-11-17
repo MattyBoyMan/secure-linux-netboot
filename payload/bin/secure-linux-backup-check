@@ -1,7 +1,8 @@
 #!/bin/bash
 # secure-linux-backup-check: daily (user timer) check that your backups actually happen.
 #   secure-linux-backup-check            check now (alerts: no backup in 7 days, backups not set up,
-#                                        monthly restore-drill reminder, home-server backup too old)
+#                                        monthly restore-drill reminder, home-server backup too old,
+#                                        home-folder backups (secure-linux-backup) too old or failing a check)
 #   secure-linux-backup-check --status   print what it found, no notifications
 # Also saves the list of installed apps to ~/.config/secure-linux/apps.txt so it is in your backups.
 # This helper shows no notifications itself. It writes each alert to
@@ -16,7 +17,7 @@ PIKA=$HOME/.var/app/org.gnome.World.PikaBackup/config/pika-backup   # VERIFY: ba
 USTATE=$HOME/.local/state/secure-linux
 UALERTS=$SL_STATE/user-alerts/$USER
 QUIET=0; [ "${1:-}" = --status ] && QUIET=1
-case "${1:-}" in -h|--help) sed -n '2,9p' "$0"; exit 0 ;; esac
+case "${1:-}" in -h|--help) sed -n '2,10p' "$0"; exit 0 ;; esac
 mkdir -p "$USTATE/backup-seen"
 NOW=$(date +%s)
 [ -f "$USTATE/first-seen" ] || date +%s > "$USTATE/first-seen"
@@ -33,6 +34,13 @@ clear_alert() { rm -f "$UALERTS/$1" "$USTATE/backup-seen/$1" 2>/dev/null; return
 
 # 1. App list (so a restore can reinstall your apps)
 bash "$SL_EXP/user-setup.sh" applist >/dev/null 2>&1 || true
+
+# 2a. Optional home-folder backups made by secure-linux-backup (BorgBackup). When they are on, this computer HAS
+#     backups, so the Pika "not set up" alert is not raised.
+HB_CONF=$HOME/.config/secure-linux/backup/config
+HB_STATE=$HOME/.local/state/secure-linux/home-backup/state
+hb_get() { sed -n "s/^$2=//p" "$1" 2>/dev/null | tail -n 1; }
+HB_ON=no; [ "$(hb_get "$HB_CONF" enabled)" = yes ] && HB_ON=yes
 
 # 2. Pika Backup: how many backups are set up, and when did one last finish successfully?
 pika_info() {     # prints "<configs> <last-success-epoch or 0>"
@@ -69,7 +77,9 @@ if flatpak info org.gnome.World.PikaBackup >/dev/null 2>&1 || [ -d "$PIKA" ]; th
   read -r NCONF LAST <<< "$(pika_info)"
   if [ "${NCONF:-0}" -eq 0 ]; then
     clear_alert backup-old
-    if [ "$AGE_DAYS" -ge 7 ]; then
+    if [ "$HB_ON" = yes ]; then
+      clear_alert backup-none
+    elif [ "$AGE_DAYS" -ge 7 ]; then
       alert backup-none "Backups aren't set up yet" "If this laptop were lost or broke today, your files would be gone." \
         "Open Pika Backup and set up a backup to a USB drive or your home server (about 5 minutes)." 3
     fi
@@ -93,6 +103,48 @@ if flatpak info org.gnome.World.PikaBackup >/dev/null 2>&1 || [ -d "$PIKA" ]; th
       [ -f "$USTATE/backup-seen/restore-drill" ] && [ $(( NOW - $(stat -c %Y "$USTATE/backup-seen/restore-drill") )) -ge 259200 ] && clear_alert restore-drill
     fi
   fi
+fi
+
+# 2b. Home-folder backups (secure-linux-backup): last good backup within 7 days, and no failed check
+if [ "$HB_ON" = yes ]; then
+  HB_LAST=$(hb_get "$HB_STATE" last_good_time); case "$HB_LAST" in ''|*[!0-9]*) HB_LAST=0 ;; esac
+  HB_SINCE=$(hb_get "$HB_CONF" created); case "$HB_SINCE" in ''|*[!0-9]*) HB_SINCE=0 ;; esac
+  if [ "$HB_LAST" -gt 0 ] && [ $(( (NOW - HB_LAST) / 86400 )) -lt 7 ]; then
+    clear_alert home-backup-old
+    [ $QUIET = 1 ] && echo "Last home-folder backup: $(date -d "@$HB_LAST" '+%a %d %b %H:%M' 2>/dev/null || echo "$HB_LAST") (checked)"
+  elif [ "$HB_LAST" -eq 0 ] && [ $(( (NOW - HB_SINCE) / 86400 )) -lt 2 ]; then
+    clear_alert home-backup-old   # just switched on: the first backup has not had its chance yet
+  else
+    if [ "$HB_LAST" -gt 0 ]; then days="$(( (NOW - HB_LAST) / 86400 )) days"; else days="a while"; fi
+    alert home-backup-old "No home backup in $days" "Your home folder hasn't been backed up for $days." \
+      "Connect your home server or backup drive, then open Backups and click Back up now."
+  fi
+  if [ "$(hb_get "$HB_STATE" last_check_result)" = failed ] || [ "$(hb_get "$HB_STATE" last_full_check_result)" = failed ] ||
+     [ "$(hb_get "$HB_STATE" last_restore_test_result)" = failed ]; then
+    alert home-backup-problem "Your backups need attention" "A check found a problem with your backups. Your older backups were kept." \
+      "Open Backups and choose Repair backups (or type: secure-linux-backup repair)."
+  else
+    clear_alert home-backup-problem
+  fi
+else
+  clear_alert home-backup-old; clear_alert home-backup-problem
+  if [ ! -f "$HB_CONF" ]; then
+    # not set up (or the settings were removed): none of the home-backup alerts can still be true
+    for a in home-backup-copy-due home-backup-copy-problem home-backup-keyring home-backup-deleted home-backup-copy-deleted; do
+      clear_alert "$a"
+    done
+  else
+    # paused: the backups are kept, so a deletion alarm or a damaged drive copy stays visible until it is looked at
+    clear_alert home-backup-copy-due; clear_alert home-backup-keyring
+  fi
+fi
+
+# 2c. One gentle offer, once, only for the owner: backups to the home server once it is connected. Nothing is turned
+#     on by itself; secure-linux-backup decides and writes the notice (see: secure-linux-backup offer-home).
+if [ $QUIET = 0 ] && [ "$HB_ON" = no ]; then
+  HB_TOOL=$(dirname "$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")")/secure-linux-backup
+  [ -x "$HB_TOOL" ] || HB_TOOL=$(command -v secure-linux-backup 2>/dev/null)
+  if [ -n "$HB_TOOL" ]; then "$HB_TOOL" offer-home < /dev/null > /dev/null 2>&1; fi
 fi
 
 # 3. Optional: the home server's own backup health file (see server/README.md). Its address is the saved choice

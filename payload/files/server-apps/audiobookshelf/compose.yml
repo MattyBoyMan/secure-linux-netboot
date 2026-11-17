@@ -1,0 +1,26 @@
+# Audiobookshelf for Secure Linux: your own private shelf for audiobooks and podcasts. Home network only.
+# Started only by secure-linux-server-apps, which fills in the SL_* values from this computer (see app.conf).
+# Image pinned by version AND digest (checked on GitHub Container Registry, 2026-11-16): the official
+# advplyr/audiobookshelf 2.37.2. Runs as your own account (not as the administrator).
+# Your audiobooks folder is mounted READ-ONLY. The podcasts folder can be written, because podcast episodes
+# are downloaded into it. The first person to open it makes the first account: do that yourself straight away.
+# It listens on its own high port inside, so it needs no extra rights to open port 80.
+services:
+  audiobookshelf:
+    image: ghcr.io/advplyr/audiobookshelf:2.37.2@sha256:b897c33f05972fb1bf484f7487bc878fa91ec8691335c1db6e2929c3a7658efa
+    restart: unless-stopped
+    user: "${SL_UID:?user missing}:${SL_GID:?group missing}"
+    ports:
+      - "${SL_BIND:?home address missing}:${SL_PORT:?port missing}:13378"
+    volumes:
+      - "${SL_DATA:?data folder missing}/config:/config:Z"
+      - "${SL_DATA:?data folder missing}/metadata:/metadata:Z"
+      - "${SL_DATA:?data folder missing}/audiobooks:/audiobooks:ro,z"
+      - "${SL_DATA:?data folder missing}/podcasts:/podcasts:z"
+    environment:
+      TZ: "${SL_TZ:-UTC}"
+      PORT: "13378"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL

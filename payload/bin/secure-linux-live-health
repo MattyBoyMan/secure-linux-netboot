@@ -1,0 +1,322 @@
+#!/bin/bash
+# secure-linux-live-health: live health graphs for this computer (Netdata), local-only, private, no sign-in.
+#
+#   secure-linux-live-health summary             one plain screen: is this computer healthy right now? (works without Netdata too)
+#   secure-linux-live-health setup [--yes]       install Netdata after you have read what it does and said yes
+#   secure-linux-live-health open [NAME]         open the live graphs in your browser (NAME = another computer you added)
+#   secure-linux-live-health status [--short]    is it on? who can see it? (short: not-set-up|off|on|down)
+#   secure-linux-live-health off                 stop it and close it to the network (the program stays installed)
+#   secure-linux-live-health on                  start it again
+#   secure-linux-live-health network on|off      let other computers at HOME open these graphs (home network only)
+#   secure-linux-live-health others [list|add NAME ADDRESS|remove NAME]
+#                                                the other computers at home whose graphs you want to open from here
+#   secure-linux-live-health remove [--delete-data] [--yes]   take it away completely
+#
+# By default the graphs can only be opened on THIS computer (address 127.0.0.1). Nothing is sent to the
+# makers: anonymous statistics are switched off, and this computer is never connected to Netdata Cloud
+# (no account, no sign-in). Reuses Netdata (agent GPL-3.0-or-later, https://github.com/netdata/netdata) from
+# Netdata's own package repository for Fedora, set up from a small pinned package (SHA-256 checked).
+# Note for the curious: Netdata's dashboard screens are free to use but are under Netdata's own licence
+# (NCUL1), not an open-source licence. The program that collects the numbers is open source.
+set -u
+export LC_ALL=C
+P=${SL_LIVEHEALTH_PREFIX:-}               # tests only: a fake root folder for /etc, /var and /run
+STATE=$P/var/lib/secure-linux/live-health
+NDETC=$P/etc/netdata
+CONF=$NDETC/netdata.conf
+OPTOUT=$NDETC/.opt-out-from-anonymous-statistics
+DROPIN=$P/etc/systemd/system/netdata.service.d/secure-linux.conf
+REPO_VER=5-6
+REPO_URL=https://repository.netdata.cloud/repos/repoconfig
+PORT=19999
+PRIVATE_PATTERNS='localhost 10.* 192.168.* 172.16.* 172.17.* 172.18.* 172.19.* 172.20.* 172.21.* 172.22.* 172.23.* 172.24.* 172.25.* 172.26.* 172.27.* 172.28.* 172.29.* 172.30.* 172.31.* fd* fe80:*'
+
+say() { printf '%s\n' "$*"; }
+die() { say "$*"; exit 1; }
+have() { command -v "$1" >/dev/null 2>&1; }
+SELF=$(readlink -f "$0" 2>/dev/null || echo "$0")
+usage() { sed -n '2,20p' "$SELF" | sed 's/^# \{0,1\}//'; }
+need_root() { [ -n "$P" ] || [ "$(id -u)" -eq 0 ] || exec pkexec "$SELF" "$@"; }
+st_get() { sed -n "s/^$1=//p" "$STATE/state" 2>/dev/null | tail -1; }
+st_set() { mkdir -p "$STATE"; touch "$STATE/state"; sed -i "/^$1=/d" "$STATE/state"; printf '%s=%s\n' "$1" "$2" >> "$STATE/state"; chmod 0644 "$STATE/state"; }
+active() { systemctl is-active --quiet netdata.service 2>/dev/null; }
+
+# SHA-256 of the small package that adds Netdata's package source (netdata-repo-5-6.noarch.rpm), per Fedora version and CPU.
+# Computed 2026-11-14 from https://repository.netdata.cloud/repos/repoconfig/fedora/<version>/<cpu>/
+repo_pin() {
+  [ -n "$P" ] && [ -n "${SL_LIVEHEALTH_TEST_PIN:-}" ] && { echo "$SL_LIVEHEALTH_TEST_PIN"; return 0; }   # tests only (needs the fake root)
+  case "$1/$2" in
+    43/x86_64) echo 239dc363ce2dba6e98f57023b479922af9d41f7693c6964a38310006c5dc86ab ;;
+    43/aarch64) echo 234eebac5d3824de3ee655cbd1a0b5f8c5ef74da50c827e71b8c8aa4f3afd2f8 ;;
+    44/x86_64|44/aarch64) echo 1433aa2207edb45a24d92ded49d6ae8fed52024978459f59ecff754043c0049f ;;
+    45/x86_64) echo e1848a200692af504b7226d0c89b9d522913f51f4e59fb30c64e041cece87885 ;;
+    45/aarch64) echo 83ea7e302013c152237968c901ad99ab3e96da4f208dc61ddd0f7ec6f984596c ;;
+    *) return 1 ;;
+  esac
+}
+fedora_ver() { sed -n 's/^VERSION_ID=//p' "${SL_LIVEHEALTH_OSREL:-$P/etc/os-release}" 2>/dev/null | tr -d '"' | head -1; }
+cpu() { local a=${SL_LIVEHEALTH_ARCH:-$(uname -m)}; case "$a" in x86_64|amd64) echo x86_64 ;; aarch64|arm64) echo aarch64 ;; *) echo "$a" ;; esac; }
+
+explain() {
+  cat <<'EOF'
+
+LIVE HEALTH - what it is
+  Netdata draws live graphs of this computer: processor, memory, disk, network, temperatures, and warnings
+  when something looks wrong. It is free.
+
+What it does with your privacy
+  - The graphs can only be opened on THIS computer. They are not visible to other computers unless you
+    choose "network on" later (and then only on your home network, never the internet).
+  - Anonymous statistics ("telemetry") to the makers are switched off.
+  - This computer is NOT connected to Netdata Cloud. There is no account and no sign-in.
+  - It downloads the program once from Netdata's own package source (checked by a fixed fingerprint and the
+    package signature) and later program updates come through the normal Secure Linux updates.
+  - It needs about 150 MB of space.
+Until you say yes, nothing is installed. You can switch it off or take it away at any time.
+EOF
+}
+
+# ---------------------------------------------------------------- config we write
+write_conf() { # $1 = local | home
+  mkdir -p "$NDETC"
+  if [ "$1" = home ]; then
+    local ip; ip=$(lan_ip)
+    cat > "$CONF" <<EOF
+# Written by secure-linux-live-health. Home network only: this computer and the private ranges of a home network.
+[web]
+    bind to = 127.0.0.1:$PORT $ip:$PORT
+    allow connections from = $PRIVATE_PATTERNS
+    allow dashboard from = $PRIVATE_PATTERNS
+EOF
+  else
+    cat > "$CONF" <<EOF
+# Written by secure-linux-live-health. This computer only.
+[web]
+    bind to = 127.0.0.1:$PORT
+    allow connections from = localhost
+    allow dashboard from = localhost
+EOF
+  fi
+  chmod 0644 "$CONF"
+}
+write_privacy() {
+  mkdir -p "$NDETC" "$(dirname "$DROPIN")"
+  : > "$OPTOUT"
+  cat > "$DROPIN" <<'EOF'
+# Written by secure-linux-live-health: no anonymous statistics, whatever the program's own settings say.
+[Service]
+Environment=DISABLE_TELEMETRY=1
+Environment=DO_NOT_TRACK=1
+EOF
+}
+lan_ip() {
+  [ -n "${SL_LIVEHEALTH_BIND:-}" ] && { printf '%s' "$SL_LIVEHEALTH_BIND"; return; }
+  ip -4 route get 1.1.1.1 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p'
+}
+private_ip() { printf '%s' "$1" | grep -Eq '^(10\.[0-9]+\.[0-9]+\.[0-9]+|192\.168\.[0-9]+\.[0-9]+|172\.(1[6-9]|2[0-9]|3[01])\.[0-9]+\.[0-9]+)$'; }
+fw() { if firewall-cmd --state >/dev/null 2>&1; then firewall-cmd "$@"; fi; }
+bound_to_everyone() { # true if anything listens on all addresses
+  ss -Hltn "sport = :$PORT" 2>/dev/null | awk '{print $4}' | grep -Eq '^(0\.0\.0\.0|\*|\[::\]|::):'
+}
+
+# ---------------------------------------------------------------- setup
+cmd_setup() {
+  local yes=0; [ "${1:-}" = --yes ] && yes=1
+  explain
+  if [ $yes -ne 1 ]; then
+    local a=""; printf '\nInstall the live health graphs on this computer? [y/N] '; read -r a || a=""
+    case "$a" in [Yy]|[Yy][Ee][Ss]) ;; *) say; say "Not installed. Nothing was changed."; return 0 ;; esac
+  fi
+  need_root setup --yes
+  [ -e "$P/run/ostree-booted" ] && die "This computer type (atomic) cannot add Netdata this way. Nothing was changed."
+  have dnf || die "The package tool (dnf) was not found. Nothing was changed."
+  local ver arch pin url tmp got
+  ver=$(fedora_ver); arch=$(cpu)
+  pin=$(repo_pin "$ver" "$arch") || die "Netdata's package source is not known for Fedora ${ver:-?} on $arch. Nothing was changed."
+  url=$REPO_URL/fedora/$ver/$arch/netdata-repo-$REPO_VER.noarch.rpm
+  mkdir -p "$STATE"; tmp=$(mktemp -d "${TMPDIR:-/tmp}/sl-livehealth.XXXXXX") || die "No temporary space. Nothing was changed."
+  trap "rm -rf '$tmp'" EXIT
+  say "Step 1 of 4: fetching Netdata's package-source file and checking its fingerprint."
+  if ! curl -fsSL --proto '=https' --tlsv1.2 --max-time 120 -o "$tmp/repo.rpm" "$url" 2>/dev/null; then
+    [ -f "${SL_LIVEHEALTH_DRIVE_DIR:-$P/var/cache/secure-linux/offline/live-health}/netdata-repo-$REPO_VER.noarch.rpm" ] && \
+      cp "${SL_LIVEHEALTH_DRIVE_DIR:-$P/var/cache/secure-linux/offline/live-health}/netdata-repo-$REPO_VER.noarch.rpm" "$tmp/repo.rpm"
+  fi
+  [ -s "$tmp/repo.rpm" ] || die "Could not download it (no internet and no copy on the drive). Nothing was changed."
+  got=$(sha256sum "$tmp/repo.rpm" | awk '{print $1}')
+  [ "$got" = "$pin" ] || die "The downloaded file does not match the expected fingerprint, so it was NOT used. Nothing was changed."
+  say "Step 2 of 4: adding the package source."
+  systemctl mask netdata.service >/dev/null 2>&1       # it must not start before it is set to this computer only
+  write_privacy; write_conf local
+  dnf -y install "$tmp/repo.rpm" >/dev/null 2>&1 || { say "The package source could not be added. Nothing is running."; return 1; }
+  say "Step 3 of 4: installing Netdata."
+  if ! dnf -y install netdata >/dev/null 2>&1; then
+    have secure-linux-offline-bundle && secure-linux-offline-bundle install --profile "fedora-$(cat "$P/etc/secure-linux/profile" 2>/dev/null || echo full)" --arch "$arch" --kind system --packages netdata >/dev/null 2>&1 \
+      || { say "Netdata could not be installed. Nothing is running."; return 1; }
+  fi
+  write_privacy; [ -f "$CONF" ] && grep -q 'secure-linux-live-health' "$CONF" || write_conf local
+  say "Step 4 of 4: starting it for this computer only."
+  systemctl daemon-reload >/dev/null 2>&1
+  systemctl unmask netdata.service >/dev/null 2>&1
+  systemctl enable --now netdata.service >/dev/null 2>&1 || { say "Netdata did not start."; return 1; }
+  if bound_to_everyone; then
+    systemctl disable --now netdata.service >/dev/null 2>&1
+    die "It was listening more widely than planned, so it was stopped again. Nothing is reachable."
+  fi
+  st_set enabled yes; st_set network off
+  say
+  say "Live health is ON for this computer only. Open it with: secure-linux-live-health open"
+  say "Plain summary any time: secure-linux-live-health summary"
+}
+cmd_on() {
+  need_root on
+  systemctl unmask netdata.service >/dev/null 2>&1
+  systemctl enable --now netdata.service >/dev/null 2>&1 || die "It is not installed or did not start. Run: secure-linux-live-health setup"
+  st_set enabled yes; say "Live health is on."
+}
+cmd_off() {
+  need_root off
+  systemctl disable --now netdata.service >/dev/null 2>&1
+  if [ "$(st_get network)" = on ]; then
+    fw --permanent --zone=home --remove-port="$PORT/tcp" >/dev/null 2>&1; fw --zone=home --remove-port="$PORT/tcp" >/dev/null 2>&1
+    write_conf local; st_set network off
+  fi
+  [ -d "$STATE" ] && st_set enabled no
+  say "Live health is OFF. The graphs are closed and nothing is reachable. Switch on again: secure-linux-live-health on"
+}
+cmd_network() {
+  case "${1:-}" in
+    on)
+      need_root network on
+      [ -d "$STATE" ] || die "Live health is not set up. Run: secure-linux-live-health setup"
+      local ip; ip=$(lan_ip)
+      private_ip "$ip" || die "This computer's address ('${ip:-none}') does not look like a home network. Nothing was changed."
+      write_conf home
+      fw --permanent --zone=home --add-port="$PORT/tcp" >/dev/null 2>&1; fw --zone=home --add-port="$PORT/tcp" >/dev/null 2>&1
+      systemctl restart netdata.service >/dev/null 2>&1
+      st_set network on
+      say "Other computers on your home network can now open: http://$ip:$PORT"
+      say "It is not reachable from the internet. Close it again with: secure-linux-live-health network off" ;;
+    off)
+      need_root network off
+      fw --permanent --zone=home --remove-port="$PORT/tcp" >/dev/null 2>&1; fw --zone=home --remove-port="$PORT/tcp" >/dev/null 2>&1
+      [ -d "$STATE" ] && { write_conf local; systemctl restart netdata.service >/dev/null 2>&1; st_set network off; }
+      say "The graphs can only be opened on this computer again." ;;
+    *) say "Use: secure-linux-live-health network on   or   network off" ;;
+  esac
+}
+
+# ---------------------------------------------------------------- status and summary
+cmd_status() {
+  local w=off
+  if [ ! -f "$STATE/state" ]; then w=not-set-up
+  elif [ "$(st_get enabled)" = yes ]; then if active; then w=on; else w=down; fi; fi
+  [ "${1:-}" = --short ] && { echo "$w"; return 0; }
+  case "$w" in
+    not-set-up) say "Live health is not installed. To read what it does and decide: secure-linux-live-health setup" ; return 0 ;;
+    off) say "Live health is OFF." ; return 0 ;;
+    down) say "Live health should be on but is not running. Try: secure-linux-live-health on" ;;
+    on) say "Live health is ON." ;;
+  esac
+  if [ "$(st_get network)" = on ]; then say "  Who can see it: this computer and your home network (not the internet)."
+  else say "  Who can see it: this computer only."; fi
+  [ -f "$OPTOUT" ] && say "  Statistics to the makers: switched off." || say "  Statistics to the makers: NOT switched off. Run setup again to fix."
+  if [ -s "$P/var/lib/netdata/cloud.d/claimed_id" ]; then say "  Netdata Cloud: CONNECTED. This is not what Secure Linux sets up. Run: secure-linux-live-health remove"
+  else say "  Netdata Cloud: not connected (no account)."; fi
+  return 0
+}
+cmd_summary() {
+  local load mem_total mem_avail used disk up crit="" warn="" info line verdict=OK
+  load=$(awk '{print $1}' "${SL_LIVEHEALTH_PROC:-/proc}/loadavg" 2>/dev/null)
+  mem_total=$(awk '/^MemTotal:/ {print $2}' "${SL_LIVEHEALTH_PROC:-/proc}/meminfo" 2>/dev/null)
+  mem_avail=$(awk '/^MemAvailable:/ {print $2}' "${SL_LIVEHEALTH_PROC:-/proc}/meminfo" 2>/dev/null)
+  if [ -n "${mem_total:-}" ] && [ "${mem_total:-0}" -gt 0 ]; then used=$(( (mem_total - ${mem_avail:-0}) * 100 / mem_total )); fi
+  disk=$(df -P / 2>/dev/null | awk 'NR==2 {gsub("%","",$5); print $5}')
+  up=$(awk '{d=int($1/86400); h=int(($1%86400)/3600); printf "%d days %d hours", d, h}' "${SL_LIVEHEALTH_PROC:-/proc}/uptime" 2>/dev/null)
+  if active && have curl; then
+    info=$(curl -s --max-time 5 "http://127.0.0.1:$PORT/api/v1/info" 2>/dev/null | tr -d '\n ')
+    crit=$(printf '%s' "$info" | sed -n 's/.*"alarms":{[^}]*"critical":\([0-9]*\).*/\1/p')
+    warn=$(printf '%s' "$info" | sed -n 's/.*"alarms":{[^}]*"warning":\([0-9]*\).*/\1/p')
+  fi
+  [ -n "${used:-}" ] && [ "${used:-0}" -ge 90 ] && verdict=CHECK
+  [ -n "${disk:-}" ] && [ "${disk:-0}" -ge 90 ] && verdict=CHECK
+  [ -n "$warn" ] && [ "$warn" -gt 0 ] && verdict=CHECK
+  [ -n "$crit" ] && [ "$crit" -gt 0 ] && verdict=ATTENTION
+  say "THIS COMPUTER RIGHT NOW: $verdict"
+  say "  Busy-ness (processor load): ${load:-unknown}"
+  say "  Memory in use:              ${used:-unknown}%"
+  say "  Main disk full:             ${disk:-unknown}%"
+  say "  Running for:                ${up:-unknown}"
+  if [ -n "$crit$warn" ]; then say "  Warnings from live health:  ${crit:-0} serious, ${warn:-0} minor"
+  elif active; then say "  Warnings from live health:  could not be read just now"
+  else say "  Live graphs: off (switch on with: secure-linux-live-health setup)"; fi
+  case "$verdict" in
+    OK) say "Nothing needs your attention." ;;
+    CHECK) say "Something is getting full or busy. Open the live graphs: secure-linux-live-health open" ;;
+    ATTENTION) say "Live health reports a serious warning. Open the graphs: secure-linux-live-health open. For help: secure-linux-status" ;;
+  esac
+  say "This is a quick look at how the computer is running. It is not a diagnosis. If something looks wrong, ask someone you trust or a repair shop."
+}
+
+# ---------------------------------------------------------------- other computers and open
+valid_name() { printf '%s' "$1" | grep -Eq '^[A-Za-z0-9._-]{1,40}$'; }
+cmd_others() {
+  local f=$STATE/others
+  case "${1:-list}" in
+    list) [ -s "$f" ] || { say "No other computers added. Add one: secure-linux-live-health others add NAME 192.168.1.20"; return 0; }
+          while read -r n a; do say "  $n  http://$a:$PORT"; done < "$f" ;;
+    add) valid_name "${2:-}" || die "Give a short name (letters and digits), then the home address, for example: others add kitchen-pc 192.168.1.20"
+         private_ip "${3:-}" || die "Only home-network addresses (like 192.168.1.20) can be added. Nothing was changed."
+         need_root others add "$2" "$3"; mkdir -p "$STATE"; touch "$f"; sed -i "/^$2 /d" "$f"; echo "$2 $3" >> "$f"; chmod 0644 "$f"
+         say "Added $2. On that computer, run: secure-linux-live-health setup  then  network on. Open it from here: secure-linux-live-health open $2" ;;
+    remove) valid_name "${2:-}" || die "Give the name to remove."
+            need_root others remove "$2"; [ -f "$f" ] && sed -i "/^$2 /d" "$f"; say "Removed $2." ;;
+    *) die "Use: others list | add NAME ADDRESS | remove NAME" ;;
+  esac
+}
+cmd_open() {
+  local url=http://127.0.0.1:$PORT n=${1:-}
+  if [ -n "$n" ]; then
+    valid_name "$n" || die "That is not a name I know."
+    local a; a=$(awk -v n="$n" '$1==n {print $2}' "$STATE/others" 2>/dev/null)
+    [ -n "$a" ] || die "No computer called '$n'. See the list: secure-linux-live-health others list"
+    url=http://$a:$PORT
+  else
+    [ -d "$STATE" ] && active || die "Live health is not running on this computer. Run: secure-linux-live-health setup"
+  fi
+  if have xdg-open; then
+    # Run it in front (not in the background) so the browser is really asked before this tool ends; 20 seconds at most.
+    if have timeout; then timeout 20 xdg-open "$url" >/dev/null 2>&1 </dev/null || true; else xdg-open "$url" >/dev/null 2>&1 </dev/null || true; fi
+    say "Opening $url in your browser."
+  else say "Open this address in your browser: $url"; fi
+}
+
+cmd_remove() {
+  local yes=0 deldata=0 a
+  for a in "$@"; do case "$a" in --yes) yes=1 ;; --delete-data) deldata=1 ;; esac; done
+  need_root remove "$@"
+  if [ $yes -ne 1 ]; then local r=""; printf 'Take live health away completely? [y/N] '; read -r r || r=""; case "$r" in [Yy]|[Yy][Ee][Ss]) ;; *) say "Left as it is."; return 0 ;; esac; fi
+  systemctl disable --now netdata.service >/dev/null 2>&1
+  fw --permanent --zone=home --remove-port="$PORT/tcp" >/dev/null 2>&1; fw --zone=home --remove-port="$PORT/tcp" >/dev/null 2>&1
+  have dnf && dnf -y remove netdata netdata-repo >/dev/null 2>&1
+  systemctl unmask netdata.service >/dev/null 2>&1
+  rm -rf "$DROPIN" "$(dirname "$DROPIN")" "$OPTOUT" "$CONF" "$STATE"
+  [ $deldata -eq 1 ] && rm -rf "$P/var/lib/netdata" "$P/var/cache/netdata"
+  systemctl daemon-reload >/dev/null 2>&1
+  say "Live health is gone. No service is left running."
+  [ $deldata -eq 1 ] || say "Its saved graphs were kept. Delete them too with: secure-linux-live-health remove --delete-data"
+}
+
+case "${1:-}" in
+  ""|-h|--help|help) usage ;;
+  summary) cmd_summary ;;
+  setup) shift; cmd_setup "$@" ;;
+  open) shift; cmd_open "$@" ;;
+  status) shift; cmd_status "$@" ;;
+  on) cmd_on ;;
+  off) cmd_off ;;
+  network) shift; cmd_network "$@" ;;
+  others) shift; cmd_others "$@" ;;
+  remove) shift; cmd_remove "$@" ;;
+  explain) explain ;;
+  *) usage; exit 2 ;;
+esac

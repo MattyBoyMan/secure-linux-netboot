@@ -1,0 +1,21 @@
+# 30-home-server.tsv: home-server apps (kind serverapp). The id is the recipe folder name under linux/files/server-apps/ and the app is set up with
+# "secure-linux-server-apps install ID". Setup never installs these by itself (default off, and the library only lists them).
+# Columns (TAB separated): id kind title plain_description approx_size_mb profiles default arch idea
+# The size is the compressed download of the app's container images for Intel and AMD, taken from the registry on 2026-11-17 (rounded up);
+# the app's own data and the unpacked images need more room: the recipe's min_free_gb is what the set-up checks before it starts.
+activepieces	serverapp	Activepieces (automations)	Makes your apps work together by themselves: "when this happens, do that". No code needed. Home-server app: your home network only. Needs Docker or Podman.	526	full,lite	off	all	59
+actual	serverapp	Actual Budget (money)	A private budget for your household: where the money goes, and what is left. Works over a safe (https) link. Home-server app: your home network only. Needs Docker or Podman.	147	full,lite	off	all	56
+archivebox	serverapp	ArchiveBox (save web pages)	Saves copies of web pages for later, so they cannot vanish. Home-server app: your home network only. Needs Docker or Podman.	1074	full,lite	off	all	X1
+audiobookshelf	serverapp	Audiobookshelf	Your own private shelf for audiobooks and podcasts. Copy your audiobooks into its audiobooks folder. Home-server app: your home network only. Needs Docker or Podman.	132	full,lite	off	all	52
+changedetection	serverapp	changedetection.io (page watcher)	Watches web pages and tells you when one changes. Home-server app: your home network only. Needs Docker or Podman.	409	full,lite	off	all	X1
+homepage	serverapp	Homepage (start page)	One start page for your home, with a button for each of your home apps. No ads. Home-server app: your home network only. Needs Docker or Podman.	85	full,lite	off	all	58
+jellyfin	serverapp	Jellyfin	Your own private streaming for films, shows and music. Copy your videos into its media folder. Home-server app: your home network only. Needs Docker or Podman.	752	full,lite	off	all	52
+mealie	serverapp	Mealie (recipes and meal plans)	Recipes, a weekly meal plan and a shopping list for the whole family, in one place. Home-server app: your home network only. Needs Docker or Podman.	382	full,lite	off	all	56
+navidrome	serverapp	Navidrome	Your own private music streaming. Copy your music into its music folder and play it on any device at home. Home-server app: your home network only. Needs Docker or Podman.	95	full,lite	off	all	52
+nextcloud	serverapp	Nextcloud	Your own private cloud: files, photos, calendar and contacts, kept on this computer. Home-server app: your home network only. Needs Docker or Podman.	634	full,lite	off	all	51
+ntfy	serverapp	ntfy (phone notifications)	Sends alerts from this computer to your phone. Home-server app: your home network only. Needs Docker or Podman.	37	full,lite	off	all	X1
+paperless	serverapp	Paperless-ngx	Turns paper letters and bills into searchable files. Put scans in its consume folder. Home-server app: your home network only. Needs Docker or Podman.	960	full,lite	off	all	53
+searxng	serverapp	SearXNG (private search)	A private search page for your home. It does not track you or keep a history. Home-server app: your home network only. Needs Docker or Podman.	103	full,lite	off	all	X1
+stirling-pdf	serverapp	Stirling-PDF (PDF tools)	Join, split, sign, shrink, turn and convert PDF files in your web browser. Your files never leave home. Home-server app: your home network only. Needs Docker or Podman.	1131	full,lite	off	all	54
+uptime-kuma	serverapp	Uptime Kuma (health checks)	Watches your home apps and websites and tells you when one stops answering. Home-server app: your home network only. Needs Docker or Podman.	186	full,lite	off	all	58
+vaultwarden	serverapp	Vaultwarden (passwords)	Your own private password safe for the whole family. Works with the free Bitwarden apps, always over a safe (https) link. Home-server app: your home network only. Needs Docker or Podman.	91	full,lite	off	all	55

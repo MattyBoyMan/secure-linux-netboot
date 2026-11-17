@@ -1,0 +1,534 @@
+#!/usr/bin/env python3
+# secure-linux-drive-test: test a new USB drive before you trust it. Finds fake-size drives and bad spots.
+"""Test a new USB drive: is it really as big as it says, and does it keep what is written to it?
+
+  secure-linux-drive-test --device /dev/sdX --confirm "TEST <serial>"            full test (checks every part)
+  secure-linux-drive-test --device /dev/sdX --confirm "TEST <serial>" --quick    quick test (checks spots all over)
+  secure-linux-drive-test --device /dev/sdX --confirm "TEST <serial>" --json     one line of JSON at the end
+
+The test ERASES everything on the drive. It works only on a USB or removable drive that is not in use,
+and only after you type TEST and the drive's serial number (or WWN), exactly as shown.
+Internal disks are never tested. When the f3probe program is installed it is used for the size check.
+
+Results: "DRIVE TEST PASSED: <size> usable, 0 bad blocks" (exit 0), "DRIVE TEST FAILED: <reason>" (exit 2).
+A refusal (wrong drive, wrong phrase, drive in use) changes nothing and exits 1.
+"""
+
+import argparse
+import errno
+import hashlib
+import importlib.machinery
+import importlib.util
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import stat
+import struct
+import subprocess
+import sys
+
+try:
+    import fcntl
+except ImportError:  # Windows: only the regular-file test mode works there.
+    fcntl = None
+
+INSTALLED_SELF = "/usr/local/bin/secure-linux-drive-test"
+BUILDER_NAME = "secure-linux-usb-creator"
+MAGIC = b"SLDT"
+HEADER = 24                      # MAGIC (4) + run code (12) + offset (8)
+MAX_BLOCK = 1024 * 1024
+MIN_BLOCK = 4096
+QUICK_SPREAD = 256               # evenly spread spots in the quick test
+MAX_IO_ERRORS = 256              # stop early when the drive keeps failing to read or write
+MIN_DRIVE = 2 * MIN_BLOCK
+GONE_ERRNOS = {getattr(errno, name) for name in ("ENODEV", "ENXIO", "ENOMEDIUM", "ESHUTDOWN") if hasattr(errno, name)}
+BLKGETSIZE64 = 0x80081272
+BLKROGET = 0x125E
+BLKFLSBUF = 0x1261
+
+EXIT_PASSED, EXIT_REFUSED, EXIT_FAILED = 0, 1, 2
+
+
+class Refused(Exception):
+    """The test was not started; nothing was written."""
+
+
+class DriveGone(Exception):
+    """The drive stopped answering during the test."""
+
+
+# ------------------------------------------------------------------ the drive builder's identity rules
+def load_builder():
+    """Load the drive builder that sits beside this tool, so both use the same identity rules."""
+    here = Path(__file__).resolve().parent
+    for candidate in (here / BUILDER_NAME, Path("/usr/local/bin") / BUILDER_NAME):
+        if not candidate.is_file():
+            continue
+        sys.dont_write_bytecode = True
+        loader = importlib.machinery.SourceFileLoader("secure_linux_usb_creator", str(candidate))
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        module = importlib.util.module_from_spec(spec)
+        try:
+            loader.exec_module(module)
+        except Exception as exc:  # noqa: BLE001 - any failure means we cannot check drives safely
+            raise Refused(f"the drive checker could not start ({exc.__class__.__name__}). Nothing was written.") from exc
+        for name in ("Devices", "identity", "identity_label", "require_unambiguous", "mock_regular_file", "CreatorError"):
+            if not hasattr(module, name):
+                raise Refused("the drive checker is incomplete. Nothing was written.")
+        return module
+    raise Refused("the drive checker (secure-linux-usb-creator) is missing. Nothing was written.")
+
+
+def human(number):
+    number = float(number)
+    for unit, size in (("TB", 1000 ** 4), ("GB", 1000 ** 3), ("MB", 1000 ** 2), ("KB", 1000)):
+        if number >= size:
+            return f"{number / size:.1f} {unit}"
+    return f"{int(number)} bytes"
+
+
+def removable(device):
+    """USB or removable media only. A fixed internal disk is never tested."""
+    return device.get("tran") == "usb" or bool(device.get("rm"))
+
+
+def pick_drive(builder, rows, wanted):
+    path = os.path.realpath(os.path.abspath(wanted))
+    matches = [row for row in rows if os.path.realpath(row["path"]) == path]
+    if len(matches) != 1:
+        raise Refused(f"{wanted} is not a USB or removable whole drive. Internal disks and partitions are never tested.")
+    drive = matches[0]
+    if str(drive.get("type") or "disk") != "disk":
+        raise Refused(f"{wanted} is a part of a drive, not a whole drive.")
+    if not removable(drive):
+        raise Refused(f"{wanted} is an internal or fixed disk. Only USB and removable drives are tested.")
+    try:
+        builder.require_unambiguous(rows, drive)
+    except builder.CreatorError as exc:
+        raise Refused(str(exc)) from exc
+    if drive.get("ro"):
+        raise Refused(f"{wanted} is read-only, so it cannot be tested.")
+    if drive.get("mountpoints"):
+        raise Refused(f"{wanted} is in use (open at {', '.join(drive['mountpoints'])}). Eject it in Files first, then try again.")
+    if int(drive.get("size") or 0) < MIN_DRIVE:
+        raise Refused(f"{wanted} is too small to test.")
+    return drive
+
+
+# ------------------------------------------------------------------ opening the drive
+class DriveIO:
+    """Reads and writes at exact places on the drive (a whole block device, or a regular file in test mode)."""
+
+    def __init__(self, fd, real):
+        self.fd = fd
+        self.real = real
+
+    def write_at(self, offset, data):
+        os.lseek(self.fd, offset, os.SEEK_SET)
+        view = memoryview(data)
+        while view:
+            count = os.write(self.fd, view)
+            if count <= 0:
+                raise OSError(errno.EIO, "short write")
+            view = view[count:]
+
+    def read_at(self, offset, length):
+        os.lseek(self.fd, offset, os.SEEK_SET)
+        parts = []
+        while length:
+            data = os.read(self.fd, length)
+            if not data:
+                break
+            parts.append(data)
+            length -= len(data)
+        return b"".join(parts)
+
+    def flush(self):
+        """Push every write to the drive and forget the computer's own copy, so reads come from the drive."""
+        os.fsync(self.fd)
+        if self.real and fcntl is not None:
+            try:
+                fcntl.ioctl(self.fd, BLKFLSBUF, 0)
+            except OSError:
+                pass
+        if hasattr(os, "posix_fadvise"):
+            try:
+                os.posix_fadvise(self.fd, 0, 0, os.POSIX_FADV_DONTNEED)
+            except OSError:
+                pass
+
+    def close(self):
+        os.close(self.fd)
+
+
+def open_drive(builder, drive, mock):
+    path = drive["path"]
+    if mock:
+        try:
+            builder.mock_regular_file(drive)
+        except builder.CreatorError as exc:
+            raise Refused(str(exc)) from exc
+        try:
+            return DriveIO(os.open(path, os.O_RDWR | getattr(os, "O_BINARY", 0)), False)
+        except OSError as exc:
+            raise Refused(f"{path} could not be opened ({exc.strerror}). Nothing was written.") from exc
+    info = os.stat(path)
+    if not stat.S_ISBLK(info.st_mode):
+        raise Refused(f"{path} is not a whole drive.")
+    # O_EXCL on a block device fails when anything (a mount, a swap area, another program) holds it.
+    try:
+        fd = os.open(path, os.O_RDWR | os.O_EXCL)
+    except OSError as exc:
+        raise Refused(f"{path} is busy or could not be opened ({exc.strerror}). Nothing was written.") from exc
+    try:
+        size = struct.unpack("Q", fcntl.ioctl(fd, BLKGETSIZE64, b"\0" * 8))[0]
+        if size != drive["size"]:
+            raise Refused("the drive's size changed after it was chosen (was it unplugged?). Nothing was written.")
+        if struct.unpack("I", fcntl.ioctl(fd, BLKROGET, b"\0" * 4))[0]:
+            raise Refused("the drive is read-only. Nothing was written.")
+    except BaseException:
+        os.close(fd)
+        raise
+    return DriveIO(fd, True)
+
+
+# ------------------------------------------------------------------ the write-then-read pattern
+def pattern(code, offset, length):
+    """Unique bytes for one part of the drive in one run: a header naming the place, then filler from a hash."""
+    header = MAGIC + code + offset.to_bytes(8, "big")
+    seed = hashlib.sha256(code + offset.to_bytes(8, "big")).digest()
+    body = seed * ((max(length - HEADER, 0) // len(seed)) + 1)
+    return (header + body)[:length]
+
+
+def block_size_for(size):
+    block = (size // 64) // MIN_BLOCK * MIN_BLOCK
+    return max(MIN_BLOCK, min(MAX_BLOCK, block))
+
+
+def plan_parts(size, block, quick):
+    """The (offset, length) parts to test. Full: every part. Quick: spots spread over the drive, every power of two."""
+    count = size // block
+    parts = [(index * block, block) for index in range(count)]
+    remainder = size - count * block
+    if remainder >= 512:
+        parts.append((count * block, remainder))
+    if not quick or len(parts) <= QUICK_SPREAD:
+        return parts
+    chosen = {0, len(parts) - 1}
+    chosen.update(index * len(parts) // QUICK_SPREAD for index in range(QUICK_SPREAD))
+    power = 1
+    while power < len(parts):
+        # A fake drive usually repeats its real size; its real size is almost always a power of two.
+        chosen.update((power - 1, power))
+        power *= 2
+    return [parts[index] for index in sorted(chosen) if index < len(parts)]
+
+
+def run_pattern(io, size, parts, code, progress=None):
+    """Write every part, push it to the drive, then read every part back and compare."""
+    failures = {}      # offset -> "write" | "read" | "changed"
+    aliased = {}       # offset -> the offset whose data came back instead
+    io_errors = 0
+    stopped_early = False
+    total = len(parts) * 2
+    done = 0
+
+    def io_error(exc, offset, kind):
+        nonlocal io_errors
+        if getattr(exc, "errno", None) in GONE_ERRNOS:
+            raise DriveGone() from exc
+        io_errors += 1
+        failures[offset] = kind
+
+    for offset, length in parts:
+        try:
+            io.write_at(offset, pattern(code, offset, length))
+        except OSError as exc:
+            io_error(exc, offset, "write")
+        done += 1
+        if progress:
+            progress("Writing the test pattern", done, total)
+        if io_errors >= MAX_IO_ERRORS:
+            stopped_early = True
+            break
+    try:
+        io.flush()
+    except OSError as exc:
+        if getattr(exc, "errno", None) in GONE_ERRNOS:
+            raise DriveGone() from exc
+    if not stopped_early:
+        for offset, length in parts:
+            done += 1
+            if offset in failures:
+                continue
+            try:
+                data = io.read_at(offset, length)
+            except OSError as exc:
+                io_error(exc, offset, "read")
+                if io_errors >= MAX_IO_ERRORS:
+                    stopped_early = True
+                    break
+                continue
+            if progress:
+                progress("Reading it back", done, total)
+            if data == pattern(code, offset, length):
+                continue
+            failures[offset] = "changed"
+            if len(data) >= HEADER and data[:4] == MAGIC and data[4:16] == code:
+                other = int.from_bytes(data[16:HEADER], "big")
+                if other != offset:
+                    aliased[offset] = other
+    return classify(size, parts, failures, aliased, stopped_early)
+
+
+def classify(size, parts, failures, aliased, stopped_early):
+    result = {"announced_bytes": size, "tested_parts": len(parts), "bad_blocks": len(failures),
+              "stopped_early": stopped_early, "fake": False, "usable_bytes": size}
+    if aliased:
+        # A fake drive wraps round: writing past its real size overwrites its start. The step between the two
+        # places is a multiple of the real size, so the smallest step is the real size.
+        result.update(fake=True, usable_bytes=min(abs(other - offset) for offset, other in aliased.items()))
+        return result
+    if not failures:
+        return result
+    first_bad = min(failures)
+    tail = [offset for offset, _ in parts if offset >= first_bad]
+    if (not stopped_early and len(failures) >= 2 and all(offset in failures for offset in tail)
+            and size - first_bad >= size // 16 and first_bad > 0):
+        # Everything from one place to the end lost what was written: the drive is smaller than it says.
+        result.update(fake=True, usable_bytes=first_bad)
+        return result
+    if len(failures) * 4 >= len(parts):
+        result.update(fake=True, usable_bytes=None)
+        return result
+    result["usable_bytes"] = None
+    return result
+
+
+# ------------------------------------------------------------------ f3probe (used when it is installed)
+def parse_f3probe(text):
+    """Read f3probe's answer: ('real', None) / ('fake', usable bytes) / ('damaged', None) / (None, None)."""
+    if re.search(r"Good news: The device .* is the real thing", text):
+        return "real", None
+    if re.search(r"Bad news: The device .* is a counterfeit", text):
+        usable = None
+        sizes = re.search(r"\*Usable\* size:.*\((\d+) blocks\)", text)
+        block = re.search(r"Physical block size:.*\(2\^(\d+) Bytes\)", text)
+        if sizes:
+            usable = int(sizes.group(1)) * (2 ** int(block.group(1)) if block else 512)
+        else:
+            last = re.search(r"--last-sec=(\d+)", text)
+            if last:
+                usable = (int(last.group(1)) + 1) * 512
+        return "fake", usable
+    if re.search(r"Bad news: The device .* is damaged", text):
+        return "damaged", None
+    return None, None
+
+
+def run_f3probe(path):
+    """Run f3probe; returns (verdict, usable bytes, text). It erases the drive like our own test."""
+    try:
+        result = subprocess.run(["f3probe", "--destructive", "--time-ops", path], text=True,
+                                capture_output=True, timeout=6 * 3600)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return None, None, str(exc)
+    text = (result.stdout or "") + (result.stderr or "")
+    verdict, usable = parse_f3probe(text)
+    return verdict, usable, text
+
+
+# ------------------------------------------------------------------ the whole test
+def say(args, text="", err=False):
+    if args.json and not err:
+        return
+    print(text, file=sys.stderr if err else sys.stdout, flush=True)
+
+
+def make_progress(args):
+    last = {"value": -1}
+
+    def progress(label, done, total):
+        if args.json:
+            return
+        percent = done * 100 // max(total, 1)
+        step = percent // 10
+        if step != last["value"]:
+            last["value"] = step
+            print(f"  {label}: {percent}%", file=sys.stderr, flush=True)
+    return progress
+
+
+def given_phrase(args, phrase):
+    """The phrase is always given with --confirm (the window passes what the person typed). It is never guessed."""
+    if args.confirm is None:
+        raise Refused(f'type the phrase with --confirm "{phrase}". Nothing was written.')
+    return args.confirm
+
+
+def f3probe_available(mock):
+    """f3probe is used only on real drives, and only when it is installed."""
+    return not mock and bool(shutil.which("f3probe"))
+
+
+def f3probe_result(size, verdict, usable):
+    base = {"announced_bytes": size, "bad_blocks": 0, "tested_parts": 0, "stopped_early": False, "method": "f3probe"}
+    if verdict == "fake":
+        base.update(fake=True, usable_bytes=usable)
+    elif verdict == "damaged":
+        base.update(fake=False, usable_bytes=None, damaged=True)
+    else:
+        base.update(fake=False, usable_bytes=size)
+    return base
+
+
+def test_drive(args, builder, devices, drive):
+    """Run the test on a chosen, confirmed drive. Returns the result dictionary."""
+    size = drive["size"]
+    method = []
+    io = open_drive(builder, drive, devices.mock)   # the busy and size checks happen here, before anything is written
+    if f3probe_available(devices.mock):
+        io.close()                                   # f3probe needs the drive to itself while it runs
+        say(args, "Checking the real size with f3probe. This erases the drive.")
+        verdict, usable, _ = run_f3probe(drive["path"])
+        if verdict in ("fake", "damaged") or (verdict == "real" and args.quick):
+            return f3probe_result(size, verdict, usable)
+        if verdict == "real":
+            method.append("f3probe")
+        else:
+            say(args, "f3probe gave no clear answer, so Secure Linux runs its own test instead.")
+        io = open_drive(builder, drive, devices.mock)
+    try:
+        block = block_size_for(size)
+        parts = plan_parts(size, block, args.quick)
+        method.append("pattern-quick" if args.quick else "pattern-full")
+        if args.quick:
+            say(args, f"Quick test: writing and reading back {len(parts)} spots spread over the drive.")
+        else:
+            say(args, f"Full test: writing and reading back every part of the drive ({human(size)}). "
+                      "This can take a long time on a big drive.")
+        result = run_pattern(io, size, parts, os.urandom(12), make_progress(args))
+        result["block_size"] = block
+        result["method"] = "+".join(method)
+        # Leave the drive looking empty: zero its first part (the test pattern is not a file system).
+        try:
+            io.write_at(0, bytes(min(block, size)))
+            io.flush()
+        except OSError:
+            pass
+        return result
+    finally:
+        io.close()
+
+
+def verdict_line(result):
+    if result.get("drive_gone"):
+        return EXIT_FAILED, "DRIVE TEST FAILED: the drive stopped answering during the test"
+    if result.get("fake"):
+        usable = result.get("usable_bytes")
+        if usable:
+            return EXIT_FAILED, (f"DRIVE TEST FAILED: this drive is fake. It says it holds "
+                                 f"{human(result['announced_bytes'])}, but only about {human(usable)} really works")
+        return EXIT_FAILED, (f"DRIVE TEST FAILED: this drive is fake or badly broken. It lost what was written to "
+                             f"{result['bad_blocks']} of {result['tested_parts']} tested parts")
+    if result.get("damaged"):
+        return EXIT_FAILED, "DRIVE TEST FAILED: the drive is damaged (f3probe found parts that do not keep data)"
+    bad = result.get("bad_blocks", 0)
+    if bad:
+        more = "more than " if result.get("stopped_early") else ""
+        word = "block" if bad == 1 else "blocks"
+        return EXIT_FAILED, f"DRIVE TEST FAILED: {more}{bad} bad {word} found"
+    return EXIT_PASSED, f"DRIVE TEST PASSED: {human(result['announced_bytes'])} usable, 0 bad blocks"
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        prog="secure-linux-drive-test",
+        description="Test a new USB drive: is it really as big as it says, and does it keep what is written to it? "
+                    "The test ERASES everything on the drive.",
+        epilog='Example: secure-linux-drive-test --device /dev/sdb --confirm "TEST 4C530001230615117" --quick')
+    parser.add_argument("--device", required=True, help="the whole USB drive, for example /dev/sdb")
+    parser.add_argument("--confirm", help='the exact phrase: TEST and the drive\'s serial number (or WWN)')
+    parser.add_argument("--quick", action="store_true", help="check spots all over the drive instead of every part")
+    parser.add_argument("--json", action="store_true", help="print one line of JSON with the result")
+    parser.add_argument("--mock-devices", help="test-only drive list; every drive in it must be a regular file")
+    return parser
+
+
+def finish(args, code, line, details):
+    if args.json:
+        payload = dict(details)
+        payload.update({"result": {EXIT_PASSED: "passed", EXIT_FAILED: "failed"}.get(code, "refused"), "message": line})
+        print(json.dumps(payload, sort_keys=True), flush=True)
+    else:
+        print(line, flush=True)
+    return code
+
+
+def elevate(argv):
+    """Real drives need administrator rights: run this same tool again through the password prompt."""
+    me = INSTALLED_SELF if os.access(INSTALLED_SELF, os.X_OK) else os.path.realpath(sys.argv[0])
+    if not shutil.which("pkexec"):
+        raise Refused("administrator rights are needed to test a drive, and the password prompt is not available.")
+    os.execvp("pkexec", ["pkexec", me] + list(argv))
+
+
+def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    args = build_parser().parse_args(argv)
+    details = {"device": args.device}
+    try:
+        mock = bool(args.mock_devices)
+        if not mock:
+            if not sys.platform.startswith("linux") or fcntl is None:
+                raise Refused("testing a real drive works only on Secure Linux. Nothing was written.")
+            if os.geteuid() != 0:
+                elevate(argv)
+        builder = load_builder()
+        devices = builder.Devices(args.mock_devices)
+        try:
+            rows = devices.scan(probe_smart=False)
+        except builder.CreatorError as exc:
+            raise Refused(str(exc)) from exc
+        drive = pick_drive(builder, rows, args.device)
+        label = builder.identity_label(drive)
+        details.update(serial=label, model=drive.get("model"), announced_bytes=drive["size"])
+        phrase = "TEST " + label
+        say(args, f"Drive: {drive['path']} | {drive.get('model') or 'unknown'} | serial {label} | {human(drive['size'])}")
+        say(args, "Testing ERASES everything on this drive.")
+        if given_phrase(args, phrase) != phrase:
+            raise Refused(f'the phrase did not match "{phrase}". Nothing was written.')
+        # Look again after the phrase: a different drive in the same socket must not be erased.
+        try:
+            again = pick_drive(builder, devices.scan(probe_smart=False), args.device)
+        except Refused as exc:
+            raise Refused("the drive changed after it was chosen (was it unplugged?). " + str(exc)) from exc
+        if (builder.identity(again) != builder.identity(drive) or again["size"] != drive["size"]
+                or again.get("model") != drive.get("model")):
+            raise Refused("a different drive is now in that place. Nothing was written.")
+        try:
+            result = test_drive(args, builder, devices, drive)
+        except DriveGone:
+            result = {"announced_bytes": drive["size"], "drive_gone": True, "bad_blocks": 0, "fake": False}
+        code, line = verdict_line(result)
+        details.update(result)
+        if code == EXIT_PASSED:
+            say(args, "The drive is now empty and ready to use.")
+            if args.quick:
+                say(args, "This was the quick test. The full test (without --quick) checks every part of the drive.")
+        else:
+            say(args, "Do not keep files on this drive. If it is new, the shop should take it back as faulty.")
+        return finish(args, code, line, details)
+    except Refused as exc:
+        return finish(args, EXIT_REFUSED, f"REFUSED: {exc}", details)
+    except KeyboardInterrupt:
+        return finish(args, EXIT_FAILED, "DRIVE TEST FAILED: the test was stopped before it finished", details)
+    except OSError as exc:
+        return finish(args, EXIT_FAILED, f"DRIVE TEST FAILED: the drive could not be used ({exc.strerror or exc})", details)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

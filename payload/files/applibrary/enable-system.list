@@ -1,0 +1,2 @@
+# Enabled by 00-early.sh on every profile. The service only runs when an app is waiting for internet.
+secure-linux-app-library-retry.timer

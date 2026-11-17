@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=AI chat page
+GenericName=Private AI chat in your web browser
+Comment=Chat with the AI on this computer and ask questions about your own documents. Nothing is sent to the internet.
+Exec=/usr/local/bin/secure-linux-ai-web
+Icon=internet-chat
+Terminal=true
+Categories=Utility;Office;
+Keywords=AI;chat;documents;local;private;offline;Open WebUI;Ollama;
+StartupNotify=false

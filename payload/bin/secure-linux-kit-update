@@ -11,35 +11,138 @@ One rule, used by the installer and by the USB creator:
 Nothing is changed until every new file has been downloaded and has matched the published SHA-256.
 This tool never fails an install: every refusal is reported and the local copy stays as it was.
 
+Going back (undo): before `apply` swaps anything in, a copy of every file it replaces or removes is kept in
+the folder .kit-update-undo inside the same Secure Linux folder (one earlier version only, size-limited).
+`undo` puts that earlier version back exactly, checks every file by SHA-256, and can be run again if it is
+cut short. An update that fails half-way, or is cut short by a power cut, is put back automatically.
+A release that changed the release keys or the signature checker cannot be undone (it could trust a
+withdrawn key again). After an undo this computer does not install that same release again until a newer
+one is published, unless asked to (`apply --ignore-hold`).
+
+Signed releases: once a release key is in the kit (share/secure-linux-release-keys), only a release whose
+release.json and payload-files.json carry valid signatures is installed. The exact published file list and
+both signatures are then kept here, so a copy made later without internet (the saved master) is checked
+again. Only one update runs at a time on one folder (the lock file .kit-update.lock inside it).
+online=no in /etc/secure-linux/kit-update.conf (or KIT_UPDATE_ONLINE=no in build.conf) means no network
+request at all.
+
+Safety check after every update (idea 12). Before anything is swapped in, every changed Python file is
+compiled, every changed shell script is read with `bash -n`, a new copy of this tool must start, a changed
+key folder must still load, and the update may not delete setup.sh, this tool, the signature checker or
+revoked.txt. Any problem: nothing is installed. After the swap, setup.sh --help and this tool's --help must
+work; if not, the update is undone at once (exactly as `undo` does) and that release is not installed again.
+Either way one plain alert is written for the desktop (/var/lib/secure-linux/alerts.d/kit-update-check).
+Run as root, setup.sh is only started when it stops at --help (setup.sh ignores words it does not know, so
+a copy without that line would run a full setup).
+Release history (C15): in signed mode the published history/releases.jsonl must carry a valid signature, end
+with the published release, and continue the history this computer saw last (kept here); any doubt keeps
+the local copy. A computer that never saw a history accepts the first one.
+Where updates come from (C8 order): the published release on the internet (GitHub, https) first. In signed
+mode only, then the home server copy (the mirror= folder of /etc/secure-linux/kit-update.conf, or
+/media/homeserver/<HOME_SHARE_UPDATES>; only while that share is mounted and this computer is at home), then
+other Secure Linux computers on this network (/run/secure-linux/kit-peers.json; plain http, because every
+file is checked against the signed list). Every source passes exactly the same checks. When none of them
+gives a newer, fully checked release, the local copy is used, as always.
+Channel (idea 7): channel=testing in kit-update.conf reads the public testing branch; otherwise stable. In
+signed mode the signed channel record (channel.json) must name this release; a stable computer takes only
+releases whose record says stable. Once a record was seen here, a release without one is refused. The home
+server copy and other computers are used only when they give a signed record for their release.
+Downloads: four files at a time; a cut connection continues where it stopped (on this computer's own copy
+also in the next run). The size is shown before a large download. --max-download-mb skips an update that
+would download more than that when no person is at the screen (runs by itself).
+A copy of the latest release with damaged or missing files (gap check HIGH 2): `check` says so, `apply` puts
+back only those files, each checked against the list applied here.
+Sets (ideas 21, 22): the Debian install files, the Flipper files and the network-install files are published
+beside the payload. Their lists sit in payload-files.json under the optional key "sets" (signed with it; older
+copies of this tool ignore the key). `check|apply --set debian|flipper|netboot --tree DIR` keeps a folder that
+holds one set up to date with exactly the same checks; keys, settings and sources come from the Secure Linux files
+this tool belongs to (the folder above its bin/, or /usr/local/lib/secure-linux for the copy in /usr/local/bin),
+never from DIR. Only files this tool put in DIR (still unchanged) are ever removed.
+
   secure-linux-kit-update manifest --payload DIR --release-id ID --output FILE   (release tooling only)
+  secure-linux-kit-update manifest ... --sets-from DIST     (adds the set lists of a rendered public tree)
   secure-linux-kit-update check --tree DIR
-  secure-linux-kit-update apply --tree DIR
+  secure-linux-kit-update apply --tree DIR [--ignore-hold] [--max-download-mb MB]
+  secure-linux-kit-update check|apply --set debian|flipper|netboot --tree DIR [--max-download-mb MB]
+  secure-linux-kit-update undo --tree DIR
+  secure-linux-kit-update status --tree DIR [--json]                             (no network)
+  secure-linux-kit-update activate --tree DIR        (helpers only: bring what setup installed up to date)
+Exit codes: 0 done or safely kept; 1 undo refused; 2 usage; 75 another update is running.
 """
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
+import contextlib
 import datetime
 import hashlib
+import http.client
+import importlib.machinery
+import inspect
 import io
+import ipaddress
 import json
 import os
 from pathlib import Path, PurePosixPath
 import re
 import shutil
+import stat
+import subprocess
 import sys
 import tarfile
 import tempfile
 import time
+import types
 import urllib.error
+import warnings
+import urllib.parse
 import urllib.request
+
+try:
+    import ssl
+except ImportError:                 # no TLS at all: every https request fails and the local copy is used
+    ssl = None
+try:
+    import fcntl
+except ImportError:                 # not Linux (the Windows test host): the same lock through msvcrt
+    fcntl = None
+try:
+    import msvcrt
+except ImportError:
+    msvcrt = None
 
 REPO = "MattyBoyMan/secure-linux-netboot"
 DEFAULT_BASE = f"https://raw.githubusercontent.com/{REPO}/main"
 DEFAULT_TARBALL = f"https://codeload.github.com/{REPO}/tar.gz/refs/heads/main"
 TARBALL_ROOT = "secure-linux-netboot-main"
+TESTING_BASE = f"https://raw.githubusercontent.com/{REPO}/testing"      # idea 7: the public test channel
+TESTING_TARBALL = f"https://codeload.github.com/{REPO}/tar.gz/refs/heads/testing"
+TESTING_TARBALL_ROOT = "secure-linux-netboot-testing"
 MANIFEST_NAME = "payload-files.json"
 RECORD_NAME = ".kit-update.json"
 FILES_NAME = ".kit-update-files.json"   # the published file list that was applied here
+# Signed mode: the exact published bytes, kept so offline copies can be checked again (FILES_NAME is re-written).
+KEPT_LIST = ".kit-update-published-files.json"          # payload-files.json, byte for byte
+KEPT_LIST_SIG = ".kit-update-published-files.json.sig"  # payload-files.json.sig, byte for byte
+KEPT_RECORD_SIG = ".kit-update-release.json.sig"        # release.json.sig, byte for byte
+KEPT = (KEPT_LIST, KEPT_LIST_SIG, KEPT_RECORD_SIG)
+# C15: the public list of every release. The history this computer saw last is kept here (signed mode); it is
+# never put back by undo, so the newest history seen only ever moves forward.
+HISTORY_NAME = "history/releases.jsonl"
+KEPT_HISTORY = ".kit-update-history.jsonl"
+KEPT_HISTORY_SIG = ".kit-update-history.jsonl.sig"
+HISTORY_KEPT = (KEPT_HISTORY, KEPT_HISTORY_SIG)
+# C14: the signed channel record. The record accepted last is kept here (signed mode, never put back by undo):
+# once one was seen, a release without a valid record is refused.
+CHANNEL_NAME = "channel.json"
+KEPT_CHANNEL = ".kit-update-channel.json"
+KEPT_CHANNEL_SIG = ".kit-update-channel.json.sig"
+CHANNEL_KEPT = (KEPT_CHANNEL, KEPT_CHANNEL_SIG)
+CHANNELS = ("stable", "testing")
+HISTORY_FIELDS = ("created_at", "list_sha256", "prev_sha256", "record_sha256", "release_id")
+ZERO_HASH = "0" * 64
+MAX_HISTORY_BYTES = 16 * 1024 * 1024
+LOCK_NAME = ".kit-update.lock"          # only one apply, undo or copy at a time on one folder
 SCHEMA = 1
 RELEASE_ID_RE = re.compile(r"^secure-linux-([0-9]{4})\.([0-9]{2})\.([0-9]{2})-[0-9a-f]{16}$")
 HASH_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -50,22 +153,188 @@ SKIP_TOP = {"rescue", "server", "asahi", "build.conf", "debian"}
 SKIP_PATHS = {("hw", "mac")}
 GENERATED_DIRS = {"__pycache__"}
 GENERATED_SUFFIXES = (".pyc", ".pyo")
-UNMANAGED = {"release.json", "build.conf", "START-HERE.html", RECORD_NAME, FILES_NAME, MANIFEST_NAME}
+# ".whats-new-seen.json" is written per computer by secure-linux-whats-new beside these files.
+UNMANAGED = {"release.json", "build.conf", "START-HERE.html", RECORD_NAME, FILES_NAME, MANIFEST_NAME,
+             ".whats-new-seen.json", LOCK_NAME, *KEPT, *HISTORY_KEPT, *CHANNEL_KEPT}
 MAX_FILES = 5000
 MAX_FILE_BYTES = 8 * 1024 * 1024
 MAX_MANIFEST_BYTES = 2 * 1024 * 1024
+MAX_SIGNATURE_BYTES = 65536
+MAX_RECORD_BYTES = 65536
 MAX_TARBALL_BYTES = 200 * 1024 * 1024
 TARBALL_THRESHOLD = 40          # more changed files than this: one archive is quicker than many requests
 REQUEST_TIMEOUT = 15
 TOTAL_DEADLINE = 240
+OVERALL_DEADLINE = 480          # every source together (kit-update-auto stops waiting after 600 seconds)
+PARALLEL_DOWNLOADS = 4          # changed files fetched at the same time
+FETCH_TRIES = 3                 # a cut connection is picked up where it stopped, this many tries per file
+READ_CHUNK = 256 * 1024
+MEGABYTE = 1024 * 1024
+SIZE_NOTICE_BYTES = 10 * MEGABYTE   # a bigger download is announced before it starts
+FILE_MODES = {"0644": 0o644, "0755": 0o755}     # the only modes a published file list may ask for
+
+# ---- undo: one earlier version, kept inside the same folder (same filesystem, so every swap is a rename)
+UNDO_DIR = ".kit-update-undo"                  # the earlier version that `undo` puts back
+UNDO_PENDING = ".kit-update-undo-pending"      # being written by an `apply` that has not finished yet
+UNDO_OLD = ".kit-update-undo-old"              # on its way to being deleted
+UNDO_NAMES = {UNDO_DIR, UNDO_PENDING, UNDO_OLD}
+UNDO_STATE = "state.json"
+UNDO_TMP = ".kit-update-undo-tmp"              # suffix of a half-written file; always cleaned up
+UNDO_MAX_BYTES = 256 * 1024 * 1024             # never keep more than this for undo
+FREE_SPACE_MARGIN = 32 * 1024 * 1024           # always leave this much free space on the disk
+LEGACY_METADATA = ("release.json", RECORD_NAME, FILES_NAME)   # what undo folders made before signed mode hold
+METADATA = (RECORD_NAME, FILES_NAME, *KEPT, "release.json")   # put back last, release.json very last
+STATUSES = {"ready", "applied", "undoing"}
+KEYS_FOLDER = "secure-linux-release-keys"
+# Going back over a change to any of these could trust a withdrawn key again, or put back an older checker.
+TRUST_PREFIX = f"share/{KEYS_FOLDER}/"
+TRUST_FILES = {"bin/secure-linux-release-verify", "bin/secure-linux-kit-update"}
+# An update may never delete these when they are here (gap check LOW 14): without revoked.txt a withdrawn key
+# is trusted again; without the checker or this tool no later update can be checked; without setup.sh this
+# tool refuses the folder for good ("no setup.sh").
+NEVER_REMOVED = (f"{TRUST_PREFIX}revoked.txt", "bin/secure-linux-release-verify", "bin/secure-linux-kit-update",
+                 "setup.sh")
+
+# ---- the safety check after an update (idea 12)
+CHECK_TIMEOUT = 60                              # seconds for each program the check starts
+PYTHON_LINE_RE = re.compile(rb"^#![^\n]*\bpython[0-9.]*\b")
+SHELL_LINE_RE = re.compile(rb"^#![^\n]*/(?:env\s+)?(?:ba)?sh\b|^#![^\n]*\benv\s+(?:-\S+\s+)*(?:ba)?sh\b")
+# setup.sh's own "-h|--help) ...; exit 0 ;;" line (linux/setup.sh:22). setup.sh ignores words it does not know,
+# so as root it is only started for the check when this line is there; otherwise --help would run a full setup.
+SETUP_HELP_RE = re.compile(rb"(?m)^[ \t]*(?:[^\s|)]+\|)*--help(?:\|[^\s|)]+)*\)[^\n]*\bexit 0\b")
+ALERTS_DEFAULT = "/var/lib/secure-linux/alerts.d"   # three lines each: title, message, what to do (secure-linux-notify)
+ALERT_ID = "kit-update-check"
+ALERTS = {
+    "not-installed": ("An update was not installed",
+                      "A safety check found a problem in the newest Secure Linux update, so it was not installed. "
+                      "Your computer keeps working as before.",
+                      "Nothing to do now. The next update is checked the same way."),
+    "undone": ("An update was undone",
+               "The newest Secure Linux update did not pass its safety check after it was installed, so your "
+               "computer went straight back to the version it had before.",
+               "Nothing to do now. That update is not installed again. The next one is checked the same way."),
+    "stuck": ("An update needs attention",
+              "The newest Secure Linux update did not pass its safety check, and it could not be undone because "
+              "it changed how updates are checked. Some Secure Linux tools may not work until the next update.",
+              "Your files are safe. The next update fixes this. If something does not work, open "
+              "'Secure Linux Status & Fixes'."),
+}
+
+# ---- this computer's own copy (the installed tree): settings, the "went back" hold, the last result
+SYSTEM_TREE = Path("/usr/local/lib/secure-linux")
+CONF_DEFAULT = "/etc/secure-linux/kit-update.conf"
+HOLD_DEFAULT = "/var/lib/secure-linux/kit-update-hold.json"
+LAST_DEFAULT = "/var/lib/secure-linux/kit-update-last.json"
+PEERS_DEFAULT = "/run/secure-linux/kit-peers.json"     # C7: other Secure Linux computers on this network
+LOCATION_DEFAULT = "/run/secure-linux/location"        # home|away|offline (Wave 0 H's network dispatcher)
+MOUNTS_DEFAULT = "/proc/self/mounts"
+PARTS_DEFAULT = "/var/lib/secure-linux/kit-update-parts"   # downloads not finished yet (this computer's own copy)
+HOME_MIRROR_ROOT = "/media/homeserver"
+PEER_MAX_AGE = datetime.timedelta(hours=24)
+MAX_PEERS = 4
+MIRROR_LABEL = "the home server copy"
+PEER_LABEL = "another Secure Linux computer on this network"
+STATE_DIR = "/var/lib/secure-linux/written"   # setup's record of what it wrote (sl_write_file in lib/common.sh)
+# Sets (ideas 21, 22). Where each set is published is fixed here, never taken from a list.
+SET_PREFIX = {"debian": "payload/debian/", "flipper": "flipper/", "netboot": ""}
+SET_LABEL = {"debian": "the Debian install files", "flipper": "the Flipper files",
+             "netboot": "the network-install files"}
+NETBOOT_SET_TOP = ("menu.ipxe", "fedora-netboot.ks")     # plus the netboot preseeds under debian/
+SET_PERSONAL = {"debian": ("payload/build.conf", "wifi-records.txt", "backups.txt")}   # a USB build adds these
+SET_RECORD = ".kit-update-set.json"      # the set list applied in that folder (the release it came from)
+SET_OWN_PREFIX = ".kit-update"           # this tool's own files in a set folder; never a set file
+DEBIAN_SUMS = "debian-files.sha256"      # the plain list the Debian installer checks (debian/installer/late.sh)
+ENABLE_LIST_RE = re.compile(r"^files/[^/]+/enable-(system|user)\.list$")
+# Files that setup steps OTHER than 00-early.sh copy out of this folder (sl_install_file in linux/steps). Each
+# is only refreshed where setup already put it (setup decides per computer whether it is wanted) and only when
+# it was not changed on this computer. Keep in step with linux/steps; tests/kitupdate/test_kit_selftest.py
+# checks that every place below is still installed by a step.
+OTHER_STEP_PLACES = {
+    "files/security/resolved/10-secure-linux-dns.conf": (("/etc/systemd/resolved.conf.d/10-secure-linux-dns.conf",), 0o644),
+    "files/security/resolved/15-secure-linux-family.conf": (("/etc/systemd/resolved.conf.d/15-secure-linux-family.conf",), 0o644),
+    "files/security/polkit/org.securelinux.security.policy": (("/usr/share/polkit-1/actions/org.securelinux.security.policy",), 0o644),
+    "files/security/networkmanager/90-secure-linux-privacy.conf": (("/etc/NetworkManager/conf.d/90-secure-linux-privacy.conf",), 0o644),
+    "files/security/sysctl/90-secure-linux-hardening.conf": (("/etc/sysctl.d/90-secure-linux-hardening.conf",), 0o644),
+    "files/security/networkmanager/50-secure-linux": (("/etc/NetworkManager/dispatcher.d/50-secure-linux",), 0o755),
+    "files/security/usbguard-daemon.conf": (("/etc/usbguard/usbguard-daemon.conf",), 0o600),
+    "files/security/secure-linux.rules": (("/etc/audit/rules.d/secure-linux.rules",), 0o600),
+    "files/security/ssh/40-secure-linux.conf": (("/etc/ssh/sshd_config.d/40-secure-linux.conf",), 0o600),
+    "files/security/ssh/fail2ban-sshd.local": (("/etc/fail2ban/jail.d/sshd.local",), 0o644),
+    "files/system/snapper.actions": (("/etc/dnf/libdnf5-plugins/actions.d/secure-linux-snapper.actions",), 0o644),
+    "files/system/smartd-alert.sh": (("/usr/local/libexec/secure-linux-smartd-alert",), 0o755),
+    "files/system/system-sleep/secure-linux-mt7921e": (("/usr/lib/systemd/system-sleep/secure-linux-mt7921e",
+                                                        "/etc/systemd/system-sleep/secure-linux-mt7921e"), 0o755),
+    "files/hardware/udev/90-secure-linux-parts.rules": (("/etc/udev/rules.d/90-secure-linux-parts.rules",), 0o644),
+    "files/experience/42-flipperzero.rules": (("/etc/udev/rules.d/42-flipperzero.rules",), 0o644),
+    "files/experience/90-secure-linux-battery.rules": (("/etc/udev/rules.d/90-secure-linux-battery.rules",), 0o644),
+    "files/experience/org.securelinux.experience.policy": (("/usr/share/polkit-1/actions/org.securelinux.experience.policy",), 0o644),
+    "files/comfort/SecureLinuxHighContrast.colors": (("/usr/share/color-schemes/SecureLinuxHighContrast.colors",), 0o644),
+}
+UNIT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9@._:-]*\.(service|timer|socket|path|target|mount)$")
+APPS_DIRS = ("/usr/local/share/applications", "/usr/share/applications")   # atomic (Kinoite), then others
+OFF_WORDS = {"no", "false", "off", "0"}
+ON_WORDS = {"yes", "true", "on", "1"}
+
+# ---- one update at a time (C4)
+LOCK_WAIT = 60                  # seconds a second run waits for the first one
+LOCK_POLL = 0.2
+WINDOWS_LOCK_AT = 1 << 30       # msvcrt locks one byte far past the end, so the empty lock file stays readable
+EXIT_BUSY = 75
+BUSY_TEXT = "Another update is running. Try again in a few minutes."
+ONLINE_OFF_TEXT = "Online checks are switched off on this computer."
+CLOCK_TEXT = ("This computer's clock seems wrong (it shows {date}). "
+              "Secure downloads fail until the date is right.")
 
 
 class Keep(Exception):
     """A safe reason to keep the local copy unchanged."""
 
 
+class NothingToUndo(Keep):
+    """There is no earlier version saved here."""
+
+
+class Busy(Keep):
+    """Another apply, undo or copy holds this folder's lock; nothing was changed."""
+
+
+class ClockWrong(Keep):
+    """The computer's date is wrong, so secure downloads cannot work."""
+
+
+class Held(Keep):
+    """The person went back from this release; it is not installed again until a newer one appears."""
+
+
+class CheckFailed(Keep):
+    """The safety check found a problem in the new files before anything was swapped in."""
+
+
 class Offline(Exception):
     """The published release could not be reached at all."""
+
+
+class NotNewer(Keep):
+    """The release offered is older than the one here (for example a home server copy that has not caught up)."""
+
+
+class TooBig(Keep):
+    """A run without a person at the screen would download more than it may (--max-download-mb)."""
+
+
+class SetPartly(Exception):
+    """Writing a set's checked files stopped part-way (every file written was checked; apply again finishes it)."""
+
+
+class Final(Exception):
+    """A problem after the files here started to change: never try another source after it."""
+
+    def __init__(self, inner: BaseException):
+        super().__init__(str(inner))
+        self.inner = inner
+
+
+RUN_STARTED = time.monotonic()
 
 
 def say(text: str) -> None:
@@ -83,6 +352,14 @@ def sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
 def safe_relative(value: object) -> str:
     if not isinstance(value, str) or not value or "\\" in value or "\0" in value:
         raise Keep("the published file list contains an unsafe path")
@@ -94,7 +371,7 @@ def safe_relative(value: object) -> str:
 
 def managed(relative: str) -> bool:
     parts = PurePosixPath(relative).parts
-    if relative in UNMANAGED or parts[0] in SKIP_TOP:
+    if relative in UNMANAGED or parts[0] in SKIP_TOP or parts[0] in UNDO_NAMES:
         return False
     if any(part in GENERATED_DIRS for part in parts) or relative.endswith(GENERATED_SUFFIXES):
         return False
@@ -105,7 +382,8 @@ def local_files(tree: Path) -> dict[str, Path]:
     """Every managed regular file of a payload tree. Links are never followed or replaced."""
     found: dict[str, Path] = {}
     for base, directories, files in os.walk(tree, followlinks=False):
-        directories[:] = sorted(d for d in directories if not (Path(base) / d).is_symlink())
+        directories[:] = sorted(d for d in directories if not (Path(base) / d).is_symlink()
+                                and not (Path(base) == tree and d in UNDO_NAMES))
         for name in sorted(files):
             path = Path(base) / name
             relative = path.relative_to(tree).as_posix()
@@ -115,14 +393,23 @@ def local_files(tree: Path) -> dict[str, Path]:
     return found
 
 
-def release_id_of(path: Path) -> str:
+def record_id(raw: bytes, name: str = "release.json") -> str:
+    """The release ID inside the bytes of a local release record."""
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))["release_id"]
-    except (OSError, ValueError, KeyError, TypeError) as exc:
-        raise Keep(f"the local release record cannot be read ({path.name})") from exc
+        value = json.loads(raw.decode("utf-8"))["release_id"]
+    except (ValueError, KeyError, TypeError) as exc:
+        raise Keep(f"the local release record cannot be read ({name})") from exc
     if not isinstance(value, str) or not RELEASE_ID_RE.match(value):
         raise Keep("the local release record has an invalid release ID")
     return value
+
+
+def release_id_of(path: Path) -> str:
+    try:
+        raw = path.read_bytes()
+    except OSError as exc:
+        raise Keep(f"the local release record cannot be read ({path.name})") from exc
+    return record_id(raw, path.name)
 
 
 def release_date(release_id: str) -> tuple[int, int, int]:
@@ -132,37 +419,747 @@ def release_date(release_id: str) -> tuple[int, int, int]:
     return int(match.group(1)), int(match.group(2)), int(match.group(3))
 
 
+# ------------------------------------------------------------------ this computer: settings and notes
+def is_system_tree(tree: Path) -> bool:
+    """True for this computer's own installed copy (/usr/local/lib/secure-linux)."""
+    if os.name != "posix":
+        return False
+    try:
+        return tree.resolve() == SYSTEM_TREE.resolve()
+    except OSError:
+        return False
+
+
+def computer_path(tree: Path, variable: str, default: str) -> Path | None:
+    """A per-computer file, used only for the computer's own copy (or when a test names one)."""
+    given = os.environ.get(variable)
+    if given:
+        return Path(given)
+    return Path(default) if is_system_tree(tree) else None
+
+
+def setting_word(raw: str) -> str:
+    value = raw.split("#", 1)[0].strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+        value = value[1:-1]
+    return value.strip().lower()
+
+
+def last_setting(text: str, pattern: re.Pattern) -> str | None:
+    found = None
+    for line in text.splitlines():
+        match = pattern.match(line)
+        if match:
+            found = setting_word(match.group(1))
+    return found
+
+
+CONF_ONLINE_RE = re.compile(r"^\s*online\s*=(.*)$", re.IGNORECASE)
+BUILD_ONLINE_RE = re.compile(r"^\s*(?:export\s+)?KIT_UPDATE_ONLINE\s*=(.*)$")
+
+
+def online_allowed(tree: Path) -> bool:
+    """C8: online= in kit-update.conf wins; without it, KIT_UPDATE_ONLINE in the tree's build.conf; else yes.
+    A value that is neither yes nor no keeps this computer offline (never go online on a guess)."""
+    conf = Path(os.environ.get("SL_KIT_UPDATE_CONF") or CONF_DEFAULT)
+    try:
+        text = conf.read_text(encoding="utf-8-sig")
+    except FileNotFoundError:
+        text = None
+    except (OSError, ValueError):
+        return False                     # a settings file that cannot be read: stay offline
+    value = last_setting(text, CONF_ONLINE_RE) if text is not None else None
+    if not value:
+        try:
+            build = (tree / "build.conf").read_text(encoding="utf-8-sig", errors="replace")
+        except OSError:
+            build = ""
+        value = last_setting(build, BUILD_ONLINE_RE)
+    if not value:
+        return True
+    return value in ON_WORDS
+
+
+CONF_CHANNEL_RE = re.compile(r"^\s*channel\s*=(.*)$", re.IGNORECASE)
+CONF_MIRROR_RE = re.compile(r"^\s*mirror\s*=(.*)$", re.IGNORECASE)
+BUILD_UPDATES_RE = re.compile(r"^\s*(?:export\s+)?HOME_SHARE_UPDATES\s*=(.*)$")
+
+
+def settings_text() -> str | None:
+    """/etc/secure-linux/kit-update.conf (C8), or None when there is none or it cannot be read."""
+    try:
+        return Path(os.environ.get("SL_KIT_UPDATE_CONF") or CONF_DEFAULT).read_text(encoding="utf-8-sig")
+    except (OSError, ValueError):
+        return None
+
+
+def update_channel() -> str:
+    """C8 channel=stable|testing. No setting, or anything else, is stable."""
+    text = settings_text()
+    value = last_setting(text, CONF_CHANNEL_RE) if text is not None else None
+    return value if value in CHANNELS else "stable"
+
+
+def plain_value(raw: str) -> str:
+    value = raw.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+        value = value[1:-1].strip()
+    return value
+
+
+def last_raw(text: str, pattern: re.Pattern) -> str | None:
+    found = None
+    for line in text.splitlines():
+        match = pattern.match(line)
+        if match:
+            found = plain_value(match.group(1))
+    return found
+
+
+def mirror_setting(tree: Path) -> str:
+    """C8 mirror=<folder> (empty = none). Without that line: /media/homeserver/<HOME_SHARE_UPDATES> when the
+    tree's build.conf names a folder on the home share (Wave 0 H)."""
+    text = settings_text()
+    value = last_raw(text, CONF_MIRROR_RE) if text is not None else None
+    if value is not None:
+        return value
+    try:
+        build = (tree / "build.conf").read_text(encoding="utf-8-sig", errors="replace")
+    except OSError:
+        return ""
+    share = (last_raw(build, BUILD_UPDATES_RE) or "").strip("/")
+    return f"{HOME_MIRROR_ROOT}/{share}" if share else ""
+
+
+def valid_mirror(value: str) -> bool:
+    """The same rule as secure-linux-kit-update-auto: a plain absolute folder, no '..', no control characters."""
+    if not value or len(value) > 4096 or not os.path.isabs(value):
+        return False
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in value):
+        return False
+    return ".." not in value.replace("\\", "/").split("/")
+
+
+def at_home() -> bool:
+    """Wave 0 H's network dispatcher writes home, away or offline."""
+    path = Path(os.environ.get("SL_KIT_UPDATE_LOCATION") or LOCATION_DEFAULT)
+    try:
+        return path.read_text(encoding="utf-8", errors="replace").strip().lower() == "home"
+    except OSError:
+        return False
+
+
+def mount_points() -> list[Path]:
+    path = Path(os.environ.get("SL_KIT_UPDATE_MOUNTS") or MOUNTS_DEFAULT)
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return []
+    found = []
+    for line in text.splitlines():
+        fields = line.split()
+        if len(fields) >= 2:
+            found.append(Path(re.sub(r"\\([0-7]{3})", lambda match: chr(int(match.group(1), 8)), fields[1])))
+    return found
+
+
+def mounted_folder(folder: Path) -> bool:
+    """True when the folder lies on a mounted file system other than the main one: the share is really there
+    (an empty /media/homeserver folder on this computer's own disk is never used)."""
+    try:
+        target = folder.resolve()
+    except OSError:
+        return False
+    for point in mount_points():
+        try:
+            point = point.resolve()
+        except OSError:
+            continue
+        if point == Path(point.anchor):
+            continue                     # the main file system
+        if target == point or point in target.parents:
+            return True
+    return False
+
+
+def clock_wrong() -> ClockWrong:
+    return ClockWrong(CLOCK_TEXT.format(date=datetime.date.today().isoformat()))
+
+
+def check_clock(local_id: str) -> None:
+    """A computer date before the local release's date (release IDs carry the UTC stamping date)."""
+    try:
+        made = datetime.date(*release_date(local_id))
+    except ValueError:
+        return
+    if datetime.datetime.now(datetime.timezone.utc).date() < made:
+        raise clock_wrong()
+
+
+def tls_clock_problem(exc: BaseException) -> bool:
+    """A secure connection refused because a certificate is 'not yet valid' or 'expired' (a wrong clock)."""
+    if ssl is None:
+        return False
+    for candidate in (exc, getattr(exc, "reason", None), exc.__cause__, exc.__context__):
+        if isinstance(candidate, ssl.SSLCertVerificationError):
+            text = f"{getattr(candidate, 'verify_message', '') or ''} {candidate}".lower()
+            if "not yet valid" in text or "expired" in text:
+                return True
+    return False
+
+
+def held_release(tree: Path) -> str | None:
+    path = computer_path(tree, "SL_KIT_UPDATE_HOLD", HOLD_DEFAULT)
+    if path is None:
+        return None
+    try:
+        value = json.loads(path.read_text(encoding="utf-8")).get("release_id")
+    except (OSError, ValueError, AttributeError):
+        return None
+    return value if isinstance(value, str) and RELEASE_ID_RE.match(value) else None
+
+
+def write_small(path: Path, data: bytes) -> None:
+    """A small per-computer note outside the Secure Linux files, swapped in with one rename."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + ".kit-update-new")
+    write_new(temporary, data)
+    os.chmod(temporary, 0o644)
+    os.replace(temporary, path)
+
+
+# ------------------------------------------------------------------ temporary files (check C2 F3)
+class TempRefused(Keep, OSError):
+    """Something other than a plain file sits at a temporary name. It is never written through. (A Keep for the
+    update itself, and an OSError for the best-effort notes that skip a file they cannot write.)"""
+
+
+def open_new(path: Path):
+    """Open a temporary name as a brand-new private file, never through a link (check C2 F3). A plain file left
+    there by an earlier run that was cut off is removed first: removing a name never changes another file, not
+    even one it shares its bytes with (a hard link). A link, a folder or anything else there is refused. O_EXCL
+    also refuses a link that appears in between, and O_NOFOLLOW is added where the system has it."""
+    path = Path(path)
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        info = None
+    if info is not None:
+        if not stat.S_ISREG(info.st_mode):
+            raise TempRefused(f"a link or something else that is not a plain file sits where a temporary file is "
+                              f"written ({path.name}); it is never written through")
+        os.unlink(path)
+    flags = (os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+             | getattr(os, "O_BINARY", 0))
+    try:
+        handle = os.open(path, flags, 0o600)
+    except FileExistsError as exc:
+        raise TempRefused(f"something appeared where a temporary file is written ({path.name}); nothing was "
+                          "written through it") from exc
+    return os.fdopen(handle, "wb")
+
+
+def write_new(path: Path, data: bytes) -> None:
+    """All of `data` into a brand-new file at `path` (open_new's rules)."""
+    with open_new(path) as handle:
+        handle.write(data)
+
+
+def copy_new(source: Path, path: Path) -> None:
+    """A copy of `source` into a brand-new file at `path` (open_new's rules)."""
+    with open(source, "rb") as reader, open_new(path) as handle:
+        shutil.copyfileobj(reader, handle, 1024 * 1024)
+
+
+def open_part(path: Path):
+    """A half-downloaded file, opened to add to its end: only a plain file with no other name (never a link,
+    never a file it shares its bytes with)."""
+    flags = (os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+             | getattr(os, "O_BINARY", 0))
+    handle = os.open(path, flags, 0o600)
+    try:
+        info = os.fstat(handle)
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            raise TempRefused(f"a half-downloaded file is not a plain file of its own ({Path(path).name})")
+    except BaseException:
+        os.close(handle)
+        raise
+    return os.fdopen(handle, "ab")
+
+
+def write_hold(tree: Path, release_id: str | None) -> bool:
+    """C8 hold record: after going back, do not install that release again until a newer one appears."""
+    path = computer_path(tree, "SL_KIT_UPDATE_HOLD", HOLD_DEFAULT)
+    if path is None or not release_id or not RELEASE_ID_RE.match(release_id):
+        return True
+    try:
+        write_small(path, (json.dumps({"release_id": release_id}, sort_keys=True) + "\n").encode("utf-8"))
+        return True
+    except OSError:
+        return False
+
+
+def clear_hold(tree: Path) -> None:
+    path = computer_path(tree, "SL_KIT_UPDATE_HOLD", HOLD_DEFAULT)
+    if path is not None:
+        try:
+            path.unlink()
+        except OSError:
+            pass
+
+
+def remember(tree: Path, result: str, line: str) -> None:
+    """The last answer, for `status` (only for the computer's own copy, outside its files)."""
+    path = computer_path(tree, "SL_KIT_UPDATE_LAST", LAST_DEFAULT)
+    if path is None:
+        return
+    note = {"schema_version": SCHEMA, "result": result, "line": line, "tree": str(tree),
+            "at": datetime.datetime.now(datetime.timezone.utc).isoformat()}
+    try:
+        write_small(path, (json.dumps(note, indent=2, sort_keys=True) + "\n").encode("utf-8"))
+    except OSError:
+        pass                             # a note that cannot be written never changes the answer
+
+
+def last_result(tree: Path) -> str:
+    path = computer_path(tree, "SL_KIT_UPDATE_LAST", LAST_DEFAULT)
+    if path is None:
+        return "not-recorded"
+    try:
+        value = json.loads(path.read_text(encoding="utf-8")).get("result")
+    except (OSError, ValueError, AttributeError):
+        return "never-checked"
+    return value if isinstance(value, str) and value else "never-checked"
+
+
+def alert_path(tree: Path) -> Path | None:
+    folder = computer_path(tree, "SL_KIT_UPDATE_ALERTS", ALERTS_DEFAULT)
+    return None if folder is None else folder / ALERT_ID
+
+
+def raise_alert(tree: Path, kind: str) -> None:
+    """One plain alert for the desktop (title, message, what to do), only for this computer's own copy."""
+    path = alert_path(tree)
+    if path is None:
+        return
+    title, message, hint = ALERTS[kind]
+    try:
+        write_small(path, f"{title}\n{message}\n{hint}\n".encode("utf-8"))
+    except OSError:
+        pass                             # an alert that cannot be written never changes the answer
+
+
+def clear_alert(tree: Path) -> None:
+    path = alert_path(tree)
+    if path is not None:
+        try:
+            path.unlink()
+        except OSError:
+            pass
+
+
+# ------------------------------------------------------------------ one update at a time
+_HELD_LOCKS: dict[str, list] = {}
+
+
+def lock_wait() -> float:
+    if os.environ.get("SL_KIT_UPDATE_TEST_SOURCE") == "1" and os.environ.get("SL_KIT_UPDATE_LOCK_WAIT"):
+        try:
+            return max(0.0, float(os.environ["SL_KIT_UPDATE_LOCK_WAIT"]))
+        except ValueError:
+            pass
+    return LOCK_WAIT
+
+
+def _try_lock(handle: int) -> bool:
+    if fcntl is not None:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except BlockingIOError:
+            return False
+    os.lseek(handle, WINDOWS_LOCK_AT, os.SEEK_SET)
+    try:
+        msvcrt.locking(handle, msvcrt.LK_NBLCK, 1)
+        return True
+    except OSError:
+        return False
+
+
+def _unlock(handle: int) -> None:
+    try:
+        if fcntl is not None:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+        else:
+            os.lseek(handle, WINDOWS_LOCK_AT, os.SEEK_SET)
+            msvcrt.locking(handle, msvcrt.LK_UNLCK, 1)
+    except OSError:
+        pass
+
+
+class TreeLock:
+    """An exclusive lock on <tree>/.kit-update.lock around apply, undo and copying from one tree to another.
+
+    A second run waits up to LOCK_WAIT seconds, then gives up with Busy and changes nothing. The lock file is
+    removed when the run ends (while still locked), so a finished or refused run leaves the folder exactly as it
+    was; a run that was waiting on the removed file sees that it no longer is the file at that name and tries
+    again. Re-entrant inside one process (apply finishing an interrupted undo).
+    With required=False a folder this user cannot write to is read without the lock (every file is still
+    checked by SHA-256)."""
+
+    def __init__(self, tree: Path, required: bool = True):
+        self.tree = Path(tree)
+        self.required = required
+        self.key = os.path.normcase(os.path.realpath(str(self.tree)))
+        self.handle: int | None = None
+        self.mode = "none"
+
+    def __enter__(self) -> "TreeLock":
+        held = _HELD_LOCKS.get(self.key)
+        if held is not None:
+            held[1] += 1
+            self.mode = "nested"
+            return self
+        path = self.tree / LOCK_NAME
+        deadline = time.monotonic() + lock_wait()
+        flags = (os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+                 | getattr(os, "O_BINARY", 0))
+        while True:
+            try:
+                handle = os.open(path, flags, 0o600)
+            except OSError as exc:
+                if not self.required:
+                    return self
+                raise Keep(f"the update lock in this folder could not be made ({exc.strerror or exc})") from exc
+            try:
+                if _try_lock(handle):
+                    try:
+                        same = os.path.samestat(os.fstat(handle), os.stat(path, follow_symlinks=False))
+                    except OSError:
+                        same = False
+                    if same:
+                        self.handle = handle
+                        self.mode = "owner"
+                        _HELD_LOCKS[self.key] = [handle, 1]
+                        return self
+                    _unlock(handle)
+            except BaseException:
+                os.close(handle)
+                raise
+            os.close(handle)
+            if time.monotonic() >= deadline:
+                raise Busy(BUSY_TEXT)
+            time.sleep(LOCK_POLL)
+
+    def __exit__(self, *exc_info) -> bool:
+        if self.mode == "nested":
+            _HELD_LOCKS[self.key][1] -= 1
+        elif self.mode == "owner":
+            del _HELD_LOCKS[self.key]
+            path = self.tree / LOCK_NAME
+            if fcntl is not None:
+                try:
+                    os.unlink(path)          # removed while still locked: nobody can take the old file afterwards
+                except OSError:
+                    pass
+                os.close(self.handle)
+            else:
+                _unlock(self.handle)
+                os.close(self.handle)
+                try:
+                    os.unlink(path)          # Windows refuses this while another run has it open, which is fine
+                except OSError:
+                    pass
+        self.mode = "none"
+        return False
+
+
 # ------------------------------------------------------------------ fetching
 class Source:
-    def __init__(self) -> None:
-        self.base = os.environ.get("SL_KIT_UPDATE_BASE", DEFAULT_BASE).rstrip("/")
-        self.tarball = os.environ.get("SL_KIT_UPDATE_TARBALL", DEFAULT_TARBALL)
-        self.tarball_root = os.environ.get("SL_KIT_UPDATE_TARBALL_ROOT", TARBALL_ROOT)
+    """The published release on the internet (GitHub, https only). Its messages read exactly as before."""
+    label = ""                  # "" = the internet; other sources name themselves in every message
+    use_archive = True          # more than TARBALL_THRESHOLD changed files: one archive
+    resumable = True            # half-finished downloads may wait in the parts folder for the next run
+    size_limited = True         # --max-download-mb counts only downloads from the internet
+
+    def __init__(self, channel: str = "stable") -> None:
+        if channel == "testing":
+            self.base = os.environ.get("SL_KIT_UPDATE_TESTING_BASE", TESTING_BASE).rstrip("/")
+            self.tarball = os.environ.get("SL_KIT_UPDATE_TESTING_TARBALL", TESTING_TARBALL)
+            self.tarball_root = os.environ.get("SL_KIT_UPDATE_TESTING_TARBALL_ROOT", TESTING_TARBALL_ROOT)
+        else:
+            self.base = os.environ.get("SL_KIT_UPDATE_BASE", DEFAULT_BASE).rstrip("/")
+            self.tarball = os.environ.get("SL_KIT_UPDATE_TARBALL", DEFAULT_TARBALL)
+            self.tarball_root = os.environ.get("SL_KIT_UPDATE_TARBALL_ROOT", TARBALL_ROOT)
         test = os.environ.get("SL_KIT_UPDATE_TEST_SOURCE") == "1"
         for url in (self.base, self.tarball):
             if not (url.startswith("https://") or (test and url.startswith(("http://127.0.0.1:", "http://localhost:")))):
                 raise Keep("the update address is not a secure (https) address")
         self.started = time.monotonic()
 
-    def get(self, url: str, limit: int) -> bytes:
-        if time.monotonic() - self.started > TOTAL_DEADLINE:
+    def deadline(self) -> None:
+        now = time.monotonic()
+        if now - self.started > TOTAL_DEADLINE or now - RUN_STARTED > OVERALL_DEADLINE:
             raise Keep("the update took too long")
+
+    def get(self, url: str, limit: int) -> bytes:
+        self.deadline()
         request = urllib.request.Request(url, headers={"User-Agent": "secure-linux-kit-update", "Cache-Control": "no-cache"})
-        with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT) as response:
-            final = response.geturl()
-            if not final.startswith(url.split("/", 3)[0] + "//" + url.split("/", 3)[2]):
-                raise Keep("the update address redirected somewhere unexpected")
-            data = response.read(limit + 1)
+        try:
+            with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT) as response:
+                if not same_place(url, response.geturl()):
+                    raise Keep("the update address redirected somewhere unexpected")
+                data = response.read(limit + 1)
+        except http.client.HTTPException as exc:      # a broken answer is a broken connection
+            raise ConnectionError(f"the connection broke off ({type(exc).__name__})") from exc
         if len(data) > limit:
             raise Keep("a published file is larger than allowed")
         return data
+
+    def download(self, url: str, limit: int, part: Path | None = None) -> bytes:
+        """A larger file. A connection cut short is picked up where it stopped (HTTP Range); `part` keeps the
+        bytes for a later run. A short answer is never taken: it must reach the length the server announced,
+        and the caller checks the SHA-256 of the whole file."""
+        have = bytearray()
+        if part is not None and part.is_file() and not part.is_symlink() and part.stat().st_nlink == 1:
+            have += part.read_bytes()[:limit]
+        problem: BaseException | None = None
+        for _ in range(FETCH_TRIES):
+            self.deadline()
+            headers = {"User-Agent": "secure-linux-kit-update", "Cache-Control": "no-cache"}
+            if have:
+                headers["Range"] = f"bytes={len(have)}-"
+            request = urllib.request.Request(url, headers=headers)
+            total = None
+            try:
+                with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT) as response:
+                    if not same_place(url, response.geturl()):
+                        raise Keep("the update address redirected somewhere unexpected")
+                    if not (have and getattr(response, "status", 200) == 206
+                            and range_start(response) == len(have)):
+                        have = bytearray()       # the whole file follows (no resume offered, or a new one)
+                        if part is not None:
+                            write_new(part, b"")
+                    length = response.headers.get("Content-Length") if getattr(response, "headers", None) else None
+                    if length is not None and length.strip().isdigit():
+                        total = len(have) + int(length.strip())
+                    with (open_part(part) if part is not None else contextlib.nullcontext()) as out:
+                        while True:
+                            chunk = response.read(READ_CHUNK)
+                            if not chunk:
+                                break
+                            have += chunk
+                            if len(have) > limit:
+                                raise Keep("a published file is larger than allowed")
+                            if out is not None:
+                                out.write(chunk)
+                            if self.label:
+                                self.deadline()      # a slow neighbour never holds the update past the limit
+            except urllib.error.HTTPError as exc:
+                if exc.code == 416 and have:     # the bytes kept here no longer fit: start again
+                    have = bytearray()
+                    if part is not None:
+                        write_new(part, b"")
+                    problem = exc
+                    continue
+                raise
+            except (urllib.error.URLError, OSError, TimeoutError, http.client.HTTPException) as exc:
+                problem = exc                    # cut short: the next try continues from what arrived
+                continue
+            if total is not None and len(have) < total:
+                problem = ConnectionError("the connection broke off before the whole file arrived")
+                continue
+            return bytes(have)
+        if isinstance(problem, (urllib.error.URLError, OSError, TimeoutError)):
+            raise problem
+        raise ConnectionError(f"the connection broke off ({type(problem).__name__})") from problem
+
+    def fetch_file(self, relative: str, digest: str, parts: Path | None, prefix: str = "payload/") -> bytes:
+        """One published file: a copy already finished in an earlier run (same SHA-256), or a download that
+        continues a half-finished one. `prefix` is the published folder (a set's folder for --set)."""
+        if parts is not None:
+            done = parts / digest
+            if done.is_file() and not done.is_symlink():
+                data = done.read_bytes()
+                if sha256(data) == digest:
+                    return data
+        part = parts / (digest + ".part") if parts is not None else None
+        return self.download(f"{self.base}/{prefix}{relative}", MAX_FILE_BYTES, part)
+
+
+def range_start(response) -> int | None:
+    """Where a 206 answer starts (Content-Range: bytes START-END/TOTAL)."""
+    headers = getattr(response, "headers", None)
+    value = headers.get("Content-Range", "") if headers is not None else ""
+    match = re.match(r"^\s*bytes\s+([0-9]+)-([0-9]+)/([0-9]+|\*)\s*$", value or "")
+    return int(match.group(1)) if match else None
+
+
+class FolderSource(Source):
+    """A copy of the published files in a folder: the home server share (C8 mirror). Read like a download and
+    checked exactly the same. The folder's path never appears in a message (it names the home server)."""
+    label = MIRROR_LABEL
+    use_archive = False
+    resumable = False
+    size_limited = False
+
+    def __init__(self, folder: Path) -> None:
+        self.folder = folder
+        self.base = "mirror:"
+        self.tarball = ""
+        self.tarball_root = ""
+        self.started = time.monotonic()
+
+    def path_for(self, url: str) -> Path:
+        relative = url[len(self.base) + 1:] if url.startswith(self.base + "/") else ""
+        parts = PurePosixPath(relative).parts
+        if not relative or "\\" in relative or "\0" in relative or PurePosixPath(relative).is_absolute() \
+                or any(part in ("", ".", "..") for part in parts):
+            raise Keep(f"{MIRROR_LABEL} was asked for an unsafe path")
+        path = self.folder
+        for part in parts:
+            path = path / part
+            if path.is_symlink():
+                raise Keep(f"{MIRROR_LABEL} holds a link, which is never followed")
+        return path
+
+    def get(self, url: str, limit: int) -> bytes:
+        self.deadline()
+        path = self.path_for(url)
+        try:
+            if not path.is_file():
+                raise urllib.error.HTTPError(url, 404, f"not in {MIRROR_LABEL}", None, None)
+            with open(path, "rb") as handle:
+                data = handle.read(limit + 1)
+        except urllib.error.HTTPError:
+            raise
+        except OSError:
+            raise OSError(f"{MIRROR_LABEL} could not be read") from None
+        if len(data) > limit:
+            raise Keep("a published file is larger than allowed")
+        return data
+
+    def download(self, url: str, limit: int, part: Path | None = None) -> bytes:
+        return self.get(url, limit)
+
+    def fetch_file(self, relative: str, digest: str, parts: Path | None, prefix: str = "payload/") -> bytes:
+        return self.get(f"{self.base}/{prefix}{relative}", MAX_FILE_BYTES)
+
+
+class PeerSource(Source):
+    """Another Secure Linux computer on this network (C7). Plain http is allowed only because every file is
+    checked against the signed list, exactly like a download. Never the archive."""
+    label = PEER_LABEL
+    use_archive = False
+    resumable = False
+    size_limited = False
+
+    def __init__(self, url: str) -> None:
+        self.base = url.rstrip("/")
+        self.tarball = ""
+        self.tarball_root = ""
+        self.started = time.monotonic()
+
+
+def peer_url_ok(url: object) -> bool:
+    """http(s)://<private or link-local IP address>[:port]/ only: never a name, never the internet."""
+    if not isinstance(url, str) or len(url) > 200 or any(ord(ch) < 33 or ord(ch) == 127 for ch in url):
+        return False
+    try:
+        parts = urllib.parse.urlsplit(url)
+        address = ipaddress.ip_address(parts.hostname or "")
+        parts.port                        # a bad port raises ValueError
+    except ValueError:
+        return False
+    if parts.scheme not in ("http", "https") or parts.username is not None or parts.password is not None \
+            or parts.query or parts.fragment or parts.path not in ("", "/"):
+        return False
+    if address.is_loopback:
+        return os.environ.get("SL_KIT_UPDATE_TEST_SOURCE") == "1"
+    if address.is_unspecified or address.is_multicast or address.is_reserved:
+        return False
+    return address.is_private or address.is_link_local
+
+
+def peer_sources(channel: str) -> list[Source]:
+    """C7: /run/secure-linux/kit-peers.json. Only peers seen in the last day; a stable computer only asks
+    stable peers (the channel record is checked as well)."""
+    path = Path(os.environ.get("SL_KIT_PEERS") or PEERS_DEFAULT)
+    try:
+        if path.is_symlink():
+            return []
+        with open(path, "rb") as handle:
+            data = json.loads(handle.read(MAX_RECORD_BYTES + 1).decode("utf-8"))
+    except (OSError, ValueError):
+        return []
+    if not isinstance(data, dict) or data.get("schema") != 1 or not isinstance(data.get("peers"), list):
+        return []
+    now = datetime.datetime.now(datetime.timezone.utc)
+    found: list[Source] = []
+    seen: set[str] = set()
+    for peer in data["peers"]:
+        if not isinstance(peer, dict) or not peer_url_ok(peer.get("url")) or peer["url"] in seen:
+            continue
+        if peer.get("channel") not in CHANNELS or (channel == "stable" and peer.get("channel") != "stable"):
+            continue
+        try:
+            seen_at = datetime.datetime.fromisoformat(str(peer.get("seen_at")))
+        except ValueError:
+            continue
+        if seen_at.tzinfo is None:
+            seen_at = seen_at.replace(tzinfo=datetime.timezone.utc)
+        if not now - PEER_MAX_AGE <= seen_at <= now + datetime.timedelta(hours=1):
+            continue
+        seen.add(peer["url"])
+        found.append(PeerSource(peer["url"]))
+        if len(found) >= MAX_PEERS:
+            break
+    return found
+
+
+def update_sources(tree: Path, channel: str) -> list[Source]:
+    """C8 order: the internet first. In signed mode only, then the home server copy (while its share is mounted
+    and this computer is at home), then other computers on this network. The local copy is what stays when
+    none of them gives a newer, fully checked release."""
+    sources: list[Source] = [Source(channel)]
+    try:
+        signed = load_checker(keys_folder(tree)) is not None
+    except Exception:                    # the internet source's own check refuses and explains it
+        signed = False
+    if not signed:
+        return sources
+    folder = mirror_setting(tree)
+    if folder and valid_mirror(folder) and at_home():
+        path = Path(folder)
+        try:
+            usable = mounted_folder(path) and not path.is_symlink() and path.is_dir()
+        except OSError:
+            usable = False
+        if usable:
+            sources.append(FolderSource(path))
+    if at_home():                        # check C2 F6: other computers are asked only at home, like the copy
+        sources.extend(peer_sources(channel))
+    return sources
+
+
+def same_place(asked: str, final: str) -> bool:
+    """A redirect may only stay on exactly the same scheme, host and port (never a look-alike host name)."""
+    try:
+        first, last = urllib.parse.urlsplit(asked), urllib.parse.urlsplit(final)
+        return (first.scheme.lower() == last.scheme.lower() and last.username is None and last.password is None
+                and (first.hostname or "") == (last.hostname or "") and first.port == last.port
+                and bool(last.hostname))
+    except ValueError:
+        return False
 
 
 def load_remote(source: Source) -> tuple[str, dict, bytes]:
     """The published release ID, its file list, and the exact release record to install with it."""
     try:
-        record_raw = source.get(source.base + "/release.json", 65536)
+        record_raw = source.get(source.base + "/release.json", MAX_RECORD_BYTES)
     except (urllib.error.URLError, OSError, TimeoutError) as exc:
+        if tls_clock_problem(exc):
+            raise clock_wrong() from exc
         raise Offline(str(getattr(exc, "reason", exc))) from exc
     try:
         record = json.loads(record_raw.decode("utf-8"))
@@ -201,6 +1198,24 @@ def check_manifest(manifest: object, remote_id: str) -> dict:
             raise Keep(f"the published file list names a file that is never updated this way: {relative}")
         if not isinstance(digest, str) or not HASH_RE.match(digest):
             raise Keep(f"the published file list has an invalid SHA-256 for {relative}")
+    if "modes" in manifest:             # idea 16: only 0644 and 0755, only for files the list names
+        modes = manifest["modes"]
+        if not isinstance(modes, dict):
+            raise Keep("the published file list has file modes in a form this version does not understand")
+        for relative, mode in modes.items():
+            if relative not in files:
+                raise Keep(f"the published file list gives a mode for a file it does not list: {relative!r}")
+            if mode not in FILE_MODES:
+                raise Keep(f"the published file list asks for a file mode that is never used ({mode!r} for {relative})")
+    if "sizes" in manifest:             # idea 24: the size of each file, so a download can be announced first
+        sizes = manifest["sizes"]
+        if not isinstance(sizes, dict):
+            raise Keep("the published file list has file sizes in a form this version does not understand")
+        for relative, size in sizes.items():
+            if relative not in files:
+                raise Keep(f"the published file list gives a size for a file it does not list: {relative!r}")
+            if not isinstance(size, int) or isinstance(size, bool) or not 0 <= size <= MAX_FILE_BYTES:
+                raise Keep(f"the published file list gives an impossible size for {relative}")
     if "setup.sh" not in files:
         raise Keep("the published file list is incomplete (no setup.sh)")
     try:
@@ -210,10 +1225,265 @@ def check_manifest(manifest: object, remote_id: str) -> dict:
     return manifest
 
 
+def keys_folder(tree: Path) -> Path:
+    """The release keys this tree trusts. They always come from a LOCAL tree, never from a download."""
+    keys = tree / "share" / KEYS_FOLDER
+    if not keys.is_dir():
+        keys = Path(__file__).resolve().parent.parent / "share" / KEYS_FOLDER
+    return keys
+
+
+def load_checker(keys: Path):
+    """secure-linux-release-verify (beside this tool), or None while signing is not set up for `keys`."""
+    verifier = Path(__file__).resolve().with_name("secure-linux-release-verify")
+    if not verifier.is_file():
+        if keys.is_dir() and any(keys.glob("*.asc")):
+            raise Keep("the release signature checker is missing")
+        return None
+    loader = importlib.machinery.SourceFileLoader("sl_release_verify", str(verifier))
+    checker = types.ModuleType(loader.name)
+    checker.__file__ = str(verifier)
+    loader.exec_module(checker)
+    return checker if checker.signing_configured(keys) else None
+
+
+def fetch_optional(source: Source, url: str, limit: int, what: str) -> bytes | None:
+    """A file that may not be published (None); any other failure keeps the local copy."""
+    try:
+        return source.get(url, limit)
+    except urllib.error.HTTPError:
+        return None
+    except (urllib.error.URLError, OSError, TimeoutError) as exc:
+        raise Keep(f"{what} could not be downloaded") from exc
+
+
+def must_list_for(checker, tree: Path) -> dict:
+    """The NEVER_REMOVED files this folder has, for a checker that knows must_list (gap check LOW 14)."""
+    try:
+        known = "must_list" in inspect.signature(checker.verify_release).parameters
+    except (TypeError, ValueError):
+        known = False
+    return {"must_list": [name for name in NEVER_REMOVED if (tree / name).is_file()]} if known else {}
+
+
+def signature_gate(source: Source, tree: Path, record_raw: bytes, remote_id: str,
+                   channel: str = "stable") -> tuple[dict, dict] | None:
+    """Signed releases (secure-linux-release-verify). While no release key is in the kit this returns None and
+    nothing changes. Once a key is set up, the published release.json and payload-files.json must carry valid
+    signatures; the returned file list is exactly the bytes that were verified, with those bytes and both
+    signatures to keep beside it (KEPT). The published release history is checked too (history_gate)."""
+    keys = keys_folder(tree)
+    checker = load_checker(keys)
+    if checker is None:
+        return None
+
+    def optional(url: str, limit: int) -> bytes | None:
+        # not published: the checker refuses an unsigned release
+        return fetch_optional(source, url, limit, "the release signature")
+
+    list_raw = optional(f"{source.base}/{MANIFEST_NAME}", MAX_MANIFEST_BYTES)
+    if list_raw is None:                     # a signed release record alone never names the files to install
+        raise Keep("the published release has no file list yet")
+    local_record = tree / "release.json"
+    applied_list = tree / FILES_NAME
+    record_sig = optional(source.base + "/release.json.sig", MAX_SIGNATURE_BYTES)
+    list_sig = optional(f"{source.base}/{MANIFEST_NAME}.sig", MAX_SIGNATURE_BYTES)
+    verdict = checker.verify_release(
+        record_raw, record_sig, list_raw, list_sig, keys,
+        local_record_raw=local_record.read_bytes() if local_record.is_file() else None,
+        local_file_list_raw=applied_list.read_bytes() if applied_list.is_file() else None,
+        source="the published release", **must_list_for(checker, tree))
+    if verdict.state != "verified" or record_sig is None or list_sig is None:
+        raise Keep(f"the published release did not pass the signature check: {verdict.message}")
+    try:
+        manifest = check_manifest(json.loads(list_raw.decode("utf-8")), remote_id)
+    except ValueError as exc:
+        raise Keep("the published file list is not readable") from exc
+    kept = {KEPT_LIST: list_raw, KEPT_LIST_SIG: list_sig, KEPT_RECORD_SIG: record_sig}
+    history = history_gate(source, tree, checker, keys, record_raw, list_raw, manifest, remote_id)
+    kept.update(history or {})
+    kept.update(channel_gate(source, tree, checker, keys, remote_id, channel))
+    if history is None and source.label:
+        # check C2 (history_gate remainder): a copy on the home network that leaves the signed history out could
+        # hold a computer that never kept one on an older release (a freeze). Only the internet may.
+        raise Keep("a copy on the home network is used only with a signed release history")
+    return manifest, kept
+
+
+def channel_gate(source: Source, tree: Path, checker, keys: Path, remote_id: str, channel: str) -> dict:
+    """C14, signed mode: a channel record that is published must carry a valid signature and name exactly this
+    release; a stable computer takes only a release whose record says stable. A computer that never saw a
+    record accepts a release without one from the internet (the first release with records is not refused);
+    after that, a release without a record is refused. A copy on the home network (the home server copy or
+    another computer) is used only when it gives a signed record for its own release, so it can never pass a
+    test release to a stable computer by leaving the record out (P17 finding F1). Returns the bytes to keep
+    here once the update is in."""
+    raw = fetch_optional(source, f"{source.base}/{CHANNEL_NAME}", MAX_RECORD_BYTES, "the channel record")
+    signature = fetch_optional(source, f"{source.base}/{CHANNEL_NAME}.sig", MAX_SIGNATURE_BYTES,
+                               "the channel record's signature")
+    if raw is None and signature is None:
+        if source.label:
+            raise Keep("a copy on the home network is used only with a signed channel record")
+        if read_kept(tree / KEPT_CHANNEL, MAX_RECORD_BYTES) is not None:
+            raise Keep("the published release has no channel record, but this computer has seen one before")
+        return {}
+    if raw is None:
+        raise Keep("the channel record is missing (only its signature is there)")
+    if len(raw) > MAX_RECORD_BYTES:
+        raise Keep("the channel record is larger than allowed")
+    good, why = detached_check(checker, raw, signature, keys, CHANNEL_NAME)
+    if not good:
+        raise Keep(f"the channel record did not pass the signature check: {why}")
+    try:
+        record = json.loads(raw.decode("utf-8"))
+        named, said = record["release_id"], record["channel"]
+        if record["schema_version"] != 1 or not isinstance(named, str) or said not in CHANNELS:
+            raise ValueError("unexpected values")
+        datetime.datetime.fromisoformat(str(record["created_at"]))
+    except (UnicodeDecodeError, ValueError, KeyError, TypeError) as exc:
+        raise Keep("the channel record is not in the expected form") from exc
+    if named != remote_id:
+        raise Keep("the channel record belongs to a different release (publishing may be in progress)")
+    if channel == "stable" and said != "stable":
+        raise Keep(f"{remote_id} is a test release, and this computer takes only finished (stable) releases")
+    return {KEPT_CHANNEL: raw, KEPT_CHANNEL_SIG: signature}
+
+
+def keep_channel(tree: Path, kept: dict | None) -> None:
+    """Remember the channel record just checked (signature first). Never fails an update."""
+    if not kept or kept.get(KEPT_CHANNEL) is None:
+        return
+    try:
+        write_durable(tree / KEPT_CHANNEL_SIG, kept[KEPT_CHANNEL_SIG])
+        write_durable(tree / KEPT_CHANNEL, kept[KEPT_CHANNEL])
+    except OSError:
+        pass
+
+
+# ------------------------------------------------------------------ the release history (C15, signed mode)
+def detached_check(checker, data: bytes, signature: bytes | None, keys: Path, label: str) -> tuple[bool, str]:
+    """One signed file: the checker's verify_detached (C1), or its signature check for an older checker."""
+    if hasattr(checker, "verify_detached"):
+        verdict = checker.verify_detached(data, signature, keys, label=label)
+        return verdict.state == "verified", str(verdict.message)
+    try:
+        checker.check_signature(data, signature, checker.Trust(Path(keys)), label)
+    except checker.Refuse as exc:
+        return False, str(exc)
+    except OSError as exc:
+        return False, f"{label} could not be checked ({type(exc).__name__})"
+    return True, ""
+
+
+def parse_history(raw: bytes) -> list[tuple[bytes, dict]]:
+    """C15: one line per release, each in the one exact form, each linked to the line before it."""
+    what = "the published release history"
+    if len(raw) > MAX_HISTORY_BYTES:
+        raise Keep(f"{what} is larger than allowed")
+    if not raw:
+        return []
+    if not raw.endswith(b"\n"):
+        raise Keep(f"{what} is cut short")
+    entries: list[tuple[bytes, dict]] = []
+    seen: set[str] = set()
+    previous = ZERO_HASH
+    for number, line in enumerate(raw[:-1].split(b"\n"), 1):
+        where = f"{what} (line {number})"
+        try:
+            entry = json.loads(line.decode("ascii"))
+        except (UnicodeDecodeError, ValueError) as exc:
+            raise Keep(f"{where} is not readable") from exc
+        if not isinstance(entry, dict) or tuple(sorted(entry)) != HISTORY_FIELDS \
+                or not all(isinstance(entry[name], str) for name in HISTORY_FIELDS) \
+                or json.dumps(entry, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("ascii") != line:
+            raise Keep(f"{where} is not in the expected form")
+        if not RELEASE_ID_RE.match(entry["release_id"]) \
+                or not all(HASH_RE.match(entry[name]) for name in ("list_sha256", "prev_sha256", "record_sha256")):
+            raise Keep(f"{where} is damaged")
+        try:
+            datetime.datetime.fromisoformat(entry["created_at"])
+        except ValueError as exc:
+            raise Keep(f"{where} is damaged") from exc
+        if entry["prev_sha256"] != previous:
+            raise Keep(f"{where} does not link to the line before it")
+        if entry["release_id"] in seen:
+            raise Keep(f"{where} names a release a second time")
+        seen.add(entry["release_id"])
+        entries.append((line, entry))
+        previous = sha256(line)
+    return entries
+
+
+def history_gate(source: Source, tree: Path, checker, keys: Path, record_raw: bytes, list_raw: bytes,
+                 manifest: dict, remote_id: str) -> dict | None:
+    """C15, signed mode: the published history must carry a valid signature, end with exactly this release, and
+    start with the history this computer saw last. Returns the bytes to keep here, or None while no history is
+    published and this computer never saw one. Also orders two releases from the same day (gap check LOW 13):
+    a history that does not list the release already here, or no history at all, cannot show that a same-day
+    release is newer (unless this folder's own update record gives the time of the release here)."""
+    seen = read_kept(tree / KEPT_HISTORY, MAX_HISTORY_BYTES)
+    raw = fetch_optional(source, f"{source.base}/{HISTORY_NAME}", MAX_HISTORY_BYTES, "the published release history")
+    signature = fetch_optional(source, f"{source.base}/{HISTORY_NAME}.sig", MAX_SIGNATURE_BYTES,
+                               "the release history's signature")
+    if raw is None and signature is None:
+        if seen is not None:
+            raise Keep("the published release history is missing, but this computer has seen one before")
+        local_id = release_id_of(tree / "release.json")
+        if release_date(remote_id) == release_date(local_id) and not own_time_known(tree, local_id):
+            # gap check LOW 13: no history, no own record - two releases from one day cannot be put in order
+            raise Keep(f"no release history is published, so a release from the same day as the one already here "
+                       f"({local_id}) cannot be shown to be newer")
+        return None                      # no history published yet: the first one seen is accepted later
+    if raw is None:
+        raise Keep("the published release history is missing (only its signature is there)")
+    good, why = detached_check(checker, raw, signature, keys, HISTORY_NAME)
+    if not good:
+        raise Keep(f"the published release history did not pass the signature check: {why}")
+    entries = parse_history(raw)
+    if not entries:
+        raise Keep("the published release history is empty")
+    newest = entries[-1][1]
+    if (newest["release_id"], newest["record_sha256"], newest["list_sha256"], newest["created_at"]) \
+            != (remote_id, sha256(record_raw), sha256(list_raw), manifest.get("created_at")):
+        raise Keep("the published release history does not end with this release (publishing may be in progress)")
+    if seen is not None and not raw.startswith(seen):
+        raise Keep("the published release history does not continue the one this computer saw before "
+                   "(it was rewritten, or it is an older one)")
+    local_id = release_id_of(tree / "release.json")
+    if local_id not in {entry["release_id"] for _, entry in entries} \
+            and release_date(remote_id) == release_date(local_id) and not own_time_known(tree, local_id):
+        raise Keep(f"the published release history does not list the release already here ({local_id}), "
+                   "so a release from the same day cannot be shown to be newer")
+    return {KEPT_HISTORY: raw, KEPT_HISTORY_SIG: signature}
+
+
+def own_time_known(tree: Path, local_id: str) -> bool:
+    """True when this folder's own update record names the release already here, with its published time.
+    refuse_older then orders two releases from the same day by that time (a history that started after that
+    release need not list it). A fresh folder from a drive has no such record."""
+    try:
+        note = json.loads((tree / RECORD_NAME).read_text(encoding="utf-8"))
+        datetime.datetime.fromisoformat(note["created_at"])
+        return note.get("release_id") == local_id
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return False
+
+
+def keep_history(tree: Path, kept: dict | None) -> None:
+    """Remember the history just checked (signature first, the history itself last). Never fails an update."""
+    if not kept or kept.get(KEPT_HISTORY) is None:
+        return
+    try:
+        write_durable(tree / KEPT_HISTORY_SIG, kept[KEPT_HISTORY_SIG])
+        write_durable(tree / KEPT_HISTORY, kept[KEPT_HISTORY])
+    except OSError:
+        pass
+
+
 def refuse_older(tree: Path, local_id: str, remote_id: str, manifest: dict) -> None:
     """Never swap a newer local copy for an older published one."""
     if release_date(remote_id) < release_date(local_id):
-        raise Keep("the published release is older than the local one")
+        raise NotNewer("the published release is older than the local one")
     record = tree / RECORD_NAME
     if record.is_file():
         try:
@@ -221,7 +1491,7 @@ def refuse_older(tree: Path, local_id: str, remote_id: str, manifest: dict) -> N
         except (OSError, ValueError, KeyError, TypeError):
             return
         if datetime.datetime.fromisoformat(manifest["created_at"]) < applied:
-            raise Keep("the published release is older than the one already applied here")
+            raise NotNewer("the published release is older than the one already applied here")
 
 
 def plan(tree: Path, manifest: dict) -> tuple[list[str], list[str]]:
@@ -236,21 +1506,136 @@ def plan(tree: Path, manifest: dict) -> tuple[list[str], list[str]]:
     return fetch, remove
 
 
-def fetch_each(source: Source, manifest: dict, wanted: list[str], stage: Path) -> None:
+def fetch_each(source: Source, manifest: dict, wanted: list[str], stage: Path, parts: Path | None = None,
+               prefix: str = "payload/") -> None:
+    """Every changed file, PARALLEL_DOWNLOADS at a time; each must match its published SHA-256 (store).
+    With a parts folder, a file that arrived whole is kept there until the update is in (a later run takes it
+    again only if its SHA-256 still matches), and a half-finished one is continued."""
+    if not wanted:
+        return
+    alike: dict[str, list[str]] = {}     # files with the same bytes are downloaded once (and share one part)
     for relative in wanted:
+        alike.setdefault(manifest["files"][relative], []).append(relative)
+
+    def one(digest: str, names: list[str]) -> None:
+        relative = names[0]
         try:
-            data = source.get(f"{source.base}/payload/{relative}", MAX_FILE_BYTES)
-        except (urllib.error.URLError, OSError, TimeoutError) as exc:
+            data = (source.fetch_file(relative, digest, parts) if prefix == "payload/"
+                    else source.fetch_file(relative, digest, parts, prefix))
+        except (urllib.error.URLError, OSError, TimeoutError, http.client.HTTPException) as exc:
             raise Keep(f"a changed file could not be downloaded: {relative}") from exc
-        store(stage, relative, data, manifest)
+        try:
+            for name in names:
+                store(stage, name, data, manifest)
+        except Keep:
+            forget_part(parts, digest)   # never continue from bytes that turned out wrong
+            raise
+        finish_part(parts, digest, data)
+
+    failures: dict[str, BaseException] = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=PARALLEL_DOWNLOADS) as pool:
+        futures = {pool.submit(one, digest, names): names[0] for digest, names in alike.items()}
+        for future in concurrent.futures.as_completed(futures):
+            if future.cancelled():
+                continue
+            problem = future.exception()
+            if problem is not None:
+                failures[futures[future]] = problem
+                for other in futures:
+                    other.cancel()       # one refusal is enough: do not download the rest
+    if failures:
+        raise failures[sorted(failures)[0]]
 
 
-def fetch_archive(source: Source, manifest: dict, wanted: list[str], stage: Path) -> None:
+def parts_folder(tree: Path, source: Source) -> Path | None:
+    """Where downloads wait for the next run (this computer's own copy, from the internet only)."""
+    if not source.resumable:
+        return None
+    path = computer_path(tree, "SL_KIT_UPDATE_PARTS", PARTS_DEFAULT)
+    if path is None:
+        return None
     try:
-        raw = source.get(source.tarball, MAX_TARBALL_BYTES)
-    except (urllib.error.URLError, OSError, TimeoutError) as exc:
+        if path.is_symlink():
+            return None
+        path.mkdir(mode=0o700, parents=True, exist_ok=True)
+        return path if path.is_dir() and not path.is_symlink() else None
+    except OSError:
+        return None
+
+
+def tidy_parts(parts: Path | None, keep: set[str]) -> None:
+    """Remove every waiting download that belongs to no file wanted now. Never fails an update."""
+    if parts is None:
+        return
+    try:
+        for entry in parts.iterdir():
+            name = entry.name[:-len(".part")] if entry.name.endswith(".part") else entry.name
+            if name in keep and entry.is_file() and not entry.is_symlink():
+                continue
+            if entry.is_dir() and not entry.is_symlink():
+                shutil.rmtree(entry, ignore_errors=True)
+            else:
+                entry.unlink()
+    except OSError:
+        pass
+
+
+def forget_part(parts: Path | None, digest: str) -> None:
+    if parts is None:
+        return
+    for name in (digest, digest + ".part"):
+        try:
+            (parts / name).unlink()
+        except OSError:
+            pass
+
+
+def finish_part(parts: Path | None, digest: str, data: bytes) -> None:
+    """A whole, checked file waits under its SHA-256 until the update is in."""
+    if parts is None:
+        return
+    try:
+        if not (parts / digest).is_file():
+            temporary = parts / (digest + ".new")
+            write_new(temporary, data)
+            os.replace(temporary, parts / digest)
+        (parts / (digest + ".part")).unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def download_size(manifest: dict, fetch: list[str]) -> int | None:
+    """The bytes the changed files need (idea 24), or None when the published list gives no sizes."""
+    sizes = manifest.get("sizes")
+    if not isinstance(sizes, dict):
+        return None
+    total = 0
+    for relative in fetch:
+        size = sizes.get(relative)
+        if not isinstance(size, int) or isinstance(size, bool) or size < 0:
+            return None
+        total += size
+    return total
+
+
+def megabytes(size: int) -> str:
+    return f"{max(size / MEGABYTE, 0.1):.1f} MB"
+
+
+def interactive() -> bool:
+    """A person is watching this run in a terminal (no window, no timer)."""
+    try:
+        return bool(sys.stdin is not None and sys.stdin.isatty() and sys.stdout.isatty())
+    except (AttributeError, ValueError, OSError):
+        return False
+
+
+def fetch_archive(source: Source, manifest: dict, wanted: list[str], stage: Path, folder: str = "payload/") -> None:
+    try:
+        raw = source.download(source.tarball, MAX_TARBALL_BYTES)
+    except (urllib.error.URLError, OSError, TimeoutError, http.client.HTTPException) as exc:
         raise Keep("the published archive could not be downloaded") from exc
-    prefix = f"{source.tarball_root}/payload/"
+    prefix = f"{source.tarball_root}/{folder}"
     need = set(wanted)
     try:
         with tarfile.open(fileobj=io.BytesIO(raw), mode="r:gz") as archive:
@@ -280,8 +1665,809 @@ def store(stage: Path, relative: str, data: bytes, manifest: dict) -> None:
     target.write_bytes(data)
 
 
-def swap_in(tree: Path, stage: Path, fetch: list[str], remove: list[str], manifest: dict, record_raw: bytes) -> None:
-    """Every new file is already verified; now replace only what changed. The release record goes last."""
+# ------------------------------------------------------------------ undo: keeping and restoring one earlier version
+def sync_folder(folder: Path) -> None:
+    """Make a rename inside `folder` survive a power cut (Linux; a no-op where folders cannot be opened)."""
+    try:
+        handle = os.open(folder, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(handle)
+    except OSError:
+        pass
+    finally:
+        os.close(handle)
+
+
+def write_durable(path: Path, data: bytes) -> None:
+    """Write a whole file, flushed to the disk, then swap it in with one rename."""
+    temporary = path.with_name(path.name + UNDO_TMP)
+    with open_new(temporary) as handle:
+        handle.write(data)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temporary, path)
+    sync_folder(path.parent)
+
+
+def remove_folder(path: Path) -> None:
+    def writable_then_retry(function, failed, _info):
+        os.chmod(failed, stat.S_IWRITE | stat.S_IREAD | stat.S_IEXEC)
+        function(failed)
+    if sys.version_info >= (3, 12):
+        shutil.rmtree(path, onexc=writable_then_retry)
+    else:
+        shutil.rmtree(path, onerror=writable_then_retry)
+
+
+def discard(tree: Path, folder: Path) -> None:
+    """Delete an undo folder: one rename first, so a half-deleted folder is never mistaken for a whole one."""
+    old = tree / UNDO_OLD
+    if folder != old:
+        if old.exists():
+            remove_folder(old)
+        os.rename(folder, old)
+        sync_folder(tree)
+    remove_folder(old)
+
+
+def file_info(path: Path) -> dict | None:
+    if path.is_symlink() or not path.is_file():
+        return None
+    return {"sha256": file_sha256(path), "size": path.stat().st_size, "mode": stat.S_IMODE(path.stat().st_mode)}
+
+
+def tree_folders(tree: Path) -> list[str]:
+    found = []
+    for base, directories, _ in os.walk(tree, followlinks=False):
+        directories[:] = sorted(d for d in directories if not (Path(base) / d).is_symlink()
+                                and not (Path(base) == tree and d in UNDO_NAMES))
+        found.extend((Path(base) / d).relative_to(tree).as_posix() for d in directories)
+    return sorted(found)
+
+
+def read_state(folder: Path) -> dict | None:
+    """The record of an undo folder, or None when it is missing, unfinished or not trustworthy."""
+    try:
+        state = json.loads((folder / UNDO_STATE).read_text(encoding="utf-8"))
+        if not isinstance(state, dict) or state.get("schema_version") != SCHEMA or state.get("status") not in STATUSES:
+            return None
+        before, saved, metadata = state["before"], state["saved"], state["metadata"]
+        if not isinstance(before, dict) or not isinstance(saved, list) or not isinstance(metadata, dict):
+            return None
+        for relative, info in before.items():
+            safe_relative(relative)
+            if not managed(relative) or not isinstance(info, dict) or not HASH_RE.match(str(info.get("sha256"))) \
+                    or not isinstance(info.get("mode"), int):
+                return None
+        # An undo folder written before signed mode records only the three older names: the kept signed
+        # files did not exist then, so going back removes any that are there now.
+        if any(relative not in before for relative in saved) \
+                or not set(LEGACY_METADATA) <= set(metadata) <= set(METADATA):
+            return None
+        for info in metadata.values():
+            if info is not None and (not isinstance(info, dict) or not HASH_RE.match(str(info.get("sha256")))
+                                     or not isinstance(info.get("mode"), int)):
+                return None
+        if not isinstance(state.get("dirs"), list) or not all(isinstance(d, str) for d in state["dirs"]):
+            return None
+        if not isinstance(state.get("added"), list):
+            return None
+        for name in METADATA:
+            metadata.setdefault(name, None)
+        return state
+    except (OSError, ValueError, KeyError, TypeError, Keep):
+        return None
+
+
+def write_state(folder: Path, state: dict) -> None:
+    write_durable(folder / UNDO_STATE, (json.dumps(state, indent=2, sort_keys=True) + "\n").encode("utf-8"))
+
+
+def keep_previous(tree: Path, stage: Path, fetch: list[str], remove: list[str], new_id: str) -> tuple[Path, dict]:
+    """Copy aside every file the update is about to replace or remove. Nothing in the tree is changed here."""
+    before = {relative: file_info(path) for relative, path in local_files(tree).items()}
+    metadata = {name: file_info(tree / name) for name in METADATA}
+    saved = sorted(relative for relative in set(fetch) | set(remove) if relative in before)
+    added = sorted(relative for relative in fetch if relative not in before)
+    keep_bytes = sum(before[r]["size"] for r in saved) + sum(i["size"] for i in metadata.values() if i)
+    new_bytes = sum(stage.joinpath(*PurePosixPath(r).parts).stat().st_size for r in fetch)
+    if keep_bytes > UNDO_MAX_BYTES:
+        raise Keep(f"the files this update replaces are too large ({keep_bytes // (1024 * 1024)} MB) "
+                   "to keep a copy to go back to")
+    if shutil.disk_usage(tree).free < keep_bytes + new_bytes + FREE_SPACE_MARGIN:
+        raise Keep("there is not enough free disk space to keep a copy of the current version to go back to")
+    pending = tree / UNDO_PENDING
+    if pending.exists():
+        remove_folder(pending)
+    pending.mkdir(mode=0o700)
+    for relative in saved:
+        copy_aside(tree.joinpath(*PurePosixPath(relative).parts),
+                   pending.joinpath("files", *PurePosixPath(relative).parts), before[relative]["sha256"])
+    for name, info in metadata.items():
+        if info is not None:
+            copy_aside(tree / name, pending / "meta" / name, info["sha256"])
+    previous_id = None
+    try:
+        previous_id = release_id_of(tree / "release.json")
+    except Keep:
+        pass
+    state = {"schema_version": SCHEMA, "status": "ready", "previous_release_id": previous_id,
+             "new_release_id": new_id, "before": before, "metadata": metadata, "saved": saved, "added": added,
+             "dirs": tree_folders(tree), "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat()}
+    write_state(pending, state)      # written last: a folder without it was never finished, the tree is untouched
+    sync_folder(tree)
+    return pending, state
+
+
+def copy_aside(source: Path, target: Path, digest: str) -> None:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    data = source.read_bytes()
+    if sha256(data) != digest:
+        raise Keep(f"a local file changed while a copy was being kept: {source.name}")
+    with open_new(target) as handle:
+        handle.write(data)
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+def put_back(tree: Path, root: Path, relative: str, source: Path, info: dict) -> bool:
+    """Put one saved file back, unless it is already exactly right. Safe to repeat."""
+    target = tree.joinpath(*PurePosixPath(relative).parts)
+    folder = target.parent
+    while not folder.exists():
+        folder = folder.parent
+    if folder.resolve() != root and root not in folder.resolve().parents:
+        raise Keep(f"a local folder points outside the Secure Linux files: {relative}")
+    if target.is_symlink() or (target.exists() and not target.is_file()):
+        raise Keep(f"a local file is a link or folder and is never replaced: {relative}")
+    if target.is_file() and file_sha256(target) == info["sha256"]:
+        if stat.S_IMODE(target.stat().st_mode) != info["mode"]:
+            os.chmod(target, info["mode"])
+        return False
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_name(target.name + UNDO_TMP)
+    copy_aside(source, temporary, info["sha256"])
+    os.chmod(temporary, info["mode"])
+    os.replace(temporary, target)
+    return True
+
+
+def restore_tree(tree: Path, folder: Path, state: dict) -> None:
+    """Make the tree exactly what it was before the update. Every step is safe to repeat."""
+    root = tree.resolve()
+    before = state["before"]
+    for relative in state["saved"]:
+        put_back(tree, root, relative, folder.joinpath("files", *PurePosixPath(relative).parts), before[relative])
+    for relative, path in local_files(tree).items():   # files the update added, and any half-written file
+        if relative not in before:
+            path.unlink()
+    known_folders = set(state["dirs"])
+    for relative in reversed(tree_folders(tree)):        # deepest first
+        if relative not in known_folders:
+            try:
+                tree.joinpath(*PurePosixPath(relative).parts).rmdir()   # only ever an empty folder
+            except OSError:
+                pass
+    for name in METADATA:              # release.json last: until then the tree still says "new release"
+        info = state["metadata"][name]
+        target = tree / name
+        if info is None:
+            if target.is_file() and not target.is_symlink():
+                target.unlink()
+        else:
+            put_back(tree, root, name, folder / "meta" / name, info)
+    for name in METADATA:
+        leftover = tree / (name + UNDO_TMP)
+        if leftover.is_file() and not leftover.is_symlink():
+            leftover.unlink()
+    sync_folder(tree)
+
+
+def differences(tree: Path, state: dict) -> list[str]:
+    """Every way the tree differs from the earlier version, checked by SHA-256 (empty: identical)."""
+    before = state["before"]
+    now = local_files(tree)
+    problems = []
+    for relative in sorted(set(now) | set(before)):
+        if relative not in now:
+            problems.append(f"missing {relative}")
+        elif relative not in before:
+            problems.append(f"extra {relative}")
+        elif file_sha256(now[relative]) != before[relative]["sha256"]:
+            problems.append(f"different {relative}")
+    for name in METADATA:
+        info, target = state["metadata"][name], tree / name
+        exists = target.is_file() and not target.is_symlink()
+        if info is None and exists:
+            problems.append(f"extra {name}")
+        elif info is not None and (not exists or file_sha256(target) != info["sha256"]):
+            problems.append(f"different {name}")
+    return problems
+
+
+def check_saved_copies(folder: Path, state: dict) -> None:
+    for relative in state["saved"]:
+        copy = folder.joinpath("files", *PurePosixPath(relative).parts)
+        if not copy.is_file() or file_sha256(copy) != state["before"][relative]["sha256"]:
+            raise Keep(f"the saved copy of the earlier version is damaged ({relative}), so nothing was changed")
+    for name, info in state["metadata"].items():
+        if info is not None and (not (folder / "meta" / name).is_file()
+                                 or file_sha256(folder / "meta" / name) != info["sha256"]):
+            raise Keep(f"the saved copy of the earlier version is damaged ({name}), so nothing was changed")
+
+
+def roll_back(tree: Path, folder: Path, state: dict) -> None:
+    check_saved_copies(folder, state)
+    restore_tree(tree, folder, state)
+    problems = differences(tree, state)
+    if problems:
+        raise Keep(f"the earlier files could not all be put back ({problems[0]}); "
+                   "this is tried again the next time this tool runs")
+    discard(tree, folder)
+
+
+def promote(tree: Path) -> None:
+    """The update finished: its saved copy becomes the one earlier version that `undo` goes back to."""
+    pending, current, old = tree / UNDO_PENDING, tree / UNDO_DIR, tree / UNDO_OLD
+    if old.exists():
+        remove_folder(old)
+    if current.exists():
+        os.rename(current, old)
+    os.rename(pending, current)
+    sync_folder(tree)
+    if old.exists():
+        remove_folder(old)
+
+
+def recover(tree: Path) -> str | None:
+    """Put right an update that was cut short (power cut, killed). Returns what was done, if anything."""
+    pending = tree / UNDO_PENDING
+    done = None
+    if pending.is_dir():
+        state = read_state(pending)
+        if state is None:                       # the copy was never finished: nothing in the tree was changed
+            discard(tree, pending)
+        elif state["status"] == "applied":      # the update itself finished; only the last rename was cut short
+            promote(tree)
+            done = "finished"
+        else:                                   # the update was cut short half-way: put the earlier files back
+            roll_back(tree, pending, state)
+            done = "rolled back"
+    if (tree / UNDO_OLD).exists():
+        remove_folder(tree / UNDO_OLD)
+    return done
+
+
+def trust_changes(state: dict) -> list[str]:
+    """Release-key and checker files that the saved update replaced, removed or added."""
+    touched = set(state["saved"]) | {r for r in state["added"] if isinstance(r, str)}
+    return sorted(r for r in touched if r.startswith(TRUST_PREFIX) or r in TRUST_FILES)
+
+
+def undo_tree(tree: Path) -> str:
+    """Go back to the version from before the last update, exactly, and check it."""
+    if not (tree / "setup.sh").is_file():
+        raise Keep("this folder does not hold the Secure Linux files (no setup.sh)")
+    with TreeLock(tree):
+        return undo_locked(tree)
+
+
+def undo_locked(tree: Path) -> str:
+    if recover(tree) == "rolled back":
+        return ("KIT UPDATE: an update had been cut short; it was undone and every file was put back as it was "
+                f"({release_id_of(tree / 'release.json')}).")
+    folder = tree / UNDO_DIR
+    state = read_state(folder) if folder.is_dir() else None
+    if state is None or state["status"] not in ("applied", "undoing"):
+        raise NothingToUndo("nothing to undo: no earlier version is saved here "
+                            "(no update was applied here, or the last one was already undone)")
+    changed_trust = trust_changes(state)
+    if state["status"] == "applied" and changed_trust:      # a going-back that already started is always finished
+        raise Keep(f"the last update changed the release keys or the signature checker ({changed_trust[0]}), so it "
+                   "cannot be undone: going back could make this computer trust a withdrawn key again. "
+                   "Nothing was changed")
+    check_saved_copies(folder, state)
+    saved = set(state["saved"])
+    for relative, info in sorted(state["before"].items()):    # files the update did not touch must still be the same
+        if relative in saved:
+            continue
+        path = tree.joinpath(*PurePosixPath(relative).parts)
+        if path.is_symlink() or not path.is_file() or file_sha256(path) != info["sha256"]:
+            raise Keep(f"a file changed after the update ({relative}), so the earlier version cannot be put back "
+                       "exactly; nothing was changed")
+    installed = activation_snapshot(tree, saved | set(state["added"]))
+    if state["status"] != "undoing":
+        state["status"] = "undoing"
+        write_state(folder, state)
+    restore_tree(tree, folder, state)
+    problems = differences(tree, state)
+    if problems:
+        raise Keep(f"going back did not finish ({problems[0]}); run undo again to finish it")
+    discard(tree, folder)
+    previous = state.get("previous_release_id") or "the earlier release"
+    text = (f"KIT UPDATE: went back to {previous} (was {state.get('new_release_id')}): "
+            f"{len(state['saved'])} file(s) put back, {len(state['added'])} file(s) from the update removed; "
+            "every file checked by SHA-256.")
+    if not write_hold(tree, state.get("new_release_id")):
+        text += " The note that keeps that release from being installed again could not be written."
+    return text + activate(tree, installed, switch_off=recorded_switched_on(state))
+
+
+# ------------------------------------------------------------------ what setup installed from this tree (00-early.sh)
+def activation_root(tree: Path) -> Path | None:
+    """Where setup installed this tree's helpers: "/" for the computer's own copy (or a test's stand-in folder)."""
+    given = os.environ.get("SL_KIT_UPDATE_ACTIVATE_ROOT")
+    if given:
+        return Path(given)
+    return Path("/") if is_system_tree(tree) else None
+
+
+def system_target(relative: str) -> tuple[str, int] | None:
+    """Where linux/steps/00-early.sh installs this tree file, and with which mode (None: it does not).
+    Keep in step with 00-early.sh; tests/kitupdate/test_kit_trust.py checks that every place is still there."""
+    parts = PurePosixPath(relative).parts
+    name = parts[-1]
+    if any(part in GENERATED_DIRS for part in parts) or relative.endswith(GENERATED_SUFFIXES):
+        return None
+    if len(parts) == 2 and parts[0] == "bin" and name.startswith("secure-linux-"):
+        return f"/usr/local/bin/{name}", 0o755
+    if relative == "lib/release_manifest.py":
+        return "/usr/local/lib/release_manifest.py", 0o644
+    if len(parts) > 2 and parts[:2] == ("lib", "flipper-companion"):
+        return "/usr/local/lib/flipper-companion/" + "/".join(parts[2:]), 0o644
+    if parts[0] != "files" or len(parts) < 4:
+        return None
+    area, kind = parts[1], parts[2]
+    if len(parts) == 4 and kind == "applications" and name.endswith(".desktop"):
+        return f"{APPS_DIRS[1]}/{name}", 0o644          # the menu folder is chosen per computer (apps_place)
+    if len(parts) == 4 and kind == "autostart" and name.endswith(".desktop"):
+        return f"/etc/xdg/autostart/{name}", 0o644
+    if kind == "systemd" and len(parts) >= 5 and parts[3] in ("system", "user"):
+        return f"/etc/systemd/{parts[3]}/" + "/".join(parts[4:]), 0o644
+    if len(parts) == 4 and kind == "polkit" and area == "system" and name.endswith(".rules"):
+        return f"/etc/polkit-1/rules.d/{name}", 0o644
+    if len(parts) == 4 and kind == "polkit" and area in ("system", "homeshare") and name.endswith(".policy"):
+        return f"/usr/share/polkit-1/actions/{name}", 0o644
+    return None
+
+
+def in_root(root: Path, logical: str) -> Path:
+    return root.joinpath(*PurePosixPath(logical).parts[1:])
+
+
+def apps_place(root: Path, name: str) -> str:
+    """Menu entries: /usr/local/share/applications on atomic Fedora (Kinoite), else /usr/share/applications."""
+    for folder in APPS_DIRS:
+        if in_root(root, f"{folder}/{name}").is_file():
+            return f"{folder}/{name}"
+    atomic = (root / "run" / "ostree-booted").exists()
+    return f"{APPS_DIRS[0] if atomic else APPS_DIRS[1]}/{name}"
+
+
+def step_targets(relative: str) -> tuple[tuple[str, ...], int] | None:
+    """Where a setup step other than 00-early.sh may have installed this tree file (OTHER_STEP_PLACES)."""
+    return OTHER_STEP_PLACES.get(relative)
+
+
+def activation_snapshot(tree: Path, relatives) -> dict[str, bytes | None]:
+    """The tree's bytes of every changing file that setup also installs elsewhere (None: not there)."""
+    found: dict[str, bytes | None] = {}
+    for relative in relatives:
+        if isinstance(relative, str) and (system_target(relative) or step_targets(relative)
+                                          or ENABLE_LIST_RE.match(relative)):
+            path = tree.joinpath(*PurePosixPath(relative).parts)
+            found[relative] = path.read_bytes() if path.is_file() and not path.is_symlink() else None
+    return found
+
+
+def md5_hex(data: bytes) -> str:
+    return hashlib.md5(data, usedforsecurity=False).hexdigest()
+
+
+def note_written(record: Path, data: bytes) -> None:
+    try:
+        record.parent.mkdir(parents=True, exist_ok=True)
+        record.write_text(md5_hex(data) + "\n", encoding="utf-8")
+    except OSError:
+        pass
+
+
+def install_one(root: Path, logical: str, data: bytes, mode: int, earlier: bytes | None) -> str:
+    """setup's sl_write_file rules: write only when different, and leave a copy that was changed on this
+    computer since setup (or this tool) last wrote it. Returns "written", "same" or "left"."""
+    target = in_root(root, logical)
+    record = in_root(root, STATE_DIR) / md5_hex(logical.encode("utf-8"))
+    if target.is_symlink() or (target.exists() and not target.is_file()):
+        return "left"
+    if target.is_file():
+        current = target.read_bytes()
+        if current == data:
+            note_written(record, data)
+            return "same"
+        try:
+            recorded = record.read_text(encoding="utf-8").strip()
+        except OSError:
+            recorded = ""
+        changed_here = md5_hex(current) != recorded if recorded else (earlier is None or current != earlier)
+        if changed_here:
+            return "left"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_name(f".{target.name}.kit-update-new")
+    write_new(temporary, data)
+    os.chmod(temporary, mode)
+    os.replace(temporary, target)
+    note_written(record, data)
+    return "written"
+
+
+def listed_units(data: bytes | None) -> list[str]:
+    """Unit names in an enable-*.list (comments and spaces ignored, as 00-early.sh reads them)."""
+    units: list[str] = []
+    for line in (data or b"").decode("utf-8", "replace").splitlines():
+        value = re.sub(r"\s", "", line.split("#", 1)[0])
+        if value and UNIT_RE.match(value) and value not in units:
+            units.append(value)
+    return units
+
+
+def system_tool(root: Path) -> list[str] | None:
+    """How to run systemctl: a test names a stand-in (a JSON list); on this computer's own root, the real one."""
+    given = os.environ.get("SL_KIT_UPDATE_SYSTEMCTL")
+    if given:
+        try:
+            value = json.loads(given)
+        except ValueError:
+            return None
+        return [str(part) for part in value] if isinstance(value, list) and value else None
+    if root == Path("/") and not os.environ.get("SL_KIT_UPDATE_ACTIVATE_ROOT"):
+        found = shutil.which("systemctl")
+        return [found] if found else None
+    return None
+
+
+def run_quietly(command: list[str]) -> bool:
+    try:
+        return subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True, timeout=120).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def unit_switched_on(root: Path, scope: str, unit: str) -> bool:
+    """Whether a background service is switched on already: `systemctl enable` (and `--global enable` for the
+    user scope) leaves a link with the unit's name in a *.wants / *.requires / *.upholds folder of
+    /etc/systemd/<scope>. Read from the files only, so asking never changes anything. When the folder cannot be
+    read, the answer is yes: going back then never switches off something that may have been on before."""
+    folder = in_root(root, f"/etc/systemd/{scope}")
+    if not folder.is_dir():
+        return False
+    try:
+        for entry in folder.iterdir():
+            if entry.name.endswith((".wants", ".requires", ".upholds")) and entry.is_dir() \
+                    and os.path.lexists(entry / unit):
+                return True
+    except OSError:
+        return True
+    return False
+
+
+def listed_everywhere(tree: Path) -> dict[str, set[str]]:
+    """Every unit named in any files/*/enable-system.list and enable-user.list of the tree as it is now."""
+    found: dict[str, set[str]] = {"system": set(), "user": set()}
+    files = tree / "files"
+    try:
+        areas = sorted(files.iterdir()) if files.is_dir() and not files.is_symlink() else []
+    except OSError:
+        areas = []
+    for area in areas:
+        for scope in found:
+            path = area / f"enable-{scope}.list"
+            try:
+                if path.is_file() and not path.is_symlink():
+                    found[scope].update(listed_units(path.read_bytes()))
+            except OSError:
+                continue
+    return found
+
+
+def recorded_switched_on(state: dict) -> list[tuple[str, str]]:
+    """The background services the saved update switched on (written by apply; an undo folder written before
+    this record existed has none, so going back then switches nothing off)."""
+    found: list[tuple[str, str]] = []
+    value = state.get("switched_on")
+    if not isinstance(value, list):
+        return found
+    for entry in value:
+        if isinstance(entry, list) and len(entry) == 2 and entry[0] in ("system", "user") \
+                and isinstance(entry[1], str) and UNIT_RE.match(entry[1]) and tuple(entry) not in found:
+            found.append((entry[0], entry[1]))
+    return found
+
+
+def remember_switched_on(tree: Path, release_id: str, switched: list[tuple[str, str]]) -> None:
+    """Note in the saved earlier version which background services this update switched on, so `undo`
+    switches exactly those off again. Never fails an update."""
+    if not switched:
+        return
+    for folder in (tree / UNDO_DIR, tree / UNDO_PENDING):
+        try:
+            if not folder.is_dir() or folder.is_symlink():
+                continue
+            state = read_state(folder)
+            if state is None or state["status"] != "applied" or state.get("new_release_id") != release_id:
+                continue
+            raw = json.loads((folder / UNDO_STATE).read_text(encoding="utf-8"))
+            raw["switched_on"] = [list(entry) for entry in switched]
+            write_state(folder, raw)
+            return
+        except (OSError, ValueError, TypeError):
+            return
+
+
+def activate(tree: Path, earlier: dict[str, bytes | None], switched: list | None = None,
+             switch_off: list[tuple[str, str]] | None = None) -> str:
+    """After an update or undo of this computer's own copy, bring what setup installed from it up to date.
+
+    Setup (linux/steps/00-early.sh) copies the helper commands, menu entries, autostart entries, background
+    services and polkit files out of the tree. Without this step the computer would keep running the old
+    commands and services on the new libraries. Same rules as setup: only changed files are written, a copy
+    changed on this computer is left as it is, services are reloaded, and services newly listed in an
+    enable-*.list are switched on. Nothing is removed (setup never removes either).
+
+    switched (an update): every service switched on here that was not on before is added to it.
+    switch_off (an undo): the services the update switched on; each one that the restored lists no longer
+    name is switched off again (gap check HIGH 1)."""
+    root = activation_root(tree)
+    if root is None or not (earlier or switch_off) or not in_root(root, "/usr/local/bin").is_dir():
+        return ""                        # setup has not run here yet: it installs everything itself
+    written, left, failed = [], [], []
+    later = 0                            # settings files of other steps: they take effect after a restart
+    for relative, before in sorted(earlier.items()):
+        target = system_target(relative)
+        source = tree.joinpath(*PurePosixPath(relative).parts)
+        if source.is_symlink() or not source.is_file():
+            continue
+        places: list[tuple[str, int]] = []
+        if target is not None:
+            logical, mode = target
+            if logical.startswith(APPS_DIRS[1] + "/"):
+                logical = apps_place(root, PurePosixPath(logical).name)
+            places.append((logical, mode))
+        elif step_targets(relative):
+            candidates, mode = step_targets(relative)
+            # only where that step already put it: setup decides per computer whether it is wanted
+            places += [(logical, mode) for logical in candidates
+                       if in_root(root, logical).is_file() and not in_root(root, logical).is_symlink()]
+        for logical, mode in places:
+            try:
+                outcome = install_one(root, logical, source.read_bytes(), mode, before)
+            except OSError:
+                outcome = "failed"
+            {"written": written, "left": left, "failed": failed}.get(outcome, []).append(logical)
+            later += outcome == "written" and target is None
+    switch_on: list[tuple[str, str]] = []
+    for relative, before in sorted(earlier.items()):
+        match = ENABLE_LIST_RE.match(relative)
+        path = tree.joinpath(*PurePosixPath(relative).parts)
+        if match and path.is_file() and not path.is_symlink():
+            old = listed_units(before)
+            switch_on += [(match.group(1), unit) for unit in listed_units(path.read_bytes()) if unit not in old]
+    tool = system_tool(root)
+    problems = 0
+    if tool and (switch_on or any(p.startswith("/etc/systemd/system/") for p in written)):
+        problems += not run_quietly(tool + ["daemon-reload"])
+    for scope, unit in switch_on:
+        was_on = switched is not None and unit_switched_on(root, scope, unit)
+        command = ["enable", "--now", unit] if scope == "system" else ["--global", "enable", unit]
+        done = bool(tool and run_quietly(tool + command))
+        problems += not done
+        if done and switched is not None and not was_on and (scope, unit) not in switched:
+            switched.append((scope, unit))
+    switch_off_now: list[tuple[str, str]] = []
+    if switch_off:
+        still_listed = listed_everywhere(tree)
+        switch_off_now = [(scope, unit) for scope, unit in switch_off
+                          if unit not in still_listed[scope] and (scope, unit) not in switch_on]
+    off_problems = 0
+    for scope, unit in switch_off_now:
+        command = ["disable", "--now", unit] if scope == "system" else ["--global", "disable", unit]
+        off_problems += not (tool and run_quietly(tool + command))
+    problems += off_problems
+    relabel = shutil.which("restorecon") if root == Path("/") else None
+    if written and relabel and not os.environ.get("SL_KIT_UPDATE_ACTIVATE_ROOT"):
+        run_quietly([relabel, *written])     # SELinux labels for the new files, as setup does
+    text = ""
+    if written:
+        text += f" {len(written)} installed file(s) on this computer brought up to date."
+    if later:
+        text += f" {later} of them are settings that take effect after the next restart."
+    if switch_on and not problems:
+        text += f" {len(switch_on)} new background service(s) switched on."
+    if switch_off_now and not off_problems:
+        text += f" {len(switch_off_now)} background service(s) that the update had switched on were switched off."
+    if left:
+        text += (f" {len(left)} installed file(s) changed on this computer were left as they were "
+                 f"({', '.join(left[:3])}).")
+    if failed or problems:
+        text += " Some installed files or services could not be updated now; 'Repair setup' finishes it."
+    return text
+
+
+# ------------------------------------------------------------------ the safety check after an update (idea 12)
+def script_kind(relative: str, data: bytes) -> str | None:
+    if relative.endswith(".py") or PYTHON_LINE_RE.match(data):
+        return "python"
+    if relative.endswith(".sh") or SHELL_LINE_RE.match(data):
+        return "shell"
+    return None
+
+
+def as_root() -> bool:
+    geteuid = getattr(os, "geteuid", None)
+    return geteuid is not None and geteuid() == 0
+
+
+def run_check(command: list[str], cwd: Path | None = None) -> tuple[int, str]:
+    """(exit code, what it printed) for one program the check starts. Never raises."""
+    env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1", LC_ALL="C", LANG="C")
+    try:
+        done = subprocess.run(command, cwd=cwd, stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                              errors="replace", timeout=CHECK_TIMEOUT, env=env)
+    except subprocess.TimeoutExpired:
+        return 124, f"it did not finish within {CHECK_TIMEOUT} seconds"
+    except OSError as exc:
+        return 127, f"it could not be started ({exc.strerror or exc})"
+    return done.returncode, (done.stderr or "") + (done.stdout or "")
+
+
+def short(text: str, first: bool = True) -> str:
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if not lines:
+        return "no message"
+    return (lines[0] if first else lines[-1])[:200]
+
+
+def usable_bash(work: Path) -> str | None:
+    """bash, when it can read a script file here (every Fedora computer has it; some test hosts do not)."""
+    if os.environ.get("SL_KIT_UPDATE_TEST_SOURCE") == "1" and os.environ.get("SL_TEST_BASH"):
+        bash = os.environ["SL_TEST_BASH"]
+    else:
+        bash = shutil.which("bash")
+    if not bash:
+        return None
+    probe = work / "probe.sh"
+    probe.write_bytes(b"exit 0\n")
+    return bash if run_check([bash, "-n", str(probe)])[0] == 0 else None
+
+
+def check_new_keys(tree: Path, stage: Path, fetch: list[str], remove: list[str], work: Path) -> str | None:
+    """The key folder as it will be after the update must load, with the checker it will have, and keep at least
+    one usable key once signing is set up. A broken key folder would refuse every later update, and going back
+    over a key change is not allowed, so this is checked before anything changes."""
+    folder = work / "keys"
+    folder.mkdir(exist_ok=True)
+    local = tree / "share" / KEYS_FOLDER
+    if local.is_dir() and not local.is_symlink():
+        for path in sorted(local.iterdir()):
+            relative = TRUST_PREFIX + path.name
+            if path.is_file() and not path.is_symlink() and relative not in remove and relative not in fetch:
+                copy_new(path, folder / path.name)
+    for relative in fetch:
+        name = relative[len(TRUST_PREFIX):]
+        if relative.startswith(TRUST_PREFIX) and "/" not in name:
+            copy_new(stage.joinpath(*PurePosixPath(relative).parts), folder / name)
+    if "bin/secure-linux-release-verify" in fetch:
+        verifier = stage / "bin" / "secure-linux-release-verify"
+    else:
+        verifier = tree / "bin" / "secure-linux-release-verify"
+        if not verifier.is_file():
+            verifier = Path(__file__).resolve().with_name("secure-linux-release-verify")
+    if not verifier.is_file():
+        return None                      # no checker anywhere to load the keys with (signing is not in use)
+    code, text = run_check([sys.executable, str(verifier), "--keys", str(folder), "status"])
+    if code not in (0, 3):               # 0: keys usable, 3: signing not set up; anything else is unusable
+        return f"the release keys would not be usable after this update ({short(text, first=False)})"
+    return None
+
+
+def check_before(tree: Path, stage: Path, fetch: list[str], remove: list[str], work: Path) -> str | None:
+    """First half of the safety check, on the verified new files before anything in the tree changes.
+    Returns the first problem, or None."""
+    for name in NEVER_REMOVED:
+        if name in remove:
+            return f"the update would delete {name}, which later updates need"
+    bash: str | None = None
+    looked = False
+    for relative in fetch:
+        staged = stage.joinpath(*PurePosixPath(relative).parts)
+        data = staged.read_bytes()
+        kind = script_kind(relative, data)
+        if kind == "python":
+            try:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    compile(data, relative, "exec", dont_inherit=True)
+            except SyntaxError as exc:
+                return f"{relative} is not valid Python (line {exc.lineno}: {exc.msg})"
+            except (ValueError, MemoryError, RecursionError) as exc:
+                return f"{relative} is not valid Python ({type(exc).__name__})"
+        elif kind == "shell":
+            if not looked:
+                bash, looked = usable_bash(work), True
+            if bash:
+                code, text = run_check([bash, "-n", str(staged)])
+                if code != 0:
+                    detail = short(text.replace(str(staged), relative))
+                    return f"{relative} is not a valid shell script ({detail})"
+    if "setup.sh" in fetch and as_root() and not SETUP_HELP_RE.search(stage.joinpath("setup.sh").read_bytes()):
+        return "the new setup.sh does not stop at --help, so it cannot be checked without running it"
+    if "bin/secure-linux-kit-update" in fetch:
+        code, text = run_check([sys.executable, str(stage / "bin" / "secure-linux-kit-update"), "--help"])
+        if code != 0:
+            return (f"the new bin/secure-linux-kit-update does not start (--help ended with exit code {code}: "
+                    f"{short(text, first=False)})")
+    if "bin/secure-linux-release-verify" in fetch or any(r.startswith(TRUST_PREFIX) for r in (*fetch, *remove)):
+        return check_new_keys(tree, stage, fetch, remove, work)
+    return None
+
+
+def check_after(tree: Path, work: Path) -> str | None:
+    """Second half of the safety check, on the updated folder: setup.sh and this tool must still start."""
+    setup = tree / "setup.sh"
+    try:
+        stops = bool(SETUP_HELP_RE.search(setup.read_bytes())) if setup.is_file() else None
+    except OSError:
+        stops = None
+    if stops is None:
+        return "setup.sh is missing after the update"
+    bash = usable_bash(work)
+    # as root, only a setup.sh that stops at --help is started (one that does not was refused before the swap,
+    # so this only skips an unchanged one)
+    if bash and (stops or not as_root()):
+        code, text = run_check([bash, str(setup), "--help"], cwd=tree)
+        if code != 0:
+            return f"setup.sh --help ended with exit code {code} ({short(text, first=False)})"
+    tool = tree / "bin" / "secure-linux-kit-update"
+    if tool.is_file() and not tool.is_symlink():
+        code, text = run_check([sys.executable, str(tool), "--help"], cwd=tree)
+        if code != 0:
+            return f"bin/secure-linux-kit-update --help ended with exit code {code} ({short(text, first=False)})"
+    return None
+
+
+def undo_after_failed_check(tree: Path, remote_id: str, problem: str,
+                            installed: dict[str, bytes | None]) -> tuple[str, str]:
+    """The update is in place but did not pass the check: go back at once, exactly as `undo` does (which also
+    keeps that release from being installed again), and write one plain alert."""
+    try:
+        text = undo_locked(tree)
+    except Keep as exc:
+        # The update stays (F3: an update that changed the keys or the checker is never undone). What setup
+        # installed from the folder is brought in line with it, so this computer runs one version, not two.
+        raise_alert(tree, "stuck")
+        return "check-failed-installed", (f"KIT UPDATE: updated to {remote_id}, but the safety check after the "
+                                          f"update failed ({problem}), and it could not be undone - {exc}."
+                                          + activate(tree, installed))
+    except Exception as exc:             # cut short: the next run of this tool finishes going back
+        raise_alert(tree, "stuck")
+        return "check-failed-installed", (f"KIT UPDATE: updated to {remote_id}, but the safety check after the "
+                                          f"update failed ({problem}), and going back did not finish "
+                                          f"({type(exc).__name__}: {exc}); it is finished the next time this "
+                                          "tool runs.")
+    raise_alert(tree, "undone")
+    return "rolled-back", (f"KIT UPDATE: the safety check after updating to {remote_id} failed ({problem}), so the "
+                           "update was undone at once: " + text.removeprefix("KIT UPDATE: "))
+
+
+# ------------------------------------------------------------------ swapping in
+def swap_in(tree: Path, stage: Path, fetch: list[str], remove: list[str], manifest: dict, record_raw: bytes,
+            keep_undo: bool = False, kept: dict | None = None) -> None:
+    """Every new file is already verified; now replace only what changed. The release record goes last.
+
+    With keep_undo, every replaced or removed file is first copied aside (see keep_previous); if anything
+    fails half-way the tree is put back exactly as it was before this call.
+    """
     root = tree.resolve()
     for relative in fetch:      # look at every destination BEFORE the first write, so a refusal changes nothing
         target = tree.joinpath(*PurePosixPath(relative).parts)
@@ -292,14 +2478,50 @@ def swap_in(tree: Path, stage: Path, fetch: list[str], remove: list[str], manife
             raise Keep(f"a local folder points outside the Secure Linux files: {relative}")
         if target.is_symlink() or (target.exists() and not target.is_file()):
             raise Keep(f"a local file is a link or folder and is never replaced: {relative}")
+    if not keep_undo:
+        write_new_files(tree, stage, fetch, remove, manifest, record_raw, kept)
+        return
+    pending, state = keep_previous(tree, stage, fetch, remove, manifest["release_id"])
+    try:
+        write_new_files(tree, stage, fetch, remove, manifest, record_raw, kept)
+        state["status"] = "applied"
+        write_state(pending, state)
+    except BaseException as exc:
+        try:
+            roll_back(tree, pending, state)
+        except Exception as again:
+            raise Keep(f"the update could not be finished and putting the earlier files back also failed "
+                       f"({again}); this is tried again the next time this tool runs") from exc
+        if isinstance(exc, Keep):
+            raise Keep(f"{exc}; every file was put back as it was") from exc
+        if isinstance(exc, Exception):
+            raise Keep(f"the update could not be finished ({type(exc).__name__}: {exc}), "
+                       "so every file was put back as it was") from exc
+        raise
+    try:
+        promote(tree)
+    except OSError:
+        pass        # the update is complete; the next run finishes making it the version to go back from
+
+
+def file_mode(relative: str, manifest: dict) -> int:
+    """The published mode (idea 16) when the list has one for this file; otherwise the rule used before it."""
+    modes = manifest.get("modes")
+    if isinstance(modes, dict) and modes.get(relative) in FILE_MODES:
+        return FILE_MODES[modes[relative]]
+    return 0o755 if (relative.endswith(".sh") or PurePosixPath(relative).parts[0] == "bin") else 0o644
+
+
+def write_new_files(tree: Path, stage: Path, fetch: list[str], remove: list[str], manifest: dict,
+                    record_raw: bytes, kept: dict | None = None) -> None:
     for relative in fetch:
         target = tree.joinpath(*PurePosixPath(relative).parts)
         target.parent.mkdir(parents=True, exist_ok=True)
-        mode = 0o755 if (relative.endswith(".sh") or PurePosixPath(relative).parts[0] == "bin") else 0o644
+        mode = file_mode(relative, manifest)
         staged = stage.joinpath(*PurePosixPath(relative).parts)
         os.chmod(staged, mode)
         temporary = target.with_name(target.name + ".kit-update-new")
-        shutil.copyfile(staged, temporary)
+        copy_new(staged, temporary)
         os.chmod(temporary, mode)
         os.replace(temporary, target)
     for relative in remove:
@@ -309,49 +2531,298 @@ def swap_in(tree: Path, stage: Path, fetch: list[str], remove: list[str], manife
     note = {"schema_version": SCHEMA, "release_id": manifest["release_id"], "created_at": manifest["created_at"],
             "files_updated": len(fetch), "files_removed": len(remove),
             "applied_at": datetime.datetime.now(datetime.timezone.utc).isoformat()}
-    (tree / RECORD_NAME).write_text(json.dumps(note, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    temporary = tree / (RECORD_NAME + ".kit-update-new")
+    write_new(temporary, (json.dumps(note, indent=2, sort_keys=True) + "\n").encode("utf-8"))
+    os.replace(temporary, tree / RECORD_NAME)
     temporary = tree / (FILES_NAME + ".kit-update-new")
-    temporary.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    write_new(temporary, (json.dumps(manifest, indent=2, sort_keys=True) + "\n").encode("utf-8"))
     os.replace(temporary, tree / FILES_NAME)
+    for name in KEPT:                   # the signed bytes go in before the release record that they belong to
+        target = tree / name
+        if kept is not None:
+            temporary = tree / (name + ".kit-update-new")
+            write_new(temporary, kept[name])
+            os.replace(temporary, target)
+        elif target.is_file() and not target.is_symlink():
+            target.unlink()             # never left beside a release they do not belong to
     temporary = tree / "release.json.kit-update-new"
-    temporary.write_bytes(record_raw)
+    write_new(temporary, record_raw)
     os.replace(temporary, tree / "release.json")
 
 
-def run_update(tree: Path, apply: bool) -> str:
+def run_update(tree: Path, apply: bool, ignore_hold: bool = False) -> str:
+    return update(tree, apply, ignore_hold)[1]
+
+
+def update(tree: Path, apply: bool, ignore_hold: bool = False,
+           max_mb: float | None = None) -> tuple[str, str]:
+    """(result word, the line to show)."""
     if not (tree / "setup.sh").is_file():
         raise Keep("this folder does not hold the Secure Linux files (no setup.sh)")
+    if not apply:
+        return update_locked(tree, False, ignore_hold, max_mb)
+    with TreeLock(tree):
+        return update_locked(tree, True, ignore_hold, max_mb)
+
+
+def update_locked(tree: Path, apply: bool, ignore_hold: bool, max_mb: float | None = None) -> tuple[str, str]:
+    global RUN_STARTED
+    RUN_STARTED = time.monotonic()       # the time limit for every source together starts now
+    if apply:
+        done = recover(tree)
+        if done == "rolled back":
+            say("KIT UPDATE: an update had been cut short; every file was put back as it was before it.")
+        state = read_state(tree / UNDO_DIR) if (tree / UNDO_DIR).is_dir() else None
+        if state is not None and state["status"] == "undoing":
+            say(undo_tree(tree))         # going back was cut short: finish it first
     local_id = release_id_of(tree / "release.json")
-    source = Source()
+    if not online_allowed(tree):
+        return "online-off", f"KIT UPDATE: {ONLINE_OFF_TEXT} Using the local copy."
+    check_clock(local_id)
+    channel = update_channel()
+    sources = update_sources(tree, channel)
+    tried: list[tuple[Source, Exception]] = []
+    for source in sources:
+        source.started = time.monotonic()
+        try:
+            return update_from(tree, source, apply, ignore_hold, max_mb, local_id, channel)
+        except Final as exc:
+            raise exc.inner
+        except (Held, ClockWrong, CheckFailed, Busy):
+            raise                        # about this computer or this release, not about the source
+        except (Offline, Keep) as exc:
+            if len(sources) == 1:
+                raise                    # one source: exactly as before
+            tried.append((source, exc))
+    raise every_source_failed(tried)
+
+
+def every_source_failed(tried: list[tuple[Source, Exception]]) -> Exception:
+    """No source gave a newer, fully checked release. A refusal (a bad signature, a changed file, too big) is
+    reported with the source it came from; otherwise the internet's own answer (out of reach, not newer)."""
+    for source, problem in tried:
+        if isinstance(problem, Keep) and not isinstance(problem, NotNewer):
+            if not source.label:
+                return problem
+            return type(problem)(f"{source.label}: {problem}")
+    return tried[0][1]
+
+
+def update_from(tree: Path, source: Source, apply: bool, ignore_hold: bool, max_mb: float | None,
+                local_id: str, channel: str) -> tuple[str, str]:
+    """One source, every check. Anything that goes wrong after the files here start to change is Final."""
     remote_id, _, record_raw = load_remote(source)
+    note = f" It came from {source.label}, checked exactly like a download." if source.label else ""
+    if source.label and release_date(remote_id) < release_date(local_id):
+        # a home server copy or a neighbour that has not caught up yet is not a refusal (in signed mode the
+        # signature check would say "older" and the update window would show a refused update)
+        raise NotNewer("the published release is older than the local one")
     if remote_id == local_id:
-        return f"KIT UPDATE: already the latest release ({local_id}). Using the local copy."
-    manifest = load_manifest(source, remote_id)
+        damaged = damaged_files(tree, local_id)
+        if not damaged:
+            return "current", f"KIT UPDATE: already the latest release ({local_id}). Using the local copy."
+        return repair(tree, source, apply, damaged, local_id, note)
+    held = held_release(tree)
+    if held == remote_id and not ignore_hold:
+        raise Held(f"you went back from {remote_id} on this computer, so it is not installed again "
+                   "until a newer release is published")
+    signed = signature_gate(source, tree, record_raw, remote_id, channel)
+    manifest, kept = signed if signed is not None else (load_manifest(source, remote_id), None)
     refuse_older(tree, local_id, remote_id, manifest)
     fetch, remove = plan(tree, manifest)
+    size = download_size(manifest, fetch)
+    size_text = f" About {megabytes(size)} to download." if size is not None and fetch else ""
     if not apply:
-        return (f"KIT UPDATE: a newer release is published ({remote_id}; local {local_id}): "
-                f"{len(fetch)} file(s) differ, {len(remove)} to remove.")
+        return "available", (f"KIT UPDATE: a newer release is published ({remote_id}; local {local_id}): "
+                             f"{len(fetch)} file(s) differ, {len(remove)} to remove.{size_text}")
+    limited = size is not None and max_mb is not None and source.size_limited and not interactive()
+    if limited and size > max_mb * MEGABYTE:
+        raise TooBig(f"this update needs about {megabytes(size)}, more than the {max_mb:g} MB allowed for updates "
+                     "that run by themselves; it is installed when you choose to update")
+    # One archive is quicker for many files, but its size is not known before: with a limit, file by file.
+    use_archive = len(fetch) > TARBALL_THRESHOLD and source.use_archive and not limited
+    if size is not None and size >= SIZE_NOTICE_BYTES:
+        where = f" from {source.label}" if source.label else ""
+        what = " of changed files, in one archive" if use_archive else ""
+        say(f"KIT UPDATE NOTE: downloading about {megabytes(size)}{what} ({len(fetch)} file(s)){where}.")
+    parts = parts_folder(tree, source)
     stage = Path(tempfile.mkdtemp(prefix="sl-kit-update-"))
+    work = Path(tempfile.mkdtemp(prefix="sl-kit-check-"))
+    started = False
     try:
-        if len(fetch) > TARBALL_THRESHOLD:
+        tidy_parts(parts, {manifest["files"][relative] for relative in fetch})
+        if use_archive:
             fetch_archive(source, manifest, fetch, stage)
         else:
-            fetch_each(source, manifest, fetch, stage)
+            fetch_each(source, manifest, fetch, stage, parts)
         # The published release must not have moved while we were fetching.
         again_id, _, again_raw = load_remote(source)
         if again_id != remote_id or again_raw != record_raw:
             raise Keep("the published release changed during the download")
-        swap_in(tree, stage, fetch, remove, manifest, record_raw)
+        problem = check_before(tree, stage, fetch, remove, work)
+        if problem:
+            raise_alert(tree, "not-installed")
+            raise CheckFailed(f"the safety check found a problem in the new files, so nothing was installed: "
+                              f"{problem}")
+        installed = activation_snapshot(tree, fetch)
+        started = True
+        swap_in(tree, stage, fetch, remove, manifest, record_raw, keep_undo=True, kept=kept)
+        keep_history(tree, kept)
+        keep_channel(tree, kept)
+        problem = check_after(tree, work)
+    except Keep as exc:
+        if started:
+            raise Final(exc) from exc
+        raise
     finally:
         shutil.rmtree(stage, ignore_errors=True)
-    return (f"KIT UPDATE: updated to {remote_id} (was {local_id}): {len(fetch)} changed file(s) fetched and verified, "
-            f"{len(remove)} removed; everything else was already identical.")
+        shutil.rmtree(work, ignore_errors=True)
+    tidy_parts(parts, set())             # the update is in: nothing is left to continue
+    if problem:
+        return undo_after_failed_check(tree, remote_id, problem, installed)
+    clear_alert(tree)
+    if held is not None:
+        clear_hold(tree)                 # a newer release (or the person's own choice) replaces the hold
+    signed_note = " Its signatures were checked and are kept here." if kept is not None else ""
+    switched: list[tuple[str, str]] = []
+    activated = activate(tree, installed, switched=switched)
+    remember_switched_on(tree, remote_id, switched)       # so that undo switches exactly these off again
+    return "updated", (f"KIT UPDATE: updated to {remote_id} (was {local_id}): {len(fetch)} changed file(s) fetched "
+                       f"and verified, {len(remove)} removed; everything else was already identical.{signed_note}"
+                       f"{note} The earlier version is kept: 'secure-linux-kit-update undo --tree {tree}' goes back "
+                       "to it." + activated)
+
+
+# ------------------------------------------------------------------ a damaged copy of the latest release (HIGH 2)
+def damaged_files(tree: Path, local_id: str) -> list[str]:
+    """Files of the list applied here that are missing or no longer match it. Nothing is reported for a folder
+    this tool never updated (no applied list), or when that list belongs to another release."""
+    path = tree / FILES_NAME
+    try:
+        if path.is_symlink() or not path.is_file():
+            return []
+        listed = json.loads(path.read_text(encoding="utf-8"))
+        files = listed["files"]
+        if listed.get("release_id") != local_id or not isinstance(files, dict):
+            return []
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return []
+    local = local_files(tree)
+    found = []
+    for relative, digest in sorted(files.items()):
+        if not isinstance(relative, str) or not isinstance(digest, str):
+            continue
+        try:
+            safe_relative(relative)
+        except Keep:
+            continue
+        if not managed(relative):
+            continue
+        here = local.get(relative)
+        try:
+            if here is None or sha256(normalise(here.read_bytes())) != digest:
+                found.append(relative)
+        except OSError:
+            found.append(relative)
+    return found
+
+
+def repair(tree: Path, source: Source, apply: bool, damaged: list[str], local_id: str,
+           note: str) -> tuple[str, str]:
+    """Put back only the damaged or missing files of the release already here, each checked against the list
+    applied here (in signed mode its kept signatures are checked again first). The saved earlier version
+    (undo) is left exactly as it is."""
+    if not apply:
+        return "damaged", (f"KIT UPDATE: this computer has the latest release ({local_id}), but {len(damaged)} of "
+                           f"its file(s) are damaged or missing (first: {damaged[0]}). 'apply' puts them back.")
+    listed, _, _ = sync_source(tree, tree)
+    wanted = [relative for relative in damaged if relative in listed["files"]]
+    if not wanted:
+        return "current", f"KIT UPDATE: already the latest release ({local_id}). Using the local copy."
+    stage = Path(tempfile.mkdtemp(prefix="sl-kit-repair-"))
+    started = False
+    try:
+        fetch_each(source, listed, wanted, stage)
+        installed = activation_snapshot(tree, wanted)
+        started = True
+        put_back_files(tree, stage, wanted, listed)
+    except Keep as exc:
+        if started:
+            raise Final(exc) from exc
+        raise
+    finally:
+        shutil.rmtree(stage, ignore_errors=True)
+    return "repaired", (f"KIT UPDATE: put back {len(wanted)} damaged or missing file(s) of {local_id}, each "
+                        f"checked by SHA-256 against the list applied here; nothing else was changed.{note}"
+                        + activate(tree, installed))
+
+
+def put_back_files(tree: Path, stage: Path, wanted: list[str], listed: dict) -> None:
+    root = tree.resolve()
+    for relative in wanted:     # look at every destination BEFORE the first write, as swap_in does
+        target = tree.joinpath(*PurePosixPath(relative).parts)
+        folder = target.parent
+        while not folder.exists():
+            folder = folder.parent
+        if folder.resolve() != root and root not in folder.resolve().parents:
+            raise Keep(f"a local folder points outside the Secure Linux files: {relative}")
+        if target.is_symlink() or (target.exists() and not target.is_file()):
+            raise Keep(f"a local file is a link or folder and is never replaced: {relative}")
+    for relative in wanted:
+        target = tree.joinpath(*PurePosixPath(relative).parts)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        mode = file_mode(relative, listed)
+        temporary = target.with_name(target.name + ".kit-update-new")
+        copy_new(stage.joinpath(*PurePosixPath(relative).parts), temporary)
+        os.chmod(temporary, mode)
+        os.replace(temporary, target)
+
+
+# ------------------------------------------------------------------ copying to another local tree (no network)
+def read_kept(path: Path, limit: int) -> bytes | None:
+    if path.is_symlink() or not path.is_file():
+        return None
+    with open(path, "rb") as handle:
+        return handle.read(limit + 1)    # one byte too many: the checker refuses an oversized file
+
+
+def sync_source(source: Path, destination: Path) -> tuple[dict, bytes, dict | None]:
+    """The file list to copy by, the release record to install with it, and (signed mode) the kept bytes.
+
+    Signed mode is decided by the DESTINATION's own release keys: then the source must hold the exact
+    published file list and both signatures (kept by a verified apply), and they must verify, before anything
+    is copied. Without a key there (bridge mode) the applied file list is used exactly as before."""
+    try:
+        record_raw = (source / "release.json").read_bytes()
+    except OSError as exc:
+        raise Keep("the local release record cannot be read (release.json)") from exc
+    source_id = record_id(record_raw)
+    keys = destination / "share" / KEYS_FOLDER
+    checker = load_checker(keys)
+    if checker is None:
+        return check_manifest(read_applied_list(source), source_id), record_raw, None
+    kept = {KEPT_LIST: read_kept(source / KEPT_LIST, MAX_MANIFEST_BYTES),
+            KEPT_LIST_SIG: read_kept(source / KEPT_LIST_SIG, MAX_SIGNATURE_BYTES),
+            KEPT_RECORD_SIG: read_kept(source / KEPT_RECORD_SIG, MAX_SIGNATURE_BYTES)}
+    local_record = destination / "release.json"
+    local_list = destination / FILES_NAME
+    verdict = checker.verify_release(
+        record_raw, kept[KEPT_RECORD_SIG], kept[KEPT_LIST], kept[KEPT_LIST_SIG], keys,
+        local_record_raw=local_record.read_bytes() if local_record.is_file() else None,
+        local_file_list_raw=local_list.read_bytes() if local_list.is_file() else None,
+        source="this computer's copy", **must_list_for(checker, destination))
+    if verdict.state != "verified" or any(value is None for value in kept.values()):
+        raise Keep(f"this computer's copy did not pass the signature check: {verdict.message}")
+    try:
+        listed = check_manifest(json.loads(kept[KEPT_LIST].decode("utf-8")), source_id)
+    except ValueError as exc:
+        raise Keep("this computer's kept file list is not readable") from exc
+    return listed, record_raw, kept
 
 
 def sync_plan(source: Path, destination: Path) -> tuple[list[str], list[str]]:
     """Which files a sync_from_tree would replace and remove (nothing is changed)."""
-    listed = check_manifest(read_applied_list(source), release_id_of(source / "release.json"))
+    listed, _, _ = sync_source(source, destination)
     return plan(destination, listed)
 
 
@@ -365,10 +2836,22 @@ def read_applied_list(source: Path) -> object:
 def sync_from_tree(source: Path, destination: Path) -> tuple[int, int, str]:
     """Bring another local copy (a saved master, a packed installer payload) up to the release this
     computer already holds. No network: the newer files are taken from `source`, and each one must still
-    match the published file list that was applied there. Returns (files changed, files removed, release ID).
+    match the published file list that was applied there (in signed mode: the kept, signed list).
+    Returns (files changed, files removed, release ID).
+    The saved master keeps its own earlier generations, so no undo folder is written into `destination`.
+    Both folders are locked while this runs (the source only where this user may make the lock file).
     """
-    source_id = release_id_of(source / "release.json")
-    listed = check_manifest(read_applied_list(source), source_id)
+    source, destination = Path(source), Path(destination)
+    with TreeLock(source, required=False):
+        if not (destination / "setup.sh").is_file():
+            return sync_locked(source, destination)      # refused below, nothing written
+        with TreeLock(destination):
+            return sync_locked(source, destination)
+
+
+def sync_locked(source: Path, destination: Path) -> tuple[int, int, str]:
+    listed, record_raw, kept = sync_source(source, destination)
+    source_id = listed["release_id"]
     if not (destination / "setup.sh").is_file():
         raise Keep("the copy to update does not hold the Secure Linux files (no setup.sh)")
     fetch, remove = plan(destination, listed)
@@ -379,59 +2862,629 @@ def sync_from_tree(source: Path, destination: Path) -> tuple[int, int, str]:
             if path.is_symlink() or not path.is_file():
                 raise Keep(f"this computer's copy is missing a published file: {relative}")
             store(stage, relative, normalise(path.read_bytes()), listed)
-        swap_in(destination, stage, fetch, remove, listed, (source / "release.json").read_bytes())
+        swap_in(destination, stage, fetch, remove, listed, record_raw, kept=kept)
     finally:
         shutil.rmtree(stage, ignore_errors=True)
     return len(fetch), len(remove), source_id
 
 
-def write_manifest(payload: Path, release_id: str, output: Path) -> int:
+# ------------------------------------------------------------------ status (no network)
+def tree_status(tree: Path) -> dict:
+    """C4 status fields for one tree. Reads local files only."""
+    try:
+        release_id = release_id_of(tree / "release.json")
+    except Keep:
+        release_id = None
+    applied_at = None
+    try:
+        value = json.loads((tree / RECORD_NAME).read_text(encoding="utf-8")).get("applied_at")
+        applied_at = value if isinstance(value, str) else None
+    except (OSError, ValueError, AttributeError):
+        pass
+    try:
+        signed_mode = load_checker(keys_folder(tree)) is not None
+    except Keep:
+        signed_mode = True               # a key is there but its checker is missing: every release is refused
+    except Exception:                    # a damaged checker: releases cannot be checked, so none is installed
+        signed_mode = True
+    folder = tree / UNDO_DIR
+    state = read_state(folder) if folder.is_dir() else None
+    undo_available = bool(state is not None and (state["status"] == "undoing"
+                                                 or (state["status"] == "applied" and not trust_changes(state))))
+    return {"release_id": release_id, "applied_at": applied_at, "signed_mode": bool(signed_mode),
+            "undo_available": undo_available, "online": online_allowed(tree), "last_result": last_result(tree)}
+
+
+def status_text(info: dict) -> str:
+    yes = {True: "yes", False: "no"}
+    return (f"KIT UPDATE STATUS: release {info['release_id'] or 'unknown'}; "
+            f"last updated {info['applied_at'] or 'never by this tool'}; "
+            f"signed releases only: {yes[info['signed_mode']]}; going back possible: {yes[info['undo_available']]}; "
+            f"online checks: {'on' if info['online'] else 'off'}; last result: {info['last_result']}.")
+
+
+def activate_all(tree: Path) -> str:
+    """Helpers-only repair: every file setup installs from this folder is checked against it, with the same
+    rules as after an update (a copy changed on this computer is left as it is; settings of other steps only
+    where setup put them). No network, nothing in the folder changes."""
+    if not (tree / "setup.sh").is_file():
+        raise Keep("this folder does not hold the Secure Linux files (no setup.sh)")
+    if activation_root(tree) is None:
+        return "KIT UPDATE: nothing to bring up to date - this is not this computer's own Secure Linux folder."
+    with TreeLock(tree):
+        text = activate(tree, activation_snapshot(tree, sorted(local_files(tree))))
+    return "KIT UPDATE: the installed copies were checked against this folder." + (
+        text or " Everything was already up to date.")
+
+
+# ------------------------------------------------------------------ sets: Debian, Flipper, network-install (21, 22)
+def set_path_problem(name: str, relative: object) -> str | None:
+    """Why a path may not be part of set `name` (None: it may). Compared without case, because drives and
+    Flipper SD cards are often FAT or exFAT, where two spellings are one file."""
+    try:
+        safe_relative(relative)
+    except Keep:
+        return f"contains an unsafe path: {relative!r}"
+    parts = PurePosixPath(relative).parts
+    folded = relative.casefold()
+    if parts[0].casefold().startswith(SET_OWN_PREFIX) or folded in {p.casefold() for p in SET_PERSONAL.get(name, ())}:
+        return f"names a file that is never replaced this way: {relative}"
+    if any(part in GENERATED_DIRS for part in parts) or relative.endswith(GENERATED_SUFFIXES):
+        return f"names a file that is never replaced this way: {relative}"
+    if name == "netboot" and relative not in NETBOOT_SET_TOP and not (parts[0] == "debian" and len(parts) > 1):
+        return f"names a file that is not a network-install file: {relative}"
+    return None
+
+
+def set_paths(dist: Path, name: str) -> dict[str, Path]:
+    """The files of one set in a rendered public tree (netboot/dist), by their path inside the set."""
+    found: dict[str, Path] = {}
+    if name == "netboot":
+        for top in NETBOOT_SET_TOP:
+            if (dist / top).is_file() and not (dist / top).is_symlink():
+                found[top] = dist / top
+        roots = [(dist / "debian", "debian/")]
+    else:
+        roots = [(dist.joinpath(*PurePosixPath(SET_PREFIX[name]).parts), "")]
+    for root, lead in roots:
+        if root.is_symlink() or not root.is_dir():
+            continue
+        for base, directories, files in os.walk(root, followlinks=False):
+            directories[:] = sorted(d for d in directories
+                                    if d not in GENERATED_DIRS and not (Path(base) / d).is_symlink())
+            for file_name in sorted(files):
+                path = Path(base) / file_name
+                relative = lead + path.relative_to(root).as_posix()
+                if path.is_symlink() or not path.is_file() or set_path_problem(name, relative) is not None:
+                    continue
+                found[relative] = path
+    return found
+
+
+def set_listing(dist: Path, name: str) -> dict:
+    """{"files", "modes", "sizes"} of one set, the same form as the payload's own list."""
+    files, modes, sizes = {}, {}, {}
+    for relative, path in sorted(set_paths(dist, name).items()):
+        data = path.read_bytes()
+        if len(data) > MAX_FILE_BYTES:
+            raise ValueError(f"{relative} is larger than a published file may be")
+        files[relative] = sha256(data)
+        modes[relative] = "0755" if data[:2] == b"#!" else "0644"
+        sizes[relative] = len(data)
+    return {"files": files, "modes": modes, "sizes": sizes}
+
+
+def check_set(manifest: dict, name: str) -> dict:
+    """The checked list of one set from a published file list (new computers only; older ones ignore "sets")."""
+    label = SET_LABEL[name]
+    sets = manifest.get("sets")
+    entry = sets.get(name) if isinstance(sets, dict) else None
+    if entry is None:
+        raise Keep(f"the published release has no list of {label} yet")
+    files = entry.get("files") if isinstance(entry, dict) else None
+    if not isinstance(files, dict) or not files or len(files) > MAX_FILES:
+        raise Keep(f"the published list of {label} is empty or too large")
+    for relative, digest in files.items():
+        problem = set_path_problem(name, relative)
+        if problem is not None:
+            raise Keep(f"the published list of {label} {problem}")
+        if not isinstance(digest, str) or not HASH_RE.match(digest):
+            raise Keep(f"the published list of {label} has an invalid SHA-256 for {relative}")
+    if len({relative.casefold() for relative in files}) != len(files):
+        raise Keep(f"the published list of {label} names one file twice (in different spellings)")
+    listing = {"files": files}
+    for key, what in (("modes", "file modes"), ("sizes", "file sizes")):
+        if key not in entry:
+            continue
+        values = entry[key]
+        if not isinstance(values, dict):
+            raise Keep(f"the published list of {label} has {what} in a form this version does not understand")
+        for relative, value in values.items():
+            if relative not in files:
+                raise Keep(f"the published list of {label} gives a {what[5:-1]} for a file it does not list: "
+                           f"{relative!r}")
+            if key == "modes" and value not in FILE_MODES:
+                raise Keep(f"the published list of {label} asks for a file mode that is never used "
+                           f"({value!r} for {relative})")
+            if key == "sizes" and (not isinstance(value, int) or isinstance(value, bool)
+                                   or not 0 <= value <= MAX_FILE_BYTES):
+                raise Keep(f"the published list of {label} gives an impossible size for {relative}")
+        listing[key] = values
+    return listing
+
+
+def read_set_record(folder: Path, name: str) -> dict | None:
+    """The set list applied in this folder, or None (a folder this tool never brought up to date)."""
+    raw = read_kept(folder / SET_RECORD, MAX_MANIFEST_BYTES)
+    if raw is None:
+        return None
+    try:
+        note = json.loads(raw.decode("utf-8"))
+        said, release_id, files = note["set"], note["release_id"], note["files"]
+        datetime.datetime.fromisoformat(str(note["created_at"]))
+        if not isinstance(release_id, str) or not RELEASE_ID_RE.match(release_id) or not isinstance(files, dict):
+            return None
+    except (UnicodeDecodeError, ValueError, KeyError, TypeError, AttributeError):
+        return None
+    if said != name:
+        other = SET_LABEL.get(said, "other files") if isinstance(said, str) else "other files"
+        raise Keep(f"this folder holds {other}, not {SET_LABEL[name]}")
+    return note
+
+
+def write_set_record(folder: Path, name: str, release_id: str, manifest: dict, listing: dict) -> None:
+    note = {"schema_version": SCHEMA, "set": name, "release_id": release_id,
+            "created_at": manifest.get("created_at"), "files": listing["files"]}
+    write_durable(folder / SET_RECORD, (json.dumps(note, indent=2, sort_keys=True) + "\n").encode("utf-8"))
+
+
+def set_local_files(folder: Path) -> dict[str, Path]:
+    """Every regular file in a set folder except this tool's own files. Links are never followed."""
+    found: dict[str, Path] = {}
+    for base, directories, files in os.walk(folder, followlinks=False):
+        directories[:] = sorted(d for d in directories if not (Path(base) / d).is_symlink()
+                                and not (Path(base) == folder and d.startswith(SET_OWN_PREFIX)))
+        for file_name in sorted(files):
+            path = Path(base) / file_name
+            relative = path.relative_to(folder).as_posix()
+            if path.is_symlink() or not path.is_file() or relative.startswith(SET_OWN_PREFIX):
+                continue
+            found[relative] = path
+    return found
+
+
+def set_plan(name: str, folder: Path, listing: dict, here: dict | None) -> tuple[list[str], list[str]]:
+    """(files to fetch, files to remove). Only a file the list applied here named, that is still exactly as
+    this tool wrote it and is no longer published, is removed: a person's own files are never touched."""
+    local = set_local_files(folder)
+    fetch = []
+    for relative, digest in sorted(listing["files"].items()):
+        path = local.get(relative)
+        try:
+            same = path is not None and file_sha256(path) == digest
+        except OSError:
+            same = False
+        if not same:
+            fetch.append(relative)
+    remove = []
+    for relative, digest in sorted((here or {}).get("files", {}).items()):
+        if relative in listing["files"] or relative not in local or set_path_problem(name, relative) is not None:
+            continue
+        try:
+            if file_sha256(local[relative]) == digest:
+                remove.append(relative)
+        except OSError:
+            pass
+    return fetch, remove
+
+
+def own_tree() -> Path:
+    """The Secure Linux files this tool belongs to: the folder above its bin/ when that holds release.json (the kit,
+    or /usr/local/lib/secure-linux/bin), otherwise this computer's own copy (the command in /usr/local/bin is a copy
+    of the one in /usr/local/lib/secure-linux/bin). Its release, settings, keys, history and channel record are all
+    read from this one folder, never from the set folder."""
+    system = SYSTEM_TREE
+    if os.environ.get("SL_KIT_UPDATE_TEST_SOURCE") == "1" and os.environ.get("SL_KIT_UPDATE_SYSTEM_TREE"):
+        system = Path(os.environ["SL_KIT_UPDATE_SYSTEM_TREE"])         # tests only
+    for tree in (Path(__file__).resolve().parent.parent, system):
+        if (tree / "release.json").is_file():
+            return tree
+    raise Keep("the Secure Linux files this tool belongs to were not found, so their keys and settings cannot be read")
+
+
+def set_history_gate(source: Source, own: Path, checker, keys: Path, record_raw: bytes, list_raw: bytes,
+                     manifest: dict, remote_id: str) -> bool:
+    """C15 for a set: the published history must carry a valid signature, end with exactly this release and
+    continue the history this computer saw last (read only: nothing is kept for a set). False while no history
+    is published and this computer never saw one (only the internet is used that way)."""
+    seen = read_kept(own / KEPT_HISTORY, MAX_HISTORY_BYTES)
+    raw = fetch_optional(source, f"{source.base}/{HISTORY_NAME}", MAX_HISTORY_BYTES, "the published release history")
+    signature = fetch_optional(source, f"{source.base}/{HISTORY_NAME}.sig", MAX_SIGNATURE_BYTES,
+                               "the release history's signature")
+    if raw is None and signature is None:
+        if seen is not None:
+            raise Keep("the published release history is missing, but this computer has seen one before")
+        return False
+    if raw is None:
+        raise Keep("the published release history is missing (only its signature is there)")
+    good, why = detached_check(checker, raw, signature, keys, HISTORY_NAME)
+    if not good:
+        raise Keep(f"the published release history did not pass the signature check: {why}")
+    entries = parse_history(raw)
+    if not entries:
+        raise Keep("the published release history is empty")
+    newest = entries[-1][1]
+    if (newest["release_id"], newest["record_sha256"], newest["list_sha256"], newest["created_at"]) \
+            != (remote_id, sha256(record_raw), sha256(list_raw), manifest.get("created_at")):
+        raise Keep("the published release history does not end with this release (publishing may be in progress)")
+    if seen is not None and not raw.startswith(seen):
+        raise Keep("the published release history does not continue the one this computer saw before "
+                   "(it was rewritten, or it is an older one)")
+    return True
+
+
+def set_signature_gate(source: Source, own: Path, checker, keys: Path, record_raw: bytes, remote_id: str,
+                       channel: str, here: dict | None, floor_id: str) -> dict:
+    """Signed mode for a set: exactly the checks of an update (both signatures, history, channel record). A copy
+    on the home network (home server copy or another computer) must also give a signed channel record (P17
+    finding F1), so it can never pass a test release to a stable computer by leaving the record out."""
+    def optional(url: str, limit: int) -> bytes | None:
+        return fetch_optional(source, url, limit, "the release signature")
+
+    list_raw = optional(f"{source.base}/{MANIFEST_NAME}", MAX_MANIFEST_BYTES)
+    if list_raw is None:
+        raise Keep("the published release has no file list yet")
+    record_sig = optional(source.base + "/release.json.sig", MAX_SIGNATURE_BYTES)
+    list_sig = optional(f"{source.base}/{MANIFEST_NAME}.sig", MAX_SIGNATURE_BYTES)
+    local_list = (json.dumps({"release_id": here["release_id"], "created_at": here["created_at"]}).encode("utf-8")
+                  if here is not None else None)
+    verdict = checker.verify_release(
+        record_raw, record_sig, list_raw, list_sig, keys,
+        local_record_raw=json.dumps({"release_id": floor_id}).encode("utf-8"),
+        local_file_list_raw=local_list, source="the published release")
+    if verdict.state != "verified" or record_sig is None or list_sig is None:
+        raise Keep(f"the published release did not pass the signature check: {verdict.message}")
+    try:
+        manifest = check_manifest(json.loads(list_raw.decode("utf-8")), remote_id)
+    except ValueError as exc:
+        raise Keep("the published file list is not readable") from exc
+    history = set_history_gate(source, own, checker, keys, record_raw, list_raw, manifest, remote_id)
+    kept = channel_gate(source, own, checker, keys, remote_id, channel)
+    if source.label and not kept:
+        raise Keep("a copy on the home network is used only with a signed channel record")
+    if source.label and not history:
+        raise Keep("a copy on the home network is used only with a signed release history")          # check C2, as for an update
+    return manifest
+
+
+def check_set_targets(folder: Path, relatives: list[str], label: str) -> None:
+    """Look at every destination BEFORE the first write: nothing outside the folder, no link or folder replaced."""
+    root = folder.resolve()
+    for relative in relatives:
+        target = folder.joinpath(*PurePosixPath(relative).parts)
+        parent = target.parent
+        while not parent.exists():
+            parent = parent.parent
+        if parent.resolve() != root and root not in parent.resolve().parents:
+            raise Keep(f"a local folder points outside {label}: {relative}")
+        if target.is_symlink() or (target.exists() and not target.is_file()):
+            raise Keep(f"a local file is a link or folder and is never replaced: {relative}")
+        temporary = target.with_name(target.name + ".kit-update-new")      # check C2 F3
+        if temporary.is_symlink() or (temporary.exists() and not temporary.is_file()):
+            raise Keep(f"a link or folder sits where a temporary file is written, and is never written through: "
+                       f"{relative}.kit-update-new")
+
+
+def place_set_files(folder: Path, stage: Path, fetch: list[str], remove: list[str], listing: dict) -> None:
+    for relative in fetch:
+        target = folder.joinpath(*PurePosixPath(relative).parts)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        temporary = target.with_name(target.name + ".kit-update-new")
+        copy_new(stage.joinpath(*PurePosixPath(relative).parts), temporary)
+        try:
+            os.chmod(temporary, file_mode(relative, listing))
+        except OSError:
+            pass                         # FAT and exFAT (USB drives, Flipper SD cards) keep no file modes
+        os.replace(temporary, target)
+    for relative in remove:
+        target = folder.joinpath(*PurePosixPath(relative).parts)
+        if target.is_file() and not target.is_symlink():
+            target.unlink()
+
+
+def update_set(name: str, folder: Path, apply: bool, max_mb: float | None = None) -> tuple[str, str]:
+    """(result word, the line to show) for one set in `folder`."""
+    if folder.is_symlink() or not folder.is_dir():
+        raise Keep(f"the folder for {SET_LABEL[name]} does not exist (make it first)")
+    if not apply:
+        return set_locked(name, folder, False, max_mb)
+    with TreeLock(folder):
+        return set_locked(name, folder, True, max_mb)
+
+
+def set_locked(name: str, folder: Path, apply: bool, max_mb: float | None) -> tuple[str, str]:
+    global RUN_STARTED
+    RUN_STARTED = time.monotonic()
+    own = own_tree()
+    own_id = release_id_of(own / "release.json")
+    if not online_allowed(own):
+        return "online-off", f"KIT UPDATE: {ONLINE_OFF_TEXT} {set_kept(name)}."
+    check_clock(own_id)
+    here = read_set_record(folder, name)
+    channel = update_channel()
+    sources = update_sources(own, channel)
+    tried: list[tuple[Source, Exception]] = []
+    for source in sources:
+        source.started = time.monotonic()
+        try:
+            return set_from(name, folder, source, apply, max_mb, own, own_id, here, channel)
+        except (ClockWrong, Busy):
+            raise
+        except (Offline, Keep) as exc:
+            if len(sources) == 1:
+                raise
+            tried.append((source, exc))
+    raise every_source_failed(tried)
+
+
+def set_kept(name: str) -> str:
+    label = SET_LABEL[name]
+    return f"{label[0].upper()}{label[1:]} here stay as they are"
+
+
+def set_from(name: str, folder: Path, source: Source, apply: bool, max_mb: float | None, own: Path, own_id: str,
+             here: dict | None, channel: str) -> tuple[str, str]:
+    """One source, every check, then only the set files that differ (each checked by SHA-256) are written."""
+    label = SET_LABEL[name]
+    remote_id, _, record_raw = load_remote(source)
+    note = f" It came from {source.label}, checked exactly like a download." if source.label else ""
+    floor_id = own_id
+    if here is not None and release_date(here["release_id"]) > release_date(floor_id):
+        floor_id = here["release_id"]
+    if release_date(remote_id) < release_date(floor_id):
+        raise NotNewer(f"the published release ({remote_id}) is older than {floor_id}")
+    keys = keys_folder(own)
+    checker = load_checker(keys)
+    if checker is not None:
+        manifest = set_signature_gate(source, own, checker, keys, record_raw, remote_id, channel, here, floor_id)
+    else:
+        manifest = load_manifest(source, remote_id)
+    listing = check_set(manifest, name)
+    same_release = here is not None and here["release_id"] == remote_id
+    if here is not None and not same_release:
+        try:
+            older = (datetime.datetime.fromisoformat(str(manifest.get("created_at")))
+                     < datetime.datetime.fromisoformat(str(here["created_at"])))
+        except (ValueError, TypeError):
+            older = False
+        if older:
+            raise NotNewer("the published release is older than the one these files came from")
+    fetch, remove = set_plan(name, folder, listing, here)
+    size = download_size(listing, fetch)
+    size_text = f" About {megabytes(size)} to download." if size is not None and fetch else ""
+    current = f"KIT UPDATE: {label} here already match the published release ({remote_id})."
+    if not apply:
+        if not fetch and not remove:
+            return "current", current
+        if same_release:
+            return "damaged", (f"KIT UPDATE: {label} here are from the latest release ({remote_id}), but "
+                               f"{len(fetch)} of them are damaged or missing (first: {fetch[0]}). "
+                               f"'apply --set {name}' puts them back.")
+        was = here["release_id"] if here is not None else "not checked here before"
+        return "available", (f"KIT UPDATE: {label} here differ from the published release ({remote_id}; here: "
+                             f"{was}): {len(fetch)} file(s) to fetch, {len(remove)} to remove.{size_text}")
+    if not fetch and not remove:
+        if not same_release:
+            try:
+                write_set_record(folder, name, remote_id, manifest, listing)
+            except OSError:
+                pass                     # a note that cannot be written never changes the answer
+        return "current", current
+    limited = size is not None and max_mb is not None and source.size_limited and not interactive()
+    if limited and size > max_mb * MEGABYTE:
+        raise TooBig(f"this update needs about {megabytes(size)}, more than the {max_mb:g} MB allowed for updates "
+                     "that run by themselves; it is installed when you choose to update")
+    use_archive = len(fetch) > TARBALL_THRESHOLD and source.use_archive and not limited
+    if size is not None and size >= SIZE_NOTICE_BYTES:
+        where = f" from {source.label}" if source.label else ""
+        say(f"KIT UPDATE NOTE: downloading about {megabytes(size)} ({len(fetch)} file(s)){where}.")
+    stage = Path(tempfile.mkdtemp(prefix="sl-kit-set-"))
+    try:
+        if use_archive:
+            fetch_archive(source, listing, fetch, stage, SET_PREFIX[name])
+        else:
+            fetch_each(source, listing, fetch, stage, None, SET_PREFIX[name])
+        again_id, _, again_raw = load_remote(source)
+        if again_id != remote_id or again_raw != record_raw:
+            raise Keep("the published release changed during the download")
+        check_set_targets(folder, fetch + remove, label)
+        try:
+            place_set_files(folder, stage, fetch, remove, listing)
+            write_set_record(folder, name, remote_id, manifest, listing)
+        except Exception as exc:         # after the first write: never another source, say what happened
+            raise SetPartly(f"{type(exc).__name__}: {exc}") from exc
+    finally:
+        shutil.rmtree(stage, ignore_errors=True)
+    signed_note = " Its signatures were checked." if checker is not None else ""
+    if same_release:
+        return "repaired", (f"KIT UPDATE: put back {len(fetch)} damaged or missing file(s) of {label} "
+                            f"({remote_id}), each checked by SHA-256 against the published list.{signed_note}{note}")
+    was = here["release_id"] if here is not None else "not checked here before"
+    return "updated", (f"KIT UPDATE: {label} here were updated to {remote_id} (was {was}): {len(fetch)} file(s) "
+                       f"fetched and verified, {len(remove)} removed; every other file already matched."
+                       f"{signed_note}{note}")
+
+
+def set_main(args) -> int:
+    """check|apply --set: the same answers as an update, in words about the set. Never fails (exit 0)."""
+    name, folder = args.set, args.tree
+    result, line = "error", ""
+    try:
+        result, line = update_set(name, folder, apply=args.command == "apply",
+                                  max_mb=args.max_download_mb if args.command == "apply" else None)
+    except Busy as exc:
+        say(f"KIT UPDATE: {exc}")
+        return EXIT_BUSY
+    except Offline as exc:
+        result, line = "offline", f"KIT UPDATE: no internet connection to the published release ({exc}). " \
+                                  f"{set_kept(name)}."
+    except ClockWrong as exc:
+        result, line = "clock-wrong", f"KIT UPDATE: {exc} {set_kept(name)}."
+    except TooBig as exc:
+        result, line = "too-big", f"KIT UPDATE: {set_kept(name)} - {exc}."
+    except Keep as exc:
+        result, line = "refused", f"KIT UPDATE: {set_kept(name)} - {exc}."
+    except SetPartly as exc:
+        result, line = "partly", (f"KIT UPDATE: {SET_LABEL[name]} here were only partly brought up to date "
+                                  f"({exc}). Every file written was checked first; running apply again finishes it.")
+    except Exception as exc:  # never the reason anything else stops
+        line = f"KIT UPDATE: {set_kept(name)} - unexpected problem ({type(exc).__name__}: {exc})."
+    say(line)
+    return 0
+
+
+def write_manifest(payload: Path, release_id: str, output: Path, sets_from: Path | None = None) -> int:
     if not RELEASE_ID_RE.match(release_id):
         say("ERROR: invalid release ID")
         return 2
+    sets = None
+    if sets_from is not None:            # ideas 21, 22: the set lists of the rendered public tree
+        try:
+            sets = {name: listing for name in SET_PREFIX
+                    if (listing := set_listing(sets_from, name))["files"]}
+        except (OSError, ValueError) as exc:
+            say(f"ERROR: the set lists could not be written: {exc}")
+            return 2
     files = {}
+    modes = {}
+    sizes = {}
     for relative, path in sorted(local_files(payload).items()):
         data = path.read_bytes()
         if normalise(data) != data:
             say(f"ERROR: payload file is not normalised plain text: {relative}")
             return 2
         files[relative] = sha256(data)
+        modes[relative] = "0755" if data[:2] == b"#!" else "0644"     # idea 16; old computers ignore this key
+        sizes[relative] = len(data)                                       # idea 24; old computers ignore it too
     created = datetime.datetime.now(datetime.timezone.utc).isoformat()
     if output.is_file():      # an unchanged payload keeps its time, so re-rendering is repeatable
         try:
             previous = json.loads(output.read_text(encoding="utf-8"))
-            if previous.get("release_id") == release_id and previous.get("files") == files:
+            if previous.get("release_id") == release_id and previous.get("files") == files \
+                    and previous.get("sets") == sets:
                 created = previous["created_at"]
         except (OSError, ValueError, KeyError, TypeError):
             pass
     manifest = {"schema_version": SCHEMA, "release_id": release_id, "created_at": created,
-                "file_count": len(files), "files": files}
+                "file_count": len(files), "files": files, "modes": modes, "sizes": sizes}
+    if sets is not None:
+        manifest["sets"] = sets          # older computers ignore this key (F44)
     output.write_bytes((json.dumps(manifest, indent=2, sort_keys=True) + "\n").encode("utf-8"))
     say(f"payload file list: {len(files)} files for {release_id}")
+    if sets is not None:
+        say("set lists: " + ", ".join(f"{name} {len(listing['files'])}" for name, listing in sets.items()))
     return 0
+
+
+def download_limit(value: str) -> float:
+    try:
+        number = float(value)
+    except ValueError:
+        number = -1.0
+    if not 0 <= number < 10 ** 7:
+        raise argparse.ArgumentTypeError("give the most MB to download, for example 200")
+    return number
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="secure-linux-kit-update", description=__doc__.split("\n")[0])
     commands = parser.add_subparsers(dest="command", required=True)
-    for name in ("check", "apply"):
-        sub = commands.add_parser(name)
+    helps = {"check": "say whether a newer release is published (changes nothing)",
+             "apply": "install a newer published release, checked file by file",
+             "undo": "go back to the version from before the last update",
+             "status": "show this copy's release, undo and settings (no network)"}
+    helps["activate"] = ("helpers only: bring the commands, services and settings setup installed from this "
+                         "folder up to date (no network)")
+    for name in ("check", "apply", "undo", "status", "activate"):
+        sub = commands.add_parser(name, help=helps[name])
         sub.add_argument("--tree", required=True, type=Path, help="folder holding setup.sh and release.json")
-    manifest = commands.add_parser("manifest")
+        if name in ("check", "apply"):
+            sub.add_argument("--set", choices=tuple(SET_PREFIX),
+                             help="work on a folder holding the Debian install files, the Flipper files or the "
+                                  "network-install files instead (--tree names that folder)")
+        if name == "apply":
+            sub.add_argument("--ignore-hold", action="store_true",
+                             help="install the release you went back from after all")
+            sub.add_argument("--max-download-mb", type=download_limit, metavar="MB",
+                             help="when no person is at the screen: skip an update that would download more "
+                                  "than this many MB (it is installed when someone chooses to update)")
+        if name == "status":
+            sub.add_argument("--json", action="store_true", help="answer as JSON")
+    manifest = commands.add_parser("manifest", help="write payload-files.json (release tooling only)")
     manifest.add_argument("--payload", required=True, type=Path)
     manifest.add_argument("--release-id", required=True)
     manifest.add_argument("--output", required=True, type=Path)
+    manifest.add_argument("--sets-from", type=Path, metavar="DIST",
+                          help="also list the Debian, Flipper and network-install files of this rendered tree")
     args = parser.parse_args(argv)
     if args.command == "manifest":
-        return write_manifest(args.payload, args.release_id, args.output)
+        return write_manifest(args.payload, args.release_id, args.output, args.sets_from)
+    if args.command in ("check", "apply") and args.set:
+        return set_main(args)
+    if args.command == "status":
+        info = tree_status(args.tree)
+        say(json.dumps(info, indent=2, sort_keys=True) if args.json else status_text(info))
+        return 0
+    if args.command == "activate":
+        try:
+            say(activate_all(args.tree))
+        except Busy as exc:
+            say(f"KIT UPDATE: {exc}")
+            return EXIT_BUSY
+        except Keep as exc:
+            say(f"KIT UPDATE: nothing was brought up to date - {exc}.")
+        return 0
+    if args.command == "undo":     # asked for by a person: a refusal is reported with exit code 1
+        try:
+            line = undo_tree(args.tree)
+            say(line)
+            remember(args.tree, "undone", line)
+            return 0
+        except Busy as exc:
+            say(f"KIT UPDATE: {exc}")
+            return EXIT_BUSY
+        except NothingToUndo as exc:
+            say(f"KIT UPDATE: {exc}.")
+        except Keep as exc:
+            say(f"KIT UPDATE: could not go back - {exc}.")
+        except Exception as exc:
+            say(f"KIT UPDATE: could not go back - unexpected problem ({type(exc).__name__}: {exc}). "
+                "Running undo again is safe.")
+        return 1
+    result, line = "error", ""
     try:
-        say(run_update(args.tree, apply=args.command == "apply"))
+        result, line = update(args.tree, apply=args.command == "apply", ignore_hold=args.ignore_hold
+                              if args.command == "apply" else False,
+                              max_mb=args.max_download_mb if args.command == "apply" else None)
+    except Busy as exc:
+        say(f"KIT UPDATE: {exc}")
+        return EXIT_BUSY
     except Offline as exc:
-        say(f"KIT UPDATE: no internet connection to the published release ({exc}). Using the local copy.")
+        result, line = "offline", f"KIT UPDATE: no internet connection to the published release ({exc}). Using the local copy."
+    except ClockWrong as exc:
+        result, line = "clock-wrong", f"KIT UPDATE: {exc} Using the local copy."
+    except Held as exc:
+        result, line = "held", f"KIT UPDATE: kept the local copy unchanged - {exc}."
+    except CheckFailed as exc:
+        result, line = "check-failed", f"KIT UPDATE: kept the local copy unchanged - {exc}."
+    except TooBig as exc:
+        result, line = "too-big", f"KIT UPDATE: kept the local copy unchanged - {exc}."
     except Keep as exc:
-        say(f"KIT UPDATE: kept the local copy unchanged - {exc}.")
+        result, line = "refused", f"KIT UPDATE: kept the local copy unchanged - {exc}."
     except Exception as exc:  # an update check must never be the reason an install stops
-        say(f"KIT UPDATE: kept the local copy unchanged - unexpected problem ({type(exc).__name__}: {exc}).")
+        line = f"KIT UPDATE: kept the local copy unchanged - unexpected problem ({type(exc).__name__}: {exc})."
+    say(line)
+    remember(args.tree, result, line)
     return 0
 
 

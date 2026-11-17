@@ -1,0 +1,263 @@
+#!/usr/bin/env python3
+"""secure-linux-daily-summary: one line about this computer: backups, updates, disk and security.
+
+  secure-linux-daily-summary            print the line ("All good: ..." or the one thing to do)
+  secure-linux-daily-summary --pause    same, then wait for Enter (for the menu entry, so the window stays open)
+  secure-linux-daily-summary --notify   same, and show it once a day as a quiet notification (used by the daily timer)
+  secure-linux-daily-summary --help     this page
+
+It only READS the results of the health check and the alerts the other helpers already wrote
+(/var/lib/secure-linux/checks, alerts.d and your own user-alerts). It changes nothing, sends nothing anywhere and
+needs no password. To switch the daily notification off: put the line  daily_summary=off  in
+/etc/secure-linux/choices (the line is only read, never written, by this helper).
+"""
+import datetime
+import getpass
+import os
+import re
+import shutil
+import subprocess
+import sys
+
+STALE_DAYS = 3
+
+# Which of the four areas a result belongs to. First match wins; anything else is "other" (still shown).
+AREAS = ("backups", "updates", "disk", "security")
+AREA_PATTERNS = (
+    ("backups", r"^(backup|home-backup|server-backup|restore-drill)"),
+    ("updates", r"^(restart|reboot|updates|firmware|fedora|flatpak-eol|server-update|upgrade|kit-update)"),
+    ("disk", r"^(disk|snapshot|btrfs|scrub|wear|battery)"),
+    ("security", r"^(firewall|selinux|secureboot|antivirus|security|encryption|recovery-key|vpn|dns|server-cert|"
+                 r"services|setup-failures|mok|av-)"),
+)
+# Order used to pick "the one thing" when two problems are equally serious.
+PICK_ORDER = ("security", "backups", "disk", "updates", "other")
+# Rows that are only for information: they are shown in Secure Linux Status but never spoil "All good".
+INFO_ONLY = {"battery-wear", "wifi-resume", "hibernate", "snapshot-space-info"}
+# Friendly offers and reminders: worth one mention, but they rank below a real problem.
+SOFT_ALERTS = {"home-backup-offer", "restore-drill"}
+FIX_LABELS = {
+    "restart": "Restart the computer", "updates": "Install updates now", "repair": "Repair setup",
+    "firmware": "Update firmware (BIOS, SSD)", "upgrade": "Upgrade Fedora", "diag": "Create a diagnostics file",
+    "av-findings": "Show antivirus findings", "snapshots-clean": "Free space from old snapshots",
+    "disk": "See what's using disk space", "vpn": "Set up VPN", "vpn-renew": "Renew VPN subscription",
+    "recovery-key": "Make a disk recovery key", "backup": "Check backups", "battery": "Battery care",
+    "hibernate": "Hibernate settings", "outside-apps": "Update apps from outside Fedora",
+}
+
+
+def home():
+    return os.environ.get("HOME") or os.environ.get("USERPROFILE") or os.path.expanduser("~")
+
+
+def user():
+    return os.environ.get("USER") or os.environ.get("LOGNAME") or getpass.getuser()
+
+
+def state_dir():
+    return os.environ.get("SL_STATE", "/var/lib/secure-linux")
+
+
+def etc_dir():
+    return os.environ.get("SL_ETC", "/etc/secure-linux")
+
+
+def now():
+    """Seconds since 1970. SL_DAILY_NOW lets a test fix the clock."""
+    try:
+        return float(os.environ["SL_DAILY_NOW"])
+    except (KeyError, ValueError):
+        return datetime.datetime.now().timestamp()
+
+
+def read_lines(path):
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            return [ln.rstrip("\r\n") for ln in fh]
+    except OSError:
+        return []
+
+
+def area_of(item_id):
+    for area, pattern in AREA_PATTERNS:
+        if re.search(pattern, item_id):
+            return area
+    return "other"
+
+
+def read_checks(state):
+    """results lines  id|status|label|detail|fix   (a '|' inside the detail is kept)."""
+    rows = {}
+    for ln in read_lines(os.path.join(state, "checks")):
+        parts = ln.split("|")
+        if len(parts) < 3 or not parts[0].strip():
+            continue
+        item_id, status, label = parts[0].strip(), parts[1].strip(), parts[2].strip()
+        fix = parts[-1].strip() if len(parts) >= 5 else ""
+        detail = "|".join(parts[3:-1]) if len(parts) >= 5 else "|".join(parts[3:])
+        rows[item_id] = {"id": item_id, "status": status, "label": label, "detail": detail.strip(), "fix": fix}
+    return rows
+
+
+def read_alerts(state):
+    """Alerts the helpers wrote: first line title, second line message, third line action hint."""
+    found = {}
+    for folder in (os.path.join(state, "alerts.d"), os.path.join(state, "user-alerts", user())):
+        try:
+            names = sorted(os.listdir(folder))
+        except OSError:
+            continue
+        for name in names:
+            path = os.path.join(folder, name)
+            if not os.path.isfile(path):
+                continue
+            lines = read_lines(path)
+            title = lines[0].strip() if lines else ""
+            if not title:
+                continue
+            found[name] = {"id": name, "title": title, "message": lines[1].strip() if len(lines) > 1 else "",
+                           "hint": lines[2].strip() if len(lines) > 2 else ""}
+    return found
+
+
+def clean(text):
+    return re.sub(r"\s+", " ", text or "").strip()
+
+
+def sentence(text):
+    """Text with no full stop at the end (a question mark or exclamation mark stays)."""
+    return clean(text).rstrip(". ")
+
+
+def then(text, more):
+    """text followed by more, with a full stop in between unless text already ends with ? or !"""
+    return "%s%s %s" % (text, "" if text[-1:] in "?!" else ".", more)
+
+
+def problems(rows, alerts):
+    """List of problem dicts, worst first. An alert and a row with the same id are one problem."""
+    out = []
+    for item_id, alert in alerts.items():
+        soft = item_id in SOFT_ALERTS
+        row = rows.get(item_id)
+        fix = row["fix"] if row else ""
+        hint = alert["hint"]
+        if not hint:
+            hint = "Open 'Secure Linux Status & Fixes' and choose '%s'." % FIX_LABELS[fix] if fix in FIX_LABELS \
+                else "Open 'Secure Linux Status & Fixes' to see what to do."
+        out.append({"id": item_id, "rank": 1 if soft else 0, "area": area_of(item_id),
+                    "text": sentence(alert["title"]), "hint": clean(hint)})
+    for item_id, row in rows.items():
+        if item_id in alerts or row["status"] not in ("bad", "warn"):
+            continue
+        if row["status"] == "warn" and item_id in INFO_ONLY:
+            continue
+        what = clean(row["label"])
+        if row["detail"]:
+            what = "%s: %s" % (what, sentence(row["detail"]))
+        fix = row["fix"]
+        hint = "Open 'Secure Linux Status & Fixes' and choose '%s'." % FIX_LABELS[fix] if fix in FIX_LABELS \
+            else "Open 'Secure Linux Status & Fixes' to see what to do."
+        out.append({"id": item_id, "rank": 0 if row["status"] == "bad" else 1, "area": area_of(item_id),
+                    "text": sentence(what), "hint": hint})
+    out.sort(key=lambda p: (p["rank"], PICK_ORDER.index(p["area"]), p["id"]))
+    return out
+
+
+def checked_age_days(state):
+    """Days since the last health check, or None when unknown."""
+    lines = read_lines(os.path.join(state, "checks.time"))
+    if not lines:
+        return None
+    try:
+        when = datetime.datetime.strptime(lines[0].strip(), "%Y-%m-%d %H:%M")
+    except ValueError:
+        return None
+    return max(0, int((now() - when.timestamp()) // 86400))
+
+
+def build_line(state=None):
+    state = state or state_dir()
+    rows = read_checks(state)
+    alerts = read_alerts(state)
+    found = problems(rows, alerts)
+    if found:
+        first = found[0]
+        line = then("One thing to do: " + first["text"], first["hint"])
+        if len(found) > 1:
+            more = len(found) - 1
+            line += " (%d more %s waiting in Secure Linux Status.)" % (more, "thing is" if more == 1 else "things are")
+        return line, "problem"
+    if not rows:
+        return ("No health check has run on this computer yet. Open 'Secure Linux Status & Fixes' and choose "
+                "'Check again'."), "unknown"
+    age = checked_age_days(state)
+    if age is None or age > STALE_DAYS:
+        when = "a while ago" if age is None else "%d days ago" % age
+        return ("I can't tell yet: the last health check was %s. Open 'Secure Linux Status & Fixes' and choose "
+                "'Check again'." % when), "unknown"
+    seen = {area_of(i) for i in rows}
+    missing = [a for a in AREAS if a not in seen]
+    if missing:
+        names = (", ".join(missing[:-1]) + " and " + missing[-1]) if len(missing) > 1 else missing[0]
+        return ("Nothing is wrong, but there is no result yet for %s. Open 'Secure Linux Status & Fixes' and choose "
+                "'Check again'." % names), "unknown"
+    return "All good: backups, updates, disk and security look fine.", "good"
+
+
+def summary_off():
+    for ln in read_lines(os.path.join(etc_dir(), "choices")):
+        if ln.strip() == "daily_summary=off":
+            return True
+    return False
+
+
+def notify(line, kind):
+    """One quiet notification per day. Nothing is sent anywhere but the desktop's own notice."""
+    state_file = os.path.join(home(), ".local", "state", "secure-linux", "daily-summary")
+    today = datetime.datetime.fromtimestamp(now()).strftime("%Y-%m-%d")
+    previous = read_lines(state_file)
+    if previous and previous[0].strip() == today:
+        return False
+    try:
+        os.makedirs(os.path.dirname(state_file), exist_ok=True)
+        with open(state_file, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(today + "\n" + line + "\n")
+    except OSError:
+        pass
+    try:
+        subprocess.run([shutil.which("notify-send") or "notify-send", "--app-name=Secure Linux", "--icon=computer",
+                        "--urgency=" + ("low" if kind == "good" else "normal"),
+                        "Your computer today", line], timeout=20, check=False,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return True
+
+
+def main(argv):
+    args = argv[1:]
+    if any(a in ("-h", "--help") for a in args):
+        print(__doc__.strip())
+        return 0
+    unknown = [a for a in args if a not in ("--pause", "--notify")]
+    if unknown:
+        print("Unknown option: %s (see --help)" % unknown[0], file=sys.stderr)
+        return 2
+    line, kind = build_line()
+    if "--notify" in args:
+        if summary_off():
+            return 0
+        notify(line, kind)
+        return 0
+    print(line)
+    if "--pause" in args:
+        try:
+            input("\nPress Enter to close. ")
+        except EOFError:
+            pass
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

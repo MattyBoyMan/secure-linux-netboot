@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<!-- Secure Linux: clear password prompts for the two drive tools (test a new drive, make several drives at once).
+     Installed by steps/00-early.sh to /usr/share/polkit-1/actions/. Each action is tied to its one program path.
+     Both tools erase USB drives, so the password is asked every time (no remembered answer). -->
+<policyconfig>
+  <vendor>The Complete Secure Linux Package</vendor>
+  <action id="org.securelinux.drivetools.test">
+    <description>Test a USB drive</description>
+    <message>Secure Linux needs your password to test this USB drive. Testing erases everything on it.</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/bin/secure-linux-drive-test</annotate>
+  </action>
+  <action id="org.securelinux.drivetools.multi">
+    <description>Make several Secure Linux drives at once</description>
+    <message>Secure Linux needs your password to make several drives at once. Making them erases everything on those drives.</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/bin/secure-linux-usb-multi</annotate>
+  </action>
+</policyconfig>

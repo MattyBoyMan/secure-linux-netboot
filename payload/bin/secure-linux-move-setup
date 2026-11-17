@@ -1,0 +1,384 @@
+#!/bin/bash
+# secure-linux-move-setup: move your setup to another Secure Linux computer (apps, choices, desktop look and files).
+#   secure-linux-move-setup                              (from the menu) asks what you want to do
+#   secure-linux-move-setup pack FOLDER [--with-files] [--yes]
+#                                  put this computer's setup in a new folder inside FOLDER (a USB drive, for example);
+#                                  --with-files also copies Desktop, Documents, Downloads, Music, Pictures and Videos
+#   secure-linux-move-setup check FOLDER                 is this moved setup complete and safe to bring in?
+#   secure-linux-move-setup unpack FOLDER [--yes]        bring a moved setup into this computer (never overwrites);
+#                                  FOLDER is the Secure-Linux-Move-... folder, or the drive that holds only one
+#   secure-linux-move-setup install-apps ITEM...         (asks for your password) install the apps of a moved setup
+#   secure-linux-move-setup apply-pending                (run at start-up) put the moved desktop settings in place
+# Never moved: passwords, saved Wi-Fi networks, keys, browser data, messages, email and the backup key.
+# The moved setup is checked before anything is used: a damaged or changed folder is refused and nothing changes.
+# Your files are never overwritten: a different file with the same name is saved as "name (from old computer)".
+set -u   # no pipefail: "cmd | grep -q" must not fail when grep stops reading early
+export LC_ALL=C
+SL_ROOT=${SL_ROOT:-/usr/local/lib/secure-linux}
+# shellcheck source=../lib/common.sh
+. "$SL_ROOT/lib/common.sh"
+# shellcheck source=../files/movereset/movereset-lib.sh
+. "$SL_ROOT/files/movereset/movereset-lib.sh"
+
+usage() { sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'; }
+CMD=${1:-start}; [ $# -gt 0 ] && shift
+case "$CMD" in
+  -h|--help|help) usage; exit 0 ;;
+  start|pack|check|unpack|install-apps|apply-pending) ;;
+  *) echo "Unknown command: $CMD" >&2; usage >&2; exit 2 ;;
+esac
+YES=0 WITH_FILES=0 TARGET="" ITEMS=() IN_MENU=0
+for a in "$@"; do
+  case "$CMD:$a" in
+    *:-h|*:--help) usage; exit 0 ;;
+    install-apps:*) ITEMS+=("$a") ;;
+    *:--yes) YES=1 ;;
+    pack:--with-files) WITH_FILES=1 ;;
+    *:-*) echo "Unknown option: $a" >&2; usage >&2; exit 2 ;;
+    *) [ -z "$TARGET" ] || { echo "Name one folder only." >&2; exit 2; }; TARGET=$a ;;
+  esac
+done
+SELF=/usr/local/bin/secure-linux-move-setup; [ -x "$SELF" ] || SELF=$(readlink -f "$0")   # polkit names /usr/local/bin
+case "$CMD" in
+  install-apps) [ "$(id -u)" -eq 0 ] || exec pkexec "$SELF" install-apps "${ITEMS[@]}" ;;
+  start) trap mr_hold_window EXIT ;;   # the menu window stays open until the person has read the result
+  pack|unpack|apply-pending) [ "$(id -u)" -ne 0 ] || mr_die "Run this as yourself, not as the administrator: your own settings and files are used. Nothing was changed." 1 ;;
+esac
+FORMAT=secure-linux-move-setup
+# Settings brought in are cleaned first: mr_stage_setting (files/movereset/movereset-lib.sh) says what is left out.
+say() { mr_say "$@"; }
+human() { awk -v k="$1" 'BEGIN { if (k >= 1048576) printf "%.1f GB", k/1048576; else if (k >= 1024) printf "%.0f MB", k/1024; else printf "%d KB", k }'; }
+
+# ---------------------------------------------------------------- pack (this computer -> a folder)
+settings_present() {   # the move-settings files that exist here (regular files only, never links)
+  local rel f
+  while IFS= read -r rel; do
+    mr_never "$rel" && continue
+    if [ -f "$HOME/$rel" ] && [ ! -L "$HOME/$rel" ]; then printf '%s\n' "$rel"
+    elif [ -d "$HOME/$rel" ] && [ ! -L "$HOME/$rel" ]; then
+      (cd "$HOME" && find "$rel" -type f 2>/dev/null) | while IFS= read -r f; do mr_safe_rel "$f" && printf '%s\n' "$f"; done
+    fi
+  done < <(mr_list move-settings)
+}
+folder_sources() {   # lines KEY<TAB>FOLDER for each folder of files that exists here
+  local k d
+  for k in $MR_FOLDER_KEYS; do
+    d=$(mr_user_folder "$k"); [ -d "$d" ] && [ ! -L "$d" ] && printf '%s\t%s\n' "$k" "$d"
+  done
+}
+inside() { local a b; a=$(realpath -m "$1" 2>/dev/null) b=$(realpath -m "$2" 2>/dev/null); [ "$a" = "$b" ] || case "$a" in "$b"/*) return 0 ;; *) return 1 ;; esac; }
+cmd_pack() {
+  local dest k d kb=0 free st name n=0 skipped=0 failed=0 rel f id fl
+  [ -n "$TARGET" ] || mr_die "Say where to put the moved setup, for example: secure-linux-move-setup pack /run/media/$USER/MYDRIVE" 2
+  [ -d "$TARGET" ] || mr_die "The folder $TARGET was not found. Nothing was changed." 1
+  [ -w "$TARGET" ] || mr_die "The folder $TARGET cannot be written to. Nothing was changed." 1
+  if [ "$WITH_FILES" = 1 ]; then
+    while IFS=$'\t' read -r k d; do
+      inside "$TARGET" "$d" && mr_die "The folder $TARGET is inside your $k folder, which is being copied. Choose another place, such as a USB drive. Nothing was changed." 1
+      kb=$((kb + $(mr_size_kb "$d")))
+    done < <(folder_sources)
+  fi
+  free=$(mr_free_kb "$TARGET"); free=${free:-0}
+  say "Move my setup: what goes into the moved setup."
+  say "  - The list of your apps (app store apps and the optional apps you chose)."
+  say "  - Your Secure Linux choices (only app and comfort choices, never passwords or keys)."
+  say "  - Your desktop look: $(settings_present | grep -c .) settings files."
+  if [ "$WITH_FILES" = 1 ]; then say "  - Your files: $(folder_sources | cut -f1 | mr_join) (about $(human "$kb"))."
+  else say "  - Not your files (add --with-files to copy Desktop, Documents, Downloads, Music, Pictures and Videos)."; fi
+  say "Never moved: passwords, saved Wi-Fi networks, keys, browser data, messages, email and the backup key."
+  if [ "$free" -lt $((kb + kb / 20 + 10240)) ]; then
+    mr_die "There is not enough free space in $TARGET: about $(human $((kb + 10240))) is needed and $(human "$free") is free. Nothing was changed." 1
+  fi
+  if [ "$YES" != 1 ]; then say ""; [ "$IN_MENU" = 1 ] || say "Run again with --yes to do it."; return 3; fi
+  umask 077
+  st=$(mr_stamp); name=Secure-Linux-Move-$st; dest=$TARGET/$name
+  [ -e "$dest" ] && mr_die "A folder called $name is already there. Nothing was changed." 1
+  mkdir -p "$dest/apps" "$dest/choices" "$dest/settings" || mr_die "The folder $dest could not be made. Nothing was changed." 1
+  fl=$(mr_flatpaks_now) || fl=""
+  printf '%s\n' "$fl" | grep . > "$dest/apps/flatpak.txt"
+  grep -v '^[[:space:]]*#' "$SL_ETC/app-library.list" 2>/dev/null | while IFS= read -r id; do
+    mr_applib_id_ok "$id" && printf '%s\n' "$id"
+  done > "$dest/apps/app-library.txt"
+  if [ -f "$SL_ROOT/bin/secure-linux-finish" ]; then
+    bash "$SL_ROOT/bin/secure-linux-finish" export "$dest/choices" >/dev/null 2>&1 </dev/null ||
+      say "Note: your Secure Linux choices could not be added (there may be none to move)."
+    find "$dest/choices" -type f ! -name 'secure-linux-choices.json' -exec rm -f {} + 2>/dev/null
+  fi
+  while IFS= read -r rel; do
+    if ! { mkdir -p "$dest/settings/$(dirname "$rel")" && cp --preserve=timestamps "$HOME/$rel" "$dest/settings/$rel" 2>/dev/null; }; then
+      rm -f "$dest/settings/$rel"; failed=$((failed + 1))   # never a half-copied file in the moved setup
+    fi
+  done < <(settings_present)
+  if [ "$WITH_FILES" = 1 ]; then
+    while IFS=$'\t' read -r k d; do
+      mkdir -p "$dest/files/$k"
+      while IFS= read -r -d '' f; do
+        f=${f#./}
+        if ! mr_safe_rel "$f"; then skipped=$((skipped + 1)); continue; fi
+        if mkdir -p "$dest/files/$k/$(dirname "$f")" && cp --preserve=timestamps "$d/$f" "$dest/files/$k/$f" 2>/dev/null; then n=$((n + 1))
+        else rm -f "$dest/files/$k/$f"; failed=$((failed + 1)); fi   # a file too big for the drive leaves nothing behind
+      done < <(cd "$d" && find . -type f -print0 2>/dev/null)
+      skipped=$((skipped + $(cd "$d" && find . ! -type f ! -type d 2>/dev/null | grep -c .)))
+    done < <(folder_sources)
+  fi
+  printf 'format=%s\nversion=1\ncreated=%s\nfrom=%s\nfiles=%s\n' "$FORMAT" "$(date '+%Y-%m-%d %H:%M')" \
+    "$(hostname 2>/dev/null | tr -cd 'A-Za-z0-9._-')" "$([ "$WITH_FILES" = 1 ] && echo yes || echo no)" > "$dest/MOVE-SETUP.txt"
+  cat > "$dest/READ-ME.txt" <<'EOF'
+This folder is a moved Secure Linux setup: your app list, your Secure Linux choices, your desktop look and
+(if you chose it) a copy of your files. It holds NO passwords, Wi-Fi keys, keys, browser data or messages.
+On the other Secure Linux computer, open "Move My Setup" from the app menu and choose "Bring in a setup",
+or run:  secure-linux-move-setup unpack "<this folder>"
+Keep this drive safe: it holds a copy of your personal files. Delete this folder when the move is done.
+EOF
+  (cd "$dest" && find . -type f ! -path ./SHA256SUMS ! -path ./SHA256SUMS.tmp -print0 | sort -z | xargs -0 -r sha256sum | sed 's#^\([0-9a-f]\{64\}\) [ *]\./#\1  #') > "$dest/SHA256SUMS.tmp" &&
+    mv "$dest/SHA256SUMS.tmp" "$dest/SHA256SUMS" || mr_die "The check list of the moved setup could not be written. Delete $dest and try again." 1
+  say ""
+  say "Done. Your setup is in: $dest"
+  [ "$WITH_FILES" = 1 ] && say "$n files copied."
+  [ "$skipped" -gt 0 ] && say "$skipped items were left out (shortcuts, links or names that cannot be moved safely)."
+  [ "$failed" -gt 0 ] && say "$failed files could not be copied (the drive may be full, or not allow their names or sizes). They are still on this computer."
+  say "This folder holds a copy of your personal files. Keep the drive safe and delete the folder after the move."
+  return 0
+}
+
+# ---------------------------------------------------------------- check (a folder from somewhere else: untrusted)
+PROBLEMS=()
+problem() { PROBLEMS+=("$1"); }
+allowed_entry() {   # allowed_entry REL   -> true for a path a moved setup may hold
+  local rel=$1 key rest
+  case "$rel" in
+    MOVE-SETUP.txt|READ-ME.txt|apps/flatpak.txt|apps/app-library.txt|choices/secure-linux-choices.json) return 0 ;;
+    settings/*) rest=${rel#settings/}; mr_listed move-settings "$rest" && ! mr_never "$rest" ;;
+    files/*/*) rest=${rel#files/}; key=${rest%%/*}
+      case " $MR_FOLDER_KEYS " in *" $key "*) return 0 ;; esac; return 1 ;;
+    *) return 1 ;;
+  esac
+}
+check_bundle() {   # check_bundle DIR   -> 0 when the moved setup is complete and safe; PROBLEMS lists what is wrong
+  local dir=$1 line h rel n_list=0 n_files id
+  PROBLEMS=()
+  [ -d "$dir" ] || { problem "The folder $dir was not found."; return 1; }
+  [ -f "$dir/MOVE-SETUP.txt" ] && [ ! -L "$dir/MOVE-SETUP.txt" ] || { problem "This is not a moved Secure Linux setup (MOVE-SETUP.txt is missing)."; return 1; }
+  [ "$(sed -n 's/^format=//p' "$dir/MOVE-SETUP.txt" | head -n 1)" = "$FORMAT" ] || problem "This is not a moved Secure Linux setup (wrong kind of folder)."
+  [ "$(sed -n 's/^version=//p' "$dir/MOVE-SETUP.txt" | head -n 1)" = 1 ] || problem "This moved setup was made by a different version of Secure Linux that this computer does not know."
+  [ -f "$dir/SHA256SUMS" ] && [ ! -L "$dir/SHA256SUMS" ] || { problem "The check list (SHA256SUMS) is missing, so the folder cannot be checked."; return 1; }
+  if [ -n "$(find "$dir" ! -type f ! -type d -print -quit 2>/dev/null)" ]; then
+    problem "The folder holds links or special files. A moved setup only holds plain files."
+  fi
+  while IFS= read -r line || [ -n "$line" ]; do
+    n_list=$((n_list + 1))
+    [[ "$line" =~ ^([0-9a-f]{64})\ \ (.+)$ ]] || { problem "Line $n_list of the check list is not in the right form."; continue; }
+    h=${BASH_REMATCH[1]}; rel=${BASH_REMATCH[2]}
+    mr_safe_rel "$rel" || { problem "The check list names an unsafe place: line $n_list."; continue; }
+    allowed_entry "$rel" || { problem "The moved setup holds something that is never brought in: $rel"; continue; }
+    [ -f "$dir/$rel" ] || problem "A file named in the check list is missing: $rel"
+  done < "$dir/SHA256SUMS"
+  [ "$(cut -c67- "$dir/SHA256SUMS" | sort | uniq -d | grep -c .)" -eq 0 ] || problem "The check list names a file twice."
+  n_files=$(cd "$dir" && find . -type f ! -path ./SHA256SUMS | grep -c .)
+  [ "$n_files" -eq "$n_list" ] || problem "The folder holds files that are not on its check list ($n_files files, $n_list listed)."
+  if [ "${#PROBLEMS[@]}" -eq 0 ]; then
+    (cd "$dir" && sha256sum --quiet -c SHA256SUMS >/dev/null 2>&1) || problem "Some files were changed or damaged after the setup was packed."
+  fi
+  while IFS= read -r id; do [ -z "$id" ] || mr_flatpak_id_ok "$id" || problem "The app list holds a name that is not an app: $id"; done < <(cat "$dir/apps/flatpak.txt" 2>/dev/null)
+  while IFS= read -r id; do [ -z "$id" ] || mr_applib_id_ok "$id" || problem "The optional app list holds a name that is not an app: $id"; done < <(cat "$dir/apps/app-library.txt" 2>/dev/null)
+  if [ -f "$dir/choices/secure-linux-choices.json" ] && [ "$(stat -c %s "$dir/choices/secure-linux-choices.json" 2>/dev/null || echo 9999999)" -gt 1048576 ]; then
+    problem "The choices file is too large."
+  fi
+  [ "${#PROBLEMS[@]}" -eq 0 ]
+}
+find_bundle() {   # TARGET is a drive or folder holding moved setups, not one itself: use the only one inside it
+  local d found=()
+  [ -d "$TARGET" ] && [ ! -e "$TARGET/MOVE-SETUP.txt" ] || return 0
+  for d in "$TARGET"/Secure-Linux-Move-*; do [ -d "$d" ] && [ -f "$d/MOVE-SETUP.txt" ] && found+=("$d"); done
+  case ${#found[@]} in
+    0) return 0 ;;   # check_bundle says what is missing
+    1) TARGET=${found[0]}; say "Using the moved setup found in this folder: ${TARGET##*/}" ;;
+    *) say "This folder holds ${#found[@]} moved setups. Choose the Secure-Linux-Move-... folder you want (the newest is last):"
+       printf '  %s\n' "${found[@]}"
+       mr_die "Nothing was changed." 1 ;;
+  esac
+}
+cmd_check() {
+  [ -n "$TARGET" ] || mr_die "Say which moved setup to check, for example: secure-linux-move-setup check /run/media/$USER/MYDRIVE/Secure-Linux-Move-..." 2
+  find_bundle
+  if check_bundle "$TARGET"; then
+    say "This moved setup is complete and safe to bring in (made $(sed -n 's/^created=//p' "$TARGET/MOVE-SETUP.txt" | head -n 1) on $(sed -n 's/^from=//p' "$TARGET/MOVE-SETUP.txt" | head -n 1 | tr -cd 'A-Za-z0-9._-'))."
+    return 0
+  fi
+  say "This moved setup cannot be used. Nothing was changed. What is wrong:"
+  printf '  - %s\n' "${PROBLEMS[@]}"
+  return 1
+}
+
+# ---------------------------------------------------------------- unpack (a folder -> this computer)
+target_for() {   # target_for SRC DEST   -> where SRC goes: DEST when it is free, else "name (from old computer).ext"
+                 # (numbered when taken); nothing when the same file is already there (so running again is safe)
+  local src=$1 p=$2 dir base stem ext cand n=1
+  if [ ! -e "$p" ] && [ ! -L "$p" ]; then printf '%s' "$p"; return 0; fi
+  [ -f "$p" ] && [ ! -L "$p" ] && cmp -s "$src" "$p" && return 0
+  dir=$(dirname "$p"); base=$(basename "$p")
+  case "$base" in .*|*.) stem=$base; ext="" ;; *.*) stem=${base%.*}; ext=.${base##*.} ;; *) stem=$base; ext="" ;; esac
+  cand="$dir/$stem (from old computer)$ext"
+  while [ -e "$cand" ] || [ -L "$cand" ]; do
+    [ -f "$cand" ] && [ ! -L "$cand" ] && cmp -s "$src" "$cand" && return 0
+    n=$((n + 1)); cand="$dir/$stem (from old computer $n)$ext"
+  done
+  printf '%s' "$cand"
+}
+cmd_unpack() {
+  local dir kb free rel k rest base dest st stage n_same=0 n_new=0 n_alt=0 n_fail=0 n_set=0 items=() id
+  [ -n "$TARGET" ] || mr_die "Say which moved setup to bring in, for example: secure-linux-move-setup unpack /run/media/$USER/MYDRIVE/Secure-Linux-Move-..." 2
+  mr_in_rollback_session && mr_die "You are using an earlier day from the boot menu right now. Restart normally first. Nothing was changed." 3
+  find_bundle; dir=$TARGET
+  if ! check_bundle "$dir"; then
+    say "This moved setup cannot be used. Nothing was changed. What is wrong:"
+    printf '  - %s\n' "${PROBLEMS[@]}"
+    return 1
+  fi
+  kb=0; [ -d "$dir/files" ] && kb=$(mr_size_kb "$dir/files")
+  free=$(mr_free_kb "$HOME"); free=${free:-0}
+  say "Bring in a moved setup (made $(sed -n 's/^created=//p' "$dir/MOVE-SETUP.txt" | head -n 1)). What would happen:"
+  say "  - Apps to install: $(cat "$dir/apps/flatpak.txt" "$dir/apps/app-library.txt" 2>/dev/null | grep -c .) (only the missing ones; asks for your password once)."
+  [ -f "$dir/choices/secure-linux-choices.json" ] && say "  - Your Secure Linux choices: shown to you first, then applied only if you say yes (this can ask for your password)."
+  say "  - Desktop look: $(find "$dir/settings" -type f 2>/dev/null | grep -c .) settings files, put in place at the next start."
+  say "    The settings you have now are saved first in Secure-Linux-before-move-<date> in your home folder."
+  if [ -d "$dir/files" ]; then
+    say "  - Your files: $(find "$dir/files" -type f | grep -c .) files (about $(human "$kb")) into your own folders."
+    say "    Nothing is overwritten: a different file with the same name is saved as \"name (from old computer)\"."
+  fi
+  if [ "$free" -lt $((kb + kb / 20 + 10240)) ]; then
+    mr_die "There is not enough free space on this computer: about $(human $((kb + 10240))) is needed and $(human "$free") is free. Nothing was changed." 1
+  fi
+  if [ "$YES" != 1 ]; then say ""; [ "$IN_MENU" = 1 ] || say "Run again with --yes to do it."; return 3; fi
+  st=$(mr_stamp)
+  # 1. files: never overwritten, program bits removed
+  if [ -d "$dir/files" ]; then
+    while IFS= read -r -d '' rel; do
+      rel=${rel#./}; k=${rel%%/*}; rest=${rel#*/}
+      mr_safe_rel "$rel" && [ "$rest" != "$rel" ] || { n_fail=$((n_fail + 1)); continue; }
+      base=$(mr_user_folder "$k") || { n_fail=$((n_fail + 1)); continue; }
+      dest=$(target_for "$dir/files/$rel" "$base/$rest")
+      if [ -z "$dest" ]; then n_same=$((n_same + 1)); continue; fi
+      if [ "$dest" = "$base/$rest" ]; then n_new=$((n_new + 1)); else n_alt=$((n_alt + 1)); fi
+      if mkdir -p "$(dirname "$dest")" && cp --preserve=timestamps "$dir/files/$rel" "$dest"; then chmod a-x "$dest" 2>/dev/null
+      else rm -f "$dest"; n_fail=$((n_fail + 1)); fi   # never a half-copied file (a new name: nothing of yours)
+    done < <(cd "$dir/files" && find . -type f -print0)
+    say "Files: $n_new new, $n_same already here, $n_alt saved with \"(from old computer)\" in the name, $n_fail not copied."
+  fi
+  # 2. desktop look: staged now, put in place at the next start (lines that name a program are left out)
+  if [ -d "$dir/settings" ]; then
+    stage=$MR_USTATE/move-in-$st
+    rm -rf "$stage"; mkdir -p "$stage"
+    while IFS= read -r -d '' rel; do
+      rel=${rel#./}
+      mr_safe_rel "$rel" && mr_listed move-settings "$rel" && ! mr_never "$rel" || continue
+      if mkdir -p "$stage/$(dirname "$rel")" && mr_stage_setting "$dir/settings/$rel" "$stage/$rel"; then n_set=$((n_set + 1))
+      else rm -f "$stage/$rel"; fi
+    done < <(cd "$dir/settings" && find . -type f -print0)
+    if [ "$n_set" -gt 0 ]; then printf 'move-in-%s\n' "$st" > "$MR_USTATE/move-settings.pending"; else rm -rf "$stage"; fi
+  fi
+  # 3. Secure Linux choices: the finishing tool checks them, shows them and asks before anything changes
+  if [ -f "$dir/choices/secure-linux-choices.json" ] && [ -f "$SL_ROOT/bin/secure-linux-finish" ]; then
+    bash "$SL_ROOT/bin/secure-linux-finish" import "$dir/choices/secure-linux-choices.json" || say "Your Secure Linux choices were not applied."
+  fi
+  # 4. apps: one password prompt for all of them
+  while IFS= read -r id; do [ -n "$id" ] && mr_flatpak_id_ok "$id" && items+=("flatpak:$id"); done < <(cat "$dir/apps/flatpak.txt" 2>/dev/null)
+  while IFS= read -r id; do [ -n "$id" ] && mr_applib_id_ok "$id" && items+=("library:$id"); done < <(cat "$dir/apps/app-library.txt" 2>/dev/null)
+  if [ "${#items[@]}" -gt 0 ]; then
+    pkexec "$SELF" install-apps "${items[@]}" || say "Some apps were not installed now. Run this again when the computer is online; finished parts are skipped."
+  fi
+  printf '%s unpack from %s: files %s new %s alt %s same %s failed; settings %s; apps %s\n' "$(date '+%Y-%m-%d %H:%M')" \
+    "$(sed -n 's/^from=//p' "$dir/MOVE-SETUP.txt" | head -n 1 | tr -cd 'A-Za-z0-9._-')" "$n_new" "$n_alt" "$n_same" "$n_fail" "$n_set" "${#items[@]}" >> "$MR_USTATE/history.log" 2>/dev/null
+  say ""
+  say "Done. Restart the computer to finish: your desktop look is put in place at the next start."
+  return 0
+}
+
+# ---------------------------------------------------------------- install the apps (administrator)
+cmd_install_apps() {
+  local it id al rc=0 n=0 scratch
+  al=$SL_ROOT/bin/secure-linux-app-library; [ -f "$al" ] || al=/usr/local/bin/secure-linux-app-library
+  # not part of a setup run: a failed install must not land in setup's failure list (same as the App Library)
+  scratch=$(mktemp) || scratch=/dev/null
+  for it in "${ITEMS[@]}"; do
+    case "$it" in
+      flatpak:*) id=${it#flatpak:}
+        mr_flatpak_id_ok "$id" || { echo "Refusing a name that is not an app: $id" >&2; rc=2; continue; }
+        if SL_FAILS=$scratch sl_flatpak_install "$id"; then n=$((n + 1)); else rc=1; fi ;;
+      library:*) id=${it#library:}
+        mr_applib_id_ok "$id" || { echo "Refusing a name that is not an app: $id" >&2; rc=2; continue; }
+        if [ -f "$al" ] && bash "$al" install "$id"; then n=$((n + 1)); else rc=1; fi ;;
+      *) echo "Refusing an unknown item: $it" >&2; rc=2 ;;
+    esac
+  done
+  [ "$scratch" = /dev/null ] || rm -f "$scratch"
+  say "$n app(s) ready."
+  return $rc
+}
+
+# ---------------------------------------------------------------- at the next start, before the desktop starts
+cmd_apply_pending() {
+  local name stage rel dest aside st n=0
+  [ -f "$MR_USTATE/move-settings.pending" ] || return 0
+  name=$(sed -n '1p' "$MR_USTATE/move-settings.pending")
+  rm -f "$MR_USTATE/move-settings.pending"
+  [[ "$name" =~ ^move-in-[0-9]{8}-[0-9]{6}$ ]] && [ -d "$MR_USTATE/$name" ] || { echo "The moved settings were not found; nothing was changed."; return 0; }
+  stage=$MR_USTATE/$name; st=$(mr_stamp); aside=$HOME/Secure-Linux-before-move-$st
+  while IFS= read -r -d '' rel; do
+    rel=${rel#./}
+    mr_safe_rel "$rel" && mr_listed move-settings "$rel" && ! mr_never "$rel" || continue
+    dest=$HOME/$rel
+    if [ -e "$dest" ] || [ -L "$dest" ]; then
+      cmp -s "$stage/$rel" "$dest" && continue
+      mkdir -p "$aside/$(dirname "$rel")" && mv -- "$dest" "$aside/$rel" || continue
+    fi
+    mkdir -p "$(dirname "$dest")" && cp "$stage/$rel" "$dest" && chmod a-x "$dest" && n=$((n + 1))
+  done < <(cd "$stage" && find . -type f -print0)
+  rm -rf "$stage"
+  printf '%s moved settings put in place: %s\n' "$(date '+%Y-%m-%d %H:%M')" "$n" >> "$MR_USTATE/history.log"
+  return 0
+}
+
+# ---------------------------------------------------------------- from the menu
+pick_folder() {   # pick_folder QUESTION   -> a folder, chosen in a window when one can open, else typed
+  local q=$1 f=""
+  if [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]; then
+    if mr_have kdialog; then f=$(kdialog --title "Move My Setup" --getexistingdirectory "$HOME" 2>/dev/null)
+    elif mr_have zenity; then f=$(zenity --file-selection --directory --title="$q" 2>/dev/null); fi
+  fi
+  if [ -z "$f" ]; then printf '%s ' "$q" >&2; IFS= read -r f || f=""; f=${f%$'\r'}; fi
+  printf '%s' "$f"
+}
+cmd_start() {
+  local a y
+  IN_MENU=1
+  say "Move My Setup"
+  say "  1) Pack this computer's setup, to take it to another Secure Linux computer"
+  say "  2) Bring in a setup packed on another Secure Linux computer"
+  say "  3) Nothing, close this window"
+  printf '%s' "Type 1, 2 or 3: "; IFS= read -r a || a=3; a=${a%$'\r'}
+  case "$a" in
+    1) TARGET=$(pick_folder "Where should the moved setup go (for example your USB drive)?")
+       [ -n "$TARGET" ] || { say "Nothing was changed."; return 0; }
+       printf '%s' "Also copy your files (Desktop, Documents, Downloads, Music, Pictures, Videos)? Type yes or no: "
+       IFS= read -r y || y=no; y=${y%$'\r'}; [ "$y" = yes ] && WITH_FILES=1
+       cmd_pack; [ $? -eq 3 ] || return 0 ;;
+    2) TARGET=$(pick_folder "Which moved setup (the Secure-Linux-Move-... folder, or the drive that holds it)?")
+       [ -n "$TARGET" ] || { say "Nothing was changed."; return 0; }
+       cmd_unpack; [ $? -eq 3 ] || return 0 ;;
+    *) say "Nothing was changed."; return 0 ;;
+  esac
+  printf '%s' "Type yes to start, anything else stops: "; IFS= read -r y || y=""; y=${y%$'\r'}
+  [ "$y" = yes ] || { say "Nothing was changed."; return 0; }
+  YES=1
+  if [ "$a" = 1 ]; then cmd_pack; else cmd_unpack; fi
+}
+
+case "$CMD" in
+  start) cmd_start ;;
+  pack) cmd_pack ;;
+  check) cmd_check ;;
+  unpack) cmd_unpack ;;
+  install-apps) cmd_install_apps ;;
+  apply-pending) cmd_apply_pending ;;
+esac

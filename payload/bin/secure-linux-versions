@@ -1,0 +1,39 @@
+#!/bin/sh
+# secure-linux-versions: the Versions screen. Which release is on this computer, on your saved master,
+# on a plugged-in drive, and on GitHub. Buttons: Update now, Undo last update, What changed,
+# Explain this update, Never check online, Testing channel.
+#   secure-linux-versions            open the window
+#   secure-linux-versions --text     print the same facts here, no window
+#   secure-linux-versions --json     print the same facts as JSON, no window
+# Reading uses no internet. The buttons start the kit's own tools, which ask for your password themselves.
+set -u
+SELF=$(readlink -f "$0" 2>/dev/null || printf '%s\n' "$0")
+HERE=$(dirname "$SELF")
+LIB=
+for dir in "$HERE/../lib" "/usr/local/lib/secure-linux/lib"; do
+  if [ -r "$dir/versions_model.py" ]; then LIB=$dir; break; fi
+done
+case "${1:-}" in
+  -h|--help) sed -n '2,8p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+esac
+if [ -z "$LIB" ]; then
+  printf '%s\n' "The Versions screen cannot find its files. Open Secure Linux Status & Fixes and choose Repair setup." >&2
+  exit 1
+fi
+if ! command -v python3 >/dev/null 2>&1; then
+  printf '%s\n' "Python 3 is needed for the Versions screen." >&2
+  exit 1
+fi
+case "${1:-}" in
+  --text|--json) exec python3 "$LIB/versions_model.py" "$@" ;;
+esac
+if ! python3 -c 'import gi; gi.require_version("Gtk", "4.0"); gi.require_version("Adw", "1"); from gi.repository import Gtk, Adw' >/dev/null 2>&1; then
+  MESSAGE="The window needs GTK4 and Libadwaita. You can still read the same facts with: secure-linux-versions --text"
+  if [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ] && command -v zenity >/dev/null 2>&1; then
+    zenity --error --no-markup --title="Versions and updates" --width=520 --text="$MESSAGE"
+  else
+    printf '%s\n' "$MESSAGE" >&2
+  fi
+  exit 1
+fi
+exec python3 "$LIB/versions_gtk.py" "$@"

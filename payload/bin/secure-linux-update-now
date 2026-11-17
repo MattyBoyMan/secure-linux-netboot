@@ -2,7 +2,8 @@
 # secure-linux-update-now: install all updates now (needs root; asks for the password once through
 # pkexec when started by the logged-in user). Used by the Status window's "Install updates now" action.
 # Safe to run any time: the system's own update tools decide what needs doing.
-#   secure-linux-update-now      install updates (apt, dnf, or rpm-ostree on the atomic setup, plus Flatpak apps)
+#   secure-linux-update-now      install updates (apt, dnf, or rpm-ostree on the atomic setup, plus Flatpak apps and
+#                                Secure Linux's own files), then offer firmware updates (installed only after a yes)
 set -u   # no pipefail: "cmd | grep -q" must not fail when grep stops reading early
 export LC_ALL=C
 SL_ROOT=${SL_ROOT:-/usr/local/lib/secure-linux}
@@ -10,7 +11,7 @@ SL_ROOT=${SL_ROOT:-/usr/local/lib/secure-linux}
 . "$SL_ROOT/lib/common.sh"
 have() { command -v "$1" >/dev/null 2>&1; }
 
-case "${1:-}" in -h|--help) sed -n '2,5p' "$0"; exit 0 ;; esac
+case "${1:-}" in -h|--help) sed -n '2,6p' "$0"; exit 0 ;; esac
 SELF=/usr/local/bin/secure-linux-update-now; [ -x "$SELF" ] || SELF=$(readlink -f "$0")   # polkit names /usr/local/bin
 [ "$(id -u)" -eq 0 ] || exec pkexec "$SELF"
 
@@ -27,9 +28,51 @@ else
   dnf -y upgrade --refresh || rc=1
 fi
 have flatpak && { flatpak update --system -y --noninteractive || rc=1; }
+# Secure Linux's own files: checked and installed only by the verified kit-update path. Never changes the result.
+# Its plain answer is shown here, also when a newer release was refused or held back.
+KITAUTO=$SL_ROOT/bin/secure-linux-kit-update-auto
+KITNOTE=""; KITRESULT=""
+if [ -x "$KITAUTO" ]; then
+  KITNOTE=$("$SL_ROOT/bin/secure-linux-kit-update-auto" run --apply --force --report 2>/dev/null)
+  KITRESULT=$("$KITAUTO" status 2>/dev/null | sed -n 's/^  "result": "\([a-z-]*\)",\{0,1\}$/\1/p')
+fi
+[ -n "$KITNOTE" ] && printf '%s\n' "$KITNOTE"
+# What changed: a short plain-English note, shown here once after Secure Linux's own files were updated.
+[ -x "$SL_ROOT/bin/secure-linux-whats-new" ] && "$SL_ROOT/bin/secure-linux-whats-new" --tree "$SL_ROOT" --if-new 2>/dev/null
+
+# Firmware (BIOS, SSD and other device firmware): only offered, never installed without a typed yes.
+# With no one to answer (the update window), nothing is installed and the person is told where to do it.
+if have fwupdmgr && fwupdmgr get-updates </dev/null >/dev/null 2>&1; then
+  echo
+  echo "Firmware updates are available for this computer's devices."
+  printf '%s' "Install firmware updates now? The computer may need a restart afterwards. Type yes to install, anything else skips: "
+  FWANSWER=""
+  IFS= read -r FWANSWER || FWANSWER=""
+  FWANSWER=${FWANSWER%$'\r'}   # a typed yes from a terminal that ends lines with CR LF is still a yes
+  echo
+  if [ "$FWANSWER" = yes ]; then
+    echo "Installing firmware updates."
+    fwupdmgr update -y --no-reboot-check || echo "Some firmware updates could not be installed. Your computer is fine; you can try again later."
+  else
+    echo "Firmware updates were not installed. To install them later, open 'Secure Linux Status & Fixes' and choose 'Update firmware (BIOS, SSD)'."
+  fi
+fi
+
+# Container apps (Home Assistant, the media server) are not updated here: they have their own safe update steps,
+# which save a backup first and ask before changing anything. None of them can run without a person here.
+if have secure-linux-ha || have secure-linux-media-server; then
+  echo "Home Assistant and the media server are not changed here. They keep their own safe update steps."
+fi
+
 echo
 if [ $rc -eq 0 ]; then
-  echo "Updates are installed."
+  case "$KITRESULT" in
+    # check-undone: the newest Secure Linux update did not pass its safety check and was undone at once.
+    refused|held|clock-wrong|busy|check-undone) echo "System and app updates are installed. Secure Linux's own files were not changed (see above)." ;;
+    # check-stuck: it did not pass its safety check and could not be undone, so it is not called installed.
+    check-stuck) echo "System and app updates are installed. The newest Secure Linux update did not pass its safety check (see above)." ;;
+    *) echo "Updates are installed." ;;
+  esac
   [ "$PROFILE" = atomic ] && echo "Restart to start using the update."
 else
   echo "Some updates could not be installed. Trying again later usually helps; if it keeps happening, open Secure Linux Status and choose 'Repair setup'."

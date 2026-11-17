@@ -284,6 +284,12 @@ Every copy, server change, container start/stop, token save and rootless setup a
 EOF
 }
 
+_hs_home_share() {   # the owner's home server folder (secure-linux-home-share); elsewhere nothing to connect
+  if command -v secure-linux-home-share >/dev/null 2>&1; then secure-linux-home-share connect; return $?; fi
+  say "This computer was not set up with a home server, so there is nothing to connect."
+  return 0
+}
+
 _hs_menu() {
   local choice target action url
   while true; do
@@ -297,6 +303,7 @@ Home & Server Helper
  7) Open external unRAID web UI     8) Read external unRAID status
  9) Start/stop an unRAID container 10) Save/test an unRAID API token
 11) Explain Docker safety          12) Set up rootless Docker
+13) Connect my home server folder
  0) Exit
 EOF
     choice=$(ask "Choose a number:") || { say "No answer received. Nothing was changed."; return 1; }
@@ -311,7 +318,8 @@ EOF
         url=$(ask "External unRAID web address:"); action=$(ask "Type save or test:")
         if [ "$action" = save ]; then _hs_token_save "$url"; else _hs_api_test "$url"; fi ;;
       11) _hs_docker_safety ;; 12) _hs_rootless ;;
-      0) return 0 ;; *) say "Choose a number from 0 to 12." ;;
+      13) _hs_home_share ;;
+      0) return 0 ;; *) say "Choose a number from 0 to 13." ;;
     esac
   done
 }

@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Open a File Safely
+GenericName=Throw-away sandbox for files
+Comment=Open a file you are not sure about in a sandbox that cannot see your files or the internet, and is deleted afterwards
+Exec=/usr/local/bin/secure-linux-sandbox
+Icon=security-high
+Terminal=false
+Categories=Utility;Security;
+Keywords=sandbox;safe;suspicious;attachment;virus;open;

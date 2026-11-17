@@ -1,0 +1,10 @@
+[Unit]
+Description=Secure Linux: notice when the computer arrives home or leaves home (sharing updates)
+
+[Path]
+# The network dispatcher writes home, away or offline here whenever the network changes.
+PathChanged=/run/secure-linux/location
+Unit=secure-linux-kit-share-network.service
+
+[Install]
+WantedBy=paths.target

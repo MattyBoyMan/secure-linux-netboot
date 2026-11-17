@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<!-- Secure Linux: one clear password prompt for the saved-master helper (secure-linux-master-sync).
+     Installed by steps/00-early.sh to /usr/share/polkit-1/actions/. The action is tied to the one program path.
+     tests/integration/run.sh checks that every helper that re-runs itself with pkexec has an action like this. -->
+<policyconfig>
+  <vendor>The Complete Secure Linux Package</vendor>
+  <action id="org.securelinux.mastersync">
+    <description>Look at or update the saved master that makes new drives</description>
+    <message>Secure Linux needs your password to look at or bring up to date the saved copy it uses to make new drives</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/bin/secure-linux-master-sync</annotate>
+  </action>
+</policyconfig>

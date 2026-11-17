@@ -1,0 +1,400 @@
+#!/usr/bin/env python3
+"""secure-linux-network-devices: who is on my Wi-Fi?
+
+Lists the devices your computer can see on your home network and flags any that are NEW since you last looked.
+Everything stays on this computer: nothing is sent to the internet, nothing is uploaded, nothing is shared.
+
+  secure-linux-network-devices                 look at the network now (the usual command)
+  secure-linux-network-devices --look-harder   first nudge every address on YOUR home network so quiet devices show up
+  secure-linux-network-devices list            show the saved list without looking again
+  secure-linux-network-devices trust MAC|--all say "this device is mine" (stops the NEW flag)
+  secure-linux-network-devices name MAC TEXT   give a device a name, for example: name aa:bb:cc:dd:ee:ff "Mum's phone"
+  secure-linux-network-devices forget MAC      remove a device from the saved list
+  options: --json (machine-readable), --pause (wait for Enter before closing a window), --help
+
+The first time on a network, what is found is saved as your starting list. After that a device you have not seen
+before is marked NEW. Exit code: 0 = nothing new, 3 = something new was found, 2 = could not look.
+Why a "NEW" device can still be fine: phones and laptops often use a private (random) address that changes, so one
+phone can look new. If you do not recognise a device, change your Wi-Fi password in your router's settings.
+"""
+import ipaddress
+import json
+import os
+import re
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+
+MAC_RE = re.compile(r"^[0-9a-f]{2}(:[0-9a-f]{2}){5}$")
+STATE_VERSION = 1
+HOME_RANGES = [ipaddress.ip_network(n) for n in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16")]
+
+
+# ---------------------------------------------------------------- small helpers
+def norm_mac(text):
+    mac = text.strip().lower().replace("-", ":")
+    return mac if MAC_RE.match(mac) else None
+
+
+def is_private_mac(mac):
+    """Locally administered bit set: a made-up address (phones do this on purpose to protect privacy)."""
+    return bool(int(mac[:2], 16) & 0x02)
+
+
+def is_group_mac(mac):
+    first = int(mac[:2], 16)
+    return bool(first & 0x01) or mac == "ff:ff:ff:ff:ff:ff"
+
+
+def state_path():
+    d = os.environ.get("SL_NETDEV_STATE_DIR")
+    if not d:
+        base = os.environ.get("XDG_STATE_HOME") or os.path.join(os.path.expanduser("~"), ".local", "state")
+        d = os.path.join(base, "secure-linux", "network-devices")
+    return os.path.join(d, "devices.json")
+
+
+def load_state():
+    try:
+        with open(state_path(), encoding="utf-8") as fh:
+            data = json.load(fh)
+        if isinstance(data, dict) and isinstance(data.get("networks"), dict):
+            return data
+    except (OSError, ValueError):
+        pass
+    return {"version": STATE_VERSION, "networks": {}}
+
+
+def save_state(data):
+    path = state_path()
+    folder = os.path.dirname(path)
+    os.makedirs(folder, mode=0o700, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=".devices-", dir=folder)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as fh:
+            json.dump(data, fh, indent=2, sort_keys=True)
+            fh.write("\n")
+        try:
+            os.chmod(tmp, 0o600)
+        except OSError:
+            pass
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
+
+def run_text(cmd):
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=15, check=False).stdout
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def now_iso():
+    return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
+
+
+# ---------------------------------------------------------------- reading the network (local only)
+def read_default_dev():
+    """The network card (for example wlan0) the default route uses: that is the home network. None if unknown."""
+    fake = os.environ.get("SL_NETDEV_ROUTE_FILE")
+    if fake:
+        with open(fake, encoding="utf-8") as fh:
+            text = fh.read()
+    else:
+        text = run_text(["ip", "-4", "route", "show", "default"])
+    m = re.search(r"default via \S+ dev (\S+)", text)
+    return m.group(1) if m else None
+
+
+def read_neighbours():
+    """Return {mac: ip} for neighbours on the home network card only (not Docker, virtual machine or VPN bridges)."""
+    home_dev = read_default_dev()
+    fake = os.environ.get("SL_NETDEV_NEIGH_FILE")
+    if fake:
+        with open(fake, encoding="utf-8") as fh:
+            text = fh.read()
+    else:
+        text = run_text(["ip", "-4", "neigh", "show"])
+        if not text.strip():
+            text = run_text(["arp", "-an"])
+    found = {}
+    for line in text.splitlines():
+        words = line.split()
+        mac = None
+        ip = None
+        dev = words[words.index("dev") + 1] if "dev" in words and words.index("dev") + 1 < len(words) else None
+        if dev is None and " on " in line:
+            dev = line.rsplit(" on ", 1)[1].split()[0]
+        if home_dev and dev != home_dev:
+            continue
+        if "lladdr" in words and words[0].count(".") == 3:       # ip neigh: 192.168.1.5 dev wlan0 lladdr aa:.. REACHABLE
+            ip = words[0]
+            mac = norm_mac(words[words.index("lladdr") + 1]) if words.index("lladdr") + 1 < len(words) else None
+            if words[-1] in ("FAILED", "INCOMPLETE"):
+                mac = None
+        elif " at " in line and line.startswith("?"):            # arp -an: ? (192.168.1.5) at aa:.. [ether] on wlan0
+            m = re.search(r"\((\d+\.\d+\.\d+\.\d+)\) at ([0-9a-fA-F:]{17})", line)
+            if m:
+                ip, mac = m.group(1), norm_mac(m.group(2))
+        if mac and ip and not is_group_mac(mac):
+            found[mac] = ip
+    return found
+
+
+def read_gateway_ip():
+    fake = os.environ.get("SL_NETDEV_ROUTE_FILE")
+    if fake:
+        with open(fake, encoding="utf-8") as fh:
+            text = fh.read()
+    else:
+        text = run_text(["ip", "-4", "route", "show", "default"])
+    m = re.search(r"default via (\d+\.\d+\.\d+\.\d+)", text)
+    return m.group(1) if m else None
+
+
+def own_network():
+    """The home network this computer is on, as an ip_interface, or None."""
+    fake = os.environ.get("SL_NETDEV_ADDR_FILE")
+    if fake:
+        with open(fake, encoding="utf-8") as fh:
+            text = fh.read()
+    else:
+        dev = read_default_dev()
+        text = run_text(["ip", "-4", "-o", "addr", "show"] + (["dev", dev] if dev else []) + ["scope", "global"])
+    home_dev = read_default_dev()
+    for line in text.splitlines():
+        m = re.search(r"^\d+:\s+(\S+)\s+inet (\d+\.\d+\.\d+\.\d+/\d+)", line)
+        if m and (not home_dev or m.group(1) == home_dev):
+            return ipaddress.ip_interface(m.group(2))
+    return None
+
+
+def sweep_targets(iface_text):
+    """Addresses to nudge. ONLY a private home network (never the internet) and never more than one /24."""
+    try:
+        iface = ipaddress.ip_interface(iface_text)
+    except ValueError:
+        return None
+    if not any(iface.ip in home for home in HOME_RANGES):   # the three home ranges only (not "documentation" or internet ranges)
+        return None
+    net = ipaddress.ip_network("%s/%d" % (iface.ip, max(iface.network.prefixlen, 24)), strict=False)
+    return [str(h) for h in net.hosts() if h != iface.ip]
+
+
+def look_harder():
+    """Send one tiny local message to each home address so quiet devices answer. Stays inside the home network."""
+    targets = sweep_targets(str(own_network())) if own_network() else None
+    if not targets:
+        return False
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.settimeout(0.05)
+        for ip in targets:
+            try:
+                sock.sendto(b"", (ip, 9))
+            except OSError:
+                pass
+    finally:
+        sock.close()
+    time.sleep(2)
+    return True
+
+
+def vendor_names(macs):
+    """Maker names from a list already on this computer (no internet). Missing list = no names."""
+    files = [os.environ.get("SL_NETDEV_OUI_FILE")] if os.environ.get("SL_NETDEV_OUI_FILE") else [
+        "/usr/share/hwdata/oui.txt", "/usr/share/ieee-data/oui.txt", "/var/lib/ieee-data/oui.txt"]
+    want = {m[:8].upper().replace(":", "-"): m for m in macs if not is_private_mac(m)}
+    out = {}
+    for path in files:
+        try:
+            with open(path, encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    if "(hex)" in line:
+                        key = line[:8].upper()
+                        if key in want and want[key] not in out:
+                            out[want[key]] = line.split("(hex)", 1)[1].strip()[:30]
+            break
+        except OSError:
+            continue
+    return out
+
+
+# ---------------------------------------------------------------- the saved list
+def network_key(gw_mac):
+    return gw_mac or "unknown-network"
+
+
+def scan(state, neigh, gw_ip):
+    """Compare what is on the network now with the saved list. Returns (record, rows, new_count, first_time)."""
+    gw_mac = next((m for m, ip in neigh.items() if gw_ip and ip == gw_ip), None)
+    key = network_key(gw_mac)
+    first_time = key not in state["networks"]
+    rec = state["networks"].setdefault(key, {"devices": {}, "started": now_iso()})
+    devs = rec["devices"]
+    stamp = now_iso()
+    vendors = vendor_names(list(neigh))
+    rows = []
+    new_count = 0
+    for mac, ip in sorted(neigh.items(), key=lambda kv: tuple(int(p) for p in kv[1].split("."))):
+        d = devs.get(mac)
+        if d is None:
+            d = devs[mac] = {"name": "", "first_seen": stamp, "trusted": first_time}
+            status = "baseline" if first_time else "new"
+        else:
+            status = "known" if d.get("trusted") else "new"
+        d["last_seen"] = stamp
+        d["ip"] = ip
+        if status == "new":
+            new_count += 1
+        rows.append({"mac": mac, "ip": ip, "name": d.get("name", ""), "maker": vendors.get(mac, ""),
+                     "private_mac": is_private_mac(mac), "router": mac == gw_mac, "status": status})
+    return rec, rows, new_count, first_time
+
+
+def label(row):
+    if row["name"]:
+        base = row["name"]
+    elif row["router"]:
+        base = "Your router"
+    elif row["maker"]:
+        base = row["maker"]
+    elif row["private_mac"]:
+        base = "Phone or laptop with a private address"
+    else:
+        base = "Unknown maker"
+    return base + (" (router)" if row["router"] and row["name"] else "")
+
+
+def print_rows(rows, first_time, new_count, as_json):
+    if as_json:
+        print(json.dumps({"first_time": first_time, "new": new_count, "devices": rows}, indent=2, sort_keys=True))
+        return
+    print("Devices I can see on your network right now: %d\n" % len(rows))
+    for r in rows:
+        tag = {"known": "", "baseline": "saved", "new": "NEW - not seen before"}[r["status"]]
+        print("  %-15s  %s  %-38s %s" % (r["ip"], r["mac"], label(r)[:38], tag))
+    print()
+    if first_time:
+        print("This is the first time I looked at this network, so I saved this as your starting list.\n"
+              "Check that every device above is yours. If one is not, change your Wi-Fi password in your router's settings.")
+    elif new_count:
+        print("%d NEW device%s on your network. If you do not know %s:\n"
+              "  1. Change your Wi-Fi password in your router's settings (then reconnect your own devices).\n"
+              "  2. Check the router has the newest update.\n"
+              "If it is yours, say so with:  secure-linux-network-devices trust MAC   (or  trust --all)\n"
+              "A phone with a private address can look new each time; that is normal." % (new_count, "" if new_count == 1 else "s", "it" if new_count == 1 else "them"))
+    else:
+        print("Nothing new. Every device I can see is on your saved list.")
+    print("Nothing was sent to the internet: this list stays on this computer.")
+
+
+def pause_if(flag):
+    if flag:
+        try:
+            input("Press Enter to close. ")
+        except (EOFError, KeyboardInterrupt):
+            pass
+
+
+def current_record(state):
+    """The saved record for the network we are on now (needs the router to be visible), else the only one."""
+    gw_ip = read_gateway_ip()
+    neigh = read_neighbours()
+    gw_mac = next((m for m, ip in neigh.items() if gw_ip and ip == gw_ip), None)
+    nets = state["networks"]
+    if network_key(gw_mac) in nets:
+        return nets[network_key(gw_mac)]
+    if len(nets) == 1:
+        return next(iter(nets.values()))
+    return None
+
+
+def main(argv):
+    pause = "--pause" in argv
+    as_json = "--json" in argv
+    harder = "--look-harder" in argv
+    args = [a for a in argv if a not in ("--pause", "--json", "--look-harder")]
+    if any(a in ("-h", "--help") for a in args):
+        print(__doc__.strip())
+        return 0
+    cmd = args[0] if args else "scan"
+    state = load_state()
+    code = 0
+    if cmd == "scan" and len(args) <= 1:
+        if harder and not look_harder():
+            print("I can only look harder on a private home network, and I could not find yours. I will just read what I already know.")
+        try:
+            neigh = read_neighbours()
+        except OSError:
+            print("I could not read the network list on this computer.")
+            pause_if(pause)
+            return 2
+        if not neigh:
+            print("I can't see any devices yet. Are you connected to your Wi-Fi? Try:  secure-linux-network-devices --look-harder")
+            pause_if(pause)
+            return 2
+        _rec, rows, new_count, first_time = scan(state, neigh, read_gateway_ip())
+        save_state(state)
+        print_rows(rows, first_time, new_count, as_json)
+        code = 3 if new_count else 0
+    elif cmd == "list" and len(args) == 1:
+        rec = current_record(state)
+        recs = [rec] if rec else list(state["networks"].values())
+        if not any(r["devices"] for r in recs):
+            print("The saved list is empty. Run secure-linux-network-devices to look at your network.")
+        for r in recs:
+            for mac, d in sorted(r["devices"].items(), key=lambda kv: kv[1].get("ip", "")):
+                print("  %-15s  %s  %-24s %s" % (d.get("ip", "?"), mac, d.get("name") or "(no name)",
+                                                  "yours" if d.get("trusted") else "NEW - not confirmed"))
+    elif cmd == "trust" and len(args) == 2:
+        rec = current_record(state)
+        if rec is None:
+            print("I am not sure which network this is. Run secure-linux-network-devices first.")
+            code = 2
+        elif args[1] == "--all":
+            for d in rec["devices"].values():
+                d["trusted"] = True
+            save_state(state)
+            print("Done. Every device on the saved list is now marked as yours.")
+        else:
+            mac = norm_mac(args[1])
+            if mac and mac in rec["devices"]:
+                rec["devices"][mac]["trusted"] = True
+                save_state(state)
+                print("Done. %s is marked as yours." % mac)
+            else:
+                print("I do not have a device with that address. Run secure-linux-network-devices to see the list.")
+                code = 2
+    elif cmd == "name" and len(args) == 3:
+        rec = current_record(state)
+        mac = norm_mac(args[1])
+        if rec is not None and mac and mac in rec["devices"]:
+            rec["devices"][mac]["name"] = args[2][:60]
+            save_state(state)
+            print("Done. %s is now called \"%s\"." % (mac, args[2][:60]))
+        else:
+            print("I do not have a device with that address. Run secure-linux-network-devices to see the list.")
+            code = 2
+    elif cmd == "forget" and len(args) == 2:
+        rec = current_record(state)
+        mac = norm_mac(args[1])
+        if rec is not None and mac and rec["devices"].pop(mac, None) is not None:
+            save_state(state)
+            print("Done. %s was removed from the saved list. If it is on the network, it will show as NEW next time." % mac)
+        else:
+            print("I do not have a device with that address.")
+            code = 2
+    else:
+        print("I did not understand that. Run secure-linux-network-devices --help.")
+        code = 2
+    pause_if(pause)
+    return code
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

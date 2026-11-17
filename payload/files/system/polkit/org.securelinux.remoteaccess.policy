@@ -1,0 +1,76 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<!-- Secure Linux "reach home from anywhere" (secure-linux-remote-access): one action per kind of change, each tied to
+     the program path and its first word. Installed by steps/00-early.sh to /usr/share/polkit-1/actions/.
+     Changes that let a device in from outside (set up, add a device, switch on) always ask for the password again;
+     changes that close things (remove a device, switch off, remove everything) may reuse it for a few minutes. -->
+<policyconfig>
+  <vendor>The Complete Secure Linux Package</vendor>
+  <action id="org.securelinux.remoteaccess.setup">
+    <description>Set up reach home from anywhere</description>
+    <message>Secure Linux needs your password to let your own phones and laptops reach this home computer from outside, through one port</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/bin/secure-linux-remote-access</annotate>
+    <annotate key="org.freedesktop.policykit.exec.argv1">setup</annotate>
+  </action>
+  <action id="org.securelinux.remoteaccess.add">
+    <description>Add a device that can reach home</description>
+    <message>Secure Linux needs your password to give one more phone or laptop its own key to reach this home computer</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/bin/secure-linux-remote-access</annotate>
+    <annotate key="org.freedesktop.policykit.exec.argv1">add</annotate>
+  </action>
+  <action id="org.securelinux.remoteaccess.on">
+    <description>Switch on reach home from anywhere</description>
+    <message>Secure Linux needs your password to open the door for your own devices again (one port)</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/bin/secure-linux-remote-access</annotate>
+    <annotate key="org.freedesktop.policykit.exec.argv1">on</annotate>
+  </action>
+  <action id="org.securelinux.remoteaccess.remove">
+    <description>Remove a device that can reach home</description>
+    <message>Secure Linux needs your password to cancel the key of a phone or laptop, so it can no longer reach home</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/bin/secure-linux-remote-access</annotate>
+    <annotate key="org.freedesktop.policykit.exec.argv1">remove</annotate>
+  </action>
+  <action id="org.securelinux.remoteaccess.off">
+    <description>Switch off reach home from anywhere</description>
+    <message>Secure Linux needs your password to close the door from outside (your devices are kept)</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/bin/secure-linux-remote-access</annotate>
+    <annotate key="org.freedesktop.policykit.exec.argv1">off</annotate>
+  </action>
+  <action id="org.securelinux.remoteaccess.forget">
+    <description>Remove reach home from anywhere completely</description>
+    <message>Secure Linux needs your password to remove every key and device for reaching home, and close its port</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/bin/secure-linux-remote-access</annotate>
+    <annotate key="org.freedesktop.policykit.exec.argv1">forget</annotate>
+  </action>
+</policyconfig>

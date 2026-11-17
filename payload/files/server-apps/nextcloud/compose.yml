@@ -1,0 +1,80 @@
+# Nextcloud for Secure Linux: your own private cloud for files, photos, calendar and contacts. Home network only.
+# Started only by secure-linux-server-apps, which fills in the SL_* values from this computer (see app.conf).
+# Images pinned by version AND digest (checked on Docker Hub, 2026-11-16):
+#   nextcloud 34.0.6-apache (Nextcloud's "production" line), postgres 18.7-alpine (Nextcloud supports PostgreSQL 14-18).
+# Passwords are files made on this computer (app.conf "secrets"); Nextcloud reads them with its *_FILE settings.
+# The database has no internet and no port of its own: only Nextcloud talks to it.
+services:
+  db:
+    image: docker.io/library/postgres:18.7-alpine@sha256:b6972e1115a4ff8eba5d7f7d19184926d1e16d7d1136ae1e1a7ebf286da0f015
+    restart: unless-stopped
+    networks:
+      - backend
+    volumes:
+      - "${SL_DATA:?data folder missing}/db:/var/lib/postgresql:Z"
+      - "${SL_DATA:?data folder missing}/secrets/db_password:/run/secrets/db_password:ro,z"
+    environment:
+      POSTGRES_DB: nextcloud
+      POSTGRES_USER: nextcloud
+      POSTGRES_PASSWORD_FILE: /run/secrets/db_password
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - NET_RAW
+      - MKNOD
+
+  app:
+    image: docker.io/library/nextcloud:34.0.6-apache@sha256:3031e7f87baaceb863a755921ebf463bc26ea71855c07ad7858e2ae25a5a0ad7
+    restart: unless-stopped
+    depends_on:
+      - db
+    networks:
+      - backend
+      - frontend
+    ports:
+      - "${SL_BIND:?home address missing}:${SL_PORT:?port missing}:80"
+    volumes:
+      - "${SL_DATA:?data folder missing}/html:/var/www/html:z"
+      - "${SL_DATA:?data folder missing}/secrets/db_password:/run/secrets/db_password:ro,z"
+      - "${SL_DATA:?data folder missing}/secrets/admin_user:/run/secrets/admin_user:ro,z"
+      - "${SL_DATA:?data folder missing}/secrets/admin_password:/run/secrets/admin_password:ro,z"
+    environment:
+      POSTGRES_HOST: db
+      POSTGRES_DB: nextcloud
+      POSTGRES_USER: nextcloud
+      POSTGRES_PASSWORD_FILE: /run/secrets/db_password
+      NEXTCLOUD_ADMIN_USER_FILE: /run/secrets/admin_user
+      NEXTCLOUD_ADMIN_PASSWORD_FILE: /run/secrets/admin_password
+      NEXTCLOUD_TRUSTED_DOMAINS: "${SL_BIND:?home address missing} ${SL_HOSTNAME:-localhost}.local"
+      TZ: "${SL_TZ:-UTC}"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - NET_RAW
+      - MKNOD
+
+  cron:
+    # Nextcloud's own background jobs (clean-up, previews), every 5 minutes. Same checked image, no port.
+    image: docker.io/library/nextcloud:34.0.6-apache@sha256:3031e7f87baaceb863a755921ebf463bc26ea71855c07ad7858e2ae25a5a0ad7
+    restart: unless-stopped
+    entrypoint: /cron.sh
+    depends_on:
+      - db
+      - app
+    networks:
+      - backend
+      - frontend
+    volumes:
+      - "${SL_DATA:?data folder missing}/html:/var/www/html:z"
+    environment:
+      TZ: "${SL_TZ:-UTC}"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - NET_RAW
+      - MKNOD
+
+networks:
+  backend:
+    internal: true
+  frontend: {}

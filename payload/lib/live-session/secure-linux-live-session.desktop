@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=Secure Linux - start here
+Comment=Read the guide, check this drive, or see how to install
+Exec=secure-linux-live-session
+Terminal=true
+Categories=System;

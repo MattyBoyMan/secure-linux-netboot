@@ -1,0 +1,47 @@
+#!/bin/bash
+# Media server (Jellyfin) front door: setup, status, open, on, off, remove.
+# Free, private, ad-free library for the films, shows, music and photos you own. Home network only.
+set -u
+SL_ROOT=${SL_ROOT:-/usr/local/lib/secure-linux}
+say() { printf '%s\n' "$*"; }
+
+_ms_script() {
+  local d
+  for d in ${SL_SERVER_KIT:+"$SL_SERVER_KIT"} "$SL_ROOT/server" /usr/local/lib/secure-linux/server; do
+    [ -f "$d/setup-jellyfin.sh" ] && { printf '%s/setup-jellyfin.sh' "$d"; return 0; }
+  done
+  return 1
+}
+
+_ms_help() {
+  cat <<'EOF'
+Media server (Jellyfin) - your own films, shows, music and photos on every TV at home.
+Use: secure-linux-media-server COMMAND
+  setup     Set it up. It asks which folder holds your media (kept read-only).
+  status    Is it running? What address do the TVs use?
+  open      Open it in your web browser.
+  on        Switch it on again. It also starts by itself after a restart.
+  off       Switch it off. Your library is kept.
+  remove    Take it away. Your media is never deleted. Add --delete-library to also
+            delete the library data (you are asked twice).
+  steps     Show the 3 steps to add the Jellyfin app on a TV.
+It only works on your home network. Nothing is opened to the internet.
+EOF
+}
+
+SCRIPT=$(_ms_script) || { say "The media server part is not on this computer. Insert the Secure Linux USB stick or set SL_SERVER_KIT to its linux-setup/server folder. Nothing was changed."; exit 1; }
+SUDO=sudo; [ "$(id -u)" -eq 0 ] && SUDO=""
+cmd=${1:-help}; [ $# -gt 0 ] && shift
+
+case "$cmd" in
+  -h|--help|help) _ms_help ;;
+  setup|on|off|steps|remove) $SUDO bash "$SCRIPT" "$cmd" "$@" ;;
+  status) $SUDO bash "$SCRIPT" status ;;
+  open)
+    out=$($SUDO bash "$SCRIPT" status) || exit 1
+    url=$(printf '%s\n' "$out" | sed -n 's/.*\(http:\/\/[0-9.]*:[0-9]*\).*/\1/p' | head -1)
+    if [ -z "$url" ]; then printf '%s\n' "$out"; exit 1; fi
+    if command -v xdg-open >/dev/null 2>&1; then xdg-open "$url" >/dev/null 2>&1 & say "Opening Jellyfin in your browser."
+    else say "Open this address in your browser: $url"; fi ;;
+  *) _ms_help; exit 2 ;;
+esac

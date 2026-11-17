@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Home-server apps
+GenericName=Nextcloud, Paperless-ngx and more for your home
+Comment=Set up free apps that run on this computer for your home network only: your own cloud, paper scans and more.
+Exec=/usr/local/bin/secure-linux-server-apps menu
+Icon=network-server
+Terminal=true
+Categories=System;Network;
+Keywords=Nextcloud;Paperless;home server;cloud;documents;scans;
+StartupNotify=false

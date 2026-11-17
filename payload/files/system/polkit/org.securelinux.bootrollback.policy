@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<!-- Secure Linux boot rollback ("Go back to an earlier day" in the boot menu): one clear password prompt per action.
+     Installed by steps/00-early.sh to /usr/share/polkit-1/actions/. Each action is tied to the program path and to
+     its first word, so the prompt says exactly what is being asked. -->
+<policyconfig>
+  <vendor>The Complete Secure Linux Package</vendor>
+  <action id="org.securelinux.bootrollback.on">
+    <description>Add "Go back to an earlier day" to the boot menu</description>
+    <message>Secure Linux needs your password to add "Go back to an earlier day" to the boot menu (the normal start stays first)</message>
+    <defaults><allow_any>auth_admin</allow_any><allow_inactive>auth_admin</allow_inactive><allow_active>auth_admin_keep</allow_active></defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/bin/secure-linux-boot-rollback</annotate>
+    <annotate key="org.freedesktop.policykit.exec.argv1">on</annotate>
+  </action>
+  <action id="org.securelinux.bootrollback.off">
+    <description>Remove "Go back to an earlier day" from the boot menu</description>
+    <message>Secure Linux needs your password to remove "Go back to an earlier day" from the boot menu (your snapshots are kept)</message>
+    <defaults><allow_any>auth_admin</allow_any><allow_inactive>auth_admin</allow_inactive><allow_active>auth_admin_keep</allow_active></defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/bin/secure-linux-boot-rollback</annotate>
+    <annotate key="org.freedesktop.policykit.exec.argv1">off</annotate>
+  </action>
+  <action id="org.securelinux.bootrollback.refresh">
+    <description>Update the "Go back to an earlier day" list</description>
+    <message>Secure Linux needs your password to update the list of earlier days in the boot menu</message>
+    <defaults><allow_any>auth_admin</allow_any><allow_inactive>auth_admin</allow_inactive><allow_active>auth_admin_keep</allow_active></defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/bin/secure-linux-boot-rollback</annotate>
+    <annotate key="org.freedesktop.policykit.exec.argv1">refresh</annotate>
+  </action>
+  <action id="org.securelinux.bootrollback.keep">
+    <description>Keep this earlier version of the system</description>
+    <message>Secure Linux needs your password to keep this earlier version of the system (your files are not changed, and the newer version is saved)</message>
+    <defaults><allow_any>auth_admin</allow_any><allow_inactive>auth_admin</allow_inactive><allow_active>auth_admin</allow_active></defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/bin/secure-linux-boot-rollback</annotate>
+    <annotate key="org.freedesktop.policykit.exec.argv1">keep</annotate>
+  </action>
+  <action id="org.securelinux.bootrollback.newest">
+    <description>Return to the newest version of the system</description>
+    <message>Secure Linux needs your password to return to the newest version of the system (your files are not changed)</message>
+    <defaults><allow_any>auth_admin</allow_any><allow_inactive>auth_admin</allow_inactive><allow_active>auth_admin</allow_active></defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/bin/secure-linux-boot-rollback</annotate>
+    <annotate key="org.freedesktop.policykit.exec.argv1">newest</annotate>
+  </action>
+  <action id="org.securelinux.bootrollback.check">
+    <description>Check whether "Go back to an earlier day" can be used on this computer</description>
+    <message>Secure Linux needs your password to look at how this computer starts (nothing is changed)</message>
+    <defaults><allow_any>auth_admin</allow_any><allow_inactive>auth_admin</allow_inactive><allow_active>auth_admin_keep</allow_active></defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/bin/secure-linux-boot-rollback</annotate>
+    <annotate key="org.freedesktop.policykit.exec.argv1">check</annotate>
+  </action>
+  <action id="org.securelinux.bootrollback.tidy">
+    <description>Delete saved spare copies of the system</description>
+    <message>Secure Linux needs your password to delete spare system copies left by "keep" or "return to the newest" (your files are not changed)</message>
+    <defaults><allow_any>auth_admin</allow_any><allow_inactive>auth_admin</allow_inactive><allow_active>auth_admin</allow_active></defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/bin/secure-linux-boot-rollback</annotate>
+    <annotate key="org.freedesktop.policykit.exec.argv1">tidy</annotate>
+  </action>
+</policyconfig>

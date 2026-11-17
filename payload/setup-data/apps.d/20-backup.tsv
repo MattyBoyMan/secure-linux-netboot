@@ -1,0 +1,9 @@
+# 20-backup.tsv: the free backup program behind the Backups window (idea 72, HS-3).
+# Default off: the App Library does not install it during setup. When a person turns on backups and BorgBackup is
+# missing, Backups adds it from this row on request (secure-linux-backup install-borg runs
+# secure-linux-app-library install borgbackup). Atomic computers add it once with rpm-ostree instead, so this rpm row
+# does not list atomic.
+# Columns (TAB separated): id kind title plain_description approx_size_mb profiles default arch idea
+# Checked live on packages.fedoraproject.org on 2026-11-16: borgbackup 1.4.5 in Fedora 43, 44 and 45.
+# The size (20 MB) is an estimate for the program and its few Python helpers; it was not measured.
+borgbackup	rpm	BorgBackup (backups)	The free program behind Backups. It makes encrypted, compressed and checked copies of your home folder. Added when you turn on backups.	20	full,lite	off	all	72

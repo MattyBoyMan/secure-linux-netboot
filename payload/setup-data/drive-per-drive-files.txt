@@ -1,0 +1,24 @@
+# Files that belong to one drive only (contract C3). Everything else on a Secure Linux drive is shared:
+# copied unchanged from the master. Repair and check-this-drive never write a file named here.
+# One glob per line, matched from the drive's top. `**` crosses folders (`**/` at the start also matches the top);
+# `*` and `?` stay inside one name. Case is ignored (Ventoy drives are exFAT/FAT).
+# Each line names the code that makes the file per-drive. Read by linux/bin/secure-linux-usb-creator (per_drive_patterns).
+ventoy/script/secure-linux.ks  # make-usb.ps1:1292 and :1680 write it with the user, password hash (templates/fedora.ks:31), Wi-Fi records (templates/fedora.ks:87) and the packed build.conf (templates/fedora.ks:1311)
+ventoy/script/debian-*.cfg  # make-usb.ps1:1312 Set-PreseedValues puts this person's user name, full name, time zone and locale in
+ventoy/script/debian-sl-*.tar.gz  # make-usb.ps1:1325-1333 packs this drive's wifi-records.txt, backups.txt and build.conf
+ventoy/ventoy.json  # make-usb.ps1:1356-1384 writes it per build (final write make-usb.ps1:1779 lists only the tools that downloaded)
+linux-setup/linux/build.conf  # make-usb.ps1:1140 writes build.conf into the stage; make-usb.ps1:1429 copies the stage here
+linux-setup/kit/linux/build.conf  # make-usb.ps1:1501 removes it from the kit copy; listed so a stray copy is never shared
+linux-setup/wifi-networks.txt  # make-usb.ps1:1199-1213 merges this person's saved Wi-Fi records ("plain" or enc1)
+linux-setup/backups.txt  # make-usb.ps1:1196 writes the computers this person has backed up
+linux-setup/setup.conf  # make-usb.ps1:1227 copies this person's Setup-App choices
+linux-setup/scan/**  # make-usb.ps1:1232-1240 PC scan exports (browser-password CSVs); linux/bin/secure-linux-usb-creator:79 keeps them out of a master
+linux-setup/recovery/**  # linux/bin/secure-linux-usb-creator:80 one person's interrupted-setup notes, kept out of a master
+linux-setup/private/**  # linux/lib/usbc_seal.py:343 (seal-personal) writes linux-setup/private/personal-settings.enc1, this drive's locked settings (plan contract C10)
+SECURE-LINUX-DRIVE-PASSPORT.*  # linux/bin/secure-linux-usb-creator:2997 writes this drive's passport after its own check
+linux-setup/SECURE-LINUX-DRIVE-FILES.json  # linux/bin/secure-linux-usb-creator:2985 writes this drive's file list
+CHECK-THIS-DRIVE.sh  # plan contract C5 (P12 builds linux/files/drive/CHECK-THIS-DRIVE.sh, copied to the drive's top); reserved
+**/*.enc1  # linux/lib/usbc_seal.py:343 locks one drive's login and home-server settings with enc1; templates/sl-wifi.py:235 opens them at install (plan contract C10)
+scan/**  # save-apps-mac.sh:10 and save-apps.ps1:15 write scan/apps-<computer>.json next to themselves (the stick's top)
+linux-setup/preflight/**  # save-wifi.ps1:29 -ThenPreflight writes this computer's checklist, winget and conda lists
+persistence/**  # linux/lib/usbc_live.py:943 make_persistence makes this drive's own saved-changes space (plan contract C9)

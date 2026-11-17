@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Reach Home From Anywhere
+GenericName=Your own private way home
+Comment=Let your own phone and laptop reach this home computer safely when you are away. Off until you set it up
+Exec=/usr/local/bin/secure-linux-remote-access
+Icon=network-vpn
+Terminal=true
+Categories=Network;Security;
+Keywords=wireguard;vpn;remote;away;home;phone;qr;laptop;

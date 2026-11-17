@@ -1,0 +1,11 @@
+[Unit]
+Description=Look for a newer Secure Linux release after start-up and daily
+
+[Timer]
+OnBootSec=5min
+OnCalendar=daily
+Persistent=true
+RandomizedDelaySec=1h
+
+[Install]
+WantedBy=timers.target

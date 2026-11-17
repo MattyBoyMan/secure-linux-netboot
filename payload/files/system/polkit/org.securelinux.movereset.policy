@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<!-- Secure Linux "Move my setup" and "Reset this computer, keep my files": one clear password prompt per action.
+     Installed by steps/00-early.sh to /usr/share/polkit-1/actions/. Each action is tied to the program path and to
+     its first word, so the prompt says exactly what is being asked. The reset asks every time. -->
+<policyconfig>
+  <vendor>The Complete Secure Linux Package</vendor>
+  <action id="org.securelinux.movereset.reset-system">
+    <description>Reset this computer, keep my files</description>
+    <message>Secure Linux needs your password to reset this computer's apps and settings. Your files are kept.</message>
+    <defaults><allow_any>auth_admin</allow_any><allow_inactive>auth_admin</allow_inactive><allow_active>auth_admin</allow_active></defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/bin/secure-linux-reset</annotate>
+    <annotate key="org.freedesktop.policykit.exec.argv1">system</annotate>
+  </action>
+  <action id="org.securelinux.movereset.reset-undo-apps">
+    <description>Install the apps a reset removed again</description>
+    <message>Secure Linux needs your password to install the apps the last reset removed again.</message>
+    <defaults><allow_any>auth_admin</allow_any><allow_inactive>auth_admin</allow_inactive><allow_active>auth_admin_keep</allow_active></defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/bin/secure-linux-reset</annotate>
+    <annotate key="org.freedesktop.policykit.exec.argv1">undo-apps</annotate>
+  </action>
+  <action id="org.securelinux.movereset.reset-point">
+    <description>Remember today's apps for a later reset</description>
+    <message>Secure Linux needs your password to remember which apps this computer has today, for a later reset.</message>
+    <defaults><allow_any>auth_admin</allow_any><allow_inactive>auth_admin</allow_inactive><allow_active>auth_admin_keep</allow_active></defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/bin/secure-linux-reset</annotate>
+    <annotate key="org.freedesktop.policykit.exec.argv1">point</annotate>
+  </action>
+  <action id="org.securelinux.movereset.move-install-apps">
+    <description>Install the apps of a moved setup</description>
+    <message>Secure Linux needs your password to install the apps from your other computer.</message>
+    <defaults><allow_any>auth_admin</allow_any><allow_inactive>auth_admin</allow_inactive><allow_active>auth_admin_keep</allow_active></defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/bin/secure-linux-move-setup</annotate>
+    <annotate key="org.freedesktop.policykit.exec.argv1">install-apps</annotate>
+  </action>
+</policyconfig>

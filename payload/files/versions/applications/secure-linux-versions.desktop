@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Versions and Updates
+GenericName=Which release is where
+Comment=See the release on this computer, your saved master and a drive, and update, go back or read what changed
+Exec=secure-linux-versions
+Icon=software-update-available
+Terminal=false
+Categories=System;Settings;
+Keywords=versions;update;release;undo;what changed;testing channel;
+StartupNotify=true
+StartupWMClass=secure-linux-versions

@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Which app should I use?
+GenericName=Find an app for a job
+Comment=Say what you want to do, for example "edit photos", and get one good free app
+Exec=/usr/local/bin/secure-linux-which-app --ask
+Icon=system-search
+Terminal=true
+Categories=System;Utility;
+Keywords=which;app;program;software;suggest;recommend;replace;alternative;
+StartupNotify=false

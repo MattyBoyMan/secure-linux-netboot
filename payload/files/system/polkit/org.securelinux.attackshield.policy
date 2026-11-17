@@ -1,0 +1,108 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<!-- Secure Linux Attack Shield: password prompts for the few steps that change the computer.
+     Installed by steps/00-early.sh to /usr/share/polkit-1/actions/. Each action is tied to the program path and to
+     its first word, so the prompt says exactly what is being asked. -->
+<policyconfig>
+  <vendor>The Complete Secure Linux Package</vendor>
+  <action id="org.securelinux.attackshield.setup">
+    <description>Switch the Attack Shield on</description>
+    <message>Secure Linux needs your password to add the Attack Shield (it blocks addresses that are attacking other people). You have just read what it shares and said yes</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/bin/secure-linux-attack-shield</annotate>
+    <annotate key="org.freedesktop.policykit.exec.argv1">setup</annotate>
+  </action>
+  <action id="org.securelinux.attackshield.on">
+    <description>Switch the Attack Shield on again</description>
+    <message>Secure Linux needs your password to start blocking attacking addresses again</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/bin/secure-linux-attack-shield</annotate>
+    <annotate key="org.freedesktop.policykit.exec.argv1">on</annotate>
+  </action>
+  <action id="org.securelinux.attackshield.off">
+    <description>Switch the Attack Shield off</description>
+    <message>Secure Linux needs your password to stop the Attack Shield and remove every block</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/bin/secure-linux-attack-shield</annotate>
+    <annotate key="org.freedesktop.policykit.exec.argv1">off</annotate>
+  </action>
+  <action id="org.securelinux.attackshield.panic-off">
+    <description>Remove every block now</description>
+    <message>Secure Linux needs your password to remove every attack block at once and stop the blocking</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/bin/secure-linux-attack-shield</annotate>
+    <annotate key="org.freedesktop.policykit.exec.argv1">panic-off</annotate>
+  </action>
+  <action id="org.securelinux.attackshield.why-blocked">
+    <description>See why an address is blocked</description>
+    <message>Secure Linux needs your password to look up why one address is blocked (nothing is changed)</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/bin/secure-linux-attack-shield</annotate>
+    <annotate key="org.freedesktop.policykit.exec.argv1">why-blocked</annotate>
+  </action>
+  <action id="org.securelinux.attackshield.unblock">
+    <description>Let an address through</description>
+    <message>Secure Linux needs your password to let one address through the Attack Shield for good</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/bin/secure-linux-attack-shield</annotate>
+    <annotate key="org.freedesktop.policykit.exec.argv1">unblock</annotate>
+  </action>
+  <action id="org.securelinux.attackshield.allow">
+    <description>Never block an address</description>
+    <message>Secure Linux needs your password to add one address to the list that is never blocked</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/bin/secure-linux-attack-shield</annotate>
+    <annotate key="org.freedesktop.policykit.exec.argv1">allow</annotate>
+  </action>
+  <action id="org.securelinux.attackshield.remove">
+    <description>Take the Attack Shield away</description>
+    <message>Secure Linux needs your password to take the Attack Shield away completely</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/bin/secure-linux-attack-shield</annotate>
+    <annotate key="org.freedesktop.policykit.exec.argv1">remove</annotate>
+  </action>
+  <action id="org.securelinux.attackshield.refresh-allow">
+    <description>Update the never-block list</description>
+    <message>Secure Linux needs your password to refresh the list of addresses that are never blocked</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/bin/secure-linux-attack-shield</annotate>
+    <annotate key="org.freedesktop.policykit.exec.argv1">refresh-allow</annotate>
+  </action>
+</policyconfig>

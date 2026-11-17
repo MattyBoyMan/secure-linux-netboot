@@ -1,0 +1,70 @@
+# Vaultwarden for Secure Linux: your own password safe, used with the free Bitwarden apps. Home network only.
+# Started only by secure-linux-server-apps, which fills in the SL_* values from this computer (see app.conf).
+# Images pinned by version AND digest (checked on Docker Hub, 2026-11-16): vaultwarden/server 1.37.5-alpine and the
+# official caddy 2.11.9-alpine. Licences: Vaultwarden AGPL-3.0, Caddy Apache-2.0 (both free to use).
+# Safety: Vaultwarden itself sits on a private inside network with NO way out to the internet and NO port of its own.
+# Only the small "https" helper (Caddy) can reach it, and it speaks only https (an encrypted link) on your home address.
+# The helper makes its own home certificate on this computer (no outside company is asked). The plain port only sends
+# the browser on to https. Its settings are written as one line below: listen on 8451, answer only to this computer's
+# home address, hand on to the app, use the home certificate even when a browser does not say which name it wants
+# (browsers never do for a number address: default_sni), and never try to change this computer's trusted certificates.
+# Both run as your own account, not as the administrator, with every extra right removed.
+# Privacy: no website icons are fetched, no password hints, no admin page, no push service, no mail.
+# The first person to open it makes the first account: do that yourself straight away (see the guide).
+services:
+  vaultwarden:
+    image: docker.io/vaultwarden/server:1.37.5-alpine@sha256:bbe684a02d6b0db54256ff88eac9754f4519284a7b26314afc241fd7d0918191
+    restart: unless-stopped
+    user: "${SL_UID:?user missing}:${SL_GID:?group missing}"
+    networks:
+      - backend
+    volumes:
+      - "${SL_DATA:?data folder missing}/data:/data:Z"
+    environment:
+      TZ: "${SL_TZ:-UTC}"
+      DOMAIN: "https://${SL_BIND:?home address missing}:8451"
+      ROCKET_PORT: "8080"
+      SIGNUPS_ALLOWED: "true"
+      PASSWORD_HINTS_ALLOWED: "false"
+      SHOW_PASSWORD_HINT: "false"
+      DISABLE_ICON_DOWNLOAD: "true"
+      ICON_CACHE_TTL: "0"
+      PUSH_ENABLED: "false"
+      IP_HEADER: X-Forwarded-For
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+  https:
+    image: docker.io/library/caddy:2.11.9-alpine@sha256:003a97808e781aa9f7e75cc2f43d34d461099031faf5e20faefb9f61126836f0
+    restart: unless-stopped
+    user: "${SL_UID:?user missing}:${SL_GID:?group missing}"
+    depends_on:
+      - vaultwarden
+    command:
+      - /bin/sh
+      - -c
+      - 'printf ''%s'' ''{"admin":{"disabled":true},"apps":{"http":{"servers":{"home":{"listen":[":8451"],"protocols":["h1","h2"],"routes":[{"match":[{"host":["${SL_BIND:?home address missing}"]}],"handle":[{"handler":"reverse_proxy","upstreams":[{"dial":"vaultwarden:8080"}]}],"terminal":true}],"tls_connection_policies":[{"default_sni":"${SL_BIND:?home address missing}"}]}}},"tls":{"automation":{"policies":[{"subjects":["${SL_BIND:?home address missing}"],"issuers":[{"module":"internal"}]}]}},"pki":{"certificate_authorities":{"local":{"install_trust":false}}}}}'' > /config/caddy.json && exec caddy run --config /config/caddy.json'
+    networks:
+      - backend
+      - frontend
+    ports:
+      - "${SL_BIND:?home address missing}:${SL_PORT:?port missing}:80"
+      - "${SL_BIND:?home address missing}:8451:8451"
+    volumes:
+      - "${SL_DATA:?data folder missing}/certs:/data:Z"
+      - "${SL_DATA:?data folder missing}/certs-config:/config:Z"
+    environment:
+      TZ: "${SL_TZ:-UTC}"
+    sysctls:
+      net.ipv4.ip_unprivileged_port_start: 0
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+networks:
+  backend:
+    internal: true
+  frontend: {}

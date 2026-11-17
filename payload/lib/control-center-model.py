@@ -25,7 +25,15 @@ FEATURE_ORDER = (
     "disk_encryption",
     "flatpak_permissions",
     "docker_rootless",
+    "kit_share",
 )
+# The first ten are the protection switches; the next four are information cards. "Share updates with my other
+# computers at home" is a switch too, but not a protection: no preset ever turns it on (it stays off until the
+# person turns it on, because it opens a port on the home network).
+PROTECTION_SWITCHES = FEATURE_ORDER[:10]
+HOME_SWITCHES = ("kit_share",)
+SWITCH_FEATURES = PROTECTION_SWITCHES + HOME_SWITCHES
+INFO_FEATURES = tuple(key for key in FEATURE_ORDER[10:] if key not in HOME_SWITCHES)
 
 FEATURES = {
     "firewall": {
@@ -97,6 +105,11 @@ FEATURES = {
         "title": "Docker rootless mode",
         "summary": "Checks the active Docker context and opens the existing Home & Server Helper for setup.",
         "why": "Rootless setup is per user. Existing rootful Docker is never disabled by this centre.",
+    },
+    "kit_share": {
+        "title": "Share updates with my other computers at home",
+        "summary": "Other Secure Linux computers at home can get updates from this one, even when the internet is down. They still check every file against the official signature.",
+        "why": "Off until you turn it on. Sharing happens only on your home network and stops by itself when this computer leaves home.",
     },
 }
 
@@ -277,7 +290,10 @@ def review_text(plan: Iterable[PlannedChange]) -> str:
     lines = ["Please review every change. Nothing happens until you press Confirm.", ""]
     for number, change in enumerate(items, 1):
         lines.append(f"{number}. {change.sentence}")
-        if not change.desired:
+        if change.feature in HOME_SWITCHES:
+            if change.desired:
+                lines.append("   Other Secure Linux computers at home can get updates from this one, only on your home network.")
+        elif not change.desired:
             lines.append("   This reduces protection until you turn it back on.")
         if change.feature == "usbguard" and change.desired:
             lines.append("   USB devices may be blocked. Keep a recovery method available.")

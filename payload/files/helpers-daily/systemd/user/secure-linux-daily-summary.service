@@ -1,0 +1,7 @@
+[Unit]
+Description=Secure Linux: one-line summary of this computer (backups, updates, disk, security)
+ConditionPathExists=/usr/local/bin/secure-linux-daily-summary
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/secure-linux-daily-summary --notify

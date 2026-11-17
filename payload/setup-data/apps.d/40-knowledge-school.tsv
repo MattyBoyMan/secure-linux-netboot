@@ -1,0 +1,16 @@
+# 40-knowledge-school.tsv: offline knowledge, school, talk and Graphify apps (ideas 38, 44, 47, 48, 49, 50).
+# Columns (TAB separated): id kind title plain_description approx_size_mb profiles default arch idea
+# Every flatpak id and rpm name was checked live on Flathub or packages.fedoraproject.org on 2026-11-14; pipx names on PyPI.
+# Notes: sizes are the Flathub download size times about two (installed size). Speech Note (idea 49) stays in the wizard's
+# extra tools and is not listed here. Scratch itself is left out on purpose: its Flathub wrapper is unverified and over six
+# years old; TurboWarp (a maintained Scratch editor) is offered instead.
+org.kiwix.desktop	flatpak	Kiwix (offline reader)	Read Wikipedia and other libraries with no internet. The app is small; the libraries are separate downloads you choose yourself (from 0.3 GB to about 50 GB).	150	full,lite,atomic	on	all	47
+org.learningequality.Kolibri	flatpak	Kolibri (school lessons)	Free school lessons, videos and exercises that work offline. Lesson channels are optional extra downloads and can be very large.	200	full,lite,atomic	off	all	48
+org.kde.gcompris	flatpak	GCompris (learning games)	Learning games for young children: letters, numbers, shapes, music and more. Free and works offline.	120	full,lite,atomic	off	all	48
+org.stellarium.Stellarium	flatpak	Stellarium (night sky)	A planetarium for your computer. Shows the real night sky from anywhere, with stars, planets and constellations.	950	full,atomic	off	all	48
+org.geogebra.GeoGebra	flatpak	GeoGebra (maths)	Draw graphs, shapes and equations and see how they change. Works offline for school maths.	220	full,lite,atomic	off	all	48
+org.turbowarp.TurboWarp	flatpak	TurboWarp (Scratch coding)	Learn to code by snapping colourful blocks together. A fast, free editor for Scratch projects. Works offline.	360	full,atomic	off	all	48
+org.briarproject.Briar	flatpak	Briar (private messages)	Private chat that needs no company server. Messages go straight between devices, by Tor on the internet or by Bluetooth and Wi-Fi when the internet is down.	370	full,lite,atomic	on	all	50
+meshtastic	pipx	Meshtastic tools	Talk to a Meshtastic radio to send short messages with no phone signal or internet. You need a Meshtastic radio to use it.	60	full	off	all	50
+waydroid	rpm	Waydroid (Android apps)	Run Android apps in a window on this computer. The first start downloads an Android image of about 1 GB. Needs a recent Wayland desktop.	1010	full	off	all	44
+graphifyy	pipx	Graphify (map of a folder)	Turns a folder of notes, code or documents into a map you can search and ask questions about. Runs on this computer.	300	full	off	all	38

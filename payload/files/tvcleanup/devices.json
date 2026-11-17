@@ -1,0 +1,12 @@
+{
+  "format": 1,
+  "written": "2026-11-14",
+  "how_to_read": "Devices the tool treats as known without being told. 'device' is the code name the TV reports (ro.product.device). 'known_models' matches the model name plus maker the TV reports (ro.product.model and ro.product.manufacturer); the owner reported that both of their Chromecasts show Model 'Chromecast' with Android TV OS 14. Anything else needs you to type the model name to confirm. Code names come from third-party reports, not from Google (UNVERIFIED by Google).",
+  "known": [
+    {"device": "sabrina", "name": "Chromecast with Google TV (4K)", "source": "https://github.com/SirBisgaard/Sabrina-LineageOs"},
+    {"device": "kirkwood", "name": "Google TV Streamer", "source": "https://raelize.com/blog/setresuid-glitching-google-tv-streamer-from-adb-to-root/"}
+  ],
+  "known_models": [
+    {"model": "Chromecast", "manufacturer": "Google", "name": "Chromecast with Google TV", "source": "owner report 2026-11-14: Model 'Chromecast', Android TV OS 14, kernel 5.15"}
+  ]
+}

@@ -1,0 +1,36 @@
+# SearXNG for Secure Linux: a private search page that asks many search sites for you and keeps no history of you.
+# Home network only. One recipe file: the x-secure-linux block below is read by secure-linux-server-apps.
+# Image pinned by version AND digest (checked on Docker Hub, 2026-11-16): official searxng/searxng 2026.11.15-2d500cb6b.
+# SearXNG has no numbered releases: its tag is the build date plus the code id, and it is rebuilt every few days.
+# Licence: AGPL-3.0-or-later (free software). Runs as your own account, not as the administrator.
+# On first start the image makes its own settings.yml in the config folder, with a new random secret key
+# (checked in the image's own entrypoint.sh), so this recipe needs no password or key of its own.
+# Your searches go to the search sites SearXNG asks, without your name (they see this computer's internet address).
+x-secure-linux:
+  title: SearXNG (private search)
+  about: A private search page for your home. It does not track you or keep a history. Home network only.
+  port: 8141
+  lan_only: yes
+  data_dirs: config cache
+  user_dirs: config cache
+  backup_include: config
+  min_free_gb: 1
+  idea: X1
+services:
+  searxng:
+    image: docker.io/searxng/searxng:2026.11.15-2d500cb6b@sha256:932f69dca010db9880bddebb2171f05d8e1a25d04a59149ff65409993d680024
+    restart: unless-stopped
+    user: "${SL_UID:?user missing}:${SL_GID:?group missing}"
+    ports:
+      - "${SL_BIND:?home address missing}:${SL_PORT:?port missing}:8080"
+    volumes:
+      - "${SL_DATA:?data folder missing}/config:/etc/searxng:Z"
+      - "${SL_DATA:?data folder missing}/cache:/var/cache/searxng:Z"
+    environment:
+      TZ: "${SL_TZ:-UTC}"
+      GRANIAN_HOST: "0.0.0.0"
+      GRANIAN_PORT: "8080"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL

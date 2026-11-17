@@ -1,0 +1,95 @@
+#!/bin/bash
+# secure-linux-panic-lock: lock this computer right now, in one go.
+#
+#   secure-linux-panic-lock          lock the screen at once, then: close the home server folder, forget any
+#                                    password typed in the last few minutes for administrator tasks, and clear
+#                                    copied text. Nothing is deleted and nothing is switched off for good.
+#   secure-linux-panic-lock --help
+#
+# Unlock with your normal password. The home server folder opens again by itself the next time you are at home.
+# It never asks for a password: locking can only make the computer safer.
+set -u
+SL_ROOT=${SL_ROOT:-/usr/local/lib/secure-linux}
+PL_SYS=${SL_TEST_SYSROOT:-}                     # tests only: prefix for the system folders
+HS_UNITDIR=$PL_SYS/etc/systemd/system
+HS_UNIT=media-homeserver                        # the home server folder (made by secure-linux-home-share)
+HS_WHERE=/media/homeserver
+SUDO_TS=$PL_SYS/run/sudo/ts                     # where "remembered for a few minutes" admin passwords live
+
+pl_log() { command -v logger >/dev/null 2>&1 && logger -t secure-linux-panic-lock "$1" 2>/dev/null; return 0; }
+pl_try() { timeout 10 "$@" >/dev/null 2>&1; }   # every part is best effort and quick: never hang the lock
+
+pl_lock_own_screen() {   # the first thing, before anything else: lock the screen of the person who pressed it
+  if [ -n "${XDG_SESSION_ID:-}" ] && pl_try loginctl lock-session "$XDG_SESSION_ID"; then return 0; fi
+  pl_try loginctl lock-session && return 0
+  if command -v qdbus6 >/dev/null 2>&1; then pl_try qdbus6 org.freedesktop.ScreenSaver /ScreenSaver Lock && return 0; fi
+  if command -v qdbus >/dev/null 2>&1; then pl_try qdbus org.freedesktop.ScreenSaver /ScreenSaver Lock && return 0; fi
+  pl_try dbus-send --session --type=method_call --dest=org.freedesktop.ScreenSaver /org/freedesktop/ScreenSaver \
+    org.freedesktop.ScreenSaver.Lock && return 0
+  pl_try loginctl lock-sessions && return 0
+  return 1
+}
+
+pl_clear_clipboard() {   # copied text (and the clipboard history) is cleared
+  local q
+  for q in qdbus6 qdbus; do
+    command -v "$q" >/dev/null 2>&1 && pl_try "$q" org.kde.klipper /klipper org.kde.klipper.klipper.clearClipboardHistory
+  done
+  command -v wl-copy >/dev/null 2>&1 && pl_try wl-copy --clear
+  command -v xsel >/dev/null 2>&1 && pl_try xsel --clipboard --clear
+  return 0
+}
+
+pl_close_home_folder() {   # same as secure-linux-home-share does when you leave home
+  [ -e "$HS_UNITDIR/$HS_UNIT.automount" ] || [ -e "$HS_UNITDIR/$HS_UNIT.mount" ] || return 0
+  pl_try systemctl stop "$HS_UNIT.automount"
+  if command -v mountpoint >/dev/null 2>&1 && mountpoint -q "$PL_SYS$HS_WHERE" 2>/dev/null; then
+    pl_try umount -l "$PL_SYS$HS_WHERE"
+  fi
+  pl_try systemctl --no-block stop "$HS_UNIT.mount"
+  return 0
+}
+
+pl_system_part() {   # run with administrator rights (no password: the action only locks things)
+  pl_try loginctl lock-sessions                       # every screen on this computer
+  pl_close_home_folder
+  if [ -d "$SUDO_TS" ]; then                          # remembered administrator passwords are forgotten
+    find "$SUDO_TS" -mindepth 1 -maxdepth 1 -type f -delete 2>/dev/null
+  fi
+  pl_log "Panic lock: every screen locked, home server folder closed, remembered administrator passwords forgotten."
+  return 0
+}
+
+case "${1:-}" in
+  -h|--help|help) sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+esac
+
+if [ "$(id -u)" -eq 0 ]; then
+  # Run as the administrator (through the password-free action, or by hand): only the known system part, whatever
+  # was asked. Under pkexec anything except --system is refused, so the action can never do anything else.
+  if [ -n "${PKEXEC_UID:-}" ] && [ "${1:-}" != --system ]; then
+    echo "The panic lock only accepts its own request." >&2
+    exit 1
+  fi
+  pl_system_part
+  echo "Locked."
+  exit 0
+fi
+
+case "${1:-}" in
+  '') ;;
+  *) echo "Unknown choice: $1. Run secure-linux-panic-lock --help to see what it does."; exit 1 ;;
+esac
+
+pl_lock_own_screen; locked=$?
+pl_clear_clipboard
+command -v pkcheck >/dev/null 2>&1 && pl_try pkcheck --revoke-temp-authorizations
+SELF=/usr/local/bin/secure-linux-panic-lock; [ -x "$SELF" ] || SELF=$(readlink -f "$0")
+timeout 30 pkexec "$SELF" --system >/dev/null 2>&1   # its own action: no password, only the system part
+pl_log "Panic lock pressed."
+if [ $locked -eq 0 ]; then
+  echo "Locked. Unlock with your normal password."
+  exit 0
+fi
+echo "The screen could not be locked from here. Hold the Meta key (the one with the logo, next to Ctrl) and press L to lock it." >&2
+exit 2

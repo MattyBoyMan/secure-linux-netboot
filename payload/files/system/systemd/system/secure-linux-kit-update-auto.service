@@ -1,0 +1,14 @@
+# Quietly looks for a newer Secure Linux release (never installs unless you allowed it; never shows a message).
+[Unit]
+Description=Look for a newer Secure Linux release
+Wants=network-online.target
+After=network-online.target
+ConditionPathExists=/usr/local/bin/secure-linux-kit-update-auto
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/secure-linux-kit-update-auto run
+SuccessExitStatus=0
+Nice=15
+IOSchedulingClass=idle
+TimeoutStartSec=15min

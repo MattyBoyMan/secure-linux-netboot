@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<!-- Secure Linux AI chat page (secure-linux-ai-web): the only part that needs a password is opening or closing its
+     port in the firewall's home zone when you share the page at home. Installed by steps/00-early.sh to
+     /usr/share/polkit-1/actions/. Tied to the program path and its first word. -->
+<policyconfig>
+  <vendor>The Complete Secure Linux Package</vendor>
+  <action id="org.securelinux.aiweb.homefirewall">
+    <description>Let your devices at home reach the AI chat page</description>
+    <message>Secure Linux needs your password to let your other devices at home reach the AI chat page (or to close it to them again). It is never opened to the internet.</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/bin/secure-linux-ai-web</annotate>
+    <annotate key="org.freedesktop.policykit.exec.argv1">home-firewall</annotate>
+  </action>
+</policyconfig>

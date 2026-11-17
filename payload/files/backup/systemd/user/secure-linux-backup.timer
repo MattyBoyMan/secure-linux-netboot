@@ -1,0 +1,16 @@
+[Unit]
+Description=Secure Linux: daily home-folder backup (switched on by secure-linux-backup setup)
+
+[Timer]
+# One backup a day. If the computer was off at the planned time, Persistent=true starts the missed run at the next
+# start; OnStartupSec tries again soon after you log in (when the home server has had time to connect), and the
+# hourly try catches a backup place that was not connected yet. secure-linux-backup does nothing when today's
+# backup is already made, and tries at most 3 times a day.
+OnCalendar=daily
+OnCalendar=hourly
+Persistent=true
+OnStartupSec=10min
+RandomizedDelaySec=10min
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,50 @@
+# Secure Linux "Which app should I use?": what a person wants to do -> one good free app. Tab-separated; no tabs inside a field.
+# task_id: short name; keywords: comma-separated words or phrases a person might type (all words of a phrase must appear);
+# task_title: the task in plain words; app_name: what to show; linux_id/pkg_type: must match a row in app-equivalents.tsv (builtin rows use - and builtin);
+# tip: one plain sentence. secure-linux-which-app reads app-equivalents.tsv (read-only) for profile, state and how to get the app.
+# task_id	keywords	task_title	app_name	linux_id	pkg_type	tip
+write-document	write,letter,document,essay,word processor,type up,cv,resume,report,essays,word	Write a letter or document	LibreOffice Writer	org.libreoffice.LibreOffice	flatpak	Writes letters and documents, and opens Word files.
+spreadsheet	spreadsheet,budget,table of numbers,excel,formula,chart,numbers,sums	Work with numbers and spreadsheets	LibreOffice Calc	org.libreoffice.LibreOffice	flatpak	Handles spreadsheets, formulas and charts, and opens Excel files.
+slides	slides,slideshow,presentation,powerpoint,talk,present	Make a slideshow	LibreOffice Impress	org.libreoffice.LibreOffice	flatpak	Makes slide presentations and opens PowerPoint files.
+email	email,e-mail,mail,inbox,gmail,outlook,send a message	Read and send email	Thunderbird	org.mozilla.Thunderbird	flatpak	Private email that works with Gmail, Outlook.com, iCloud and work accounts.
+calendar	calendar,contacts,appointments,schedule,address book,reminders	Keep a calendar and contacts	Thunderbird	org.mozilla.Thunderbird	flatpak	Has a calendar and address book built in next to your email.
+notes	notes,note taking,notebook,to-do,todo,journal,jot down,notes app	Take notes	Joplin	net.cozic.joplin_desktop	flatpak	Notebooks, lists and attachments that stay on your own computer.
+web-browser	browse the web,internet,browser,web browser,surf,online,google	Browse the web	LibreWolf	io.gitlab.librewolf-community	flatpak	A private web browser that blocks many trackers.
+edit-photos	edit photos,photo editing,retouch,fix a photo,crop,photoshop,resize pictures,edit pictures,edit images,photo	Edit photos and pictures	GIMP	org.gimp.GIMP	flatpak	The main free photo editor: crop, fix colours, remove things, layers.
+paint-draw	paint,draw,sketch,digital art,illustration,painting,drawing,tablet	Paint or draw	Krita	org.kde.krita	flatpak	A painting and drawing app, good with a pen tablet.
+vector-design	logo,vector,svg,icon design,poster,design,illustrator	Design a logo or poster	Inkscape	org.inkscape.Inkscape	flatpak	Draws sharp shapes and logos that stay clear at any size.
+camera-photos	raw,photo library,develop photos,camera photos,lightroom,organise photos,photographer	Sort and develop camera photos	darktable	org.darktable.Darktable	flatpak	Develops raw camera photos and keeps your photo library tidy.
+edit-video	edit videos,video editing,cut video,movie maker,film,trim video,make a movie,video	Edit a video	Kdenlive	org.kde.kdenlive	flatpak	A full video editor with a timeline, titles and effects.
+record-screen	record screen,screen recording,stream,streaming,livestream,webcam,record my screen	Record your screen or stream live	OBS Studio	com.obsproject.Studio	flatpak	Records the screen and webcam, or streams live.
+convert-video	convert video,shrink video,compress video,rip dvd,transcode,change video format,handbrake	Convert or shrink a video	HandBrake	fr.handbrake.ghb	flatpak	Changes a video to another format or makes the file smaller.
+3d-animation	3d,animation,3d model,render,blender,animate	Make 3D models and animations	Blender	org.blender.Blender	flatpak	Free 3D modelling, animation and rendering.
+play-media	play video,play music,watch a movie,media player,dvd,play songs,listen to music,watch videos,music player,itunes	Play music and videos	VLC	org.videolan.VLC	rpm	Plays almost any music or video file, and DVDs.
+edit-audio	edit audio,record my voice,record audio,podcast,remove noise,sound editing,voice recording	Record or edit sound	Audacity	org.audacityteam.Audacity	flatpak	Records and edits sound, voices and podcasts.
+make-music	make music,compose,beats,synth,music making,garageband,electronic music	Make music	LMMS	io.lmms.LMMS	flatpak	Make beats and tunes with instruments and a sequencer.
+music-studio	record a band,multitrack,recording studio,mix a song,produce music,mixing	Record and mix a band or song	Ardour	org.ardour.Ardour	flatpak	A recording studio for many tracks and real instruments.
+torrents	torrent,torrents,bittorrent,download torrent,magnet link	Download torrents	qBittorrent	org.qbittorrent.qBittorrent	flatpak	A clean, ad-free torrent downloader.
+telegram	telegram,messaging,chat with friends,instant messages,texting	Chat on Telegram	Telegram	org.telegram.desktop	flatpak	The official Telegram app for your desktop.
+discord	discord,voice chat,gaming chat,community chat	Chat on Discord	Vesktop	dev.vencord.Vesktop	flatpak	A Discord app that works well on Linux.
+passwords-keepass	passwords,password manager,logins,store passwords,remember passwords,safe place for passwords,1password	Keep your passwords safe	KeePassXC	org.keepassxc.KeePassXC	flatpak	Keeps your passwords in one locked file on your own computer.
+passwords-sync	share passwords,sync passwords,passwords on my phone,password manager for phone,bitwarden	Share passwords between your devices	Bitwarden	com.bitwarden.desktop	flatpak	A password manager that works on your computer and your phone.
+backup	backup,back up,save a copy of my files,copy my files,protect my files	Back up your files	Pika Backup	org.gnome.World.PikaBackup	flatpak	Makes safe copies of your files on a drive or server.
+remote-help	remote desktop,help someone,remote help,share my screen,teamviewer,remote access,control another computer	Help someone from far away	RustDesk	com.rustdesk.RustDesk	flatpak	Lets you see and help with another computer, or lets someone help you.
+file-transfer	ftp,sftp,files to a website,send files,upload to a website,transfer files to a server,web server files,winscp	Send files to a website or server	FileZilla	org.filezillaproject.Filezilla	flatpak	Moves files to and from a website or server.
+write-code	code,programming,coding,write a program,develop,text editor,write code,python,html,notepad	Write code or edit text files	VSCodium	com.vscodium.codium	flatpak	A code editor with no tracking.
+pdf-pages	merge pdf,split pdf,combine pdf,rotate pdf,reorder pdf,pdf pages,join pdf,acrobat	Merge or rearrange PDF pages	PDF Arranger	com.github.jeromerobert.pdfarranger	flatpak	Joins, splits, rotates and reorders the pages of PDF files.
+pdf-read	read pdf,open pdf,view pdf,print pdf,pdf viewer,look at a pdf	Read or print a PDF	Document Viewer	-	builtin	Already on this computer: opens, searches and prints PDFs.
+diagrams	diagram,flowchart,mind map,network map,org chart,visio,draw a chart	Draw diagrams and flowcharts	draw.io	com.jgraph.drawio.desktop	flatpak	Makes flowcharts and diagrams, and works offline.
+publishing	newsletter,flyer,booklet,brochure,desktop publishing,magazine,page layout	Lay out a newsletter or booklet	Scribus	net.scribus.Scribus	flatpak	Page layout for newsletters, flyers and booklets.
+accounts	accounting,bookkeeping,accounts,invoices,home budget,finance,quickbooks,money	Keep accounts and track money	GnuCash	org.gnucash.GnuCash	flatpak	Tracks income and spending with proper accounts and reports.
+project-plan	project plan,project planning,gantt,schedule tasks,plan a project	Plan a project	ProjectLibre	com.projectlibre.ProjectLibre	flatpak	Plans tasks, dates and who does what.
+cad-drawing	cad,technical drawing,3d printing design,engineering,architecture,autocad,design a part	Make technical drawings (CAD)	FreeCAD	org.freecad.FreeCAD	flatpak	Designs parts and technical drawings for 3D printing or building.
+virtual-machine	virtual machine,try another system,run another operating system,test software safely,vmware,virtualbox	Try another operating system safely	GNOME Boxes	org.gnome.Boxes	flatpak	Runs another system in a window so you can try it safely.
+bootable-usb	bootable usb,make a usb,write iso,flash usb,installer stick,rufus,burn iso	Make a bootable USB stick	Impression	io.gitlab.adhami3310.Impression	flatpak	Writes a system image to a USB stick. Check the drive name carefully first.
+disk-tools	disk health,smart,partition,format a drive,format usb,disks,check my drive,hard drive health	Check or format a drive	Disks	gnome-disk-utility	rpm	Shows drive health and formats drives. Read the drive name carefully before you format.
+system-monitor	what is using cpu,slow computer,task manager,memory use,cpu use,performance,why is my computer slow,running programs	See what is slowing the computer	Mission Center	io.missioncenter.MissionCenter	flatpak	Shows which programs use the processor, memory and disk.
+find-files	find files,search files,locate a file,search my computer,where is my file,everything	Find a file on this computer	FSearch	io.github.cboxdoerfer.FSearch	flatpak	Finds files by name very quickly.
+play-games	games,play games,steam,gaming,video games	Play games	Steam	com.valvesoftware.Steam	flatpak	The Steam store and library, with many games that run on Linux.
+other-stores	epic games,gog,heroic,epic,game launcher	Use Epic or GOG games	Heroic Games Launcher	com.heroicgameslauncher.hgl	flatpak	Opens your Epic and GOG game libraries.
+minecraft	minecraft,mods,modpack	Play Minecraft	Prism Launcher	org.prismlauncher.PrismLauncher	flatpak	Starts Minecraft and keeps different versions and mods apart.
+api-testing	api testing,test an api,postman,http requests,rest api	Test a web API	Bruno	com.usebruno.Bruno	flatpak	Sends test requests to a web service and shows the answers.
+windows-programs	windows app,windows program,exe file,run windows software,wine,run an exe	Run a Windows-only program	Bottles	com.usebottles.bottles	flatpak	Runs some Windows programs. It does not work for every program.

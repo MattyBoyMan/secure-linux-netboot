@@ -1,0 +1,778 @@
+#!/usr/bin/env python3
+"""secure-linux-phone-backup: encrypted phone backups and a phone mirror, only when you ask.
+
+  secure-linux-phone-backup check                    see which phone is plugged in and which helper programs are here
+  secure-linux-phone-backup backup [android|iphone]  copy the phone to this computer and lock the copy with a password
+  secure-linux-phone-backup list                     show the backups you have made
+  secure-linux-phone-backup open FILE                unlock a backup into a new folder
+  secure-linux-phone-backup mirror                   show the phone screen on this computer (scrcpy), Android only
+
+Options for backup:
+  --dest DIR       save the locked backup in this folder (default: Phone-Backups in your home folder)
+  --device ID      pick one phone when several are plugged in (the serial from "check")
+  --what LIST      Android only: photos, videos, documents, downloads, music (default: photos,videos,documents,downloads)
+  --yes            skip the "are you sure" question (the password is still asked by the locking program)
+
+Options for open:   --into DIR   unlock into this new folder (default: next to the backup)
+Options for mirror: --from FILE  use a scrcpy file you already have (it must match the checksum this kit knows)
+                    --yes        download without asking      --install-only   get scrcpy, do not start it
+                    anything after  --  is handed to scrcpy
+
+How it keeps you safe:
+  - The backup is locked with a password YOU type into age (or gpg). This tool never sees it, never makes one up,
+    never takes one on the command line and never writes it anywhere.
+  - The unlocked copy only lives in a private temporary folder on this computer's own disk (in your home folder) while
+    the backup is made - never in the folder you save to, which may be a USB stick. Only the locked file goes there.
+    The unlocked copy is deleted when the work ends, also when something goes wrong. If no locking program is
+    installed, nothing is saved at all.
+  - Android phones: this copies your photos, videos, documents and downloads. It does not copy apps, texts or contacts.
+    Use the phone's own backup for those. iPhones: this makes the normal full iPhone backup.
+  - scrcpy is not in Fedora or Flathub. "mirror" downloads the maker's own file from the maker's own page and refuses it
+    unless its SHA-256 checksum matches the one this kit has pinned. It asks first and installs only for you.
+Nothing here runs by itself and nothing is sent anywhere except the one scrcpy download you agree to.
+Exit codes: 0 done, 1 problem, 2 wrong use, 3 you said no, 4 not enough space, 5 checksum did not match, 6 no internet.
+"""
+import datetime
+import hashlib
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import tarfile
+import tempfile
+import urllib.error
+import urllib.parse
+import urllib.request
+
+PROG = "secure-linux-phone-backup"
+GIB = 1024 ** 3
+MIB = 1024 ** 2
+ANDROID_FOLDERS = {
+    "photos": ["DCIM", "Pictures"],
+    "videos": ["Movies"],
+    "documents": ["Documents"],
+    "downloads": ["Download"],
+    "music": ["Music"],
+}
+DEFAULT_WHAT = "photos,videos,documents,downloads"
+SERIAL_RE = re.compile(r"^[A-Za-z0-9._:-]{1,64}$")
+SCRCPY_URL_PREFIX = "https://github.com/Genymobile/scrcpy/releases/download/"
+EXIT_OK, EXIT_PROBLEM, EXIT_USAGE, EXIT_NO, EXIT_SPACE, EXIT_SUM, EXIT_NET = 0, 1, 2, 3, 4, 5, 6
+
+
+class Stop(Exception):
+    def __init__(self, message, code=EXIT_PROBLEM):
+        Exception.__init__(self, message)
+        self.message = message
+        self.code = code
+
+
+def say(text=""):
+    print(text)
+    sys.stdout.flush()
+
+
+def warn(text):
+    print(text, file=sys.stderr)
+    sys.stderr.flush()
+
+
+# ---------------------------------------------------------------- helper programs
+def tool_cmd(name):
+    """The command (as a list) for a helper program, or None. SL_PHONE_CMD_<NAME> lets the tests stand in for a program."""
+    over = os.environ.get("SL_PHONE_CMD_" + name.upper().replace("-", "_"))
+    if over == "none":
+        return None
+    if over:
+        return shlex.split(over)
+    path = shutil.which(name)
+    return [path] if path else None
+
+
+def run(cmd, **kw):
+    kw.setdefault("stdin", subprocess.DEVNULL)
+    return subprocess.run(cmd, **kw)
+
+
+def capture(cmd, timeout=60):
+    try:
+        r = run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return 1, str(e)
+    return r.returncode, r.stdout.decode("utf-8", "replace")
+
+
+def adb_cmd():
+    c = tool_cmd("adb")
+    if c:
+        return c
+    bundled = os.path.join(scrcpy_dir(), "adb")
+    if os.path.isfile(bundled) and os.access(bundled, os.X_OK):
+        return [bundled]
+    return None
+
+
+def lock_cmd():
+    """The locking program: age first, gpg second. Returns (kind, command) or (None, None)."""
+    a = tool_cmd("age")
+    if a:
+        return "age", a
+    g = tool_cmd("gpg")
+    if g:
+        return "gpg", g
+    return None, None
+
+
+# ---------------------------------------------------------------- folders and sizes
+def default_dest():
+    return os.environ.get("SL_PHONE_DEST") or os.path.join(os.path.expanduser("~"), "Phone-Backups")
+
+
+def work_root():
+    """The private folder for the unlocked working copy: in your home folder on this computer's own disk (encrypted on
+    an installed Secure Linux computer), never inside --dest. SL_PHONE_WORK_DIR lets a test use a throw-away folder."""
+    base = os.environ.get("SL_PHONE_WORK_DIR") or os.path.join(
+        os.environ.get("XDG_CACHE_HOME") or os.path.join(os.path.expanduser("~"), ".cache"), "secure-linux-phone-backup")
+    os.makedirs(base, mode=0o700, exist_ok=True)
+    os.chmod(base, 0o700)
+    return base
+
+
+def device_of(path):
+    """The disk a folder is on (its nearest existing parent), or None."""
+    probe = os.path.abspath(path)
+    while probe and not os.path.exists(probe):
+        parent = os.path.dirname(probe)
+        if parent == probe:
+            break
+        probe = parent
+    try:
+        return os.stat(probe).st_dev
+    except OSError:
+        return None
+
+
+def scrcpy_dir():
+    base = os.environ.get("SL_PHONE_TOOLS_DIR") or os.path.join(os.path.expanduser("~"), ".local", "share", "secure-linux", "scrcpy")
+    return os.path.join(base, load_pin().get("VERSION", "current")) if os.path.isfile(pin_path()) else base
+
+
+def free_bytes(path):
+    forced = os.environ.get("SL_PHONE_FREE_BYTES")
+    if forced and forced.isdigit():
+        return int(forced)
+    probe = path
+    while probe and not os.path.exists(probe):
+        parent = os.path.dirname(probe)
+        if parent == probe:
+            break
+        probe = parent
+    return shutil.disk_usage(probe or ".").free
+
+
+def human(n):
+    if n >= GIB:
+        return "%.1f GB" % (n / GIB)
+    return "%d MB" % max(1, int(round(n / MIB)))
+
+
+def stamp():
+    return os.environ.get("SL_PHONE_STAMP") or datetime.datetime.now().strftime("%Y-%m-%d-%H%M")
+
+
+def ask_yes(question, assume_yes):
+    if assume_yes:
+        return True
+    if not sys.stdin.isatty():
+        raise Stop("This needs your answer, and no one can answer here. Run it in a terminal, or add --yes.", EXIT_NO)
+    try:
+        answer = input(question + " [yes/no] ").strip().lower()
+    except EOFError:
+        answer = ""
+    return answer in ("y", "yes")
+
+
+# ---------------------------------------------------------------- locking the backup
+def anonymous(info):
+    """Keep no user names or numbers from this computer inside the backup."""
+    info.uid = info.gid = 0
+    info.uname = info.gname = ""
+    return info
+
+
+def lock_stream_to_file(staging, out_file, kind, cmd):
+    """tar the staging folder and push it through the locking program. The password is asked by that program itself."""
+    part = out_file + ".part"
+    if os.path.exists(part):
+        os.remove(part)
+    if kind == "age":
+        argv = cmd + ["-p", "-o", part]
+    else:
+        argv = cmd + ["--symmetric", "--cipher-algo", "AES256", "--output", part]
+    proc = subprocess.Popen(argv, stdin=subprocess.PIPE)
+    ok = True
+    try:
+        with tarfile.open(fileobj=proc.stdin, mode="w|") as tf:
+            for name in sorted(os.listdir(staging)):
+                tf.add(os.path.join(staging, name), arcname=name, filter=anonymous)
+    except (OSError, ValueError):
+        ok = False
+    try:
+        proc.stdin.close()
+    except OSError:
+        pass
+    rc = proc.wait()
+    if rc != 0 or not ok or not os.path.isfile(part) or os.path.getsize(part) == 0:
+        if os.path.exists(part):
+            os.remove(part)
+        raise Stop("The backup could not be locked, so nothing was saved. Run it again and type the same password twice.")
+    os.replace(part, out_file)
+    os.chmod(out_file, 0o600)
+
+
+def sha256_file(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+# ---------------------------------------------------------------- phones
+def adb_devices(adb):
+    code, out = capture(adb + ["devices"], 30)
+    if code != 0:
+        raise Stop("The phone helper (adb) did not answer. Unplug the phone, plug it in again and try once more.")
+    found = []
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) == 2 and SERIAL_RE.match(parts[0]) and parts[1] in ("device", "unauthorized", "offline", "recovery", "sideload"):
+            found.append((parts[0], parts[1]))
+    return found
+
+
+def iphone_ids():
+    idev = tool_cmd("idevice_id")
+    if not idev:
+        return None, []
+    code, out = capture(idev + ["-l"], 30)
+    ids = [x.strip() for x in out.splitlines() if re.match(r"^[0-9A-Fa-f-]{20,64}$", x.strip())]
+    return idev, ids
+
+
+ANDROID_HELP = (
+    "Turn on USB debugging on the phone first:\n"
+    "  1. Open Settings, then About phone. Tap Build number seven times.\n"
+    "  2. Go back to Settings, open Developer options and turn on USB debugging.\n"
+    "  3. Plug the phone in, unlock it, and when it asks \"Allow USB debugging?\" tap Allow.\n"
+    "Then run this again.")
+
+
+def cmd_check(args):
+    say("Phone helpers on this computer:")
+    adb = adb_cmd()
+    say("  Android helper (adb):   " + ("found" if adb else "not installed (Secure Linux adds it during setup when online)"))
+    idev, ids = iphone_ids()
+    say("  iPhone helpers:         " + ("found" if idev else "not installed (Secure Linux adds them during setup when online)"))
+    kind, _ = lock_cmd()
+    say("  Locking program:        " + (kind if kind else "none found (install age, then backups can be made)"))
+    sc = find_scrcpy()
+    say("  Phone mirror (scrcpy):  " + ("found" if sc else "not here yet; run: %s mirror" % PROG))
+    say()
+    if adb:
+        try:
+            devs = adb_devices(adb)
+        except Stop as e:
+            warn(e.message)
+            devs = []
+        if devs:
+            for serial, state in devs:
+                note = {"device": "ready", "unauthorized": "look at the phone and tap Allow", "offline": "unplug it and plug it in again"}.get(state, state)
+                say("  Android phone %s: %s" % (serial, note))
+        else:
+            say("  No Android phone found.")
+    if idev:
+        if ids:
+            for i in ids:
+                say("  iPhone %s: found (unlock it and tap Trust if it asks)" % i)
+        else:
+            say("  No iPhone found.")
+    return EXIT_OK
+
+
+def pick_phone(args):
+    """Return ("android", serial) or ("iphone", udid)."""
+    want = args["kind"]
+    adb = adb_cmd()
+    android = []
+    if want in ("auto", "android") and adb:
+        android = adb_devices(adb)
+    _, ids = iphone_ids() if want in ("auto", "iphone") else (None, [])
+    ready = [("android", s) for s, st in android if st == "device"]
+    pending = [(s, st) for s, st in android if st != "device"]
+    iph = [("iphone", i) for i in ids]
+    if args["device"]:
+        for k, ident in ready + iph:
+            if ident == args["device"]:
+                return k, ident
+        raise Stop("I cannot see a phone with that number. Run \"%s check\" to see what is plugged in." % PROG)
+    choices = ready + iph
+    if len(choices) == 1:
+        return choices[0]
+    if len(choices) > 1:
+        raise Stop("More than one phone is plugged in. Unplug the ones you do not want, or pick one with --device. "
+                   "Run \"%s check\" to see their numbers." % PROG)
+    if pending:
+        s, st = pending[0]
+        if st == "unauthorized":
+            raise Stop("The phone is plugged in but has not said yes yet. Unlock it and tap Allow on the question that appears.")
+        raise Stop("The phone is plugged in but not ready (%s). Unplug it, plug it in again and unlock it." % st)
+    if want == "android" and not adb:
+        raise Stop("The Android helper (adb) is not installed. Connect to the internet and run Secure Linux repair, or install android-tools.")
+    if want == "iphone" and not tool_cmd("idevice_id"):
+        raise Stop("The iPhone helpers are not installed. Connect to the internet and run Secure Linux repair, or install libimobiledevice-utils.")
+    if want == "iphone":
+        raise Stop("I cannot see an iPhone. Plug it in with its cable, unlock it and tap Trust if it asks.")
+    raise Stop("I cannot see a phone. Plug it in with its cable and unlock it.\n" + ANDROID_HELP)
+
+
+def android_pull(serial, what, staging):
+    adb = adb_cmd()
+    base = adb + ["-s", serial]
+    pulled = 0
+    wanted = []
+    for key in what:
+        wanted.extend(ANDROID_FOLDERS[key])
+    total_kb = 0
+    present = []
+    for folder in wanted:
+        path = "/sdcard/" + folder
+        code, out = capture(base + ["shell", "test -d '%s' && echo yes" % path], 30)
+        if code == 0 and "yes" in out:
+            present.append((folder, path))
+            c2, o2 = capture(base + ["shell", "du -sk '%s'" % path], 120)
+            m = re.match(r"^\s*(\d+)", o2) if c2 == 0 else None
+            if m:
+                total_kb += int(m.group(1))
+    return present, total_kb * 1024, base
+
+
+def clear_stale_staging(dest):
+    """A closed terminal or a power cut can leave an unlocked working folder behind. Remove old ones (over two hours old)."""
+    now = datetime.datetime.now().timestamp()
+    try:
+        names = os.listdir(dest)
+    except OSError:
+        return
+    for n in names:
+        p = os.path.join(dest, n)
+        if n.startswith(".staging-") and os.path.isdir(p) and not os.path.islink(p):
+            try:
+                if now - os.path.getmtime(p) > 2 * 3600:
+                    shutil.rmtree(p, ignore_errors=True)
+                    warn("Removed an old unfinished working folder: %s" % n)
+            except OSError:
+                pass
+
+
+def cmd_backup(args):
+    kind_lock, lock = lock_cmd()
+    if not kind_lock:
+        raise Stop("No locking program is installed (age or gpg), so I will not save an unlocked copy of your phone. "
+                   "Install age, then try again.")
+    what = [w.strip() for w in args["what"].split(",") if w.strip()]
+    for w in what:
+        if w not in ANDROID_FOLDERS:
+            raise Stop("I do not know \"%s\". Choose from: %s." % (w, ", ".join(sorted(ANDROID_FOLDERS))), EXIT_USAGE)
+    if not what:
+        raise Stop("Pick at least one thing to copy with --what.", EXIT_USAGE)
+    phone_kind, ident = pick_phone(args)
+    dest = os.path.abspath(os.path.expanduser(args["dest"] or default_dest()))
+    present, need = [], 0
+    base = None
+    if phone_kind == "android":
+        present, need, base = android_pull(ident, what, None)
+        if not present:
+            raise Stop("I found no photos, videos or files in the places I look on this phone. If the phone is locked, unlock it. "
+                       "Set the USB mode to File transfer and try again.")
+    required = int(need * 2.2) if need else (5 * GIB if phone_kind == "iphone" else 2 * GIB)
+    work_probe = os.environ.get("SL_PHONE_WORK_DIR") or os.path.join(
+        os.environ.get("XDG_CACHE_HOME") or os.path.join(os.path.expanduser("~"), ".cache"), "secure-linux-phone-backup")
+    same_disk = device_of(dest) is not None and device_of(dest) == device_of(work_probe)
+    # one disk holds both the working copy and the locked file: about twice the phone data; else about once on each
+    have = free_bytes(dest)
+    if have < (required if same_disk else required // 2):
+        raise Stop("There is not enough free space in %s. The backup needs about %s free and %s is free. "
+                   "Pick another folder with --dest." % (dest, human(required if same_disk else required // 2),
+                                                         human(have)), EXIT_SPACE)
+    if not same_disk:
+        have = free_bytes(work_probe)
+        if have < required // 2:
+            raise Stop("There is not enough free space on this computer for the working copy (%s). The backup needs "
+                       "about %s free there and %s is free. Free some space first." % (work_probe, human(required // 2),
+                                                                                    human(have)), EXIT_SPACE)
+    if phone_kind == "android":
+        say("This will copy about %s from your Android phone." % (human(need) if need else "an unknown amount"))
+    else:
+        say("This will make a full backup of your iPhone. It can take a long time and be large.")
+    say("The copy is locked with a password you choose. If you forget the password, nobody can open the backup.")
+    if not ask_yes("Make the backup now?", args["yes"]):
+        raise Stop("No backup made.", EXIT_NO)
+    os.makedirs(dest, mode=0o700, exist_ok=True)
+    clear_stale_staging(dest)                   # working folders an older version of this tool left in --dest
+    try:
+        work = work_root()
+    except OSError:
+        raise Stop("I could not make a private working folder in your home folder, so nothing was copied. "
+                   "Check that your home folder has free space and try again.")
+    clear_stale_staging(work)
+    staging = tempfile.mkdtemp(prefix=".staging-", dir=work)   # never inside --dest (it may be a USB stick)
+    os.chmod(staging, 0o700)
+    ext = ".tar.age" if kind_lock == "age" else ".tar.gpg"
+    label = "android" if phone_kind == "android" else "iphone"
+    out_file = os.path.join(dest, "phone-%s-%s%s" % (label, stamp(), ext))
+    try:
+        if os.path.exists(out_file):
+            raise Stop("A backup with this name already exists: %s. Wait a minute and try again." % out_file)
+        if phone_kind == "android":
+            ok_any = False
+            for folder, path in present:
+                say("Copying %s ..." % folder)
+                target = os.path.join(staging, folder)
+                os.makedirs(target, exist_ok=True)
+                code, out = capture(base + ["pull", path + "/.", target], 24 * 3600)
+                if code == 0:
+                    ok_any = True
+                else:
+                    warn("Some files in %s could not be copied. The rest was saved." % folder)
+            if not ok_any:
+                raise Stop("Nothing could be copied from the phone. Unlock it, set the USB mode to File transfer and try again.")
+        else:
+            idev = tool_cmd("idevicebackup2")
+            pair = tool_cmd("idevicepair")
+            if not idev:
+                raise Stop("The iPhone backup program is not installed. Connect to the internet and run Secure Linux repair.")
+            if pair:
+                code, _ = capture(pair + ["-u", ident, "validate"], 30)
+                if code != 0:
+                    say("Unlock the iPhone and tap Trust on the question that appears ...")
+                    code, out = capture(pair + ["-u", ident, "pair"], 120)
+                    if code != 0:
+                        raise Stop("The iPhone did not say yes. Unlock it, tap Trust, and try again.")
+            say("Backing up the iPhone ...")
+            code = run(idev + ["-u", ident, "backup", staging]).returncode
+            if code != 0:
+                raise Stop("The iPhone backup stopped before it finished. Keep the phone unlocked and plugged in, and try again.")
+        if not any(os.scandir(staging)):
+            raise Stop("Nothing was copied, so nothing was saved.")
+        say("Now locking the backup. Type a password when you are asked, then type it again.")
+        lock_stream_to_file(staging, out_file, kind_lock, lock)
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+    digest = sha256_file(out_file)
+    with open(out_file + ".sha256", "w", encoding="utf-8", newline="\n") as f:
+        f.write("%s  %s\n" % (digest, os.path.basename(out_file)))
+    say()
+    say("Done. Your locked backup is here:")
+    say("  " + out_file)
+    say("Size: " + human(os.path.getsize(out_file)) + ". To open it later: %s open %s" % (PROG, shlex.quote(out_file)))
+    say("Keep a second copy on another drive. Write the password down somewhere safe; it cannot be recovered.")
+    return EXIT_OK
+
+
+def cmd_list(args):
+    dest = os.path.abspath(os.path.expanduser(args["dest"] or default_dest()))
+    if not os.path.isdir(dest):
+        say("No backups yet. The folder %s does not exist." % dest)
+        return EXIT_OK
+    names = sorted(n for n in os.listdir(dest) if n.startswith("phone-") and (n.endswith(".tar.age") or n.endswith(".tar.gpg")))
+    if not names:
+        say("No backups in %s." % dest)
+        return EXIT_OK
+    say("Backups in %s:" % dest)
+    for n in names:
+        p = os.path.join(dest, n)
+        when = datetime.datetime.fromtimestamp(os.path.getmtime(p)).strftime("%Y-%m-%d %H:%M")
+        say("  %s   %s   %s" % (n, human(os.path.getsize(p)), when))
+    return EXIT_OK
+
+
+# ---------------------------------------------------------------- opening a backup
+def safe_member(member):
+    name = member.name
+    if name.startswith("/") or re.match(r"^[A-Za-z]:", name) or "\\" in name:
+        return False
+    parts = [p for p in name.split("/") if p not in ("", ".")]
+    if any(p == ".." for p in parts):
+        return False
+    return member.isreg() or member.isdir()
+
+
+def cmd_open(args):
+    src = os.path.abspath(os.path.expanduser(args["file"]))
+    if not os.path.isfile(src):
+        raise Stop("I cannot find that file: %s" % src)
+    if src.endswith(".tar.age"):
+        kind = "age"
+    elif src.endswith(".tar.gpg"):
+        kind = "gpg"
+    else:
+        raise Stop("This is not one of my backups (the name should end in .tar.age or .tar.gpg).")
+    cmd = tool_cmd(kind)
+    if not cmd:
+        raise Stop("The locking program (%s) is not installed, so I cannot open this backup." % kind)
+    sidecar = src + ".sha256"
+    if os.path.isfile(sidecar):
+        want = open(sidecar, encoding="utf-8").read().split()[0:1]
+        if want and want[0].lower() != sha256_file(src):
+            raise Stop("This backup file has changed since it was made (its checksum does not match). Do not trust it.", EXIT_SUM)
+    into = os.path.abspath(os.path.expanduser(args["into"] or src[: -len(".tar." + kind)] + "-opened"))
+    if os.path.exists(into) and os.listdir(into):
+        raise Stop("The folder %s already has things in it. Choose a new folder with --into." % into)
+    os.makedirs(into, mode=0o700, exist_ok=True)
+    argv = cmd + (["-d", src] if kind == "age" else ["--decrypt", src])
+    proc = subprocess.Popen(argv, stdout=subprocess.PIPE)
+    count = 0
+    try:
+        with tarfile.open(fileobj=proc.stdout, mode="r|") as tf:
+            for m in tf:
+                if not safe_member(m):
+                    raise Stop("This backup holds a file that is not safe to unpack (%s). I stopped." % m.name)
+                try:
+                    tf.extract(m, into, filter="data")
+                except TypeError:
+                    tf.extract(m, into)
+                count += 1
+    except tarfile.TarError:
+        proc.kill()
+        proc.wait()
+        raise Stop("I could not open the backup. The password may be wrong, or the file is damaged.")
+    except Stop:
+        proc.kill()
+        proc.wait()
+        raise
+    finally:
+        try:
+            proc.stdout.close()
+        except OSError:
+            pass
+    if proc.wait() != 0 or count == 0:
+        raise Stop("I could not open the backup. The password may be wrong, or the file is damaged.")
+    say("Opened %d items into:\n  %s" % (count, into))
+    return EXIT_OK
+
+
+# ---------------------------------------------------------------- scrcpy
+def pin_path():
+    here = os.path.dirname(os.path.abspath(__file__))
+    for p in (os.environ.get("SL_PHONE_PIN_FILE"),
+              os.path.join(here, "..", "files", "devices", "scrcpy.pin"),
+              "/usr/local/lib/secure-linux/files/devices/scrcpy.pin"):
+        if p and os.path.isfile(p):
+            return p
+    return os.environ.get("SL_PHONE_PIN_FILE") or os.path.join(here, "..", "files", "devices", "scrcpy.pin")
+
+
+def load_pin():
+    p = pin_path()
+    pin = {}
+    try:
+        for line in open(p, encoding="utf-8"):
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, v = line.split("=", 1)
+                pin[k.strip()] = v.strip()
+    except OSError:
+        pass
+    return pin
+
+
+def find_scrcpy():
+    local = os.path.join(scrcpy_dir(), "scrcpy")
+    if os.path.isfile(local) and os.access(local, os.X_OK):
+        return [local]
+    return tool_cmd("scrcpy")
+
+
+def machine_ok(pin):
+    want = pin.get("ARCH", "x86_64")
+    have = os.environ.get("SL_PHONE_ARCH") or (os.uname().machine if hasattr(os, "uname") else "x86_64")
+    return have in ("x86_64", "AMD64", "amd64") if want == "x86_64" else have == want
+
+
+def download(url, dest, size_hint):
+    parts = urllib.parse.urlsplit(url)
+    allow_local = os.environ.get("SL_PHONE_ALLOW_LOCAL") == "1" and parts.scheme == "http" and parts.hostname == "127.0.0.1"
+    if not url.startswith(SCRCPY_URL_PREFIX) and not allow_local:
+        raise Stop("The download address in this kit is not the maker's own page, so I will not use it.")
+    req = urllib.request.Request(url, headers={"User-Agent": "secure-linux-phone-backup"})
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r, open(dest, "wb") as out:
+            got = 0
+            limit = max(size_hint * 2, 64 * MIB)
+            for block in iter(lambda: r.read(1024 * 256), b""):
+                got += len(block)
+                if got > limit:
+                    raise Stop("The download is much bigger than expected, so I stopped it.", EXIT_SUM)
+                out.write(block)
+    except (urllib.error.URLError, OSError) as e:
+        if os.path.exists(dest):
+            os.remove(dest)
+        raise Stop("I could not download scrcpy (no internet, or the page is down). Try again when you are online, "
+                   "or use a file you already have with --from.", EXIT_NET)
+
+
+def install_scrcpy(archive, pin, target):
+    want = pin.get("SHA256", "").lower()
+    if not re.match(r"^[0-9a-f]{64}$", want):
+        raise Stop("This kit has no valid checksum for scrcpy, so I will not install it.")
+    if sha256_file(archive) != want:
+        raise Stop("The scrcpy file does not match the checksum this kit knows, so I threw it away and installed nothing. "
+                   "Do not use it.", EXIT_SUM)
+    top = pin.get("TOPDIR", "")
+    wanted = {"scrcpy", "scrcpy-server", "adb"}
+    tmp = target + ".new"
+    shutil.rmtree(tmp, ignore_errors=True)
+    os.makedirs(tmp, mode=0o755)
+    seen = set()
+    try:
+        with tarfile.open(archive, "r:gz") as tf:
+            for m in tf:
+                parts = m.name.split("/")
+                if not safe_member(m) or parts[0] != top:
+                    continue
+                rel = "/".join(parts[1:])
+                if m.isreg() and rel in wanted:
+                    data = tf.extractfile(m)
+                    dest_file = os.path.join(tmp, rel)
+                    with open(dest_file, "wb") as out:
+                        shutil.copyfileobj(data, out)
+                    os.chmod(dest_file, 0o755)
+                    seen.add(rel)
+        if "scrcpy" not in seen or "scrcpy-server" not in seen:
+            raise Stop("The scrcpy file did not hold what I expected, so I installed nothing.")
+        shutil.rmtree(target, ignore_errors=True)
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        os.replace(tmp, target)
+    except (tarfile.TarError, OSError) as e:
+        shutil.rmtree(tmp, ignore_errors=True)
+        raise Stop("The scrcpy file could not be unpacked, so I installed nothing.")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def cmd_mirror(args):
+    found = find_scrcpy()
+    if not found:
+        pin = load_pin()
+        if not pin.get("URL"):
+            raise Stop("This kit does not carry the scrcpy details, so I cannot get it.")
+        if not machine_ok(pin):
+            raise Stop("scrcpy is only offered here for Intel and AMD computers. On this kind of computer, install it from your "
+                       "Linux software list if it has it.")
+        size = int(pin.get("SIZE_BYTES", "0") or 0)
+        say("scrcpy shows your Android phone on this screen. It is not in Fedora or Flathub.")
+        if args["from_file"]:
+            archive = os.path.abspath(os.path.expanduser(args["from_file"]))
+            if not os.path.isfile(archive):
+                raise Stop("I cannot find that file: %s" % archive)
+            cleanup = None
+        else:
+            say("I can download the maker's own build (version %s, about %s) from github.com/Genymobile/scrcpy and check it "
+                "against a checksum before using it." % (pin.get("VERSION", "?"), human(size)))
+            if not ask_yes("Download scrcpy now?", args["yes"]):
+                raise Stop("Nothing downloaded.", EXIT_NO)
+            tmpdir = tempfile.mkdtemp(prefix="scrcpy-dl-")
+            archive = os.path.join(tmpdir, "scrcpy.tar.gz")
+            cleanup = tmpdir
+            try:
+                download(pin["URL"], archive, size)
+            except Stop:
+                shutil.rmtree(tmpdir, ignore_errors=True)
+                raise
+        try:
+            install_scrcpy(archive, pin, scrcpy_dir())
+        finally:
+            if cleanup:
+                shutil.rmtree(cleanup, ignore_errors=True)
+        say("scrcpy %s is installed for you in %s." % (pin.get("VERSION", ""), scrcpy_dir()))
+        found = find_scrcpy()
+    if args["install_only"]:
+        say("Ready. Run \"%s mirror\" when your phone is plugged in." % PROG)
+        return EXIT_OK
+    say("Starting the phone mirror. Unlock the phone and tap Allow if it asks. Close the window to stop.")
+    env = dict(os.environ)
+    here = scrcpy_dir()
+    if os.path.isfile(os.path.join(here, "scrcpy-server")):
+        env["SCRCPY_SERVER_PATH"] = os.path.join(here, "scrcpy-server")
+    if not tool_cmd("adb") and os.path.isfile(os.path.join(here, "adb")):
+        env["ADB"] = os.path.join(here, "adb")
+    try:
+        return subprocess.call(found + args["extra"], env=env)
+    except OSError:
+        raise Stop("scrcpy could not start on this computer. Remove the folder %s and run \"%s mirror\" again to fetch it fresh." % (scrcpy_dir(), PROG))
+
+
+# ---------------------------------------------------------------- command line
+def parse(argv):
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        say(__doc__.strip("\n"))
+        return None
+    cmd, rest = argv[0], argv[1:]
+    a = {"cmd": cmd, "dest": None, "device": None, "what": DEFAULT_WHAT, "yes": False, "kind": "auto", "file": None,
+         "into": None, "from_file": None, "install_only": False, "extra": []}
+    if "--" in rest:
+        i = rest.index("--")
+        a["extra"] = rest[i + 1:]
+        rest = rest[:i]
+    i = 0
+    takes = {"--dest": "dest", "--device": "device", "--what": "what", "--into": "into", "--from": "from_file"}
+    while i < len(rest):
+        t = rest[i]
+        if t in ("-h", "--help"):
+            say(__doc__.strip("\n"))
+            return None
+        if t in takes:
+            if i + 1 >= len(rest):
+                raise Stop("%s needs a value." % t, EXIT_USAGE)
+            a[takes[t]] = rest[i + 1]
+            i += 2
+            continue
+        if t == "--yes":
+            a["yes"] = True
+        elif t == "--install-only":
+            a["install_only"] = True
+        elif t.startswith("-"):
+            raise Stop("I do not know the option %s. Run \"%s --help\" to see them." % (t, PROG), EXIT_USAGE)
+        elif cmd == "backup" and t in ("android", "iphone", "auto"):
+            a["kind"] = t
+        elif cmd == "open" and a["file"] is None:
+            a["file"] = t
+        else:
+            raise Stop("I do not understand \"%s\". Run \"%s --help\" to see what I can do." % (t, PROG), EXIT_USAGE)
+        i += 1
+    if cmd not in ("check", "backup", "list", "open", "mirror"):
+        raise Stop("I do not know the command \"%s\". Run \"%s --help\" to see what I can do." % (cmd, PROG), EXIT_USAGE)
+    if cmd == "open" and not a["file"]:
+        raise Stop("Tell me which backup to open, for example: %s open Phone-Backups/phone-android-2026-11-17-1200.tar.age" % PROG, EXIT_USAGE)
+    return a
+
+
+def main(argv):
+    try:
+        a = parse(argv)
+        if a is None:
+            return EXIT_OK
+        return {"check": cmd_check, "backup": cmd_backup, "list": cmd_list, "open": cmd_open, "mirror": cmd_mirror}[a["cmd"]](a)
+    except Stop as e:
+        warn(e.message)
+        return e.code
+    except KeyboardInterrupt:
+        warn("Stopped. Nothing unlocked was kept.")
+        return EXIT_NO
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

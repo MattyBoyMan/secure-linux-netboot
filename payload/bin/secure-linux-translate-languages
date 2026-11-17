@@ -1,0 +1,363 @@
+#!/usr/bin/env python3
+"""secure-linux-translate-languages: get the language files for offline translation and speech (Speech Note).
+
+  secure-linux-translate-languages list [CODE]    show the languages, what each needs and how big it is
+  secure-linux-translate-languages get CODE       save the language files for one language (asks you first)
+  secure-linux-translate-languages status         show the language files already saved
+
+Options for get:
+  --kind translate|speech   translate = to and from English (default), speech = speech to text
+  --dest DIR                save in this folder (default: Language-Files in your home folder)
+  --yes                     answer yes to the question (for a script)
+
+CODE is a short language code such as de, fr, es or ja. Speech Note itself stays exactly as it is: this helper only
+fetches language files ahead of time, so you can keep a copy on your drive or home server. Nothing starts by itself.
+The list of files comes from the Speech Note project's own published catalogue. Only https downloads from a short list of
+known hosts are used. Every file is saved with a SHA-256 line in SHA256SUMS so you can check it later.
+Exit codes: 0 done, 1 problem, 2 wrong use, 3 you said no, 4 not enough space, 6 no internet.
+"""
+import hashlib
+import http.client
+import json
+import os
+import re
+import shutil
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+
+PROG = "secure-linux-translate-languages"
+GIB = 1024 ** 3
+HEADROOM = GIB // 2
+CATALOGUE = "https://raw.githubusercontent.com/mkiol/dsnote/main/config/models.json"
+ALLOWED_HOSTS = ("huggingface.co", "cdn-lfs.huggingface.co", "cdn-lfs-us-1.hf.co", "cdn-lfs.hf.co", "cas-bridge.xethub.hf.co",
+                 "alphacephei.com", "github.com", "objects.githubusercontent.com", "release-assets.githubusercontent.com",
+                 "storage.googleapis.com")
+KINDS = {"translate": ("mnt_bergamot",), "speech": ("stt_vosk",)}
+CODE_RE = re.compile(r"^[a-z]{2,3}(-[a-z0-9]{2,8})?$")
+ID_RE = re.compile(r"^[A-Za-z0-9_.-]{1,80}$")
+NAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,120}$")
+
+
+class Problem(Exception):
+    def __init__(self, text, code=1):
+        Exception.__init__(self, text)
+        self.text = text
+        self.code = code
+
+
+def say(m=""):
+    print(m)
+
+
+def human(n):
+    n = float(n)
+    for unit in ("bytes", "KB", "MB", "GB"):
+        if n < 1000 or unit == "GB":
+            return ("%d bytes" % n) if unit == "bytes" else ("%.1f %s" % (n, unit))
+        n /= 1000.0
+
+
+def local_host(host):
+    return host in ("127.0.0.1", "localhost", "::1")
+
+
+def check_url(url, catalogue=False):
+    p = urllib.parse.urlparse(url)
+    if p.scheme == "http" and local_host(p.hostname) and os.environ.get("SL_TL_ALLOW_LOCAL") == "1":
+        return url
+    if p.scheme != "https":
+        raise Problem("A language file address that does not start with https was refused.", 1)
+    if catalogue:
+        return url
+    host = (p.hostname or "").lower()
+    if not any(host == h or host.endswith("." + h) for h in ALLOWED_HOSTS):
+        raise Problem("A language file comes from a place that is not on the known list (%s). It was refused." % host, 1)
+    return url
+
+
+class _Redirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        try:
+            check_url(newurl)
+        except Problem:
+            raise urllib.error.HTTPError(newurl, code, "redirect refused", headers, fp)
+        return urllib.request.HTTPRedirectHandler.redirect_request(self, req, fp, code, msg, headers, newurl)
+
+
+def _open(url, headers=None, method="GET", catalogue=False, timeout=60):
+    check_url(url, catalogue)
+    req = urllib.request.Request(url, headers=dict({"User-Agent": PROG}, **(headers or {})), method=method)
+    try:
+        return urllib.request.build_opener(_Redirect).open(req, timeout=timeout)
+    except urllib.error.HTTPError as e:
+        raise Problem("The server said no (%s) for %s" % (e.code, url.rsplit("/", 1)[-1]), 1)
+    except (urllib.error.URLError, OSError):
+        raise Problem("Could not reach the internet. Check your connection and try again.", 6)
+
+
+def load_catalogue():
+    url = os.environ.get("SL_TL_CATALOGUE", CATALOGUE)
+    with _open(url, catalogue=True) as r:
+        raw = r.read(40 * 1024 * 1024)
+    try:
+        d = json.loads(raw.decode("utf-8"))
+    except ValueError:
+        raise Problem("The language list from the Speech Note project could not be read. Try again later.", 1)
+    if not isinstance(d, dict) or not isinstance(d.get("models"), list):
+        raise Problem("The language list from the Speech Note project has an unexpected shape. Nothing was downloaded.", 1)
+    return d
+
+
+def lang_names(cat):
+    out = {}
+    for l in cat.get("langs", []):
+        if isinstance(l, dict) and isinstance(l.get("id"), str):
+            out[l["id"]] = str(l.get("name_en") or l.get("name") or l["id"])
+    return out
+
+
+def models_for(cat, code, kind):
+    """Models for one language. translate: both directions with English. speech: the smallest speech model."""
+    engines = KINDS[kind]
+    picked = []
+    for m in cat["models"]:
+        if not isinstance(m, dict) or m.get("engine") not in engines:
+            continue
+        mid, lid, trg = m.get("model_id"), m.get("lang_id"), m.get("trg_lang_id")
+        if not (isinstance(mid, str) and ID_RE.match(mid) and isinstance(m.get("urls"), list) and m["urls"]):
+            continue
+        if kind == "translate":
+            if (lid == code and trg == "en") or (lid == "en" and trg == code):
+                picked.append(m)
+        elif lid == code:
+            picked.append(m)
+    if kind == "speech" and picked:
+        picked.sort(key=lambda m: int(m.get("size", "0") or 0) if str(m.get("size", "0")).isdigit() else 10 ** 12)
+        picked = picked[:1]
+    return picked
+
+
+def model_size(m):
+    s = str(m.get("size", ""))
+    return int(s) if s.isdigit() else 0
+
+
+def license_name(m):
+    lic = m.get("license")
+    return str(lic.get("name") or lic.get("id") or "") if isinstance(lic, dict) else ""
+
+
+def dest_dir(arg=None):
+    return os.path.abspath(arg or os.environ.get("SL_TL_DEST") or os.path.join(os.path.expanduser("~"), "Language-Files"))
+
+
+def free_bytes(path):
+    forced = os.environ.get("SL_TL_FREE_BYTES")
+    if forced and forced.isdigit():
+        return int(forced)
+    probe = path
+    while probe and not os.path.exists(probe):
+        parent = os.path.dirname(probe)
+        if parent == probe:
+            break
+        probe = parent
+    return shutil.disk_usage(probe or ".").free
+
+
+def interactive():
+    if os.environ.get("SL_TL_ALLOW_PIPE") == "1":   # for the tests: read the answer from a pipe
+        return True
+    return sys.stdin is not None and sys.stdin.isatty()
+
+
+def cmd_list(argv):
+    cat = load_catalogue()
+    names = lang_names(cat)
+    if argv:
+        code = argv[0].lower()
+        if not CODE_RE.match(code):
+            raise Problem("A language code looks like de, fr or es.", 2)
+        say("Language files for %s (%s)" % (names.get(code, code), code))
+        found = False
+        for kind in ("translate", "speech"):
+            ms = models_for(cat, code, kind)
+            tot = sum(model_size(m) for m in ms)
+            if ms:
+                found = True
+                say("  %-9s %s  (%s)" % (kind, human(tot), ", ".join(str(m.get("name", m["model_id"])) for m in ms)))
+        if not found:
+            say("  Speech Note has no offline files for this language.")
+        return 0
+    say("Languages with offline files from Speech Note. Nothing is downloaded by this list.")
+    rows = {}
+    for kind in ("translate", "speech"):
+        for m in cat["models"]:
+            if isinstance(m, dict) and m.get("engine") in KINDS[kind]:
+                code = m.get("trg_lang_id") if (kind == "translate" and m.get("lang_id") == "en") else m.get("lang_id")
+                if isinstance(code, str) and CODE_RE.match(code) and code != "en":
+                    rows.setdefault(code, set()).add(kind)
+    for code in sorted(rows):
+        say("  %-6s %-24s %s" % (code, names.get(code, "")[:24], ", ".join(sorted(rows[code]))))
+    say("")
+    say("See sizes for one language:  %s list CODE" % PROG)
+    return 0
+
+
+def sha256_file(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for b in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(b)
+    return h.hexdigest()
+
+
+def fetch_file(url, final):
+    part = final + ".part"
+    for _attempt in range(4):
+        have = os.path.getsize(part) if os.path.exists(part) else 0
+        hdr = {"Range": "bytes=%d-" % have} if have else {}
+        with _open(url, headers=hdr) as r:
+            total_hdr = r.headers.get("Content-Length", "")
+            status = getattr(r, "status", 200)
+            if have and status != 206:
+                have = 0
+            mode = "ab" if have else "wb"
+            try:
+                with open(part, mode) as out:
+                    while True:
+                        b = r.read(1024 * 1024)
+                        if not b:
+                            break
+                        out.write(b)
+            except (OSError, ConnectionError, http.client.HTTPException):
+                continue
+            expect = (have + int(total_hdr)) if total_hdr.isdigit() else None
+        if expect is None or os.path.getsize(part) == expect:
+            os.replace(part, final)
+            return
+    raise Problem("The download stopped. Run the same command again: it carries on where it stopped.", 6)
+
+
+def cmd_get(argv):
+    kind, dest, yes, code = "translate", None, False, None
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--yes":
+            yes = True
+        elif a in ("--kind", "--dest"):
+            i += 1
+            if i >= len(argv):
+                raise Problem("%s needs a value." % a, 2)
+            if a == "--kind":
+                kind = argv[i]
+            else:
+                dest = argv[i]
+        elif a.startswith("-"):
+            raise Problem("I do not know the option %s. Try --help." % a, 2)
+        elif code is None:
+            code = a.lower()
+        else:
+            raise Problem("Give one language at a time.", 2)
+        i += 1
+    if kind not in KINDS:
+        raise Problem("--kind must be translate or speech.", 2)
+    if not code or not CODE_RE.match(code):
+        raise Problem("Which language? A code such as de, fr or es. Run '%s list' to see them." % PROG, 2)
+    cat = load_catalogue()
+    names = lang_names(cat)
+    ms = models_for(cat, code, kind)
+    if not ms:
+        raise Problem("Speech Note has no offline %s files for '%s'. Run '%s list' to see what exists." % (kind, code, PROG), 1)
+    total = sum(model_size(m) for m in ms)
+    root = dest_dir(dest)
+    free = free_bytes(root)
+    if total + HEADROOM > free:
+        raise Problem("Not enough free space: %s needed and only %s is free. Nothing was downloaded."
+                      % (human(total + HEADROOM), human(free)), 4)
+    say("")
+    say("Language:   %s (%s), %s" % (names.get(code, code), code, kind))
+    for m in ms:
+        say("  - %s  %s  %s" % (m.get("name", m["model_id"]), human(model_size(m)), license_name(m)))
+    say("Total size: %s    Free space: %s" % (human(total), human(free)))
+    if not yes:
+        if not interactive():
+            raise Problem("Nothing was downloaded. Run this in a terminal and answer the question, or add --yes.", 3)
+        big = total >= GIB
+        try:
+            if big:
+                ans = input("This is a big download. Type the word download to start, or press Enter to cancel: ").strip().lower()
+                ok = ans == "download"
+            else:
+                ans = input("Download these files now? Type yes or no: ").strip().lower()
+                ok = ans in ("y", "yes")
+        except EOFError:
+            ok = False   # no one answered
+        if not ok:
+            raise Problem("Cancelled. Nothing was downloaded.", 3)
+    for m in ms:
+        mdir = os.path.join(root, m["model_id"])
+        os.makedirs(mdir, exist_ok=True)
+        sums = []
+        for url in m["urls"]:
+            name = urllib.parse.unquote(urllib.parse.urlparse(str(url)).path.rsplit("/", 1)[-1])
+            if not NAME_RE.match(name) or name in (".", ".."):
+                raise Problem("A file name in the language list looked unsafe. Nothing more was downloaded.", 1)
+            check_url(str(url))
+            final = os.path.join(mdir, name)
+            say("Downloading %s ..." % name)
+            fetch_file(str(url), final)
+            sums.append("%s  %s" % (sha256_file(final), name))
+        with open(os.path.join(mdir, "SHA256SUMS"), "w", encoding="utf-8", newline="\n") as f:
+            f.write("\n".join(sums) + "\n")
+        with open(os.path.join(mdir, "ABOUT.txt"), "w", encoding="utf-8", newline="\n") as f:
+            f.write("%s\nLicense: %s\nFrom the Speech Note project's published list.\n" % (m.get("name", m["model_id"]), license_name(m) or "see the project"))
+    say("")
+    say("Done. Saved in: %s" % root)
+    say("Speech Note downloads its own language files the first time you pick a language online.")
+    say("These saved files are a copy you can keep on your drive or home server.")
+    return 0
+
+
+def cmd_status(_argv):
+    root = dest_dir()
+    if not os.path.isdir(root):
+        say("No language files saved yet. See what exists:  %s list" % PROG)
+        return 0
+    n = 0
+    for d in sorted(os.listdir(root)):
+        p = os.path.join(root, d)
+        if os.path.isdir(p):
+            size = sum(os.path.getsize(os.path.join(p, f)) for f in os.listdir(p) if os.path.isfile(os.path.join(p, f)))
+            say("  %-12s %s" % (human(size), d))
+            n += 1
+    if not n:
+        say("No language files saved yet.")
+    return 0
+
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        print(__doc__.strip("\n"))
+        return 0
+    cmd, rest = argv[0], argv[1:]
+    try:
+        if cmd == "list":
+            return cmd_list(rest)
+        if cmd == "get":
+            return cmd_get(rest)
+        if cmd == "status":
+            return cmd_status(rest)
+        raise Problem("I do not know '%s'. Try --help." % cmd, 2)
+    except Problem as e:
+        print(e.text, file=sys.stderr)
+        return e.code
+    except KeyboardInterrupt:
+        print("Stopped. Run the same command again to carry on.", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

@@ -1,7 +1,7 @@
 {
   "application": "secure-linux-release",
-  "release_id": "secure-linux-2026.11.17-8ec4456433e62ad7",
-  "release_manifest_sha256": "77180508a117b9571255f4888c0b1710c812864d998d0dd27da8422f6e105671",
+  "release_id": "secure-linux-2026.11.18-958aed17f76da294",
+  "release_manifest_sha256": "dccc929cbd6f8b6a0696d9cb71e33a2c3942bbeb4ac13e171c8c43235a797cf9",
   "schema_version": 1,
-  "source_sha256": "8ec4456433e62ad7101cf35e78e56faaf437eb3d5219e697f30f5b1a243c5e21"
+  "source_sha256": "958aed17f76da2940e691eac4970acb58a0ceb8162e2ecfa7675276b1cb81c61"
 }

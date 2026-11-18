@@ -69,8 +69,10 @@ What it does with your privacy
     choose "network on" later (and then only on your home network, never the internet).
   - Anonymous statistics ("telemetry") to the makers are switched off.
   - This computer is NOT connected to Netdata Cloud. There is no account and no sign-in.
-  - It downloads the program once from Netdata's own package source (checked by a fixed fingerprint and the
-    package signature) and later program updates come through the normal Secure Linux updates.
+  - It adds Netdata's own package source from a small file whose fingerprint is fixed in this tool. The program
+    itself is checked by its package signature, using the key that Netdata's own server sends over a secure
+    (https) connection: that key is not fixed in this tool. Later program updates come through the normal
+    Secure Linux updates.
   - It needs about 150 MB of space.
 Until you say yes, nothing is installed. You can switch it off or take it away at any time.
 EOF
@@ -138,8 +140,16 @@ cmd_setup() {
   trap "rm -rf '$tmp'" EXIT
   say "Step 1 of 4: fetching Netdata's package-source file and checking its fingerprint."
   if ! curl -fsSL --proto '=https' --tlsv1.2 --max-time 120 -o "$tmp/repo.rpm" "$url" 2>/dev/null; then
-    [ -f "${SL_LIVEHEALTH_DRIVE_DIR:-$P/var/cache/secure-linux/offline/live-health}/netdata-repo-$REPO_VER.noarch.rpm" ] && \
-      cp "${SL_LIVEHEALTH_DRIVE_DIR:-$P/var/cache/secure-linux/offline/live-health}/netdata-repo-$REPO_VER.noarch.rpm" "$tmp/repo.rpm"
+    rm -f "$tmp/repo.rpm"
+    # The copy on the drive: offline_bundle.py fetch-vendor-files keeps one per Fedora version and processor in the
+    # offline app collection, which the drive builder copies to the drive and the installer copies to this computer.
+    local f
+    for f in ${SL_LIVEHEALTH_DRIVE_DIR:+"$SL_LIVEHEALTH_DRIVE_DIR/netdata-repo-$REPO_VER.noarch.rpm"} \
+             "$P/var/cache/secure-linux/offline/live-health/netdata-repo-$REPO_VER.noarch.rpm" \
+             "$P"/var/cache/secure-linux/offline/app-bundles/*/vendor-files/live-health/fedora/$ver/$arch/netdata-repo-$REPO_VER.noarch.rpm \
+             "$P"/run/media/*/*/linux-setup/offline/app-bundles/*/vendor-files/live-health/fedora/$ver/$arch/netdata-repo-$REPO_VER.noarch.rpm; do
+      [ -f "$f" ] && { say "No internet: using the copy kept on the Secure Linux drive."; cp "$f" "$tmp/repo.rpm"; break; }
+    done
   fi
   [ -s "$tmp/repo.rpm" ] || die "Could not download it (no internet and no copy on the drive). Nothing was changed."
   got=$(sha256sum "$tmp/repo.rpm" | awk '{print $1}')

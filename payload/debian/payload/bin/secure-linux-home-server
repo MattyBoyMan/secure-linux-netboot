@@ -164,10 +164,19 @@ _hs_private_write() {
   umask "$old_umask"
 }
 
+_hs_plain_http_warn() {   # a token sent to an http:// address crosses the home network unencrypted (check C4 F14)
+  case "${1:-}" in
+    http://*) say "WARNING: $1 starts with http://, so the API token travels unencrypted across your home network." >&2
+              say "Anyone else on that network could read it. If your unRAID server has an https:// address, use that instead." >&2 ;;
+  esac
+  return 0
+}
+
 _hs_token_save() {
   local url=${1:-} dir token
   _hs_valid_url "$url" || { say "Invalid unRAID web address." >&2; return 2; }
   _hs_unraid_note
+  _hs_plain_http_warn "$url"
   say "The API token will be read without showing it, stored only for this user with mode 0600, and never put in a command-line argument or log."
   dir=$(_hs_config_dir)
   [ "$DRY" = yes ] && { say "[dry run] would privately save an API token for $url under $dir"; return 0; }
@@ -194,6 +203,7 @@ _hs_api_test() {
   [ -r "$dir/unraid-api-token" ] || { say "No saved API token. Run unraid token-save first." >&2; return 1; }
   IFS= read -r token < "$dir/unraid-api-token"
   [ -n "$token" ] || { say "The saved token is empty; save it again." >&2; return 1; }
+  _hs_plain_http_warn "$url"
   escaped=${token//\\/\\\\}; escaped=${escaped//\"/\\\"}
   {
     printf 'header = "Authorization: Bearer %s"\n' "$escaped"

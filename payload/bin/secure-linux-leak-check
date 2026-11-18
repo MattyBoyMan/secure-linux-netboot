@@ -38,11 +38,18 @@ Nothing here costs money and there is no account."""
 
 
 def api_base():
-    """The service address. A test may point it at a made-up local address; nothing else is accepted."""
-    base = os.environ.get("SL_LEAK_CHECK_API", API_DEFAULT)
-    parsed = urllib.parse.urlparse(base)
-    local = parsed.scheme == "http" and parsed.hostname in ("127.0.0.1", "localhost", "::1")
-    if parsed.scheme != "https" and not local:
+    """The service address. A test may point it at a made-up service on THIS computer (http or https to 127.0.0.1,
+    localhost or ::1); any other address in SL_LEAK_CHECK_API is ignored, so the setting can never send the
+    5-character prefix to some other server on the internet (independent check C5, F6)."""
+    base = os.environ.get("SL_LEAK_CHECK_API", "")
+    if not base:
+        return API_DEFAULT
+    try:
+        parsed = urllib.parse.urlparse(base)
+        host = parsed.hostname
+    except ValueError:
+        return API_DEFAULT
+    if parsed.scheme not in ("http", "https") or host not in ("127.0.0.1", "localhost", "::1"):
         return API_DEFAULT
     return base if base.endswith("/") else base + "/"
 

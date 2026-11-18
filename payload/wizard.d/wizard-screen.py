@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""One accessible, scrollable screen for the five-screen Secure Linux wizard.
+"""One accessible, scrollable screen for the Secure Linux first-run wizard: one information page ("about": what the
+drive is, what it can and cannot do, which computers work, how a computer changes the result), then five question
+screens.
 
 The screen specification and all answers travel over stdin/stdout. Passwords are
 never command-line arguments, files, log messages or review text. The scripted
@@ -39,7 +41,64 @@ def build_spec(key: str, context: dict[str, Any], values: dict[str, Any], review
     title = ""
     text = ""
     confirm = "Next"
-    if key == "system":
+    if key == "about":
+        # Matthew, 2026-11-18: the first thing after the welcome, before the first choice, explains in beginner words
+        # what the drive can and cannot do and which computers work. Every claim comes from the kit's own documents;
+        # tests/wizardabout/run.py pins each one to its source. Information only: no question, nothing is stored.
+        title = "Welcome — what your Secure Linux drive can and cannot do"
+        text = ("Before you choose anything: what the Secure Linux drive is, what it can and cannot do, which computers "
+                "it works on and how your computer changes the result. Nothing here is a question. Read it, then press "
+                "Continue.")
+        fields = [
+            field("info", "drive", "What this drive is",
+                  "The Secure Linux drive installed this free and private system. Keep the drive: it stays useful "
+                  "afterwards as a toolkit."),
+            field("info", "can_do", "What it can do", "\n".join([
+                "• Set up this computer for you. Nothing changes until you press the final Confirm.",
+                "• Rescue a computer. Its repair tools help when a computer will not start, including copying files "
+                "off a failing drive.",
+                "• Work offline. NOMAD, if it is on your drive, has Wikipedia, maps and a private AI chat that work "
+                "with no internet.",
+                "• Look after itself. Signed updates install by themselves and can be undone (Undo last update). "
+                "Backups are encrypted and checked.",
+            ])),
+            field("info", "cannot_do", "What it cannot do", "\n".join([
+                "• Start an Apple M-chip Mac. Apple does not allow it.",
+                "• Lock or wipe a stolen computer from far away. There is no remote lock or wipe. The guide's chapter "
+                "on a lost or stolen computer says what to do instead.",
+                "• Repair broken hardware, or bring back a lost disk-encryption password.",
+                "• Promise that every computer works. Much of it has not yet been tried on a real computer, so keep a "
+                "backup of your files.",
+            ])),
+            field("info", "works", "Computers that work", "\n".join([
+                "• PCs and laptops with an Intel or AMD processor, new (UEFI) or older (legacy BIOS).",
+                "• Intel Macs: hold Option at start. Macs from 2018 to 2020 need one security setting changed once.",
+            ])),
+            field("info", "works_with_care", "Computers that work, with care", "\n".join([
+                "• Computers with less than about 3 GB of memory get a lighter desktop; with less than about 1.7 GB, "
+                "the Debian edition.",
+                "• Very old 32-bit PCs get Debian 12. Check that their web browser still gets security fixes.",
+                "• Chromebooks and Surface tablets may need special firmware. No promise is made.",
+            ])),
+            field("info", "does_not_work", "Computers that do not work", "\n".join([
+                "• Apple M-chip Macs (M1 and later). Their route is Fedora Asahi, installed from macOS.",
+                "• Phones, Raspberry Pi and anything else without an Intel or AMD processor.",
+                "• Computers with less than 512 MB of memory.",
+            ])),
+            field("info", "your_computer", "How your computer changes the result", "\n".join([
+                "• Memory: about 7 GB or more gets the full KDE desktop, about 3 GB the lighter Xfce, less the lightest "
+                "LXQt or Debian. NOMAD's AI chat needs 8 GB.",
+                "• Secure Boot: with it on, laptops cannot hibernate.",
+                "• Wi-Fi and graphics: some Broadcom Wi-Fi chips need a cable or phone tethering; NVIDIA cards may ask "
+                "you to trust one more key.",
+                "• Disk encryption: if this computer's disk is locked with a password, nobody can recover that "
+                "password, so keep it safe.",
+                "• Internet: updates and new apps need the internet. NOMAD and the apps copied onto the drive work "
+                "offline.",
+            ])),
+        ]
+        confirm = "Continue"
+    elif key == "system":
         title = "1 of 5 — Your recommended setup"
         text = "The automatic scan is complete. These safe steps are pre-ticked; untick any you do not want. Nothing changes until the final Confirm."
         fields = [
@@ -203,7 +262,7 @@ def build_spec(key: str, context: dict[str, Any], values: dict[str, Any], review
         if name in values and item["type"] not in {"info", "password"}:
             item["default"] = values[name]
     return {"key": key, "title": title, "text": text, "confirm": confirm,
-            "back": key != "system", "fields": fields}
+            "back": key != "about", "fields": fields}
 
 
 def defaults(spec: dict[str, Any]) -> dict[str, Any]:

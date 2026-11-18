@@ -1029,12 +1029,12 @@ def publish(store, old_id, old_root, manifest, parts, menu, downloads, api, engi
     payload = Path(staging) / "payload"
     try:
         files = []
-        for entry in portable["files"]:
+        kept = [entry for entry in portable["files"] if entry["path"] not in removes and entry["path"] not in adds]
+        # every kept file is still checked before it is shared, several at once (Fz4)
+        checked = _hash_many(engine, [(old_payload / entry["path"], entry["size"]) for entry in kept])
+        for entry, (size, digest) in zip(kept, checked):
             path = entry["path"]
-            if path in removes or path in adds:
-                continue
             source = old_payload / path
-            size, digest = engine.hash_file(source, entry["size"])
             if size != entry["size"] or digest != entry["sha256"]:
                 raise _verification_error(api)(f"a file of the saved master failed its check, so nothing was "
                                                f"changed: {path}")
@@ -1100,6 +1100,21 @@ def publish(store, old_id, old_root, manifest, parts, menu, downloads, api, engi
                         os.chmod(os.path.join(base, name), 0o400)
                     except OSError:
                         pass
+
+
+def _hash_many(engine, jobs, workers=None):
+    """engine.hash_file for many files at once: (size, sha256) in the order of jobs, a few files per thread in flight."""
+    import collections
+    import concurrent.futures
+    workers = workers or max(2, min(8, os.cpu_count() or 2))
+    window = collections.deque()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+        for path, size in jobs:
+            window.append(pool.submit(engine.hash_file, path, size))
+            if len(window) >= 4 * workers:
+                yield window.popleft().result()
+        while window:
+            yield window.popleft().result()
 
 
 def _link_or_copy(source, destination, size, store, api):

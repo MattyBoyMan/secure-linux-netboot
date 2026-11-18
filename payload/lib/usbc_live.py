@@ -214,6 +214,8 @@ def _engine(api):
         raise api.CreatorError("this drive builder is missing parts this add-on needs. Update Secure Linux, "
                                "then try again. Nothing was changed.")
     engine = types.SimpleNamespace(**{name: space[name] for name in wanted})
+    # Fz4: the ordered parallel hasher; an older drive builder without it is checked one file at a time.
+    engine.hash_files_parallel = space.get("hash_files_parallel") if callable(space.get("hash_files_parallel")) else None
     engine.write_master_status = space.get("write_master_status") if callable(space.get("write_master_status")) else None
     engine.files_only = space.get("FILES_ONLY_KIND", "files-only")
     engine.schema = space.get("SCHEMA", 1)
@@ -268,12 +270,15 @@ def _mock_value(name, args):
 # ---- Fedora's signed CHECKSUM ----------------------------------------------------------------------------------
 
 def dearmor_keys(raw, what):
-    """OpenPGP public keys as binary packets (gpgv reads only those). Armored or binary key files are accepted."""
+    """OpenPGP public keys as binary packets (gpgv reads only those). Armored or binary key files are accepted; a
+    private key is refused in either form."""
     if raw[:1] and raw[0] & 0x80:
-        return raw
+        return refuse_private_packets(raw, what)
     text = raw.decode("ascii", "replace").replace("\r\n", "\n")
+    if "PRIVATE KEY" in text:
+        raise ValueError(f"{what} holds a private key; only public keys are used")
     blocks = re.findall(r"-----BEGIN PGP PUBLIC KEY BLOCK-----\n(.*?)-----END PGP PUBLIC KEY BLOCK-----", text, re.S)
-    if not blocks or "PRIVATE KEY" in text:
+    if not blocks:
         raise ValueError(f"{what} is not a public key file")
     out = b""
     for block in blocks:
@@ -287,7 +292,7 @@ def dearmor_keys(raw, what):
             raise ValueError(f"{what} is damaged") from exc
     if not out or not out[0] & 0x80:
         raise ValueError(f"{what} is damaged")
-    return out
+    return refuse_private_packets(out, what)
 
 
 def trusted_key_files(args):
@@ -514,6 +519,7 @@ def publish(store, old_id, old_root, manifest, iso_path, relative, expected, rec
     try:
         payload = Path(staging) / "payload"
         kept = []
+        todo = []
         for entry in portable["files"]:
             path = entry["path"]
             if is_persistence(path):
@@ -521,8 +527,16 @@ def publish(store, old_id, old_root, manifest, iso_path, relative, expected, rec
                 continue
             if is_live_image(path) or path == LIVE_RECORD:
                 continue                        # an older live image is replaced by the new one
+            todo.append(entry)
+        # Fz5: every kept file is checked first-to-last in list order, several at once (the same ordered helper the
+        # drive builder uses); the first damaged or unreadable file stops everything, as before.
+        if engine.hash_files_parallel:
+            hashed = engine.hash_files_parallel((old_payload / entry["path"], entry["size"]) for entry in todo)
+        else:
+            hashed = (engine.hash_file(old_payload / entry["path"], entry["size"]) for entry in todo)
+        for entry, (size, digest) in zip(todo, hashed):
+            path = entry["path"]
             source = old_payload / path
-            size, digest = engine.hash_file(source, entry["size"])
             if size != entry["size"] or digest != entry["sha256"]:
                 raise _verification_error(api)(f"a file of the saved master failed its check, so nothing was "
                                                f"changed: {path}")
@@ -1034,3 +1048,55 @@ def after_copy(target_root, manifest, args, api):
         api.say("Live mode note: " + note)
     if live:
         api.say(f"LIVE MODE ON THIS DRIVE: the start menu has \"{LIVE_ALIAS if persistence else LIVE_ALIAS_NOTHING_KEPT}\".")
+
+
+def refuse_private_packets(data: bytes, what: str) -> bytes:
+    """Walk every OpenPGP packet of a binary key file. A secret-key or secret-subkey packet (tags 5 and 7) is refused,
+    in binary files too, and so is anything that is not a whole run of packets. Copied from bigfile_fetch (Fz3, C6 F4)
+    and kept at the end of this file so line numbers named elsewhere move as little as possible."""
+    position, end = 0, len(data)
+    while position < end:
+        header = data[position]
+        if not header & 0x80:
+            raise ValueError(f"{what} is not a public key file")
+        position += 1
+        if header & 0x40:                                   # new packet format
+            tag = header & 0x3F
+            if tag in (5, 7):
+                raise ValueError(f"{what} holds a private key; only public keys are used")
+            while True:
+                if position >= end:
+                    raise ValueError(f"{what} is not a public key file")
+                first = data[position]
+                partial = False
+                if first < 192:
+                    length, position = first, position + 1
+                elif first < 224:
+                    if position + 2 > end:
+                        raise ValueError(f"{what} is not a public key file")
+                    length, position = ((first - 192) << 8) + data[position + 1] + 192, position + 2
+                elif first == 255:
+                    if position + 5 > end:
+                        raise ValueError(f"{what} is not a public key file")
+                    length, position = int.from_bytes(data[position + 1:position + 5], "big"), position + 5
+                else:
+                    length, position, partial = 1 << (first & 0x1F), position + 1, True
+                position += length
+                if position > end:
+                    raise ValueError(f"{what} is not a public key file")
+                if not partial:
+                    break
+        else:                                               # old packet format
+            tag, kind = (header >> 2) & 0x0F, header & 0x03
+            if tag in (5, 7):
+                raise ValueError(f"{what} holds a private key; only public keys are used")
+            if kind == 3:                                   # "indeterminate length" never appears in a key file
+                raise ValueError(f"{what} is not a public key file")
+            size = (1, 2, 4)[kind]
+            if position + size > end:
+                raise ValueError(f"{what} is not a public key file")
+            length = int.from_bytes(data[position:position + size], "big")
+            position += size + length
+            if position > end:
+                raise ValueError(f"{what} is not a public key file")
+    return data

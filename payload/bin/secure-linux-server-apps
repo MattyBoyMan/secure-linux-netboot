@@ -16,6 +16,9 @@
 # the system can read, and never written to a log. Data lives under /srv/secure-linux/<app>.
 # Docker or Podman, whichever this computer has. Apps come from files/server-apps/<app>/: a compose.yml plus either an
 # app.conf or an "x-secure-linux:" block inside compose.yml (one recipe file). Adding an app never needs an edit here.
+# An app that keeps its own accounts (accounts_db=, accounts_table= in its recipe, such as Vaultwarden) is open for
+# sign-ups only until its first account exists; a check every minute (signups-check APP, run by the
+# secure-linux-server-app-signups@APP.timer) then closes them by itself.
 set -u
 export LC_ALL=C
 
@@ -129,7 +132,7 @@ check_compose() {
       if (t ~ /\\/) { print "backslashes are not accepted: " t; next }
       q = t; sub(/^- +/, "", q); if (q ~ /^[A-Za-z0-9_.-]+:([ \t]|$)/) sub(/^[A-Za-z0-9_.-]+:[ \t]*/, "", q); sub(/[ \t]+#[^"\047]*$/, "", q)
       if ((q ~ /^"/ && q !~ /^"[^"]*"$/) || (q ~ /^\047/ && q !~ /^\047([^\047]|\047\047)*\047$/)) { print "a quoted value must end on the same line: " t; next }
-      chk = t; gsub(/\$\$/, "", chk); gsub(/\$\{SL_(BIND|PORT|DATA|UID|GID|TZ|HOSTNAME)(:?[-?][^}$]*)?\}/, "", chk)
+      chk = t; gsub(/\$\$/, "", chk); gsub(/\$\{SL_(BIND|PORT|DATA|UID|GID|TZ|HOSTNAME|SIGNUPS)(:?[-?][^}$]*)?\}/, "", chk)
       if (chk ~ /\$/) { print "only the values this tool fills in (SL_...) may be used: " t; next }
       if (t ~ /^(- +)?[A-Za-z0-9_.-]+:[ \t]+[|>]/) {
         if (ind > 0 && t ~ /^(command|entrypoint|test):[ \t]+[|>]-?[ \t]*$/) { inblk = 1; blkind = ind; next }
@@ -230,6 +233,8 @@ load_app() {
   B_INCLUDE=$(kv_get backup_include <<<"$m") || B_INCLUDE=""
   B_EXCLUDE=$(kv_get backup_exclude <<<"$m") || B_EXCLUDE=""
   FIRST_SIGNIN=$(kv_get first_signin <<<"$m") || FIRST_SIGNIN=""   # plain text to show, never run (an app's own public first sign-in)
+  ACCOUNTS_DB=$(kv_get accounts_db <<<"$m") || ACCOUNTS_DB=""       # the app's own accounts file (sign-ups close after the first)
+  ACCOUNTS_TABLE=$(kv_get accounts_table <<<"$m") || ACCOUNTS_TABLE=""
   [ -n "$TITLE" ] || stop "The app files for '$APP' are damaged (no title). Run 'Repair setup' from Secure Linux Status."
   [ "$(kv_get lan_only <<<"$m")" = yes ] || stop "$TITLE is not marked as home-network-only, so this tool will not set it up."
   case $PORT in ''|*[!0-9]*) stop "The app files for $TITLE are damaged (bad port)." ;; esac
@@ -239,6 +244,10 @@ load_app() {
   words_ok "$DATA_DIRS $USER_DIRS $SECRETS" || stop "The app files for $TITLE are damaged (bad folder or secret name)."
   paths_ok "$B_INCLUDE $B_EXCLUDE" || stop "The app files for $TITLE are damaged (bad backup path)."
   ports_ok "$EXTRA_PORTS" || stop "The app files for $TITLE are damaged (bad extra port)."
+  if [ -n "$ACCOUNTS_DB$ACCOUNTS_TABLE" ]; then
+    { [ -n "$ACCOUNTS_DB" ] && paths_ok "$ACCOUNTS_DB" && [[ $ACCOUNTS_DB != */ ]] && [[ $ACCOUNTS_TABLE =~ ^[a-z_]{1,40}$ ]]; } ||
+      stop "The app files for $TITLE are damaged (bad accounts file)."
+  fi
   [ -n "$DATA_DIRS" ] || stop "The app files for $TITLE are damaged (no data folders)."
   bad=$(check_compose "$APPDIR/compose.yml")
   if [ -n "$bad" ]; then
@@ -250,6 +259,8 @@ load_app() {
   ENVF=$D/.compose.env
   STATEF=$STATE_DIR/$APP.state
   UNIT=secure-linux-server-app@$APP.service
+  SIGNUPS_TIMER=secure-linux-server-app-signups@$APP.timer
+  SIGNUPS=false
 }
 installed() { [ -f "$STATEF" ]; }
 
@@ -356,11 +367,61 @@ fw_close() {
   return 0
 }
 
+# ---------------------------------------------------------------- sign-ups that close by themselves (check C4 F9)
+# An app that keeps its own accounts is open for sign-ups (SL_SIGNUPS=true) only while it has no account: the first
+# person to open it makes the owner account; then signups-check (every minute, from the timer) closes sign-ups and
+# restarts the app, so nobody else on the home network can make an account. Family members are invited from inside
+# the app. The accounts file is only read (read-only, never followed through a link) and only its number of rows used.
+account_count() { # prints the number of accounts; "none" = no accounts file yet; prints nothing if it cannot be read
+  local db=$D/$ACCOUNTS_DB py
+  [ -L "$db" ] && return 1
+  [ -e "$db" ] || { printf 'none'; return 0; }
+  [ -f "$db" ] || return 1
+  py=$(command -v python3 2>/dev/null || command -v python 2>/dev/null) || return 1
+  "$py" -I - "$db" "$ACCOUNTS_TABLE" 2>/dev/null <<'PYEOF'
+import pathlib, sqlite3, sys
+con = sqlite3.connect(pathlib.Path(sys.argv[1]).resolve().as_uri() + "?mode=ro", uri=True, timeout=5)
+try:
+    con.execute("PRAGMA trusted_schema=OFF")
+    kind = con.execute("SELECT type FROM sqlite_master WHERE name = ?", (sys.argv[2],)).fetchone()
+    if not kind or kind[0] != "table":
+        sys.exit(1)
+    print(int(con.execute('SELECT COUNT(*) FROM "%s"' % sys.argv[2]).fetchone()[0]))
+finally:
+    con.close()
+PYEOF
+}
+signups_value() { # "true" only while an app that closes its own sign-ups has no account yet; unreadable = unchanged
+  local n old
+  [ -n "$ACCOUNTS_DB" ] || { printf 'false'; return 0; }
+  n=$(account_count) || n=""
+  n=${n%$'\r'}
+  case $n in
+    none|0) printf 'true' ;;
+    [1-9]|[1-9][0-9]|[1-9][0-9][0-9]*) printf 'false' ;;
+    *) old=$(conf_get "$ENVF" SL_SIGNUPS) || old=""; if [ "$old" = true ]; then printf 'true'; else printf 'false'; fi ;;
+  esac
+}
+signups_timer() { # the minute check runs only while sign-ups are open
+  [ -n "$ACCOUNTS_DB" ] || return 0
+  if [ "$SIGNUPS" = true ]; then
+    logged systemctl enable --now "$SIGNUPS_TIMER" ||
+      say "Note: the check that closes sign-ups after your first account could not be switched on. Run: secure-linux-server-apps start $APP"
+  else
+    logged systemctl disable --now "$SIGNUPS_TIMER" || :
+  fi
+  return 0
+}
+SIGNUPS_FIRST="Make your own account now: open the page and create it. About a minute after the first account exists, sign-ups close by themselves, so nobody else on your home network can make one. To add family later, make an Organization in your vault and invite them; they then make their account with the invited email address."
+SIGNUPS_CLOSED="your account exists, so nobody else on your home network can make one. To add family, make an Organization in your vault and invite them; they then make their account with the invited email address."
+
 write_env() { # the values compose fills in. No passwords here: those stay in the secret files.
+  SIGNUPS=$(signups_value)
   ( umask 077
     { printf 'SL_BIND=%s\n' "$BIND"; printf 'SL_PORT=%s\n' "$PORT"; printf 'SL_DATA=%s\n' "$D"
       printf 'SL_UID=%s\n' "${RUNAS%%:*}"; printf 'SL_GID=%s\n' "${RUNAS##*:}"
-      printf 'SL_TZ=%s\n' "$(time_zone)"; printf 'SL_HOSTNAME=%s\n' "$(host_name)"; } > "$ENVF.new" && mv -f "$ENVF.new" "$ENVF"
+      printf 'SL_TZ=%s\n' "$(time_zone)"; printf 'SL_HOSTNAME=%s\n' "$(host_name)"
+      printf 'SL_SIGNUPS=%s\n' "$SIGNUPS"; } > "$ENVF.new" && mv -f "$ENVF.new" "$ENVF"
   ) || fail "Could not write the settings file for $TITLE ($ENVF)."
 }
 write_state() { # who and where, for list/open/status. Readable by everyone: it holds no secrets.
@@ -444,6 +505,7 @@ cmd_install() {
   logged compose up -d || why "$TITLE would not start. Try again, or see: secure-linux-server-apps status $APP"
   write_state
   logged systemctl enable "$UNIT" || say "Note: could not set $TITLE to start by itself after a restart. Start it with: secure-linux-server-apps start $APP"
+  signups_timer
   fw_open
   say ""
   say "Done. $TITLE is running on this computer, for your home network only. Nothing is opened to the internet."
@@ -451,6 +513,7 @@ cmd_install() {
   case " $SECRETS " in *" admin_password "*)
     say "  First sign-in: see your sign-in name and password with: secure-linux-server-apps login $APP" ;; esac
   [ -z "$FIRST_SIGNIN" ] || say "  IMPORTANT, do this now: $FIRST_SIGNIN"
+  [ "$SIGNUPS" != true ] || say "  IMPORTANT, do this now: $SIGNUPS_FIRST"
   say "  It can take a few minutes the first time before the page appears."
   say "  Your data stays in $D. Back it up with: secure-linux-server-apps backup $APP"
   say "Tip: ask your router to always give this computer the same address, so other devices keep finding it."
@@ -474,8 +537,13 @@ cmd_start() {
   write_env
   logged compose up -d || why "$TITLE would not start. Try again in a minute."
   write_state
+  # at start-up sign-ups can be open (no account yet, or an older setup that never had the check): the check must run
+  if [ "$boot" = boot ] && [ -n "$ACCOUNTS_DB" ] && [ "$SIGNUPS" = true ]; then
+    logged systemctl enable --now --no-block "$SIGNUPS_TIMER" || :
+  fi
   if [ "$boot" != boot ]; then
     logged systemctl enable "$UNIT" || :
+    signups_timer
     fw_open
     say "$TITLE is on: http://$BIND:$PORT  (it also starts by itself after a restart)"
   fi
@@ -590,6 +658,7 @@ cmd_update() {
   logged compose pull || why "Could not download the new version. Check the internet connection. $TITLE is unchanged."
   logged compose up -d || why "$TITLE did not start after the update. Your backup is in $OUT."
   write_state
+  signups_timer
   say "$TITLE is up to date and running: http://$BIND:$PORT"
 }
 
@@ -612,6 +681,7 @@ cmd_remove() {
   say "Removing $TITLE..."
   log "remove $APP delete_data=$del"
   logged systemctl disable --now "$UNIT" || :
+  [ -z "$ACCOUNTS_DB" ] || logged systemctl disable --now "$SIGNUPS_TIMER" || :
   if [ ! -f "$ENVF" ]; then # compose needs the values to read its file; the address is never used for "down"
     BIND=$(conf_get "$STATEF" BIND 2>/dev/null) || BIND=192.168.0.1
     RUNAS=$(conf_get "$STATEF" RUNAS 2>/dev/null) || RUNAS=1000:1000
@@ -626,6 +696,33 @@ cmd_remove() {
   else
     say "Removed. Your data was kept in $D, so setting $TITLE up again finds it."
   fi
+}
+
+cmd_signups_check() { # every minute while an app's sign-ups are open (secure-linux-server-app-signups@APP.timer)
+  local old now
+  load_app "$1"
+  [ -n "$ACCOUNTS_DB" ] || return 0
+  need_installed
+  [ -f "$ENVF" ] || fail "The settings file for $TITLE is missing. Set it up again with: secure-linux-server-apps install $APP"
+  old=$(conf_get "$ENVF" SL_SIGNUPS) || old=""
+  now=$(signups_value)
+  if [ "$now" = "$old" ]; then
+    [ "$now" = true ] || logged systemctl disable --now "$SIGNUPS_TIMER" || :
+    return 0
+  fi
+  BIND=$(conf_get "$ENVF" SL_BIND) || BIND=""
+  RUNAS=$(conf_get "$STATEF" RUNAS) || RUNAS=""
+  { [[ $RUNAS =~ ^[1-9][0-9]*:[0-9]+$ ]] && [ -n "$BIND" ]; } ||
+    fail "The saved settings for $TITLE are damaged. Set it up again with: secure-linux-server-apps install $APP"
+  write_env
+  [ "$SIGNUPS" = false ] || return 0
+  log "sign-ups closed for $APP: the first account exists"
+  pick_engine
+  if [ "$(running_count)" -gt 0 ]; then
+    logged compose up -d || why "Sign-ups for $TITLE are closed in its settings, but it did not restart. Restart it with: secure-linux-server-apps start $APP"
+  fi
+  logged systemctl disable --now "$SIGNUPS_TIMER" || :
+  say "Sign-ups for $TITLE are now closed: $SIGNUPS_CLOSED"
 }
 
 cmd_menu() {
@@ -660,7 +757,7 @@ cmd_menu() {
 # ---------------------------------------------------------------- main
 cmd=${1:-menu}; [ $# -gt 0 ] && shift
 case $cmd in
-  install|start|stop|status|login|update|backup|remove) need_root "$cmd" "$@" ;;
+  install|start|stop|status|login|update|backup|remove|signups-check) need_root "$cmd" "$@" ;;
 esac
 needapp() { [ -n "${1:-}" ] || stop "Say which app, for example: secure-linux-server-apps $cmd nextcloud   (see: secure-linux-server-apps list)"; }
 case $cmd in
@@ -674,6 +771,7 @@ case $cmd in
     "cmd_$cmd" "$1" "$b" ;;
   status) [ $# -le 1 ] || stop "Use: secure-linux-server-apps status [APP]"; cmd_status "${1:-}" ;;
   open|login|update) needapp "${1:-}"; [ $# -eq 1 ] || stop "Use: secure-linux-server-apps $cmd APP"; "cmd_$cmd" "$1" ;;
+  signups-check) needapp "${1:-}"; [ $# -eq 1 ] || stop "Use: secure-linux-server-apps signups-check APP"; cmd_signups_check "$1" ;;
   backup|remove) needapp "${1:-}"; "cmd_$cmd" "$@" ;;
   *) sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
 esac

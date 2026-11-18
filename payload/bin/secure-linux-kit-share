@@ -12,6 +12,9 @@ Run by the computer itself (you never need these):
                                     check out (/run/secure-linux/kit-peers.json, read by secure-linux-kit-update)
   secure-linux-kit-share network    called when the network changes and every few hours: starts or stops
                                     sharing and looks again
+  secure-linux-kit-share look       used by `find` only: asks the other computers. When `find` runs as the
+                                    administrator, this part runs with the rights of the normal "nobody"
+                                    account, so a neighbour's answer is never read with administrator rights
 
 What is shared, read-only: this computer's signed release record, its signed file list, its signed channel
 record (stable or testing), its signed release history and the files that list names, each one only while its
@@ -23,7 +26,8 @@ checks every file against the official signature, exactly like a download from t
 A computer is shared with only while it has a signed channel record for the release it holds, so a computer
 on the testing channel can never pass a test release off as a finished one. Looking for computers lists only
 those whose release record and channel record carry a valid official signature; the channel written down is
-the one in that signed record, never what the other computer claims.
+the one in that signed record, never what the other computer claims. A computer is listed only when its
+signed release history ends with the release it shares (every computer at home refuses a copy without one).
 """
 from __future__ import annotations
 
@@ -92,6 +96,12 @@ PROBE_TIMEOUT = 0.7           # seconds to wait for a computer on the home netwo
 FETCH_TIMEOUT = 8
 MAX_HOSTS = 1024              # never look further than this many addresses
 PROBE_WORKERS = 48
+# check C2 F10 (option A): `find` asks the neighbours in a child process; as the administrator, with the rights of
+# this normal account (never root). Its answer is checked again before the list is written.
+LOOK_USER = "nobody"
+LOOK_SECONDS = 150            # the network service allows 180 seconds in all
+MAX_LOOK_ANSWER = 1024 * 1024
+MAX_LOOK_INPUT = 256 * 1024
 
 # Exit codes (the service is not restarted for 3, 4 and 5: it would only refuse again)
 OK, PROBLEM, USAGE, BRIDGE, NOT_HOME, NOTHING = 0, 1, 2, 3, 4, 5
@@ -707,9 +717,28 @@ def check_peer(host: str, number: int, checker, keys: Path) -> dict | None:
         if verdict.state != "verified":
             return None
         channel = channel_of(checker, keys, channel_raw, channel_sig, verdict.release_id)
+        history = fetch(host, number, "history/releases.jsonl", MAX_HISTORY)
+        history_sig = fetch(host, number, "history/releases.jsonl.sig", MAX_SIGNATURE)
+        if not history_ends_with(checker, keys, history, history_sig, verdict.release_id, record):
+            return None
     except Exception:                     # anything odd about a neighbour: it is simply not listed
         return None
     return {"url": f"http://{host}:{number}/", "channel": channel, "release_id": verdict.release_id}
+
+
+def history_ends_with(checker, keys: Path, history: bytes | None, signature: bytes | None, release_id: str,
+                      record: bytes) -> bool:
+    """I6 finding 2: the neighbour's release history carries a valid official signature and its newest line names
+    exactly the release record it serves (secure-linux-kit-update refuses a copy at home without one)."""
+    if history is None or signature is None:
+        return False
+    if checker.verify_detached(history, signature, keys, label="history/releases.jsonl").state != "verified":
+        return False
+    try:
+        newest = json.loads(history.decode("utf-8").splitlines()[-1])
+        return newest["release_id"] == release_id and newest["record_sha256"] == hashlib.sha256(record).hexdigest()
+    except (UnicodeDecodeError, ValueError, KeyError, TypeError, IndexError, RecursionError):
+        return False
 
 
 def release_order(release_id: str) -> tuple:
@@ -761,6 +790,121 @@ def online_allowed(tree: Path) -> bool:
         return False
 
 
+def normal_user_ids() -> tuple[int, int]:
+    """The user and group number of LOOK_USER (Linux only; asked only when this process is the administrator)."""
+    import pwd
+    entry = pwd.getpwnam(LOOK_USER)
+    return entry.pw_uid, entry.pw_gid
+
+
+def child_rights() -> dict | None:
+    """check C2 F10: how the child that asks the neighbours is started. {} when this process is not the
+    administrator (it already has a normal user's rights); the normal account's numbers and no extra groups when it
+    is; None when no normal account can be used - then nobody is asked (never with administrator rights)."""
+    if not hasattr(os, "geteuid") or os.geteuid() != 0:
+        return {}
+    try:
+        uid, gid = normal_user_ids()
+    except (KeyError, OSError, ImportError, ValueError):
+        return None
+    if not isinstance(uid, int) or not isinstance(gid, int) or uid <= 0 or gid <= 0:
+        return None
+    return {"user": uid, "group": gid, "extra_groups": []}
+
+
+def checked_answer(raw: bytes, hosts: list[tuple[str, int]]) -> list[dict] | None:
+    """The child's answer, checked again by the administrator: only addresses that were asked (each once), a
+    known channel and a real release name. None when the answer is not in the expected form at all."""
+    try:
+        answer = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError, RecursionError):
+        return None
+    if not isinstance(answer, dict) or not isinstance(answer.get("peers"), list):
+        return None
+    asked = {f"http://{host}:{number}/" for host, number in hosts}
+    found: list[dict] = []
+    seen: set[str] = set()
+    for item in answer["peers"]:
+        if not isinstance(item, dict) or set(item) != {"url", "channel", "release_id"}:
+            continue
+        url, channel, release_id = item["url"], item["channel"], item["release_id"]
+        if not isinstance(url, str) or url not in asked or url in seen:
+            continue
+        if not isinstance(channel, str) or channel not in CHANNELS:
+            continue
+        if not isinstance(release_id, str) or not RELEASE_ID_RE.fullmatch(release_id):
+            continue
+        seen.add(url)
+        found.append({"url": url, "channel": channel, "release_id": release_id})
+    return found
+
+
+def look_as_normal_user(tree: Path, hosts: list[tuple[str, int]], rights: dict) -> list[dict] | None:
+    """check C2 F10: the neighbours are asked by a child process (`look`), with `rights` (see child_rights).
+    Returns the checked list, or None when the child could not run, failed, took too long or answered too much."""
+    command = [sys.executable, "-I", str(Path(__file__).resolve()), "look", "--tree", str(tree)]
+    env = dict(os.environ)
+    options: dict = {}
+    if rights:
+        env["HOME"] = "/"
+        options = {"cwd": "/", **rights}
+    try:
+        process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                   stderr=subprocess.DEVNULL, env=env, **options)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None                       # for example the change to the normal account was refused
+    timer = threading.Timer(LOOK_SECONDS, process.kill)
+    timer.start()
+    try:
+        try:
+            process.stdin.write(json.dumps([[host, number] for host, number in hosts]).encode("ascii"))
+            process.stdin.close()
+        except OSError:
+            pass
+        raw = process.stdout.read(MAX_LOOK_ANSWER + 1)
+        if len(raw) > MAX_LOOK_ANSWER:
+            process.kill()
+        code = process.wait()
+    finally:
+        timer.cancel()
+    if code != 0 or len(raw) > MAX_LOOK_ANSWER:
+        return None
+    return checked_answer(raw, hosts)
+
+
+def look(tree: Path) -> int:
+    """The child of `find` (check C2 F10): asks the addresses given on standard input (a JSON list of
+    [address, port]) and prints the neighbours that check out as JSON. Writes nothing and changes nothing."""
+    try:
+        raw = sys.stdin.buffer.read(MAX_LOOK_INPUT + 1)
+        given = json.loads(raw.decode("ascii")) if len(raw) <= MAX_LOOK_INPUT else None
+    except (UnicodeDecodeError, ValueError, RecursionError, OSError):
+        given = None
+    if not isinstance(given, list) or len(given) > MAX_HOSTS:
+        return PROBLEM
+    hosts: list[tuple[str, int]] = []
+    for item in given:
+        if (not isinstance(item, list) or len(item) != 2 or not isinstance(item[0], str)
+                or not isinstance(item[1], int) or isinstance(item[1], bool) or not 0 < item[1] < 65536
+                or not is_home_address(item[0])):
+            return PROBLEM
+        hosts.append((item[0], item[1]))
+    keys = keys_folder(tree)
+    try:
+        checker = load_checker(keys)
+    except NotShared:
+        return PROBLEM
+    found: list[dict] = []
+    if checker is not None and hosts:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(PROBE_WORKERS, len(hosts))) as pool:
+            for peer in pool.map(lambda item: check_peer(item[0], item[1], checker, keys), hosts):
+                if peer:
+                    found.append(peer)
+    sys.stdout.write(json.dumps({"peers": found}))
+    sys.stdout.flush()
+    return OK
+
+
 def find(tree: Path) -> int:
     if at_home() and not online_allowed(tree):
         forget_peers()
@@ -781,13 +925,19 @@ def find(tree: Path) -> int:
         forget_peers()
         say(f"KIT SHARE: {BRIDGE_TEXT}")
         return OK
+    rights = child_rights()
+    if rights is None:
+        forget_peers()
+        say(f"KIT SHARE: not looking for other computers - the normal account '{LOOK_USER}' that looks for them "
+            "cannot be used on this computer, and other computers are never asked with administrator rights.")
+        return PROBLEM
     hosts = candidates()
-    found: list[dict] = []
-    if hosts:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=min(PROBE_WORKERS, len(hosts))) as pool:
-            for peer in pool.map(lambda item: check_peer(item[0], item[1], checker, keys), hosts):
-                if peer:
-                    found.append(peer)
+    found = look_as_normal_user(tree, hosts, rights) if hosts else []
+    if found is None:
+        forget_peers()
+        say("KIT SHARE: the search for other Secure Linux computers at home did not finish, so none is listed "
+            "this time. It runs again at the next network change or within a few hours.")
+        return PROBLEM
     found.sort(key=lambda peer: release_order(peer["release_id"]), reverse=True)    # newest release first
     seen_at = datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0).isoformat()
     peers = [{"url": peer["url"], "seen_at": seen_at, "channel": peer["channel"]} for peer in found]
@@ -936,6 +1086,8 @@ def main(argv: list[str]) -> int:
         return serve(folder)
     if command == "find":
         return find(folder)
+    if command == "look":
+        return look(folder)
     if command == "network":
         return network(folder)
     if command in ("firewall-open", "firewall-close"):

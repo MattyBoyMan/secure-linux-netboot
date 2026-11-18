@@ -1,0 +1,12 @@
+# Closes sign-ups of a home-server app that keeps its own accounts (Vaultwarden) once its first account exists.
+# Switched on by "secure-linux-server-apps install|start APP" only while sign-ups are open; it switches itself off.
+[Unit]
+Description=Close sign-ups of home-server app %i after its first account
+
+[Timer]
+OnActiveSec=1min
+OnUnitActiveSec=1min
+AccuracySec=10s
+
+[Install]
+WantedBy=timers.target

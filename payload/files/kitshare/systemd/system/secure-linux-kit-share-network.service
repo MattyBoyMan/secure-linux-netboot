@@ -17,7 +17,9 @@ PrivateDevices=yes
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectControlGroups=yes
-# check C2 F10 (part): this service reads neighbours' answers and checks their signatures. It must stay root (it
+# check C2 F10: the neighbours' answers are read and their signatures checked by a child process that runs with
+# the rights of the normal "nobody" account (secure-linux-kit-share look); without that account nobody is asked.
+# The service itself must stay root (it
 # starts and stops sharing and opens the firewall port, both asked over the system bus, and those checks are not
 # proven to accept root without its capabilities), so it keeps them, but gets no namespaces, real-time,
 # set-user-ID files, personality changes, kernel log, clock or host-name changes, or foreign system calls.

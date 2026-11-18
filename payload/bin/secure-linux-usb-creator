@@ -509,7 +509,10 @@ def mock_regular_file(device):
         )
 
 
-def open_device(device, write, mock):
+def open_device(device, write, mock, exclusive=False):
+    """exclusive (check C3, P04): open a real whole drive for writing with O_EXCL, which Linux refuses while anything
+    holds it (a mounted part, swap, another program). Only for the exact clone: a Portable tools copy keeps the drive
+    open while Ventoy's own installer opens the drive's parts. A mock drive is a plain file and never gets it."""
     path = device["path"]
     if mock:
         mock_regular_file(device)
@@ -518,10 +521,15 @@ def open_device(device, write, mock):
         if not stat.S_ISBLK(info.st_mode):
             raise CreatorError(f"real mode only accepts Linux whole-block devices, not {path}")
     flags = os.O_RDWR if write else os.O_RDONLY
+    if exclusive and write and not mock:
+        flags |= os.O_EXCL
     flags |= getattr(os, "O_BINARY", 0)
     try:
         fd = os.open(path, flags)
     except OSError as exc:
+        if exclusive and write and not mock and exc.errno == errno.EBUSY:
+            raise CreatorError(f"{path} is in use (a part of it is mounted, or another program holds it). Close "
+                               "it or unmount it first; nothing was written") from exc
         raise CreatorError(f"cannot open {path} safely: {exc.strerror}") from exc
     try:
         if fcntl is not None:
@@ -541,6 +549,19 @@ def open_device(device, write, mock):
     except BaseException:
         os.close(fd)
         raise
+
+
+def check_opened_target(devices, target, target_id):
+    """Check C3 (P04): after the drive is opened, it must still be the drive that was confirmed (the same serial or
+    WWN and size), and no part of it may be mounted. Returns the drive as it is listed now."""
+    latest = devices.find_path(target["path"])
+    if identity(latest) != target_id or latest["size"] != target["size"]:
+        raise CreatorError("target changed while it was being opened; no clone is considered valid")
+    points = mountpoints(latest)
+    if points:
+        raise CreatorError("a part of the target drive is mounted (" + ", ".join(points) + "); unmount it first. "
+                           "Nothing was written")
+    return latest
 
 
 def read_up_to(fd, length):
@@ -912,7 +933,7 @@ def verify_master_files(root, manifest):
     if portable:
         payload = Path(root) / "payload"
         expected = {entry["path"]: entry for entry in portable["files"]}
-        actual = set()
+        found = []
         for base, directories, files in os.walk(payload):
             for name in directories:
                 if (Path(base) / name).is_symlink():
@@ -922,15 +943,15 @@ def verify_master_files(root, manifest):
                 if path.is_symlink() or not path.is_file():
                     raise VerificationError("saved portable payload contains a non-regular file")
                 relative = path.relative_to(payload).as_posix()
-                actual.add(relative)
                 entry = expected.get(relative)
                 if entry is None:
                     raise VerificationError(f"unexpected file in saved portable payload: {relative}")
                 check_read_only(path)
-                size, digest = hash_file(path, entry["size"])
-                if size != entry["size"] or digest != entry["sha256"]:
-                    raise VerificationError(f"saved portable file failed SHA-256: {relative}")
-        missing = sorted(set(expected) - actual)
+                found.append((relative, path, entry))
+        for (relative, _, entry), (size, digest) in zip(found, hash_files_parallel((p, e["size"]) for _, p, e in found)):
+            if size != entry["size"] or digest != entry["sha256"]:  # every file still hashed, several at once (Fz4)
+                raise VerificationError(f"saved portable file failed SHA-256: {relative}")
+        missing = sorted(set(expected) - {relative for relative, _, _ in found})
         if missing:
             raise VerificationError(f"saved portable payload is missing files, starting with: {missing[0]}")
 
@@ -1257,9 +1278,9 @@ def sync_master(args):
     try:
         payload = Path(staging) / "payload"
         old_entries = sync_kept_entries(portable["files"])
-        for relative, entry in old_entries.items():
+        checked = hash_files_parallel((old_payload / relative, entry["size"]) for relative, entry in old_entries.items())
+        for (relative, entry), (size, digest) in zip(old_entries.items(), checked):  # still checked, several at once
             source = old_payload / relative
-            size, digest = hash_file(source, entry["size"])
             if size != entry["size"] or digest != entry["sha256"]:
                 raise VerificationError(f"saved master file failed SHA-256, so the master was not updated: {relative}")
             destination = payload / relative
@@ -1770,10 +1791,8 @@ def clone_master(args):
     fd = None
     completed = False
     try:
-        fd = open_device(refreshed, True, devices.mock)
-        latest = devices.find_path(target["path"])
-        if identity(latest) != target_id or latest["size"] != target["size"]:
-            raise CreatorError("target changed while it was being opened; no clone is considered valid")
+        fd = open_device(refreshed, True, devices.mock, exclusive=True)
+        latest = check_opened_target(devices, target, target_id)
         can_resume = not args.restart and (
             args.resume or (previous and previous.get("master_id") == master_id and previous.get("target", {}).get("identity") == target_id)
         )
@@ -1915,8 +1934,16 @@ def resolve_storage_tool(name, mock):
     )
 
 
-def create_storage_partition(device_path, fmt, mock):
-    """Create partition #3 in Ventoy's reserved area and format it. Returns a description dict."""
+def create_storage_partition(device_path, fmt, mock, same_as=None):
+    """Create partition #3 in Ventoy's reserved area and format it. Returns a description dict.
+    same_as = (devices, identity, size): right before sfdisk changes the partition table, the drive at device_path
+    must still be that drive (check C3, P04: the long copy happens in between). It is checked first."""
+    if same_as is not None:
+        devices, wanted, size = same_as
+        now = devices.find_path(device_path)
+        if identity(now) != wanted or now["size"] != size:
+            raise CreatorError(f"the drive at {device_path} changed before its storage partition was made (was it "
+                               "unplugged?); the partition table was not changed")
     resolve_storage_tool(fmt, mock)
     if mock:
         return {"format": fmt, "partition": "mock", "created": True}
@@ -2020,18 +2047,19 @@ def measure_command(args):
 def validate_ventoy_installer(value, mock):
     path = Path(value).expanduser().resolve() if value else None
     if path is None:
-        raise CreatorError("--ventoy-installer is required; select the genuine Ventoy2Disk.sh from the official package")
+        raise CreatorError("--ventoy-installer is required; choose Ventoy2Disk.sh from Ventoy's own package "
+                           "(download it only from ventoy.net or Ventoy's GitHub page)")
     if path.is_symlink() or not path.is_file():
         raise CreatorError("Ventoy installer must be a regular file from the official extracted package")
     if not mock and path.name != "Ventoy2Disk.sh":
-        raise CreatorError("real portable copies require the genuine Ventoy2Disk.sh; no substitute boot writer is allowed")
+        raise CreatorError("real portable copies need Ventoy's own Ventoy2Disk.sh; no substitute boot writer is allowed")
     package = path.parent
     required = ["ventoy/ventoy.disk.img.xz", "tool/ENROLL_THIS_KEY_IN_MOKMANAGER.cer"]
     hashes = {}
     for relative in required:
         asset = package / relative
         if asset.is_symlink() or not asset.is_file() or asset.stat().st_size <= 0:
-            raise CreatorError(f"Ventoy package is missing required genuine installer asset: {relative}")
+            raise CreatorError(f"Ventoy package is missing a file its installer needs: {relative}")
         hashes[relative] = hash_file(asset)[1]
     tools = list((package / "tool").glob("*/Ventoy2Disk")) if (package / "tool").is_dir() else []
     if not tools or any(tool.is_symlink() or not tool.is_file() or tool.stat().st_size <= 0 for tool in tools):
@@ -2140,7 +2168,7 @@ def ventoy_force_needed(device, restart):
 
 
 def run_ventoy_installer(command, path, force):
-    """Run the genuine installer on the drive with both of its answers given (after this tool's own ERASE question)."""
+    """Run the chosen Ventoy installer on the drive with both of its answers given (after this tool's own ERASE question)."""
     argv = [("-I" if force else part) if part == "-i" else part for part in command] + [path]
     return subprocess.run(argv, input=VENTOY_ANSWERS, text=True)
 
@@ -2199,12 +2227,12 @@ def ensure_payload_destination(data_root, relative):
 def verify_portable_files(data_root, files, portable):
     progress = Progress("Full post-copy per-file SHA-256 verification", sum(entry["size"] for entry in files))
     tree = hashlib.sha256()
-    for entry in files:
-        path = Path(data_root) / entry["path"]
+    paths = [Path(data_root) / entry["path"] for entry in files]
+    for entry, path in zip(files, paths):
         if path.is_symlink() or not path.is_file():
             raise VerificationError(f"copied file is missing or not regular: {entry['path']}")
-        size, digest = hash_file(path, entry["size"])
-        if size != entry["size"] or digest != entry["sha256"]:
+    for entry, (size, digest) in zip(files, hash_files_parallel((path, e["size"]) for e, path in zip(files, paths))):
+        if size != entry["size"] or digest != entry["sha256"]:  # every file still read back, several at once (Fz4)
             raise VerificationError(f"copied file SHA-256 mismatch: {entry['path']}")
         tree.update(entry["path"].encode("utf-8") + b"\0" + digest.encode("ascii") + b"\n")
         progress.advance(size)
@@ -2370,7 +2398,10 @@ def portable_copy(args):
         if can_resume:
             say("Resume: retaining the existing Ventoy layout and re-hashing every already copied file.")
         else:
-            say("Starting genuine Ventoy installation; no substitute boot-sector writer is used.")
+            say("Starting genuine Ventoy installation: genuine here means Ventoy's own installer, never a substitute "
+                "boot-sector writer. Its package was checked for the right files and their fingerprints are recorded, "
+                "but this tool cannot prove where your copy came from, so use only a Ventoy2Disk.sh downloaded from "
+                "ventoy.net or Ventoy's GitHub page.")
             install_command = list(installer_command)
             if storage_plan:
                 install_command += ["-r", str(storage_plan["reserve_mb"])]
@@ -2395,9 +2426,9 @@ def portable_copy(args):
         # An earlier passport would claim a check this copy has not passed yet.
         remove_drive_identity(data_root)
         current = dict(base_state)
-        current["phase"] = "copying"
-        current["boot_asset_sha256"] = boot_hashes
+        current.update(phase="copying", boot_asset_sha256=boot_hashes)
         save_state(state_path, current)
+        last_saved = time.monotonic()
         progress = Progress("Copying verified tools, release and offline content", sum(entry["size"] for entry in files))
         for index, entry in enumerate(files):
             source = sources[entry["path"]] if entry["path"] in sources else Path(root) / "payload" / entry["path"]
@@ -2441,10 +2472,10 @@ def portable_copy(args):
                         pass
                     raise
             progress.advance(entry["size"])
-            current = dict(base_state)
-            current.update({"phase": "copying", "next_file": index + 1, "boot_asset_sha256": boot_hashes})
-            save_state(state_path, current)
             fail_after = mock_hook("SL_USBC_MOCK_EXIT_AFTER_PORTABLE_FILES", devices.mock)
+            if fail_after and index + 1 == int(fail_after) or index + 1 == len(files) or time.monotonic() - last_saved >= 2.0:
+                save_state(state_path, dict(base_state, phase="copying", next_file=index + 1, boot_asset_sha256=boot_hashes))
+                last_saved = time.monotonic()  # the receipt every 2 s, not after each of 548,000 files (Fz4)
             if fail_after and index + 1 == int(fail_after):
                 os._exit(87)
         progress.finish()
@@ -2463,7 +2494,8 @@ def portable_copy(args):
             os.sync()
         if storage_plan and not storage_plan.get("created"):
             say(f"Creating your storage partition now (format: {storage_plan['format']})...")
-            storage_info = create_storage_partition(refreshed["path"], storage_plan["format"], devices.mock)
+            storage_info = create_storage_partition(refreshed["path"], storage_plan["format"], devices.mock,
+                                                    same_as=(devices, target_id, target["size"]))
             storage_plan = dict(storage_plan)
             storage_plan.update(storage_info)
             say(f"Storage partition created: {storage_plan.get('partition')} ({storage_plan['format']}).")
@@ -4378,11 +4410,14 @@ def build_parser(plugins=()):
     clone.add_argument("--non-interactive", action="store_true")
     portable = sub.add_parser(
         "portable",
-        help="Portable tools copy: install genuine Ventoy, copy and hash-verify every saved file (not an exact clone)",
+        help="Portable tools copy: install Ventoy, copy and hash-verify every saved file (not an exact clone)",
     )
     add_store(portable)
     portable.add_argument("--target", help="explicit destination whole-drive path")
-    portable.add_argument("--ventoy-installer", required=True, help="official Ventoy2Disk.sh from its genuine extracted package")
+    portable.add_argument("--ventoy-installer", required=True,
+                          help="Ventoy2Disk.sh from Ventoy's own extracted package (download it only from ventoy.net or "
+                               "Ventoy's GitHub page; its fingerprints are recorded, but this tool "
+                               "cannot prove where it came from)")
     portable.add_argument("--confirm", help="exact typed phrase: ERASE SERIAL-OR-WWN")
     portable_mode = portable.add_mutually_exclusive_group()
     portable_mode.add_argument("--resume", action="store_true", help="retain existing Ventoy and hash-matching copied files")
@@ -4561,6 +4596,28 @@ def main(argv=None):
     except OSError as exc:
         say(f"STOPPED SAFELY: operating-system error: {exc}")
         return 1
+
+
+HASH_WORKERS = max(2, min(8, os.cpu_count() or 2))
+
+
+def hash_files_parallel(jobs, workers=None):
+    """hash_file for many files at once (Fz4): (path, expected size or None) pairs in, (size, sha256) pairs out, in
+    the same order, so callers check, report and show progress exactly as before. Threads overlap the reads (hashlib
+    lets other threads run while it hashes); at most four files per thread are in flight, so memory stays small for
+    hundreds of thousands of files. An error is raised at the first file, in list order, that cannot be read.
+    (Kept at the end of this file so the line numbers that linux/setup-data/drive-per-drive-files.txt names stay.)"""
+    import collections
+    import concurrent.futures
+    workers = workers or HASH_WORKERS
+    window = collections.deque()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+        for path, size in jobs:
+            window.append(pool.submit(hash_file, path, size))
+            if len(window) >= 4 * workers:
+                yield window.popleft().result()
+        while window:
+            yield window.popleft().result()
 
 
 if __name__ == "__main__":

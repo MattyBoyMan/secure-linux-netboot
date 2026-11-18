@@ -42,10 +42,11 @@ The historical owner table was a parallel-editing convention, not a runtime rest
 
 ## Five-screen welcome contract
 
-The default `secure-linux-welcome` journey is exactly five visible screens. The top-level files are:
+The default `secure-linux-welcome` journey is one information page (`00-about`, no question, before any choice) followed by exactly five question screens. The top-level files are:
 
 | File | Guide/checker ID | Display title |
 |---|---|---|
+| `wizard.d/00-about.sh` | `00-about` | `Welcome — what your Secure Linux drive can and cannot do` (information only) |
 | `wizard.d/00-core.sh` | `00-core` | None: titleless shared infrastructure |
 | `wizard.d/01-system.sh` | `01-system` | `1 of 5 — Your recommended setup` |
 | `wizard.d/02-identity.sh` | `02-identity` | `2 of 5 — You, Wi-Fi and passwords` |
@@ -53,7 +54,7 @@ The default `secure-linux-welcome` journey is exactly five visible screens. The 
 | `wizard.d/04-extras.sh` | `04-extras` | `4 of 5 — Optional extras` |
 | `wizard.d/05-review.sh` | `05-review` | `5 of 5 — Review everything` |
 
-The five visible page files call `sl_wizard_show system|identity|apps|extras|review`; they do **not** define `page_title`. Guide tooling therefore uses their shell stems as IDs and the guide must include both stems and display titles.
+The information page calls `sl_wizard_show about`; the five question page files call `sl_wizard_show system|identity|apps|extras|review`; they do **not** define `page_title`. Guide tooling therefore uses their shell stems as IDs and the guide must include both stems and display titles.
 
 Nothing changes before the final review. Confirm starts enabled steps, Back returns to answers and closing cancels. There is no first-run countdown. Protection choices are **Recommended — everyday protection**, **Stricter — also VPN private mode and audit log**, and **Custom — keep current settings, then untick or tick below**.
 

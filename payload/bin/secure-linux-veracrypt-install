@@ -12,20 +12,27 @@
 # The package is used only if (1) its SHA-256 fingerprint equals the one fixed in this helper and (2) when gpg is
 # present, its signature is valid for the VeraCrypt team's key 5069 A233 D55A 0EEB 174A 5FC3 821A CD02 680D 16DE
 # (a copy of that key ships with the kit). If either check fails the file is deleted and nothing is installed.
-# With no internet it uses a copy kept on the Secure Linux drive, after the same checks.
+# With no internet it uses a copy kept on the Secure Linux drive, after the same checks (the drive builder adds it when
+# the offline app collection was made with: offline_bundle.py fetch-vendor-files).
+# VeraCrypt does not update itself with the normal system updates: a newer Secure Linux kit brings a newer checked
+# package, and running "install" again updates it. "remove" also takes away the VeraCrypt team's key that "install"
+# added to this computer's trusted package keys.
 set -u
 export LC_ALL=C
 P=${SL_VERACRYPT_PREFIX:-}                 # tests only: a fake root folder; also switches the test pin hook on
 VERSION=1.26.31
 BASEURL=https://github.com/veracrypt/VeraCrypt/releases/download/VeraCrypt_$VERSION
 KEY_FPR=5069A233D55A0EEB174A5FC3821ACD02680D16DE
+KEY_RPM=gpg-pubkey-680d16de                  # how rpm names the VeraCrypt team's key once it is imported
+KEY_MARK=$P/var/lib/secure-linux/veracrypt/key-added-by-secure-linux
+UPDATE_NOTE="VeraCrypt does not update itself with the normal system updates. When a newer Secure Linux kit brings a newer VeraCrypt, run 'secure-linux-veracrypt-install install' again to update it."
 SELF=$(readlink -f "$0" 2>/dev/null || echo "$0")
 HERE=$(dirname "$SELF")
 SL_ROOT=${SL_ROOT:-/usr/local/lib/secure-linux}
 say() { printf '%s\n' "$*"; }
 die() { say "$*"; exit 1; }
 have() { [ "$1" = gpg ] && [ -n "$P" ] && [ -n "${SL_VERACRYPT_NO_GPG:-}" ] && return 1; command -v "$1" >/dev/null 2>&1; }   # (the gpg switch works only in the tests' fake root)
-usage() { sed -n '2,15p' "$SELF" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,19p' "$SELF" | sed 's/^# \{0,1\}//'; }
 need_root() { [ -n "$P" ] || [ "$(id -u)" -eq 0 ] || exec pkexec "$SELF" "$@"; }
 
 # SHA-256 of the published packages (from veracrypt-1.26.31-sha256sum.txt, and recomputed here on 2026-11-14).
@@ -55,6 +62,8 @@ Which lock should I use?
   - VeraCrypt is for one big locked box (a "container" file, or a whole USB stick) that you also want to open on
     Windows, macOS or another Linux computer. Choose it when you must share a locked box with someone who does
     not use Cryptomator. It is a bit more work than Cryptomator.
+  - VeraCrypt does not update itself with the normal system updates. When a newer Secure Linux kit brings a newer
+    VeraCrypt, run 'secure-linux-veracrypt-install install' again to update it.
 EOF
 }
 
@@ -71,7 +80,8 @@ fetch_checked() { # fetch_checked FEDORA_VER DIR -> leaves DIR/veracrypt.rpm onl
   url=$BASEURL/$name
   if ! curl -fsSL --proto '=https' --tlsv1.2 --max-time 600 -o "$dir/veracrypt.rpm" "$url" 2>/dev/null; then
     rm -f "$dir/veracrypt.rpm"
-    for dd in ${SL_VERACRYPT_DRIVE_DIR:+"$SL_VERACRYPT_DRIVE_DIR"} "$P/var/cache/secure-linux/offline/veracrypt" "$P"/run/media/*/*/linux-setup/offline/veracrypt; do
+    for dd in ${SL_VERACRYPT_DRIVE_DIR:+"$SL_VERACRYPT_DRIVE_DIR"} "$P/var/cache/secure-linux/offline/veracrypt" "$P"/run/media/*/*/linux-setup/offline/veracrypt \
+              "$P"/var/cache/secure-linux/offline/app-bundles/*/vendor-files/veracrypt "$P"/run/media/*/*/linux-setup/offline/app-bundles/*/vendor-files/veracrypt; do
       if [ -f "$dd/$name" ]; then
         say "No internet: using the copy kept on the Secure Linux drive."
         cp "$dd/$name" "$dir/veracrypt.rpm"
@@ -112,7 +122,12 @@ cmd_install() {
   say "(about 12 MB), checks its fingerprint and signature, and only then installs it."
   if [ $yes -ne 1 ]; then local a=""; printf 'Install VeraCrypt? [y/N] '; read -r a || a=""; case "$a" in [Yy]|[Yy][Ee][Ss]) ;; *) say "Not installed. Nothing was changed."; return 0 ;; esac; fi
   need_root install --yes
-  if rpm -q veracrypt >/dev/null 2>&1; then say "VeraCrypt is already installed."; return 0; fi
+  local have_ver=""
+  if rpm -q veracrypt >/dev/null 2>&1; then
+    have_ver=$(rpm -q veracrypt --qf '%{VERSION}' 2>/dev/null)
+    if [ "$have_ver" = "$VERSION" ]; then say "VeraCrypt is already installed (version $VERSION, the one this kit has checked)."; say "$UPDATE_NOTE"; return 0; fi
+    say "VeraCrypt ${have_ver:-?} is installed. This updates it to version $VERSION."
+  fi
   local tmp rc; tmp=$(mktemp -d "${TMPDIR:-/tmp}/sl-veracrypt.XXXXXX") || die "No temporary space. Nothing was changed."
   trap "rm -rf '$tmp'" EXIT
   VERIFIED_BY=""
@@ -125,9 +140,13 @@ cmd_install() {
     6) die "The package's signature is missing or not valid for the VeraCrypt team's key, so it was deleted and NOT installed. Nothing was changed." ;;
     *) die "VeraCrypt could not be fetched. Nothing was changed." ;;
   esac
-  local kf; kf=$(keyfile) && rpm --import "$kf" >/dev/null 2>&1
+  local kf
+  if ! rpm -q "$KEY_RPM" >/dev/null 2>&1; then         # remember that this tool added the key, so remove can take it out
+    kf=$(keyfile) && rpm --import "$kf" >/dev/null 2>&1 && mkdir -p "$(dirname "$KEY_MARK")" && : > "$KEY_MARK"
+  fi
   dnf -y install "$tmp/veracrypt.rpm" >/dev/null 2>&1 || die "The install did not finish. Nothing else was changed."
   say "VeraCrypt is installed (checked by $VERIFIED_BY). Open it from the apps menu."
+  say "$UPDATE_NOTE"
   say "Which lock to use when: secure-linux-veracrypt-install when"
 }
 
@@ -137,6 +156,10 @@ cmd_remove() {
   if [ $yes -ne 1 ]; then local a=""; printf 'Remove VeraCrypt? Your encrypted containers are not touched. [y/N] '; read -r a || a=""; case "$a" in [Yy]|[Yy][Ee][Ss]) ;; *) say "Left as it is."; return 0 ;; esac; fi
   need_root remove --yes
   dnf -y remove veracrypt >/dev/null 2>&1 || die "It could not be removed."
+  if [ -e "$KEY_MARK" ]; then                           # only the key this tool added; one trusted before stays
+    rpm -e --allmatches "$KEY_RPM" >/dev/null 2>&1 || say "The VeraCrypt team's key could not be taken out of the trusted package keys."
+    rm -f "$KEY_MARK"
+  fi
   say "VeraCrypt is removed. Your encrypted containers were not touched."
 }
 

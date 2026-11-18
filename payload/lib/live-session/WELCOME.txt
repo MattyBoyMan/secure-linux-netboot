@@ -6,13 +6,14 @@ You started your computer from the Secure Linux drive. This is a "try it" sessio
 What is safe about it
 - Nothing is installed. Your computer's own disks are not opened, changed or erased.
 - When you switch off, everything you did here is gone, unless this drive has "keep my files" space.
-- Nothing is sent anywhere on its own.
+- Secure Linux adds nothing here that sends your files or what you do anywhere. Like any Fedora live system,
+  it sets its clock and checks the internet connection by itself when you connect.
 
 What you can do from here
   1. Read the guide          secure-linux-live-session guide
   2. Check this drive        secure-linux-live-session check-drive
   3. Install Secure Linux    secure-linux-live-session installer   (shows the steps; it does not start anything)
-  4. Start NOMAD             secure-linux-live-session nomad       (offline library, if you have it)
+  4. Start NOMAD             secure-linux-live-session nomad       (offline library; asks for administrator rights)
 
 Or type   secure-linux-live-session   on its own to get a small menu.
 

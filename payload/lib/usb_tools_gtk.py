@@ -347,9 +347,8 @@ class USBWindow(NativeOperationWindow):
         phrase = f"ERASE {identity}"
         variant, variant_words = "", ""
         if portable:
-            variant, variant_words = self.backend.master_variant(store)
+            variant, variant_words = self._copy_variant(store)
             if not variant:
-                self.notify("No copy fits yet", variant_words)
                 return
         try:
             spec = self.backend.copy(mode, path, identity, store, resume, ventoy, personal=personal,
@@ -370,6 +369,14 @@ class USBWindow(NativeOperationWindow):
         if drive:
             self.run(self.backend.inspect_copy(action, str(drive["path"]), self.store.get_text().strip()))
 
+    def _copy_variant(self, store):
+        """Which Portable tools copy fits the saved master ("full" or "online-only") and its plain words. When none
+        fits, the person is told why and ("", words) comes back."""
+        variant, words = self.backend.master_variant(store)
+        if not variant:
+            self.notify("No copy fits yet", words)
+        return variant, words
+
     def copy_several(self):
         mode = ("clone", "portable")[self.copy_mode.get_selected()]
         chosen = [row for row, box in self.multi_checks if box.get_active()]
@@ -381,16 +388,22 @@ class USBWindow(NativeOperationWindow):
             self.notify("Several drives carry your own settings", "To make a drive for someone else, copy to one drive at a time. Nothing was changed.")
             return
         store, ventoy = self.store.get_text().strip(), self.ventoy.get_text().strip()
+        # Review R1 (P34): the same full or online-only choice as a one-drive Portable tools copy
+        variant, variant_words = "", ""
+        if mode == "portable":
+            variant, variant_words = self._copy_variant(store)
+            if not variant:
+                return
         try:
             targets = [(str(row["path"]), self._identity(row)) for row in chosen]
-            spec = self.backend.copy_several(mode, targets, store, ventoy)
+            spec = self.backend.copy_several(mode, targets, store, ventoy, variant=variant)
         except ValueError as exc:
             self.notify("These drives cannot be copied to", f"{exc}\n\nNothing was changed.")
             return
         phrases = tuple(f"ERASE {identity}" for _path, identity in targets)
         kind = "Exact whole-device clones" if mode == "clone" else "Portable tools copies (not exact clones)"
         listing = "\n".join(f"- {row['path']} ({row.get('model')}, {identity}, {format_bytes(row.get('size'))})" for row, (_path, identity) in zip(chosen, targets))
-        summary = f"{kind} on {len(targets)} drives at the same time\n\n{listing}\n\nMaster: {store}\nSettings on the copies: your own settings, as saved\n\nEVERY LISTED DRIVE IS ERASED. Nothing is written until all the drives pass their safety checks. Type each drive's words below."
+        summary = f"{kind} on {len(targets)} drives at the same time\n\n{listing}\n\nMaster: {store}\nSettings on the copies: your own settings, as saved\n{variant_words + chr(10) if variant_words else ''}\nEVERY LISTED DRIVE IS ERASED. Nothing is written until all the drives pass their safety checks. Type each drive's words below."
         self.review("Review several drives", summary, phrases, lambda _secret: self.run(spec))
 
     def test_new_drive(self):

@@ -210,10 +210,15 @@ class USBBackend:
                            expected=("DRIVE TEST PASSED:",), verified_label="The drive test passed. The drive is as big as it says.")
 
     def copy_several(self, mode: str, targets: Sequence[tuple[str, str]], store: str, ventoy: str = "",
-                     restart: bool = False) -> CommandSpec:
-        """Several destination drives at once (C6): one --target and its own --confirm per drive, in order."""
+                     restart: bool = False, variant: str = "") -> CommandSpec:
+        """Several destination drives at once (C6): one --target and its own --confirm per drive, in order.
+        variant: for Portable tools copies, "full" or "online-only" (from master_variant), like a one-drive copy."""
         if mode not in {"clone", "portable"}:
             raise ValueError("Unknown copy mode")
+        if variant not in COPY_VARIANTS:
+            raise ValueError("The copy is a full copy or an online-only copy")
+        if variant and mode != "portable":
+            raise ValueError("Only a Portable tools copy has a full or online-only choice")
         if not targets:
             raise ValueError("Choose at least one destination drive")
         paths, identities = set(), set()
@@ -233,6 +238,8 @@ class USBBackend:
             if not ventoy:
                 raise ValueError("The official Ventoy2Disk.sh path is required")
             argv.extend(("--ventoy-installer", ventoy))
+            if variant:
+                argv.extend(("--variant", variant))
         if restart:
             argv.append("--restart")
         argv.extend(self._mock())
@@ -311,17 +318,44 @@ class USBBackend:
                            verified_label="Try-without-installing is in the saved master. New drives made from it can start without installing.")
 
 
+# Review R1 (P34): what was NOT finished, in each action's own words (found by its first expected marker), and
+# why the result cannot be trusted when the tool exits without its marker.
+NOT_FINISHED = {
+    "VERIFIED CLONE": ("The drive was NOT made",
+                       "The drive builder stopped without saying it worked, so do not use this drive."),
+    "VERIFIED PORTABLE TOOLS COPY": ("The drive was NOT made",
+                                     "The drive builder stopped without saying it worked, so do not use this drive."),
+    "ALL DRIVES VERIFIED": ("The drives were NOT all made",
+                            "The drive builder stopped without saying every drive worked, so do not use these drives."),
+    "FORMAT COMPLETED": ("The drive was NOT formatted",
+                         "The format tool stopped without saying it worked, so do not use this drive."),
+    "DRIVE TEST PASSED:": ("The drive test did NOT pass",
+                           "The drive test stopped without saying the drive passed, so do not use this drive."),
+    "SAVED MASTER VERIFIED": ("The master was NOT saved",
+                              "The tool stopped without saying the master was saved and checked."),
+    "MASTER UNDONE": ("The saved master was NOT changed back",
+                      "The tool stopped without saying the earlier saved master is in use again."),
+    "MASTER REFRESHED": ("The saved master was NOT refreshed",
+                         "The tool stopped without saying its big files are up to date."),
+    "LIVE MODE ADDED TO MASTER": ("Try-without-installing was NOT added to the saved master",
+                                  "The tool stopped without saying it was added."),
+    "not merely a sampled check": ("The copy was NOT checked",
+                                   "The tool stopped without saying every part was read back and matched."),
+}
+NOT_FINISHED_OTHER = ("Nothing was finished", "The tool stopped without saying it worked.")
+
+
 def honest_result(spec: CommandSpec | None, result: OperationResult) -> OperationResult:
-    """Plain words for a drive that was not made. The tool saying nothing and exiting 0 is never a success."""
+    """Plain words for an action that did not finish. The tool saying nothing and exiting 0 is never a success."""
     if spec is None or not spec.expected:
         return result
+    headline, unsure = NOT_FINISHED.get(spec.expected[0], NOT_FINISHED_OTHER)
     if result.state == "unverified":
         return OperationResult("unverified", result.returncode, False,
-                               "The drive was NOT made. The drive builder stopped without saying it worked, "
-                               "so do not use this drive. Read the lines above, then try again.")
+                               f"{headline}. {unsure} Read the lines above, then try again.")
     if result.state == "failed":
         return OperationResult("failed", result.returncode, False,
-                               f"The drive was NOT made (the tool stopped with status {result.returncode}). "
+                               f"{headline} (the tool stopped with status {result.returncode}). "
                                "Read the lines above, then try again. Nothing is claimed as done.")
     return result
 

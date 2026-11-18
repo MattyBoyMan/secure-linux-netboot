@@ -1,4 +1,4 @@
-# Quietly looks for a newer Secure Linux release (never installs unless you allowed it; never shows a message).
+# Quietly looks for a newer Secure Linux release and, once signed releases are set up (or /etc/secure-linux/kit-update-auto-apply exists), installs it by itself, unless automatic installing is off (secure-linux-kit-update-auto set --auto-apply no); a run by itself skips an update bigger than 500 MB and never shows a message.
 [Unit]
 Description=Look for a newer Secure Linux release
 Wants=network-online.target

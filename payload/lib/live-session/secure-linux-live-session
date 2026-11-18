@@ -1,6 +1,8 @@
 #!/bin/bash
 # secure-linux-live-session: the small helper shown in the Secure Linux live session (started from the drive).
-# It only reads. It never formats, mounts, partitions or writes to any disk, and never touches this computer's own disks.
+# It never formats, partitions or erases a disk, and never touches this computer's own disks. Only its
+# nomad command changes anything: it starts NOMAD from a plugged-in drive, which asks for administrator rights,
+# mounts USB drives that are not open yet and runs NOMAD as administrator.
 #   secure-linux-live-session [menu]     a short menu
 #   secure-linux-live-session welcome    the welcome note
 #   secure-linux-live-session guide      open the guide

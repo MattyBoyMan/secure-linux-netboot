@@ -65,6 +65,7 @@ TRUST_WORDS = {
 
 USER_AGENT = "secure-linux-bigfile-fetch"
 PARTS_FOLDER = ".bigfetch-parts"
+FINISHED_MODE = 0o644                       # every finished file, downloaded or copied: public files, readable
 WORKERS = 3                                # files fetched at the same time
 TRIES = 5                                  # connections per file before giving up (each continues the last)
 TIMEOUT = 60                               # seconds without an answer before a connection counts as broken
@@ -111,9 +112,11 @@ class Job:
     url: str
     target: Path
     part: Path
-    action: str                    # "keep" (already here, unchanged), "download" or "resume"
+    action: str                    # "keep" (already here, unchanged), "download", "resume" or "copy" (the same
+                                   # bytes are already here under another name: copied, not downloaded)
     size: int | None               # bytes of the whole file, when known before the download
     have: int = 0                  # bytes already in the half-finished part
+    source: Path | None = None     # for "copy": the kept file with the same bytes
 
     @property
     def remaining(self) -> int | None:
@@ -145,7 +148,8 @@ class Plan:
         under two names are downloaded once, so they count once."""
         seen: dict[str, int] = {}
         for job in self.to_fetch:
-            seen.setdefault(job.expected.sha256, job.remaining or 0)
+            if job.action != "copy":                     # a copy of a file that is already here downloads nothing
+                seen.setdefault(job.expected.sha256, job.remaining or 0)
         return sum(seen.values())
 
     @property
@@ -164,6 +168,8 @@ class Plan:
         for job in self.to_fetch:
             size = "size not known yet" if job.size is None else human(job.size)
             more = f", {human(job.have)} already here from last time" if job.action == "resume" else ""
+            if job.action == "copy" and job.source is not None:
+                more = f", copied from {job.source.name} (no download)"
             lines.append(f"  {job.expected.name}: {size}{more}")
         return lines
 
@@ -289,10 +295,62 @@ def parse_checksum_sizes(text: str) -> dict[str, int]:
     return found
 
 
+def refuse_private_packets(data: bytes, what: str) -> bytes:
+    """Walk every OpenPGP packet of a binary key file. A secret-key or secret-subkey packet (tags 5 and 7) is refused,
+    in binary files too (independent check C6 F4), and so is anything that is not a whole run of packets."""
+    position, end = 0, len(data)
+    while position < end:
+        header = data[position]
+        if not header & 0x80:
+            raise ValueError(f"{what} is not a public key file")
+        position += 1
+        if header & 0x40:                                   # new packet format
+            tag = header & 0x3F
+            if tag in (5, 7):
+                raise ValueError(f"{what} holds a private key; only public keys are used")
+            while True:
+                if position >= end:
+                    raise ValueError(f"{what} is not a public key file")
+                first = data[position]
+                partial = False
+                if first < 192:
+                    length, position = first, position + 1
+                elif first < 224:
+                    if position + 2 > end:
+                        raise ValueError(f"{what} is not a public key file")
+                    length, position = ((first - 192) << 8) + data[position + 1] + 192, position + 2
+                elif first == 255:
+                    if position + 5 > end:
+                        raise ValueError(f"{what} is not a public key file")
+                    length, position = int.from_bytes(data[position + 1:position + 5], "big"), position + 5
+                else:
+                    length, position, partial = 1 << (first & 0x1F), position + 1, True
+                position += length
+                if position > end:
+                    raise ValueError(f"{what} is not a public key file")
+                if not partial:
+                    break
+        else:                                               # old packet format
+            tag, kind = (header >> 2) & 0x0F, header & 0x03
+            if tag in (5, 7):
+                raise ValueError(f"{what} holds a private key; only public keys are used")
+            if kind == 3:                                   # "indeterminate length" never appears in a key file
+                raise ValueError(f"{what} is not a public key file")
+            size = (1, 2, 4)[kind]
+            if position + size > end:
+                raise ValueError(f"{what} is not a public key file")
+            length = int.from_bytes(data[position:position + size], "big")
+            position += size + length
+            if position > end:
+                raise ValueError(f"{what} is not a public key file")
+    return data
+
+
 def dearmor_keys(raw: bytes, what: str) -> bytes:
-    """OpenPGP public keys as binary packets (gpgv reads only those). Armored or binary key files are accepted."""
+    """OpenPGP public keys as binary packets (gpgv reads only those). Armored or binary key files are accepted; a
+    private key is refused in either form."""
     if raw[:1] and raw[0] & 0x80:
-        return raw
+        return refuse_private_packets(raw, what)
     text = raw.decode("ascii", "replace").replace("\r\n", "\n")
     if "PRIVATE KEY" in text:
         raise ValueError(f"{what} holds a private key; only public keys are used")
@@ -311,7 +369,7 @@ def dearmor_keys(raw: bytes, what: str) -> bytes:
             raise ValueError(f"{what} is damaged") from exc
     if not out or not out[0] & 0x80:
         raise ValueError(f"{what} is damaged")
-    return out
+    return refuse_private_packets(out, what)
 
 
 def gpgv_program() -> str | None:
@@ -635,6 +693,11 @@ class Fetcher:
             if size is not None and have > size:
                 have = 0                                   # cannot belong to this file; started again in run()
             jobs.append(Job(expected, url, target, part, "resume" if have else "download", size, have))
+        kept = {job.expected.sha256: job for job in jobs if job.action == "keep"}
+        for job in jobs:                                 # independent check C6 F4: copy, do not download again
+            source = kept.get(job.expected.sha256)
+            if job.action != "keep" and source is not None:
+                job.action, job.size, job.have, job.source = "copy", source.size, 0, source.target
         return Plan(folder, jobs)
 
     # -- the downloads
@@ -662,7 +725,17 @@ class Fetcher:
             _remove(job.part)                                # a leftover part of a file that is already complete
         first: dict[str, Job] = {}
         copies: list[Job] = []
+        for job in fetch:
+            if job.action == "copy" and job.source is not None:  # the same bytes are already here: copied below
+                try:
+                    self._copy_checked(job.source, job)
+                    report.done.append(job)
+                except FetchError as exc:
+                    report.failed.append((job, str(exc)))
+                continue
         for job in fetch:                                    # the same bytes under two names: downloaded once
+            if job.action == "copy":
+                continue
             if job.expected.sha256 in first:
                 copies.append(job)
             else:
@@ -703,6 +776,7 @@ class Fetcher:
                 raise Refused(f"{job.expected.name} did not match its checksum, so it was deleted and not used. "
                               "Nothing was changed.")
             os.replace(temporary, job.target)
+            os.chmod(job.target, FINISHED_MODE)
         except OSError as exc:
             raise FetchError(f"{job.expected.name} could not be written ({_reason(exc)}). Nothing was changed.") from exc
         finally:
@@ -723,6 +797,7 @@ class Fetcher:
                 job.target.parent.mkdir(parents=True, exist_ok=True)
                 no_links_below(Path(os.path.commonpath([job.part, job.target])), job.target)
                 os.replace(job.part, job.target)
+                os.chmod(job.target, FINISHED_MODE)              # one mode for a download and a copy (C6 F4)
                 _sync_folder(job.target.parent)
                 self.say(f"{job.expected.name}: downloaded and {TRUST_WORDS.get(job.expected.trust, 'checked')}.")
                 return downloaded
@@ -755,7 +830,9 @@ class Fetcher:
             if job.size is not None and have == job.size:
                 if not os.path.lexists(job.part):           # an empty file: nothing to download, but it must exist
                     os.close(os.open(job.part, os.O_WRONLY | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600))
-                return resumed, count, hasher.hexdigest()
+                # Bytes left by an earlier run count as continued, so a damaged full-size leftover is thrown away and
+                # fetched once more from zero in this run (independent check C6 F3).
+                return resumed or (count == 0 and have > 0), count, hasher.hexdigest()
             headers = {"Range": f"bytes={have}-"} if have else {}
             try:
                 with self._open(job.url, headers) as response:

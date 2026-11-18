@@ -613,7 +613,7 @@ def cmd_talk(args):
     if not model:
         say("That AI model is not installed. Run: ollama list")
         return 1
-    say("Talking to %s on this computer. Nothing is saved or sent anywhere." % model)
+    say("Talking to %s on this computer. Your voice is not kept and nothing is sent to the internet." % model)
     say("Press Enter, speak, then press Enter again when you have finished. Type q and press Enter to stop.")
     history = []
     work = private_tmp()

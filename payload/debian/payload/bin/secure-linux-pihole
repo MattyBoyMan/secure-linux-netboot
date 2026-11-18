@@ -126,7 +126,12 @@ if [ -z "$ENGINE" ]; then echo "SL_RESULT=no-engine"; exit 5; fi
 systemctl enable --now docker >/dev/null 2>&1 || true
 systemctl enable podman-restart.service >/dev/null 2>&1 || true'
 
-PI_FIREWALL_SNIPPET='fw() { if firewall-cmd --state >/dev/null 2>&1; then firewall-cmd --permanent "$@"; else firewall-offline-cmd "$@"; fi; }'
+# The firewall part of the scripts below comes from this kit's lib/pihole-host-firewall.sh: it opens (sl_fw_open) and
+# closes (sl_fw_close) DNS and the web page for the home network with the firewall the Pi-hole machine really has.
+# Each kit (Fedora, Debian) brings its own copy; this launcher is the same in both.
+pi_fw_part() { printf '%s\n' "$(pi_lib_dir)/pihole-host-firewall.sh"; }
+pi_fw_ready() { [ -r "$(pi_fw_part)" ] || pi_stop "The kit's Pi-hole files are incomplete ($(pi_fw_part) is missing). Run 'Repair setup' from Secure Linux Status."; }
+pi_fw_snippet() { cat "$(pi_fw_part)"; }
 
 pi_install_script() { # image ip network tz password
   printf '%s\n' "# SL-INSTALL" "set -eu" "IMAGE='$1'" "PI_IP='$2'" "NETWORK='$3'" "TZNAME='$4'" "TESTNAME='$SL_TEST_NAME'" "UPSTREAMS='$SL_UPSTREAMS'"
@@ -139,15 +144,12 @@ mkdir -p /opt/secure-linux-pihole/etc-pihole
 EOF
   printf "cat > /opt/secure-linux-pihole/admin-password <<'SL_PW_END'\n%s\nSL_PW_END\n" "$5"
   printf "cat > /opt/secure-linux-pihole/etc-pihole/adlists.list <<'SL_LISTS_END'\n%s\nSL_LISTS_END\n" "$SL_PI_LISTS"
-  printf '%s\n' "$PI_FIREWALL_SNIPPET"
+  pi_fw_snippet
   cat <<'EOF'
 chmod 600 /opt/secure-linux-pihole/admin-password
 chmod 755 /opt/secure-linux-pihole /opt/secure-linux-pihole/etc-pihole
 chmod 644 /opt/secure-linux-pihole/etc-pihole/adlists.list
-if command -v firewall-cmd >/dev/null 2>&1; then
-  for pp in 53/tcp 53/udp 80/tcp; do fw --zone=home --query-port="$pp" >/dev/null 2>&1 || fw --zone=home --add-port="$pp" || true; done
-  firewall-cmd --state >/dev/null 2>&1 && firewall-cmd --reload || true
-fi
+sl_fw_open "$NETWORK"
 echo "Downloading the Pi-hole image fixed by this kit..."
 "$ENGINE" pull "$IMAGE"
 "$ENGINE" run -d --name pihole --restart unless-stopped \
@@ -176,7 +178,7 @@ EOF
 pi_control_script() { # verb minutes
   printf '%s\n' "# SL-CONTROL" "set -eu" "VERB='$1'" "MINUTES='${2:-}'"
   printf '%s\n' 'ENGINE=$(command -v docker || command -v podman || true)' '[ -n "$ENGINE" ] || { echo "SL_RESULT=no-engine"; exit 5; }'
-  printf '%s\n' "$PI_FIREWALL_SNIPPET"
+  [ "$1" != remove ] || pi_fw_snippet   # only removal changes the firewall
   cat <<'EOF'
 case "$VERB" in
   pause)  "$ENGINE" exec pihole pihole disable "${MINUTES}m" ;;
@@ -185,10 +187,7 @@ case "$VERB" in
   status) "$ENGINE" ps --filter name=pihole --format '{{.Names}} {{.Status}}'; "$ENGINE" exec pihole pihole status || true ;;
   remove)
     "$ENGINE" rm -f pihole
-    if command -v firewall-cmd >/dev/null 2>&1; then
-      for pp in 53/tcp 53/udp 80/tcp; do fw --zone=home --query-port="$pp" >/dev/null 2>&1 && fw --zone=home --remove-port="$pp" || true; done
-      firewall-cmd --state >/dev/null 2>&1 && firewall-cmd --reload || true
-    fi ;;
+    sl_fw_close ;;
 esac
 echo "SL_RESULT=done"
 EOF
@@ -235,6 +234,7 @@ pi_parse_common() { # sets PI_HOST GO MINUTES ROUTER_OK PI_IP WRITE from argumen
 
 pi_setup() {
   pi_parse_common "$@"
+  pi_fw_ready
   image=$(pi_image)
   pi_say "SET UP PI-HOLE ON $(pi_where)"
   pi_say "I am only reading things first (nothing is changed yet)."
@@ -255,7 +255,7 @@ pi_setup() {
   pi_say "  3. Turn on these block lists, which include smart-TV and tracking lists:"
   printf '%s\n' "$SL_PI_LISTS" | sed 's/^/       /'
   pi_say "  4. Pi-hole asks Quad9 (9.9.9.9) for names it does not block. Address: $PI_IP (web page: http://$PI_IP/admin)."
-  pi_say "  5. Open the home firewall zone for DNS (port 53) and the web page (80) if firewalld is used."
+  pi_say "  5. Open DNS (port 53) and the web page (port 80) to your home network only, in the firewall that machine uses."
   pi_say "  6. Make a random admin password and save it here: $statedir/admin-password"
   pi_say "  Nothing in your router changes in this step. Undo for this step: home-remove."
   pi_say ""
@@ -318,6 +318,7 @@ pi_control() { # verb
     pi_say "DRY RUN: nothing was changed. Add --go to do it."
     return 0
   fi
+  [ "$verb" != remove ] || pi_fw_ready
   out=$(pi_control_script "$verb" "$MINUTES" | pi_run_root) || { printf '%s\n' "$out"; pi_stop "That did not work. Is Pi-hole installed (home-status)?"; }
   printf '%s\n' "$out" | grep -v '^SL_RESULT' || true
   pi_say "Done."
@@ -530,7 +531,7 @@ pi_ask() { # server name -> ANS (answer) and RC (9 = no reply)
     case "$raw" in *"timed out"*|*"no servers could be reached"*|*"communications error"*) RC=9 ;; esac
     ANS=$(printf '%s\n' "$raw" | awk '/^Name:/{n=1} n && /^Address/{print $NF}' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -n 1 || true)
   else
-    pi_stop "I need the 'dig' program (Fedora: sudo dnf install bind-utils) or 'nslookup'."
+    pi_stop "I need the 'dig' or 'nslookup' program. Add it with your system's software tool (the package is called bind-utils on Fedora, dnsutils on Debian and Raspberry Pi OS)."
   fi
 }
 

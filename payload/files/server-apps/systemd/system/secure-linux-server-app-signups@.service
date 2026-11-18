@@ -1,0 +1,8 @@
+# Run every minute by secure-linux-server-app-signups@APP.timer while that app's sign-ups are open.
+[Unit]
+Description=Close sign-ups of home-server app %i once its first account exists
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/secure-linux-server-apps signups-check %i
+TimeoutStartSec=5min

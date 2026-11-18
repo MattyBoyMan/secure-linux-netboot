@@ -1,5 +1,6 @@
 # shellcheck shell=bash
-# Shared five-screen first-run wizard. Source after common.sh and the host wizard's UI helpers.
+# Shared first-run wizard: one information page (00-about: what the drive is, can and cannot do, which computers
+# work), then five question screens. Source after common.sh and the host wizard's UI helpers.
 # Non-secret answers live in JSON in this process. Secrets have separate shell variables and are
 # never added to SL_WIZARD_VALUES, review text, choice files, command logs or the setup journal.
 [ -n "${SL_FIVE_WIZARD_LOADED:-}" ] && return 0
@@ -256,10 +257,11 @@ sl_wizard_apply() {
 }
 
 sl_wizard_run() {
-  local index=1 action page
+  local index=0 action page
   sl_wizard_scan
-  while [ "$index" -ge 1 ] && [ "$index" -le 5 ]; do
+  while [ "$index" -ge 0 ] && [ "$index" -le 5 ]; do
     case $index in
+      0) page=00-about.sh ;;
       1) page=01-system.sh ;; 2) page=02-identity.sh ;; 3) page=03-apps-security.sh ;;
       4) page=04-extras.sh ;; 5) page=05-review.sh ;;
     esac
@@ -270,7 +272,7 @@ sl_wizard_run() {
     action=$SL_WIZARD_ACTION
     case $action in
       cancel) return 1 ;;
-      back) index=$((index - 1)); [ "$index" -ge 1 ] || index=1 ;;
+      back) index=$((index - 1)); [ "$index" -ge 0 ] || index=0 ;;
       *) index=$((index + 1)) ;;
     esac
   done

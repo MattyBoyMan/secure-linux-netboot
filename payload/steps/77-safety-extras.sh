@@ -21,6 +21,10 @@ fi
 if [ ! -x "$_sf77_d/usr/bin/pasta" ]; then
   sl_dnf_install passt || echo "The network helper for opening links safely could not be added this time. Secure Linux will try again in the next repair."
 fi
+# I6 finding 5: the atomic setup cannot add it here, so say plainly what that means and how an administrator adds it
+if sl_is_atomic && [ ! -x "$_sf77_d/usr/bin/pasta" ]; then
+  echo "Note: links cannot be opened safely on this image-based edition until the network helper (passt) is added. Files still open safely. An administrator can add it by typing: sudo rpm-ostree install passt (then restart the computer)."
+fi
 # atomic: /usr is read-only, so the extras go below /usr/local/share (KDE looks there too)
 if sl_is_atomic; then _sf77_share=/usr/local/share; else _sf77_share=/usr/share; fi
 sl_install_file "$SL_ROOT/files/safety/kde/secure-linux-open-safely.desktop" \

@@ -53,6 +53,16 @@ if sl_is_atomic; then
   return 0
 fi
 
+# Fz4: dnf fetches up to 10 packages at once instead of its default 3. The same packages are installed and every
+# signature is still checked; a value the owner set in dnf.conf is kept.
+_sys_dnf_speed() {
+  local conf=/etc/dnf/dnf.conf
+  mkdir -p /etc/dnf; [ -f "$conf" ] || printf '[main]\n' > "$conf"
+  grep -q '^\[main\]' "$conf" || sed -i '1i [main]' "$conf"
+  grep -q '^max_parallel_downloads=' "$conf" || sed -i '/^\[main\]/a max_parallel_downloads=10' "$conf"
+}
+_sys_dnf_speed
+
 sl_step "Updating the system"
 [ "$SL_MODE" = install ] && try dnf -y upgrade --refresh
 

@@ -10,7 +10,9 @@
 # (browsers never do for a number address: default_sni), and never try to change this computer's trusted certificates.
 # Both run as your own account, not as the administrator, with every extra right removed.
 # Privacy: no website icons are fetched, no password hints, no admin page, no push service, no mail.
-# The first person to open it makes the first account: do that yourself straight away (see the guide).
+# The first person to open it makes the first account: do that yourself straight away (see the guide). Sign-ups are
+# open only until that first account exists: the tool then closes them by itself within about a minute (SL_SIGNUPS,
+# from secure-linux-server-apps signups-check; missing = closed). Family members are invited from inside the vault.
 services:
   vaultwarden:
     image: docker.io/vaultwarden/server:1.37.5-alpine@sha256:bbe684a02d6b0db54256ff88eac9754f4519284a7b26314afc241fd7d0918191
@@ -24,7 +26,7 @@ services:
       TZ: "${SL_TZ:-UTC}"
       DOMAIN: "https://${SL_BIND:?home address missing}:8451"
       ROCKET_PORT: "8080"
-      SIGNUPS_ALLOWED: "true"
+      SIGNUPS_ALLOWED: "${SL_SIGNUPS:-false}"
       PASSWORD_HINTS_ALLOWED: "false"
       SHOW_PASSWORD_HINT: "false"
       DISABLE_ICON_DOWNLOAD: "true"

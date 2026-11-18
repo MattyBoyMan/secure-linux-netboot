@@ -15,10 +15,10 @@ linux-setup/setup.conf  # make-usb.ps1:1227 copies this person's Setup-App choic
 linux-setup/scan/**  # make-usb.ps1:1232-1240 PC scan exports (browser-password CSVs); linux/bin/secure-linux-usb-creator:79 keeps them out of a master
 linux-setup/recovery/**  # linux/bin/secure-linux-usb-creator:80 one person's interrupted-setup notes, kept out of a master
 linux-setup/private/**  # linux/lib/usbc_seal.py:343 (seal-personal) writes linux-setup/private/personal-settings.enc1, this drive's locked settings (plan contract C10)
-SECURE-LINUX-DRIVE-PASSPORT.*  # linux/bin/secure-linux-usb-creator:2997 writes this drive's passport after its own check
-linux-setup/SECURE-LINUX-DRIVE-FILES.json  # linux/bin/secure-linux-usb-creator:2985 writes this drive's file list
+SECURE-LINUX-DRIVE-PASSPORT.*  # linux/bin/secure-linux-usb-creator:3029 writes this drive's passport after its own check
+linux-setup/SECURE-LINUX-DRIVE-FILES.json  # linux/bin/secure-linux-usb-creator:3017 writes this drive's file list
 CHECK-THIS-DRIVE.sh  # plan contract C5 (P12 builds linux/files/drive/CHECK-THIS-DRIVE.sh, copied to the drive's top); reserved
 **/*.enc1  # linux/lib/usbc_seal.py:343 locks one drive's login and home-server settings with enc1; templates/sl-wifi.py:235 opens them at install (plan contract C10)
 scan/**  # save-apps-mac.sh:10 and save-apps.ps1:15 write scan/apps-<computer>.json next to themselves (the stick's top)
 linux-setup/preflight/**  # save-wifi.ps1:29 -ThenPreflight writes this computer's checklist, winget and conda lists
-persistence/**  # linux/lib/usbc_live.py:943 make_persistence makes this drive's own saved-changes space (plan contract C9)
+persistence/**  # linux/lib/usbc_live.py:957 make_persistence makes this drive's own saved-changes space (plan contract C9)

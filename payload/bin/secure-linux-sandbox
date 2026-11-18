@@ -32,6 +32,9 @@ SB_NET_GW=192.0.2.1                 # network); pasta carries each connection to
 SB_DNS=192.0.2.53                   # pasta's name-server forwarder inside that network
 SB_BLOCKED="10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 169.254.0.0/16 100.64.0.0/10 0.0.0.0/8 224.0.0.0/4 240.0.0.0/4"
 SB_MAX_URL=2048
+# I6 finding 5: the image-based (atomic) edition cannot add system packages by itself, so it gets its own words
+SB_PASST_MISSING="It is not installed on this computer yet. Connect to the internet and run Secure Linux repair from the Status window, then try again."
+[ -e "$SB_SYS/run/ostree-booted" ] && SB_PASST_MISSING="This image-based edition of Secure Linux cannot add it by itself. An administrator can add it by typing: sudo rpm-ostree install passt (then restart the computer)."
 
 case "${1:-}" in -h|--help|help) sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;; esac
 
@@ -339,7 +342,7 @@ cmd_link() {
   case "$url" in www.*) url="https://$url" ;; esac
   sb_valid_url "$url" || fail 1 "That does not look like a web link (it should start with https://). Nothing was opened."
   sb_need_ready
-  [ -x "$SB_PASTA" ] && [ -x "$SB_IP" ] || fail 2 "Opening links safely needs the small network helper (passt) that keeps a page away from your home network. It is not installed on this computer yet. Connect to the internet and run Secure Linux repair from the Status window, then try again. Nothing was opened."
+  [ -x "$SB_PASTA" ] && [ -x "$SB_IP" ] || fail 2 "Opening links safely needs the small network helper (passt) that keeps a page away from your home network. $SB_PASST_MISSING Nothing was opened."
   sb_find_program web >/dev/null || fail 5 "The Firefox web browser is not installed on this computer as a system program, so the link was not opened."
   sb_make_work
   sb_browser_profile
@@ -360,6 +363,7 @@ cmd_check() {
   if [ -x "$SB_BWRAP" ]; then say "The sandbox is ready (bubblewrap is installed)."; ready=1
   else say "The sandbox program (bubblewrap) is not installed yet. Run Secure Linux repair from the Status window."; fi
   if [ -x "$SB_PASTA" ] && [ -x "$SB_IP" ]; then say "  links open in a network of their own that cannot reach your home network (passt is installed)"
+  elif [ -e "$SB_SYS/run/ostree-booted" ]; then say "  links cannot be opened yet: the network helper (passt) is not installed. $SB_PASST_MISSING"
   else say "  links cannot be opened yet: the network helper (passt) is not installed. Run Secure Linux repair from the Status window."; fi
   for k in doc image text office media archive web; do
     if p=$(sb_find_program "$k"); then say "  can open $(sb_kind_words "$k") with $p"

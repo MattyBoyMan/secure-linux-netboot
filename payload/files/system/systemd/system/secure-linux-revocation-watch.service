@@ -1,0 +1,19 @@
+# Looks ONLY for the tiny signed list of cancelled Secure Linux release keys (revocations.json and its signature, a few KB at most) and, when a valid one lists a key, makes this computer refuse that key from then on. Sends nothing that identifies this computer. Does nothing while no signing key is set up.
+[Unit]
+Description=Look for cancelled Secure Linux release keys
+Wants=network-online.target
+After=network-online.target
+ConditionPathExists=/usr/local/bin/secure-linux-kit-update-auto
+# A burst of network changes never starts it more than a few times a minute.
+StartLimitIntervalSec=60
+StartLimitBurst=6
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/secure-linux-kit-update-auto revocations
+SuccessExitStatus=0
+Nice=10
+IOSchedulingClass=idle
+TimeoutStartSec=3min
+PrivateTmp=yes
+NoNewPrivileges=yes

@@ -136,6 +136,16 @@ Guide sources are outside `linux/` in `guide/src/chapters/`, `guide/data/pages*.
 | `secure-linux-master-sync` | `run` and `status` only. Brings the saved master (the root-owned store behind the drive builder) up to this computer's release. Asks for a password through `pkexec`. | `linux/bin/secure-linux-master-sync` |
 | `secure-linux-boot-rollback` | `status`, `check`, `on`, `off`, `refresh`, `keep`, `newest`, `tidy`. Adds "go back to an earlier day" lines to the boot menu on Btrfs with Snapper. The normal start stays first and default. | `linux/bin/secure-linux-boot-rollback`, `linux/files/bootrollback/`, step `32-boot-rollback.sh` |
 
+## Release signing, the maker's side (Signing Assistant)
+
+| Piece | What it is | Where |
+|---|---|---|
+| Signing Assistant window | One double-click window (`Secure Linux - Signing Assistant.cmd`) in the Setup App's dark style, reusing its resource dictionary. Pages: What is signing, Set up, Publish, Keys and health, Recover, Cancel a key, Questions. It shows pages and buttons only; every job is done by the engine. Every button is created through one table, so none is without a job. | `tools/signing-assistant/Signing-Assistant.ps1`, `.xaml` |
+| Signing engine | `sl_assistant.py`: finds Git Bash and gpg, suggests passphrases (never stored), guards sticks (never C D E F H M, disks 0 and 1, shares, the kit, git repositories, two keys on one stick), makes and proves keys, runs the one-button publish (render, history, sign, channel, stage, ask once, push, fresh clones, verify) and the cancel flow (notice first, then the full release). Never reads or passes a passphrase. | `tools/signing-assistant/sl_assistant.py` |
+| `sign-release.sh` additions | `make-key --backup --out FOLDER` (role `backup`, `release-key-backup-<fpr16>.asc`), `list-keys --json` (read-only), `sign-revocations` (writes and signs `revocations.json`; the list only grows; the daily or recovery key cancels any key, a backup key only itself; a cancelled key signs nothing; the last working key is never cancelled), `backup-daily`, `prove-backup`. | `signing-tools/sign-release.sh` |
+| Key roles | A key's role comes from its public file name in `share/secure-linux-release-keys/`: `release-key-<fpr16>.asc` is daily, `release-key-recovery-<fpr16>.asc` is recovery, `release-key-backup-<fpr16>.asc` is backup. | `linux/share/secure-linux-release-keys/` |
+| Cancellation notice | `revocations.json` (UTF-8, LF, sorted keys, 2-space indent) with its detached signature `revocations.json.sig`, published next to `channel.json`. It is carried into every later release so a build can never drop it. | `netboot/dist/` |
+
 ## Drives, copies and checks
 
 | Piece | What it is |

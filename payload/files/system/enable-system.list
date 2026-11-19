@@ -7,3 +7,6 @@ secure-linux-btrfs-scrub.timer
 secure-linux-outside-apps.timer
 secure-linux-wear.timer
 secure-linux-server-watch.timer
+# Cancelled release keys: at start-up, about every 15 minutes, and whenever the network changes.
+secure-linux-revocation-watch.timer
+secure-linux-revocation-watch.path

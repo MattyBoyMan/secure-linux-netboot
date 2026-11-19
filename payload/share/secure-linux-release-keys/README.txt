@@ -11,3 +11,10 @@ Every file named *.asc here is a trusted public key. revoked.txt lists keys that
 
 The kit's maker adds keys with signing-tools/sign-release.sh make-key on his own computer.
 Check a release by hand:  secure-linux-release-verify check --from FOLDER
+
+Cancelling a key quickly: the maker can publish a tiny signed list (revocations.json and revocations.json.sig,
+next to channel.json). Online computers look for it at start-up, on every network change and about every 15
+minutes (secure-linux-revocation-watch.timer) and stop trusting a listed key at once, for good, without waiting
+for a new release. The key file name says what a key may do: release-key-<16 characters>.asc (daily) and
+release-key-recovery-<16 characters>.asc (recovery) may cancel any key; release-key-backup-<16 characters>.asc
+may cancel only itself. The last trusted key is never removed by a notice: it is kept and a warning is shown.

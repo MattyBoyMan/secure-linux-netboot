@@ -1,0 +1,13 @@
+[Unit]
+Description=Look for cancelled Secure Linux release keys when the network changes
+
+[Path]
+# The network dispatcher writes home, away or offline here whenever the network changes (the same trigger the
+# kit-share notice uses). Anything that wants a look right now (for example a phone nudge from the home
+# server's ntfy) can run: touch /run/secure-linux/revocation-nudge
+PathChanged=/run/secure-linux/location
+PathChanged=/run/secure-linux/revocation-nudge
+Unit=secure-linux-revocation-watch.service
+
+[Install]
+WantedBy=paths.target

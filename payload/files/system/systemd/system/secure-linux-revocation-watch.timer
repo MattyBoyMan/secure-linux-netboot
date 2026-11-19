@@ -1,0 +1,13 @@
+[Unit]
+Description=Look for cancelled Secure Linux release keys at start-up and about every 15 minutes
+
+[Timer]
+# REVOCATION_CHECK_MINUTES = 15 in secure-linux-kit-update and secure-linux-kit-update-auto: change all three together.
+OnBootSec=1min
+OnUnitActiveSec=15min
+AccuracySec=30s
+RandomizedDelaySec=30s
+Unit=secure-linux-revocation-watch.service
+
+[Install]
+WantedBy=timers.target

@@ -51,6 +51,7 @@ LAUNCHER_IN_KIT = "files/drive/CHECK-THIS-DRIVE.sh"    # the same file inside th
 PATTERN_FILE = "setup-data/drive-per-drive-files.txt"  # contract C3, inside a linux tree
 VERIFIER = "secure-linux-release-verify"
 KEYS_FOLDER = "secure-linux-release-keys"
+CANCELLED_MARK = "signed only by a cancelled key"      # the checker's words for a key withdrawn by a notice
 RECORD = "release.json"
 # (record signature, file list, file list signature): the bytes a verified update keeps (secure-linux-kit-update
 # KEPT), then the names a published release uses (contract C1).
@@ -323,6 +324,11 @@ def check_release(drive: Drive, keys: Path, verifier: Path) -> Release:
         return Release(Release.BRIDGE, "signing is not set up yet")
     if code == -1:
         return Release(Release.REFUSED, f"{line}, so the signed release cannot be checked")
+    if code == 1 and re.match(r"RELEASE KEYS: 0 trusted, [1-9]", line):
+        return Release(Release.REFUSED, f"the Secure Linux files on this drive are {CANCELLED_MARK}: every release key "
+                                        "this computer knows was withdrawn by the maker (lost, stolen or retired), so "
+                                        "the files cannot be proven. Make the drive again with the drive builder (it "
+                                        "takes the newest files)")
     if code != 0:
         return Release(Release.REFUSED, f"the trusted release keys cannot be used: {refusal_reason(line)}")
     chosen = next((names for names in (KEPT_SET, PUBLISHED_SET)
@@ -353,8 +359,13 @@ def check_release(drive: Drive, keys: Path, verifier: Path) -> Release:
     if code == 3:
         return Release(Release.BRIDGE, "signing is not set up yet")
     if code != 0:
-        return Release(Release.REFUSED, f"the Secure Linux files did not pass the signature check: "
-                                        f"{refusal_reason(line)}")
+        reason = refusal_reason(line)
+        if CANCELLED_MARK in reason:
+            return Release(Release.REFUSED, "the Secure Linux files on this drive are signed only by a cancelled key: "
+                                            "the maker withdrew that key because it was lost, stolen or retired, so "
+                                            "whoever has it could have made these files. Make the drive again with the "
+                                            "drive builder (it takes the newest files)")
+        return Release(Release.REFUSED, f"the Secure Linux files did not pass the signature check: {reason}")
     try:
         listed = json.loads(data["payload-files.json"].decode("utf-8-sig"))["files"]
         if not isinstance(listed, dict):

@@ -34,6 +34,11 @@ work; if not, the update is undone at once (exactly as `undo` does) and that rel
 Either way one plain alert is written for the desktop (/var/lib/secure-linux/alerts.d/kit-update-check).
 Run as root, setup.sh is only started when it stops at --help (setup.sh ignores words it does not know, so
 a copy without that line would run a full setup).
+Cancelled keys (revocations.json, secure-linux-revocation-watch.timer): `revocations --tree DIR` downloads ONLY
+the tiny signed list of cancelled keys (revocations.json and its .sig, never more than a few KB) from the same
+places as an update, with conditional requests, sends nothing that identifies this computer, and has the checker
+(secure-linux-release-verify) verify and apply it: the keys it lists are refused from then on, for good, without
+waiting for a new release. Anything doubtful changes nothing, and never stops an update.
 Release history (C15): in signed mode the published history/releases.jsonl must carry a valid signature, end
 with the published release, and continue the history this computer saw last (kept here); any doubt keeps
 the local copy. A computer that never saw a history accepts the first one.
@@ -119,6 +124,15 @@ TESTING_BASE = f"https://raw.githubusercontent.com/{REPO}/testing"      # idea 7
 TESTING_TARBALL = f"https://codeload.github.com/{REPO}/tar.gz/refs/heads/testing"
 TESTING_TARBALL_ROOT = "secure-linux-netboot-testing"
 MANIFEST_NAME = "payload-files.json"
+# The cancelled-keys notice (secure-linux-revocation-watch.timer): how often, and how little it ever downloads.
+REVOCATIONS_NAME = "revocations.json"
+REVOCATION_CHECK_MINUTES = 15            # the timer's period (OnUnitActiveSec in secure-linux-revocation-watch.timer)
+MAX_NOTICE_BYTES = 16384                 # a few KB, whatever a server sends
+MAX_NOTICE_SIGNATURE_BYTES = 8192
+NOTICE_TIMEOUT = 10                      # seconds for one request
+NOTICE_RUN_DEADLINE = 90                 # seconds for every source together: the timer is never held up
+NOTICE_MIN_GAP_SECONDS = 60              # a run closer than this to the last one only reports it (unless --force)
+REVOCATION_CACHE_DEFAULT = "/var/lib/secure-linux/revocation-watch"
 RECORD_NAME = ".kit-update.json"
 FILES_NAME = ".kit-update-files.json"   # the published file list that was applied here
 # Signed mode: the exact published bytes, kept so offline copies can be checked again (FILES_NAME is re-written).
@@ -3396,6 +3410,161 @@ def download_limit(value: str) -> float:
     return number
 
 
+# ------------------------------------------------------------------ the cancelled-keys notice (revocation watch)
+def revocation_cache() -> Path:
+    return Path(os.environ.get("SL_REVOCATION_CACHE") or REVOCATION_CACHE_DEFAULT)
+
+
+def read_cache(path: Path) -> dict:
+    try:
+        if path.is_symlink():
+            return {}
+        with open(path, "rb") as handle:
+            value = json.loads(handle.read(MAX_RECORD_BYTES + 1).decode("utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def clean_validator(value: object) -> str:
+    """A validator (ETag) is chosen by the server: kept only when short, plain and one line."""
+    text = value if isinstance(value, str) else ""
+    return text if 0 < len(text) <= 100 and all(32 <= ord(ch) < 127 for ch in text) else ""
+
+
+def read_small(response, limit: int, started: float) -> bytes:
+    data = b""
+    while len(data) <= limit:
+        if time.monotonic() - started > NOTICE_RUN_DEADLINE:
+            raise Keep("the cancelled-keys notice took too long")
+        chunk = response.read(min(4096, limit + 1 - len(data)))
+        if not chunk:
+            break
+        data += chunk
+    if len(data) > limit:
+        raise Keep("the cancelled-keys notice is larger than allowed")
+    return data
+
+
+def get_notice_file(source: Source, name: str, limit: int, validator: str, started: float) -> tuple[str, bytes | None, str]:
+    """(answer, bytes, new validator). answer: "got", "unchanged" or "none" (not published). A copy in a folder
+    (the home server) is compared by size and date; the internet by its ETag (If-None-Match); another computer
+    is simply asked (nothing is sent that could be remembered about this computer)."""
+    url = f"{source.base}/{name}"
+    if isinstance(source, FolderSource):
+        path = source.path_for(url)
+        try:
+            info = path.stat()
+        except OSError:
+            return "none", None, ""
+        mark = f"{info.st_size}:{info.st_mtime_ns}"
+        if validator and validator == mark:
+            return "unchanged", None, mark
+        try:
+            return "got", source.get(url, limit), mark
+        except urllib.error.HTTPError:
+            return "none", None, ""
+    headers = {"User-Agent": "secure-linux-revocation-watch", "Accept-Encoding": "identity"}
+    if validator and not source.label:
+        headers["If-None-Match"] = validator
+    try:
+        with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=NOTICE_TIMEOUT) as response:
+            if not same_place(url, response.geturl()):
+                raise Keep("the cancelled-keys notice address redirected somewhere unexpected")
+            data = read_small(response, limit, started)
+            tag = clean_validator(response.headers.get("ETag")) if not source.label else ""
+    except urllib.error.HTTPError as exc:
+        if exc.code == 304:
+            return "unchanged", None, validator
+        if exc.code in (404, 410):
+            return "none", None, ""
+        raise
+    except http.client.HTTPException as exc:
+        raise ConnectionError(f"the connection broke off ({type(exc).__name__})") from exc
+    return "got", data, tag
+
+
+def watch_one(source: Source, checker, keys: Path, cache: dict, started: float) -> tuple[str, str]:
+    """(outcome, plain text) for one source: applied, same, unchanged, none, or refused."""
+    label = source.label or "the published release"
+    key = "mirror" if isinstance(source, FolderSource) else ("internet" if not source.label
+                                                              else "neighbour:" + sha256(source.base.encode())[:12])
+    entry = cache.get(key) if isinstance(cache.get(key), dict) else {}
+    answer, raw, validator = get_notice_file(source, REVOCATIONS_NAME, MAX_NOTICE_BYTES,
+                                             clean_validator(entry.get("validator")) if key != "neighbour" else "", started)
+    if answer == "unchanged":
+        return "unchanged", f"{label}: no change since the last look"
+    if answer == "none":
+        return "none", f"{label}: no cancelled-keys notice published"
+    signature = None
+    sig_answer, sig_raw, _ = get_notice_file(source, REVOCATIONS_NAME + ".sig", MAX_NOTICE_SIGNATURE_BYTES, "", started)
+    if sig_answer == "got":
+        signature = sig_raw
+    verdict = checker.apply_notice(raw, signature, keys)
+    if verdict.state == "not-set-up":
+        return "none", "no signing key set up"
+    if verdict.state != "verified":
+        return "refused", f"{label}: the notice was not used ({verdict.message})"
+    cache[key] = {"validator": validator, "sha256": sha256(raw)}
+    if verdict.changed:
+        held = f" WARNING: {verdict.held} is the last trusted key, so it is kept for now." if verdict.held else ""
+        return "applied", f"{label}: {len(verdict.added)} release key(s) cancelled on this computer.{held}"
+    return "same", f"{label}: the notice is valid and tells nothing new"
+
+
+def revocation_watch(tree: Path, force: bool = False) -> tuple[str, list[str]]:
+    """One look for a cancelled-keys notice. Returns (result, lines); result is one of no-key, online-off, soon,
+    applied, same, offline, refused. Never raises and never changes the update itself."""
+    keys = keys_folder(tree)
+    try:
+        checker = load_checker(keys)
+    except Keep:
+        checker = None
+    if checker is None or not hasattr(checker, "apply_notice"):
+        return "no-key", ["REVOCATION WATCH: no signing key set up on this computer, so there is nothing to watch."]
+    if not online_allowed(tree):
+        return "online-off", [f"REVOCATION WATCH: {ONLINE_OFF_TEXT}"]
+    cache_dir = revocation_cache()
+    stamp_file, cache_file = cache_dir / "last-run.json", cache_dir / "validators.json"
+    now = time.time()
+    last = read_cache(stamp_file).get("at")
+    if not force and isinstance(last, (int, float)) and 0 <= now - last < NOTICE_MIN_GAP_SECONDS:
+        return "soon", ["REVOCATION WATCH: looked a moment ago; not asking again yet."]
+    started = time.monotonic()
+    try:
+        write_small(stamp_file, (json.dumps({"at": now}) + "\n").encode())
+    except OSError:
+        pass
+    if hasattr(checker, "settle_state"):
+        checker.settle_state(keys)
+    cache = read_cache(cache_file)
+    lines: list[str] = []
+    outcomes: list[str] = []
+    try:
+        sources = update_sources(tree, update_channel())
+    except (Keep, OSError):
+        sources = []
+    for source in sources:
+        if time.monotonic() - started > NOTICE_RUN_DEADLINE:
+            lines.append("REVOCATION WATCH: stopped looking (took too long); the next look continues.")
+            break
+        try:
+            outcome, text = watch_one(source, checker, keys, cache, started)
+        except (Keep, urllib.error.URLError, OSError, TimeoutError, ConnectionError, ValueError) as exc:
+            outcome, text = "offline", f"{source.label or 'the published release'}: could not be reached ({type(exc).__name__})"
+        outcomes.append(outcome)
+        lines.append(f"REVOCATION WATCH: {text}")
+    try:
+        write_small(cache_file, (json.dumps(cache, sort_keys=True) + "\n").encode())
+    except OSError:
+        pass
+    result = ("applied" if "applied" in outcomes else "refused" if "refused" in outcomes
+              else "same" if {"same", "unchanged", "none"} & set(outcomes) else "offline")
+    lines.append(f"REVOCATION WATCH RESULT: {result}")
+    return result, lines
+
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="secure-linux-kit-update", description=__doc__.split("\n")[0])
     commands = parser.add_subparsers(dest="command", required=True)
@@ -3420,6 +3589,9 @@ def main(argv: list[str] | None = None) -> int:
                                   "than this many MB (it is installed when someone chooses to update)")
         if name == "status":
             sub.add_argument("--json", action="store_true", help="answer as JSON")
+    watch = commands.add_parser("revocations", help="look for the tiny signed list of cancelled keys and apply it")
+    watch.add_argument("--tree", required=True, type=Path, help="folder holding setup.sh and release.json")
+    watch.add_argument("--force", action="store_true", help="look even if it looked a moment ago")
     manifest = commands.add_parser("manifest", help="write payload-files.json (release tooling only)")
     manifest.add_argument("--payload", required=True, type=Path)
     manifest.add_argument("--release-id", required=True)
@@ -3427,6 +3599,13 @@ def main(argv: list[str] | None = None) -> int:
     manifest.add_argument("--sets-from", type=Path, metavar="DIST",
                           help="also list the Debian, Flipper and network-install files of this rendered tree")
     args = parser.parse_args(argv)
+    if args.command == "revocations":
+        try:
+            for line in revocation_watch(args.tree, args.force)[1]:
+                say(line)
+        except Exception as exc:       # the watch must never be the reason anything stops
+            say(f"REVOCATION WATCH: nothing was changed - unexpected problem ({type(exc).__name__}).")
+        return 0
     if args.command == "manifest":
         return write_manifest(args.payload, args.release_id, args.output, args.sets_from)
     if args.command in ("check", "apply") and args.set:

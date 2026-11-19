@@ -15,6 +15,9 @@ never downloads more than AUTO_MAX_DOWNLOAD_MB; a bigger update waits until the 
   secure-linux-kit-update-auto [run] [--apply] [--force] [--report]   look now (skips if it looked in the last 20 hours)
   secure-linux-kit-update-auto status [--text | --settings]          the last answer and the settings (no network)
   secure-linux-kit-update-auto undo                                  go back to the previous version and keep it there
+  secure-linux-kit-update-auto revocations [--force]                 look ONLY for the tiny signed list of cancelled keys
+                                   (secure-linux-revocation-watch.timer: at start-up, on every network change and
+                                   about every REVOCATION_CHECK_MINUTES minutes while online)
   secure-linux-kit-update-auto set [--online yes|no] [--auto-apply yes|no] [--channel stable|testing]
                                    [--mirror FOLDER | --no-mirror]   change the update settings (asks for your password)
 Settings file: /etc/secure-linux/kit-update.conf (only `set` writes it).
@@ -37,6 +40,8 @@ import tempfile
 
 MIN_AGE_SECONDS = 20 * 3600
 RUN_TIMEOUT = 600
+REVOCATION_CHECK_MINUTES = 15   # how often secure-linux-revocation-watch.timer asks (its OnUnitActiveSec)
+REVOCATION_TIMEOUT = 150        # the watch itself stops after 90 seconds; this is only the safety net
 VERIFY_TIMEOUT = 120
 REFRESH_TIMEOUT = 1800
 SYNC_TIMEOUT = 3600
@@ -753,6 +758,51 @@ def fresher_copy() -> Path | None:
         return None
 
 
+# ---------------------------------------------------------------- the cancelled-keys watch
+def last_key_warning() -> bool:
+    """True while the checker's own record says the last trusted key is kept although it was cancelled."""
+    tool = verifier_path()
+    keys = root() / "share" / "secure-linux-release-keys"
+    if not tool.is_file() or not keys.is_dir():
+        return False
+    code, out = call([sys.executable, str(tool), "--keys", str(keys), "revocations", "status"], VERIFY_TIMEOUT)
+    return "WARNING:" in out
+
+
+def nudge_phone() -> None:
+    """One-line hook: only when the ntfy helper is there (and turned on, which it checks itself)."""
+    helper = shutil.which("secure-linux-ntfy") or str(root() / "bin" / "secure-linux-ntfy")
+    if Path(helper).is_file():
+        call([helper, "send", "Secure Linux key cancelled",
+              "A Secure Linux signing key was cancelled and this computer stopped trusting it."], 30)
+
+
+def revocations(force: bool) -> int:
+    """Always exits 0: a watch that cannot look changes nothing."""
+    code, output = call([sys.executable, str(tool_path()), "revocations", "--tree", root_text(),
+                         *(("--force",) if force else ())], REVOCATION_TIMEOUT)
+    result = ""
+    for line in output.splitlines():
+        if line.startswith("REVOCATION WATCH RESULT:"):
+            result = line.split(":", 1)[1].strip()
+    if result == "applied":
+        put_notice("events.d", "revocation-applied", "A Secure Linux signing key was cancelled",
+                   "The maker cancelled a signing key (it was lost, stolen or retired). This computer no longer "
+                   "trusts it. Nothing you installed was changed.", "")
+        nudge_phone()
+    if result in ("applied", "same"):
+        if last_key_warning():
+            put_notice("alerts.d", "revocation-last-key", "Secure Linux has only one signing key left",
+                       "A signing key was cancelled, but it was the last one this computer trusts, so it is kept for "
+                       "now. The maker needs to publish a new key soon.", "")
+        else:
+            drop_notices("alerts.d", "revocation-last-key")
+    for line in output.splitlines():
+        if line.startswith("REVOCATION WATCH"):
+            say(line)
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog=NAME, description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -761,6 +811,8 @@ def build_parser() -> argparse.ArgumentParser:
     runner.add_argument("--apply", action="store_true", help="install a newer release (Install updates)")
     runner.add_argument("--force", action="store_true", help="look even if it looked in the last 20 hours")
     runner.add_argument("--report", action="store_true", help="print the plain answer")
+    cancelled = sub.add_parser("revocations", help="look only for the tiny signed list of cancelled keys")
+    cancelled.add_argument("--force", action="store_true", help="look even if it looked a moment ago")
     show = sub.add_parser("status", help="show the last answer and the settings (no network)")
     which = show.add_mutually_exclusive_group()
     which.add_argument("--text", action="store_true", help="one plain line for the update window")
@@ -802,6 +854,11 @@ def main(argv: list[str] | None = None) -> int:
             say(f"The release was not installed ({type(exc).__name__}). Nothing else was changed. "
                 "Trying again is safe.")
             return 1
+    if args.command == "revocations":
+        try:
+            return revocations(args.force)
+        except Exception:   # a background look never fails loudly
+            return 0
     try:
         if args.command == "status":
             return status(args.text, args.settings)

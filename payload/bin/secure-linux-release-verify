@@ -23,7 +23,18 @@ computer already has them (--local-tree): installing such a list would delete th
 Other signed files (the release history, the channel record) are checked with verify_detached(): the same
 rule, one good signature over exactly those bytes from a trusted key that has not been withdrawn.
 
+Cancelling a key quickly (revocations.json): a tiny signed notice lists the fingerprints of cancelled keys.
+`revocations check|apply` verifies it like a release (a good signature by a trusted key that is not listed) and
+checks AUTHORITY by the file name of the signing key: a daily key (release-key-<16 hex>.asc) or a recovery key
+(release-key-recovery-<16 hex>.asc) may cancel any key; any key, a backup key included, may cancel only itself.
+The list only grows: a notice that leaves out a key this computer already knows is cancelled is ignored.
+`apply` saves the cancelled keys in this computer's own record (/var/lib/secure-linux/release-revoked.json) for
+good, and never takes away the LAST trusted key: that key is kept (and the person is warned) until another
+trusted key is installed.
+
   secure-linux-release-verify status [--keys DIR]
+  secure-linux-release-verify revocations check|apply --notice FILE [--signature FILE] [--keys DIR] [--state FILE]
+  secure-linux-release-verify revocations status [--keys DIR] [--state FILE]
   secure-linux-release-verify check --from DIR [--local-release FILE] [--local-file-list FILE]
                                     [--local-tree DIR] [--keys DIR]
   secure-linux-release-verify check --release FILE [--signature FILE] [--file-list FILE]
@@ -66,6 +77,19 @@ STRONG_HASHES = {"8", "9", "10", "11"}      # SHA-256, SHA-384, SHA-512, SHA-224
 PUBLIC_PACKETS = {2, 6, 12, 13, 14, 17}       # signature, public key, trust, user ID, public subkey, picture
 SECRET_PACKETS = {5, 7}                       # secret key, secret subkey: must never be in the kit
 GPGV_TIMEOUT = 60
+
+# ---- the cancelled-keys notice (revocations.json): small, signed, grow-only
+REVOCATIONS_NAME = "revocations.json"
+MAX_NOTICE = 16384                            # a few KB: about 100 entries of 110 bytes
+MAX_NOTICE_ENTRIES = 100
+NOTICE_REASONS = ("lost", "stolen", "retired")
+STATE_ENV = "SL_REVOCATION_STATE"
+STATE_DEFAULT = "/var/lib/secure-linux/release-revoked.json"
+NOTICE_FPR_RE = re.compile(r"^[0-9A-F]{40}$")
+ROLE_DAILY, ROLE_RECOVERY, ROLE_BACKUP, ROLE_OTHER = "daily", "recovery", "backup", "other"
+ROLE_NAME_RE = re.compile(r"^release-key-(?:(recovery|backup)-)?([0-9A-Fa-f]{16})\.asc$")
+CANCELLING_ROLES = (ROLE_DAILY, ROLE_RECOVERY)          # these two may cancel a key other than themselves
+CANCELLED_TEXT = "it is signed only by a cancelled key (a key the maker withdrew because it was lost or stolen)"
 
 VERIFIED, REFUSED, NOT_SET_UP = "verified", "refused", "not-set-up"
 EXIT = {VERIFIED: 0, REFUSED: 1, NOT_SET_UP: 3}
@@ -221,6 +245,16 @@ class Key:
     def fingerprints(self) -> set[str]:
         return {self.primary, *self.subkeys}
 
+    @property
+    def role(self) -> str:
+        """daily, recovery or backup from the file name release-key[-recovery|-backup]-<last 16 of the
+        fingerprint>.asc. Any other name (or a name that does not match the key) has no authority to cancel
+        another key."""
+        found = ROLE_NAME_RE.match(self.path.name)
+        if not found or found.group(2).upper() != self.primary[-16:]:
+            return ROLE_OTHER
+        return {None: ROLE_DAILY, "recovery": ROLE_RECOVERY, "backup": ROLE_BACKUP}[found.group(1)]
+
 
 def read_key(path: Path) -> Key:
     what = f"the release key {path.name}"
@@ -261,17 +295,97 @@ def read_revoked(folder: Path) -> set[str]:
     return revoked
 
 
+def state_file(given: Path | str | None = None) -> Path:
+    return Path(given or os.environ.get(STATE_ENV) or STATE_DEFAULT)
+
+
+def empty_state() -> dict:
+    return {"schema_version": 1, "revoked": {}, "held": [], "updated_at": ""}
+
+
+def parse_state(raw: bytes) -> dict:
+    value = json.loads(raw.decode("utf-8-sig"))
+    if not isinstance(value, dict) or value.get("schema_version") != 1 or not isinstance(value.get("revoked"), dict) \
+            or not isinstance(value.get("held"), list):
+        raise ValueError("unexpected shape")
+    if not all(NOTICE_FPR_RE.match(str(f)) for f in [*value["revoked"], *value["held"]]):
+        raise ValueError("not a fingerprint")
+    return value
+
+
+def load_state(path: Path | str | None = None, lenient: bool = False) -> dict:
+    """This computer's own record of cancelled keys (kept for good). Missing = nothing cancelled yet. A damaged
+    record is read from its backup copy; if that is damaged too the answer is a refusal (fail closed), except
+    for `lenient`, which applying a signed notice uses to rebuild it (the notice lists every cancelled key)."""
+    target = state_file(path)
+    problem = None
+    for candidate in (target, Path(str(target) + ".bak")):
+        try:
+            if candidate.is_symlink() or not candidate.is_file():
+                continue
+            with open(candidate, "rb") as handle:
+                return parse_state(handle.read(MAX_RECORD))
+        except (OSError, ValueError) as exc:
+            problem = exc
+    if problem is not None and not lenient:
+        raise Refuse("the record of cancelled release keys on this computer is damaged")
+    return empty_state()
+
+
+def save_state(state: dict, path: Path | str | None = None) -> None:
+    """Write the record through a temporary file, keeping the previous one as .bak."""
+    target = state_file(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    data = (json.dumps(state, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    handle, name = tempfile.mkstemp(dir=str(target.parent), prefix="." + target.name + ".")
+    try:
+        with os.fdopen(handle, "wb") as out:
+            out.write(data)
+            out.flush()
+            os.fsync(out.fileno())
+        os.chmod(name, 0o644)
+        if target.is_file() and not target.is_symlink():
+            try:
+                shutil.copyfile(target, str(target) + ".bak")
+            except OSError:
+                pass
+        os.replace(name, target)
+    except BaseException:
+        try:
+            os.unlink(name)
+        except OSError:
+            pass
+        raise
+
+
 class Trust:
-    def __init__(self, folder: Path):
+    def __init__(self, folder: Path, state_path: Path | str | None = None, lenient: bool = False):
         self.folder = folder
         self.keys: list[Key] = []
         self.revoked: set[str] = set()
+        self.kit_revoked: set[str] = set()       # revoked.txt, delivered with a release
+        self.notice_revoked: set[str] = set()    # cancelled by a signed notice, kept in this computer's own record
+        self.held: list[Key] = []                # the last key, kept (and warned about) although a notice cancelled it
         self.withdrawn: list[Key] = []
         if folder.is_dir():
-            self.revoked = read_revoked(folder)
-            for path in sorted(folder.glob("*.asc")):
-                key = read_key(path)
-                (self.withdrawn if key.fingerprints & self.revoked else self.keys).append(key)
+            self.kit_revoked = read_revoked(folder)
+            state = load_state(state_path, lenient)
+            self.notice_revoked = set(state["revoked"])
+            held_wanted = set(state["held"])
+            self.revoked = self.kit_revoked | self.notice_revoked
+            every = [read_key(path) for path in sorted(folder.glob("*.asc"))]
+            self.keys = [key for key in every if not key.fingerprints & self.revoked]
+            seen_then = set(state.get("held_keys_seen", []))
+            if not self.keys and {key.primary for key in every} <= seen_then:
+                # Never remove the LAST trusted key because of a notice: the one held at apply time stays
+                # trusted until another key is installed (then it is cancelled for good, even if that
+                # new key is withdrawn later).
+                self.held = [key for key in every if key.primary in held_wanted
+                             and not key.fingerprints & self.kit_revoked][:1]
+                self.keys = list(self.held)
+                for key in self.held:
+                    self.revoked -= key.fingerprints
+            self.withdrawn = [key for key in every if key not in self.keys]
 
     @property
     def configured(self) -> bool:
@@ -312,10 +426,23 @@ def check_signature(data: bytes, signature: bytes | None, trust: Trust, label: s
     if any(tag != 2 for tag, _ in parts):           # a detached signature holds signature packets only
         raise Refuse(f"the signature for {label} is not a plain detached signature")
     program = gpgv_program()
+    output = run_gpgv(program, binary, data, [key.binary for key in trust.keys])
+    try:
+        return judge(output, trust, label)
+    except Refuse as exc:
+        if trust.withdrawn and "has been changed" not in str(exc):
+            # A second look with the cancelled keys added: a good signature by one of them is said plainly.
+            extra = run_gpgv(program, binary, data, [key.binary for key in (*trust.keys, *trust.withdrawn)])
+            if cancelled_signer(extra, trust):
+                raise Refuse(f"{exc}; {CANCELLED_TEXT}") from exc
+        raise
+
+
+def run_gpgv(program: str, binary: bytes, data: bytes, keys: list[bytes]) -> str:
     work = Path(tempfile.mkdtemp(prefix="sl-release-verify-"))
     try:
         (work / "home").mkdir(mode=0o700)
-        (work / "trusted.gpg").write_bytes(b"".join(key.binary for key in trust.keys))
+        (work / "trusted.gpg").write_bytes(b"".join(keys))
         (work / "data").write_bytes(data)
         (work / "data.sig").write_bytes(binary)
         # Relative names with cwd=work: no path ever reaches gpgv's resource-URL parsing.
@@ -329,7 +456,17 @@ def check_signature(data: bytes, signature: bytes | None, trust: Trust, label: s
             raise Refuse(f"the signature checker could not run ({type(exc).__name__})") from exc
     finally:
         shutil.rmtree(work, ignore_errors=True)
-    return judge(result.stdout, trust, label)
+    return result.stdout
+
+
+def cancelled_signer(status: str, trust: Trust) -> bool:
+    """True when the gpgv answer holds a good signature made by a key that has been cancelled."""
+    for line in status.splitlines():
+        fields = line.split()
+        if len(fields) >= 10 and fields[0] == "[GNUPG:]" and fields[1] == "VALIDSIG":
+            if {fields[2].upper(), fields[11].upper() if len(fields) > 11 else fields[2].upper()} & trust.revoked:
+                return True
+    return False
 
 
 def judge(status: str, trust: Trust, label: str) -> list[str]:
@@ -513,6 +650,223 @@ def must_keep(tree: Path | None) -> list[str]:
     return [name for name in MUST_KEEP if Path(tree, *name.split("/")).is_file()]
 
 
+# ------------------------------------------------------------------ the cancelled-keys notice
+class NoticeVerdict:
+    def __init__(self, state: str, message: str, entries: list[dict] | None = None, signers: list[str] | None = None,
+                 new: list[dict] | None = None):
+        self.state, self.message = state, message
+        self.entries = entries or []          # everything the notice lists
+        self.signers = signers or []
+        self.new = new or []                  # entries this computer did not know yet
+        self.added: list[str] = []            # set by apply_notice: fingerprints saved just now
+        self.held: str = ""                   # set by apply_notice: the last key, kept although cancelled
+        self.changed = False
+
+    @property
+    def exit_code(self) -> int:
+        return EXIT[self.state]
+
+    def line(self) -> str:
+        if self.state == NOT_SET_UP:
+            return "REVOCATION NOTICE: no signing key set up on this computer, so there is nothing to cancel."
+        if self.state == VERIFIED:
+            return f"REVOCATION NOTICE: verified - {self.message}"
+        return f"REVOCATION NOTICE: refused - {self.message}. Nothing was changed."
+
+
+def parse_notice(raw: bytes) -> list[dict]:
+    """The entries of a revocations.json, or a Refuse. Strict: anything odd means the notice is not used."""
+    try:
+        value = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise Refuse(f"{REVOCATIONS_NAME} is not readable") from exc
+    if not isinstance(value, dict) or value.get("schema_version") != 1 or not isinstance(value.get("revoked"), list):
+        raise Refuse(f"{REVOCATIONS_NAME} is not in the expected form")
+    for field in ("updated_at",):
+        parse_utc(value.get(field), f"{REVOCATIONS_NAME} {field}")
+    if len(value["revoked"]) > MAX_NOTICE_ENTRIES:
+        raise Refuse(f"{REVOCATIONS_NAME} lists more keys than any notice should")
+    seen: set[str] = set()
+    entries = []
+    for item in value["revoked"]:
+        if not isinstance(item, dict) or not isinstance(item.get("fingerprint"), str) \
+                or not NOTICE_FPR_RE.match(item["fingerprint"]) or item.get("reason") not in NOTICE_REASONS:
+            raise Refuse(f"{REVOCATIONS_NAME} has an entry that is not a key fingerprint with a reason")
+        parse_utc(item.get("revoked_at"), f"{REVOCATIONS_NAME} revoked_at")
+        if item["fingerprint"] in seen:
+            raise Refuse(f"{REVOCATIONS_NAME} lists the same key twice")
+        seen.add(item["fingerprint"])
+        entries.append({"fingerprint": item["fingerprint"], "reason": item["reason"],
+                        "revoked_at": item["revoked_at"]})
+    return entries
+
+
+def parse_utc(value: object, what: str) -> None:
+    try:
+        stamp = datetime.datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise Refuse(f"{what} is not a date") from exc
+    if not isinstance(value, str) or stamp.tzinfo is None:
+        raise Refuse(f"{what} is not a UTC date")
+
+
+def verify_notice(notice_raw: bytes | None, signature_raw: bytes | None, keys_dir: Path,
+                  state_path: Path | str | None = None, lenient: bool = False) -> NoticeVerdict:
+    """Is this revocations.json real, allowed to cancel what it lists, and not older than what this computer
+    knows? Changes nothing."""
+    try:
+        trust = Trust(Path(keys_dir), state_path, lenient)
+    except (Refuse, OSError) as exc:
+        return NoticeVerdict(REFUSED, f"the kit's release key folder is not usable: {exc}")
+    if not trust.configured:
+        return NoticeVerdict(NOT_SET_UP, NOT_SET_UP_TEXT)
+    try:
+        if notice_raw is None:
+            raise Refuse(f"there is no {REVOCATIONS_NAME}")
+        if len(notice_raw) > MAX_NOTICE:
+            raise Refuse(f"{REVOCATIONS_NAME} is larger than any notice")
+        # A cancelled key can never sign a notice: only keys that are still trusted are looked at.
+        signers = check_signature(notice_raw, signature_raw, trust, REVOCATIONS_NAME)
+        entries = parse_notice(notice_raw)
+        listed = {entry["fingerprint"] for entry in entries}
+        known = set(load_state(state_path, lenient)["revoked"])
+        if known - listed:
+            raise Refuse(f"{REVOCATIONS_NAME} is older than what this computer already knows (it leaves out "
+                         f"{len(known - listed)} cancelled key(s)), so it is ignored")
+        new = [entry for entry in entries if entry["fingerprint"] not in known]
+        by_primary = {key.primary: key for key in trust.keys}
+        signing = [by_primary[s] for s in signers if s in by_primary]
+        may_cancel_any = any(key.role in CANCELLING_ROLES for key in signing)
+        for entry in new:
+            if entry["fingerprint"] in trust.kit_revoked or may_cancel_any:
+                continue
+            if any(entry["fingerprint"] in key.fingerprints for key in signing):
+                continue                                  # a key may always cancel itself
+            raise Refuse("a notice signed only by a backup key (or a key with no role) may cancel only that key "
+                         "itself; it lists another key")
+    except Refuse as exc:
+        return NoticeVerdict(REFUSED, str(exc))
+    text = (f"{len(new)} newly cancelled key(s) of {len(entries)} listed" if new
+            else f"nothing new ({len(entries)} cancelled key(s) listed, all already known)")
+    return NoticeVerdict(VERIFIED, f"{REVOCATIONS_NAME} is signed by {signed_by(trust, signers)}; {text}",
+                         entries, signers, new)
+
+
+class StateLock:
+    """One notice is applied at a time (two timers may fire together). Best effort where flock does not exist."""
+
+    def __init__(self, path: Path):
+        self.path, self.handle = path, None
+
+    def __enter__(self):
+        try:
+            import fcntl
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self.handle = open(str(self.path) + ".lock", "a")
+            fcntl.flock(self.handle, fcntl.LOCK_EX)
+        except (ImportError, OSError):
+            pass
+        return self
+
+    def __exit__(self, *exc):
+        if self.handle is not None:
+            self.handle.close()
+
+
+def apply_notice(notice_raw: bytes | None, signature_raw: bytes | None, keys_dir: Path,
+                 state_path: Path | str | None = None) -> NoticeVerdict:
+    """Verify, then remember every newly cancelled key for good in this computer's own record. The LAST trusted
+    key is never taken away because of a notice: it is held (and `held` says which) until another trusted key
+    is installed. Any failure changes nothing."""
+    target = state_file(state_path)
+    with StateLock(target):
+        try:
+            load_state(target)
+            lenient = False
+        except Refuse:
+            lenient = True                     # a damaged record is rebuilt from the notice (it lists every key)
+        verdict = verify_notice(notice_raw, signature_raw, keys_dir, target, lenient)
+        if verdict.state != VERIFIED or not (verdict.new or lenient):
+            return verdict
+        trust = Trust(Path(keys_dir), target, lenient)
+        state = load_state(target, lenient)
+        newly = {entry["fingerprint"] for entry in verdict.new}
+        cancelling = [key for key in trust.keys if key.fingerprints & newly]
+        if cancelling and len(cancelling) == len(trust.keys):
+            signing = set(verdict.signers)
+            cancelling.sort(key=lambda key: (key.primary not in signing, key.name))
+            held = cancelling[0].primary
+            state["held"] = [held]
+            state["held_keys_seen"] = sorted(key.primary for key in
+                                             [read_key(p) for p in sorted(Path(keys_dir).glob("*.asc"))])
+            verdict.held = held
+        stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        for entry in verdict.entries:
+            state["revoked"].setdefault(entry["fingerprint"], {"reason": entry["reason"],
+                                                               "revoked_at": entry["revoked_at"], "learned_at": stamp})
+        state["updated_at"] = stamp
+        try:
+            save_state(state, target)
+        except OSError as exc:
+            return NoticeVerdict(REFUSED, f"the cancelled keys could not be saved on this computer "
+                                          f"({type(exc).__name__})")
+        verdict.added = sorted(newly)
+        verdict.changed = bool(newly)
+        return verdict
+
+
+def settle_state(keys_dir: Path, state_path: Path | str | None = None) -> bool:
+    """Make the end of "the last key is kept" permanent: once any key that was not there when the hold was made
+    is in the key folder, the held key is dropped from this computer's record for good (so it cannot return if
+    that new key goes away again). True when the record was changed. Never fails."""
+    target = state_file(state_path)
+    try:
+        with StateLock(target):
+            state = load_state(target)
+            if not state["held"]:
+                return False
+            primaries = {read_key(p).primary for p in Path(keys_dir).glob("*.asc")}
+            if primaries <= set(state.get("held_keys_seen", [])):
+                return False
+            state["held"], state["held_keys_seen"] = [], []
+            save_state(state, target)
+            return True
+    except (Refuse, OSError):
+        return False
+
+
+def notice_main(args, keys: Path) -> int:
+    if args.sub == "status":
+        settle_state(keys, args.state)
+        try:
+            trust = Trust(keys, args.state)
+            state = load_state(args.state)
+        except (Refuse, OSError) as exc:
+            print(f"REVOCATION NOTICE: {exc}.")
+            return 1
+        print(f"CANCELLED KEYS: {len(state['revoked'])} learned from notices, {len(trust.kit_revoked)} in revoked.txt")
+        for fpr, info in sorted(state["revoked"].items()):
+            print(f"  cancelled  {fpr}  {info.get('reason', '')}  {info.get('revoked_at', '')}")
+        for key in trust.held:
+            print(f"  WARNING: {key.primary} is cancelled but is the last trusted key, so it is kept for now. "
+                  "Install a new key; then this one stops being trusted.")
+        return 0
+    notice = read_optional(args.notice, MAX_NOTICE)
+    signature = read_optional(args.signature or Path(str(args.notice) + SIG_SUFFIX), MAX_SIGNATURE)
+    if args.sub == "check":
+        verdict = verify_notice(notice, signature, keys, args.state)
+    else:
+        verdict = apply_notice(notice, signature, keys, args.state)
+        if verdict.state == VERIFIED:
+            if verdict.held:
+                print(f"REVOCATION NOTICE: WARNING - {verdict.held} is the last trusted key, so it is kept although "
+                      "it is cancelled. Install a new key as soon as possible.")
+            if verdict.changed:
+                print(f"REVOCATION NOTICE: applied - {len(verdict.added)} key(s) are cancelled on this computer for good.")
+    print(verdict.line())
+    return verdict.exit_code
+
+
 # ------------------------------------------------------------------ command line
 def read_optional(path: Path | None, limit: int) -> bytes | None:
     if path is None or not path.is_file():
@@ -548,6 +902,11 @@ def main(argv: list[str] | None = None) -> int:
                         help="folder of trusted public keys (*.asc) and revoked.txt")
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("status", help="list the trusted and withdrawn release keys")
+    notices = commands.add_parser("revocations", help="check or apply a signed list of cancelled keys")
+    notices.add_argument("sub", choices=("check", "apply", "status"))
+    notices.add_argument("--notice", type=Path, help="the revocations.json file (its .sig sits beside it)")
+    notices.add_argument("--signature", type=Path)
+    notices.add_argument("--state", type=Path, help="this computer's record of cancelled keys")
     check = commands.add_parser("check", help="verify a release")
     check.add_argument("--from", dest="source", type=Path, help="folder holding release.json and its signatures")
     check.add_argument("--release", type=Path)
@@ -563,6 +922,10 @@ def main(argv: list[str] | None = None) -> int:
     keys = args.keys.expanduser()
     if args.command == "status":
         return status(keys)
+    if args.command == "revocations":
+        if args.sub != "status" and args.notice is None:
+            parser.error("give --notice FILE")
+        return notice_main(args, keys)
     if (args.source is None) == (args.release is None):
         parser.error("give either --from DIR or --release FILE")
     if args.source is not None:

@@ -17,12 +17,12 @@
     "netboot/github-workflows/build-flipper-fap.yml": "c811cd8a17b08c749e9cbcc900e55803934eadc7be990857d1f9341769c4e080"
   },
   "companion_version": "1.1.0",
-  "kit_version": "secure-linux-2026.11.19-4a2b86ea018a0eeb",
+  "kit_version": "secure-linux-2026.11.20-1cd8ac897317df3f",
   "kit_version_basis": "release.json",
   "refresh_instructions": "After reviewed payload changes, run: secure-linux-release stamp; regenerate affected USB/netboot/master outputs; then run: secure-linux-release check",
-  "refreshed_at": "2026-11-19T01:38:29.647043+00:00",
-  "release_id": "secure-linux-2026.11.19-4a2b86ea018a0eeb",
-  "release_manifest_sha256": "681c0d8f1aca23f1c51af4fe1879765944b55fea6c402893e1a6cedb8caf221f",
+  "refreshed_at": "2026-11-20T03:52:16.827392+00:00",
+  "release_id": "secure-linux-2026.11.20-1cd8ac897317df3f",
+  "release_manifest_sha256": "1f2c63654905408588eb2ceb7a6c20fdac8dd47531789ede1dedbdb3290a1833",
   "schema_version": 1,
-  "source_sha256": "4a2b86ea018a0eebd4a04f3355afaf428ce85e17f8c080850b8d2bbff3baa22a"
+  "source_sha256": "1cd8ac897317df3fcf975fc9fb52be68e24314cb23c1686f01350f1552fe0049"
 }

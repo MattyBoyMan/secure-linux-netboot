@@ -1,5 +1,5 @@
 {
-  "created_at": "2026-11-19T01:38:41.379807+00:00",
+  "created_at": "2026-11-20T03:52:26.121063+00:00",
   "file_count": 625,
   "files": {
     "ARCHITECTURE.md": "46774919253a58f2cf8fdd5c9eca70b881616a452a75873df35a8f581fcfe5c4",
@@ -468,7 +468,7 @@
     "lib/flipper-companion/flipper_companion_resources.py": "df3e02aef303e629bdce71ae8e80cd9c7996f35cc5aabc0b555b47ffcb700625",
     "lib/flipper-companion/flipper_companion_roguemaster.py": "cbe16e3dc917cf45c16a5c42e2cb77c5de1ce0f652c9b9c9c3e37baeafd1ed46",
     "lib/flipper-companion/flipper_companion_timing.py": "4e88f9756d3d3687fbb6ba12633ad827d9efcfd30a5b0bed048706fd1bcb8dfb",
-    "lib/flipper-companion/version.json": "8f17dfd598b40ccc054a88aacedd14b80c54e5b1e36c648302f67f69c2562961",
+    "lib/flipper-companion/version.json": "0dc8b238f91ef50a2bd0045d6c31ff46f38cf438be19a10df877ec0672506c2b",
     "lib/gui_tools_common.py": "863ebef457cde69192c72cd633332467866c6b395e563a20f28920e370e30cbd",
     "lib/gui_tools_gtk.py": "f72bb3236782fdf7c744f6c066bba4ce587bc77f50715ff7db4f1e2a8de429e6",
     "lib/gui_tools_launcher.py": "3f295c39a37d59de39878118e0a69aef1f1fa168cea0eb040106f1012780b99b",
@@ -1255,14 +1255,14 @@
     "wizard.d/legacy/95-finish.sh": "0644",
     "wizard.d/wizard-screen.py": "0755"
   },
-  "release_id": "secure-linux-2026.11.19-4a2b86ea018a0eeb",
+  "release_id": "secure-linux-2026.11.20-1cd8ac897317df3f",
   "schema_version": 1,
   "sets": {
     "debian": {
       "files": {
-        "START-HERE.html": "a3d56d8f33250241e2921bbbe6efcb289edf13457b9af0dbc29884c678f2a353",
+        "START-HERE.html": "471c8442e6e89fdcd9b36f7225b56cc6f48a599fcad73e411695d4c24d33029b",
         "compat-check-min.sh": "d6b6f21479e2bd343ec260963b99d11f828241bb6347f14b53377b33f15ccf48",
-        "debian-files.sha256": "df8de52d974c848871d942764fc28b2722f474b59dd3e7b2b71a1f01ab377405",
+        "debian-files.sha256": "bffe63476e25eca1944bb1ba63d406554819c89c379d5d5fd0f6400a93f6f8f4",
         "eff-words.txt": "36ecca49e4fa20ca84b176c32f2e9c82f98f446585190e75f9879a95c08247bf",
         "late.sh": "1b12c4455ca32ff3d41c57c5fffe6297e22bbc4e0d5a7df475fbf8f7f2a74ee9",
         "payload/bin/secure-linux-activity": "a8b280391776c54e06d734871967f55c889588fb972634bf7eec16dcbc989db7",
@@ -1443,7 +1443,7 @@
         "payload/lib/flipper-companion/flipper_companion_resources.py": "df3e02aef303e629bdce71ae8e80cd9c7996f35cc5aabc0b555b47ffcb700625",
         "payload/lib/flipper-companion/flipper_companion_roguemaster.py": "cbe16e3dc917cf45c16a5c42e2cb77c5de1ce0f652c9b9c9c3e37baeafd1ed46",
         "payload/lib/flipper-companion/flipper_companion_timing.py": "4e88f9756d3d3687fbb6ba12633ad827d9efcfd30a5b0bed048706fd1bcb8dfb",
-        "payload/lib/flipper-companion/version.json": "161d163639b979a8ca6297081923cc95836022de517cff2e3abda39b0fb4e61e",
+        "payload/lib/flipper-companion/version.json": "cccf9b29df63a28182706dac972d68de923813e5b77f52f7d2eb157ef47639e6",
         "payload/lib/gui_tools_common.py": "863ebef457cde69192c72cd633332467866c6b395e563a20f28920e370e30cbd",
         "payload/lib/gui_tools_gtk.py": "f72bb3236782fdf7c744f6c066bba4ce587bc77f50715ff7db4f1e2a8de429e6",
         "payload/lib/gui_tools_launcher.py": "3f295c39a37d59de39878118e0a69aef1f1fa168cea0eb040106f1012780b99b",
@@ -1482,7 +1482,7 @@
         "payload/lib/sl-progress.sh": "0b0469dea9acf7d1a66fd0222b564bd66b39289afe9a5b10739a80e683c136cb",
         "payload/lib/usb_tools_gtk.py": "7cef3563e74058f9efeaaf323286ee1390b7fd569fd16d7fd4fde7295cfc01e5",
         "payload/lib/usb_tools_gui.py": "0ff4de0b4c929047e377fd53f655fc071298f880743daf4004fb5fe6f257c1c1",
-        "payload/release.json": "90148a127cfe79fd40704e6fbf076f92799f70eb703b9b618151ad700f8d5925",
+        "payload/release.json": "796fc78136234b4b58127a53a47a2205866308b35dc26254499ff574dcbf8ca5",
         "payload/setup-data/app-equivalents.tsv": "8e043b33b5b89d215a3b11b8acabab5df64efcc8bd0314a7667fe83d7345eef7",
         "payload/setup-data/app-scan.py": "fae3e8ab50a8b091b8576b3ec7964514bbe1a94d5d1523977620c7eb2b124897",
         "payload/setup.sh": "2897c25e7a5c452e4baecc2feb3db9e8651a5d80bfe186b8a6bf4edc1315a22c",
@@ -1898,7 +1898,7 @@
         "sl-wifi.py": "0755"
       },
       "sizes": {
-        "START-HERE.html": 1304202,
+        "START-HERE.html": 1310906,
         "compat-check-min.sh": 5988,
         "debian-files.sha256": 33623,
         "eff-words.txt": 7180,
@@ -2272,9 +2272,9 @@
     },
     "netboot": {
       "files": {
-        "debian/preseed-netboot-i386.cfg": "b3c230cad012508624b684b312f5457226d1c35f09e50f94f5a9432a1054d9fe",
-        "debian/preseed-netboot-lite.cfg": "ddc44c988ddea68eac021b457bc5f6bb316051942e94f650c8cf14c0d45f2527",
-        "fedora-netboot.ks": "dced44eb7f96d66652ebd4bae3697432e5d4d22b8c143cad976d038fe5d60425",
+        "debian/preseed-netboot-i386.cfg": "d158b8e0c6ebd93f41c1bddda26dd74db4456280ae968fcd377f1d9ed6bcc661",
+        "debian/preseed-netboot-lite.cfg": "20d0c6aad30f40b5265919cb693cf79cfcfc548d7544baa808e0b0f422912c8d",
+        "fedora-netboot.ks": "8ad7460e9444e1bd36e4eaf5e28ff2176077c89d4a286471f1a2792c95a51e65",
         "menu.ipxe": "9dc45c1d6bda7f5bd6587e1aa1ce4350f8983d3314cbffcb48307e17eda60aa5"
       },
       "modes": {
